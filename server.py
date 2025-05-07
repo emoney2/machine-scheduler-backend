@@ -9,27 +9,16 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
-# Enable CORS on all routes
 CORS(app)
 
-# —————————————————————————————
-# Configuration
-# —————————————————————————————
 SCOPES           = ['https://www.googleapis.com/auth/spreadsheets.readonly']
 SPREADSHEET_ID   = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
 
 ORDERS_RANGE     = 'Production Orders!A:AC'
 EMBROIDERY_RANGE = 'Embroidery List!A:ZZ'
-
 PERSISTED_FILE   = 'persisted.json'
 
-
-# —————————————————————————————
-# Helpers
-# —————————————————————————————
 def fetch_from_sheets():
-    """Fetch and parse the 'Production Orders' tab."""
-    # Decode service account JSON from base64 env var
     b64 = os.environ['SERVICE_ACCOUNT_B64']
     creds_json = base64.b64decode(b64).decode('utf-8')
     creds_info = json.loads(creds_json)
@@ -64,7 +53,6 @@ def fetch_from_sheets():
             oid = int(row[i_id])
         except:
             continue
-
         orders.append({
             'id':           oid,
             'title':        row[i_sched],
@@ -79,13 +67,9 @@ def fetch_from_sheets():
             'end_date':     '',
             'delivery':     ''
         })
-
     return orders
 
-
 def fetch_embroidery_list():
-    """Fetch and return the 'Embroidery List' tab as a list of dicts."""
-    # Decode service account JSON from base64 env var
     b64 = os.environ['SERVICE_ACCOUNT_B64']
     creds_json = base64.b64decode(b64).decode('utf-8')
     creds_info = json.loads(creds_json)
@@ -100,16 +84,9 @@ def fetch_embroidery_list():
         return []
 
     headers, *data_rows = rows
-    json_rows = []
-    for row in data_rows:
-        entry = { headers[i]: (row[i] if i < len(row) else '') for i in range(len(headers)) }
-        json_rows.append(entry)
-    return json_rows
+    return [ { headers[i]: (row[i] if i < len(row) else '') for i in range(len(headers)) }
+             for row in data_rows ]
 
-
-# —————————————————————————————
-# Persisted state helpers
-# —————————————————————————————
 def load_persisted():
     if not os.path.exists(PERSISTED_FILE):
         return []
@@ -119,21 +96,14 @@ def load_persisted():
     except json.JSONDecodeError:
         return []
 
-
 def save_persisted(data):
     with open(PERSISTED_FILE, 'w') as f:
         json.dump(data, f, indent=2)
 
-
-# —————————————————————————————
-# Routes
-# —————————————————————————————
 @app.route('/api/orders', methods=['GET'])
 @cross_origin()
 def get_orders():
-    """Return the parsed orders list."""
     orders = fetch_from_sheets()
-    # Overlay persisted updates, if any
     persisted = load_persisted()
     by_id = {o['id']: o for o in orders}
     for p in persisted:
@@ -142,22 +112,15 @@ def get_orders():
             by_id[oid].update(p)
     return jsonify(list(by_id.values()))
 
-
 @app.route('/api/embroideryList', methods=['GET'])
 @cross_origin()
 def get_embroidery_list():
-    """Return the raw embroidery list rows as JSON."""
     try:
-        rows = fetch_embroidery_list()
-        return jsonify(rows)
+        return jsonify(fetch_embroidery_list())
     except Exception as e:
         app.logger.error('Error fetching embroidery list', exc_info=e)
-        return jsonify({'error': 'Unable to load embroidery list'}), 500
+        return jsonify({'error':'Unable to load embroidery list'}), 500
 
-
-# —————————————————————————————
-# Main
-# —————————————————————————————
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     app.run(debug=True, host='0.0.0.0', port=port)
