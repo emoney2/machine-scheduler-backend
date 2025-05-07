@@ -3,12 +3,12 @@
 import os
 import json
 from flask import Flask, jsonify, request
-from flask_cors import CORS
+from flask_cors import CORS, cross_origin
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app)   # allow CORS on all routes
 
 # —————————————————————————————
 # Configuration
@@ -135,7 +135,8 @@ def save_persisted(data):
 # Routes
 # —————————————————————————————
 
-@app.route('/api/orders', methods=['GET'])
+@app.route('/api/orders')
+@cross_origin()   # <— allow any origin for this endpoint
 def get_orders():
     # 1) live sheet orders
     live = fetch_from_sheets()
@@ -149,8 +150,9 @@ def get_orders():
     return jsonify(live)
 
 
-@app.route('/api/orders/<int:order_id>', methods=['PUT'])
-def update_order(order_id):
+@app.route('/api/embroideryList')
+@cross_origin()
+def get_embroidery_list():
     data = request.get_json(force=True)
     # remove old entry
     persisted = [p for p in load_persisted() if p.get('id') != order_id]
