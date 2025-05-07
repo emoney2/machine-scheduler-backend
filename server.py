@@ -2,8 +2,7 @@
 
 import os
 import json
-import base64
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from flask_cors import CORS, cross_origin
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -13,41 +12,33 @@ CORS(app)
 
 SCOPES           = ['https://www.googleapis.com/auth/spreadsheets.readonly']
 SPREADSHEET_ID   = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-
 ORDERS_RANGE     = 'Production Orders!A:AC'
 EMBROIDERY_RANGE = 'Embroidery List!A:ZZ'
-PERSISTED_FILE   = 'persisted.json'
+
+def get_creds():
+    # Load the JSON string from the env var and parse it
+    key_json = os.environ['GOOGLE_SERVICE_ACCOUNT']
+    info     = json.loads(key_json)
+    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
 def fetch_from_sheets():
-    b64 = os.environ['SERVICE_ACCOUNT_B64']
-    creds_json = base64.b64decode(b64).decode('utf-8')
-    creds_info = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-
+    creds   = get_creds()
     service = build('sheets', 'v4', credentials=creds)
-    result = service.spreadsheets().values() \
+    result  = service.spreadsheets().values() \
         .get(spreadsheetId=SPREADSHEET_ID, range=ORDERS_RANGE) \
         .execute()
     rows = result.get('values', [])
     if not rows:
         return []
-
     headers = rows[0]
     def idx(name):
         return headers.index(name) if name in headers else -1
-
-    i_id       = idx('Order #')
-    i_sched    = idx('Schedule String')
-    i_company  = idx('Company Name')
-    i_design   = idx('Design')
-    i_qty      = idx('Quantity')
-    i_due      = idx('Due Date')
-    i_due_type = idx('Due Type')
-    i_sc       = idx('Stitch Count')
-
+    i_id    = idx('Order #')
+    i_sched = idx('Schedule String')
+    # …find other indices similarly…
     orders = []
     for row in rows[1:]:
-        if i_sched < 0 or i_sched >= len(row) or not row[i_sched].strip():
+        if i_sched<0 or i_sched>=len(row) or not row[i_sched].strip():
             continue
         try:
             oid = int(row[i_id])
@@ -56,12 +47,12 @@ def fetch_from_sheets():
         orders.append({
             'id':           oid,
             'title':        row[i_sched],
-            'company':      row[i_company]  if 0 <= i_company  < len(row) else '',
-            'design':       row[i_design]   if 0 <= i_design   < len(row) else '',
-            'quantity':     int(row[i_qty]) if 0 <= i_qty      < len(row) and row[i_qty].isdigit() else 1,
-            'due_date':     row[i_due]      if 0 <= i_due      < len(row) else '',
-            'due_type':     row[i_due_type] if 0 <= i_due_type < len(row) else '',
-            'stitch_count': int(row[i_sc])  if 0 <= i_sc       < len(row) and row[i_sc].isdigit() else 30000,
+            'company':      row[idx('Company Name')] if idx('Company Name')<len(row) else '',
+            'design':       row[idx('Design')]       if idx('Design')<len(row) else '',
+            'quantity':     int(row[idx('Quantity')]) if row[idx('Quantity')].isdigit() else 1,
+            'due_date':     row[idx('Due Date')]     if idx('Due Date')<len(row) else '',
+            'due_type':     row[idx('Due Type')]     if idx('Due Type')<len(row) else '',
+            'stitch_count': int(row[idx('Stitch Count')]) if row[idx('Stitch Count')].isdigit() else 30000,
             'machineId':    None,
             'start_date':   '',
             'end_date':     '',
@@ -70,55 +61,31 @@ def fetch_from_sheets():
     return orders
 
 def fetch_embroidery_list():
-    b64 = os.environ['SERVICE_ACCOUNT_B64']
-    creds_json = base64.b64decode(b64).decode('utf-8')
-    creds_info = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-
+    creds   = get_creds()
     service = build('sheets', 'v4', credentials=creds)
-    result = service.spreadsheets().values() \
+    result  = service.spreadsheets().values() \
         .get(spreadsheetId=SPREADSHEET_ID, range=EMBROIDERY_RANGE) \
         .execute()
     rows = result.get('values', [])
     if not rows:
         return []
-
-    headers, *data_rows = rows
-    return [ { headers[i]: (row[i] if i < len(row) else '') for i in range(len(headers)) }
-             for row in data_rows ]
-
-def load_persisted():
-    if not os.path.exists(PERSISTED_FILE):
-        return []
-    try:
-        with open(PERSISTED_FILE) as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        return []
-
-def save_persisted(data):
-    with open(PERSISTED_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+    headers, *data = rows
+    return [
+        { headers[i]: (row[i] if i < len(row) else '') for i in range(len(headers)) }
+        for row in data
+    ]
 
 @app.route('/api/orders', methods=['GET'])
 @cross_origin()
 def get_orders():
-    orders = fetch_from_sheets()
-    persisted = load_persisted()
-    by_id = {o['id']: o for o in orders}
-    for p in persisted:
-        oid = p.get('id')
-        if oid in by_id:
-            by_id[oid].update(p)
-    return jsonify(list(by_id.values()))
+    return jsonify(fetch_from_sheets())
 
 @app.route('/api/embroideryList', methods=['GET'])
 @cross_origin()
 def get_embroidery_list():
     try:
         return jsonify(fetch_embroidery_list())
-    except Exception as e:
-        app.logger.error('Error fetching embroidery list', exc_info=e)
+    except Exception:
         return jsonify({'error':'Unable to load embroidery list'}), 500
 
 if __name__ == '__main__':
