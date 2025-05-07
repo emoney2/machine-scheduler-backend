@@ -14,16 +14,13 @@ CORS(app)
 # —————————————————————————————
 # Configuration
 # —————————————————————————————
-SERVICE_ACCOUNT_FILE = 'credentials.json'
-SCOPES               = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-SPREADSHEET_ID       = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
+SCOPES           = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+SPREADSHEET_ID   = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
 
-# Ranges in your sheet
-ORDERS_RANGE         = 'Production Orders!A:AC'
-EMBROIDERY_RANGE     = 'Embroidery List!A:ZZ'
+ORDERS_RANGE     = 'Production Orders!A:AC'
+EMBROIDERY_RANGE = 'Embroidery List!A:ZZ'
 
-# Optional persisted file (if you need to overlay local updates)
-PERSISTED_FILE       = 'persisted.json'
+PERSISTED_FILE   = 'persisted.json'
 
 
 # —————————————————————————————
@@ -31,10 +28,10 @@ PERSISTED_FILE       = 'persisted.json'
 # —————————————————————————————
 def fetch_from_sheets():
     """Fetch and parse the 'Production Orders' tab."""
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES
-    )
+    creds_info = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT'])
+    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     service = build('sheets', 'v4', credentials=creds)
+
     result = service.spreadsheets().values() \
         .get(spreadsheetId=SPREADSHEET_ID, range=ORDERS_RANGE) \
         .execute()
@@ -83,11 +80,11 @@ def fetch_from_sheets():
 
 
 def fetch_embroidery_list():
-    """Fetch and return the 'Embroidery List' tab as an array of objects."""
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES
-    )
+    """Fetch and return the 'Embroidery List' tab as a list of dicts."""
+    creds_info = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT'])
+    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     service = build('sheets', 'v4', credentials=creds)
+
     result = service.spreadsheets().values() \
         .get(spreadsheetId=SPREADSHEET_ID, range=EMBROIDERY_RANGE) \
         .execute()
@@ -104,7 +101,7 @@ def fetch_embroidery_list():
 
 
 # —————————————————————————————
-# (Optional) Persisted state helpers
+# Persisted state helpers
 # —————————————————————————————
 def load_persisted():
     if not os.path.exists(PERSISTED_FILE):
@@ -124,14 +121,12 @@ def save_persisted(data):
 # —————————————————————————————
 # Routes
 # —————————————————————————————
-
 @app.route('/api/orders', methods=['GET'])
 @cross_origin()
 def get_orders():
-    """Return the parsed orders list."""
     orders = fetch_from_sheets()
 
-    # Example: overlay persisted updates if you need it
+    # overlay persisted updates, if any
     persisted = load_persisted()
     by_id = {o['id']: o for o in orders}
     for p in persisted:
@@ -145,12 +140,11 @@ def get_orders():
 @app.route('/api/embroideryList', methods=['GET'])
 @cross_origin()
 def get_embroidery_list():
-    """Return the raw embroidery list rows as JSON."""
     try:
         rows = fetch_embroidery_list()
         return jsonify(rows)
     except Exception as e:
-        app.logger.error('Error fetching Embroidery List', exc_info=e)
+        app.logger.error('Error fetching embroidery list', exc_info=e)
         return jsonify({'error': 'Unable to load embroidery list'}), 500
 
 
@@ -158,6 +152,5 @@ def get_embroidery_list():
 # Main
 # —————————————————————————————
 if __name__ == '__main__':
-    # In production, Render will set the port via the PORT env var if needed
     port = int(os.getenv('PORT', 5000))
     app.run(debug=True, host='0.0.0.0', port=port)
