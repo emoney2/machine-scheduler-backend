@@ -2,6 +2,7 @@
 
 import os
 import json
+import base64
 from flask import Flask, jsonify, request
 from flask_cors import CORS, cross_origin
 from google.oauth2 import service_account
@@ -28,10 +29,13 @@ PERSISTED_FILE   = 'persisted.json'
 # —————————————————————————————
 def fetch_from_sheets():
     """Fetch and parse the 'Production Orders' tab."""
-    creds_info = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT'])
+    # Decode service account JSON from base64 env var
+    b64 = os.environ['SERVICE_ACCOUNT_B64']
+    creds_json = base64.b64decode(b64).decode('utf-8')
+    creds_info = json.loads(creds_json)
     creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-    service = build('sheets', 'v4', credentials=creds)
 
+    service = build('sheets', 'v4', credentials=creds)
     result = service.spreadsheets().values() \
         .get(spreadsheetId=SPREADSHEET_ID, range=ORDERS_RANGE) \
         .execute()
@@ -81,10 +85,13 @@ def fetch_from_sheets():
 
 def fetch_embroidery_list():
     """Fetch and return the 'Embroidery List' tab as a list of dicts."""
-    creds_info = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT'])
+    # Decode service account JSON from base64 env var
+    b64 = os.environ['SERVICE_ACCOUNT_B64']
+    creds_json = base64.b64decode(b64).decode('utf-8')
+    creds_info = json.loads(creds_json)
     creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-    service = build('sheets', 'v4', credentials=creds)
 
+    service = build('sheets', 'v4', credentials=creds)
     result = service.spreadsheets().values() \
         .get(spreadsheetId=SPREADSHEET_ID, range=EMBROIDERY_RANGE) \
         .execute()
@@ -124,22 +131,22 @@ def save_persisted(data):
 @app.route('/api/orders', methods=['GET'])
 @cross_origin()
 def get_orders():
+    """Return the parsed orders list."""
     orders = fetch_from_sheets()
-
-    # overlay persisted updates, if any
+    # Overlay persisted updates, if any
     persisted = load_persisted()
     by_id = {o['id']: o for o in orders}
     for p in persisted:
         oid = p.get('id')
         if oid in by_id:
             by_id[oid].update(p)
-
     return jsonify(list(by_id.values()))
 
 
 @app.route('/api/embroideryList', methods=['GET'])
 @cross_origin()
 def get_embroidery_list():
+    """Return the raw embroidery list rows as JSON."""
     try:
         rows = fetch_embroidery_list()
         return jsonify(rows)
