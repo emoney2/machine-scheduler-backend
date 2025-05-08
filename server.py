@@ -2,6 +2,7 @@
 
 import os
 import json
+import base64
 from flask import Flask, jsonify, request
 from flask_cors import CORS, cross_origin
 from google.oauth2 import service_account
@@ -13,7 +14,7 @@ CORS(app)  # allow CORS on all routes
 # —————————————————————————————
 # Configuration
 # —————————————————————————————
-SERVICE_ACCOUNT_FILE = 'credentials.json'
+# (no more SERVICE_ACCOUNT_FILE)
 SCOPES               = ['https://www.googleapis.com/auth/spreadsheets.readonly']
 SPREADSHEET_ID       = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
 
@@ -24,12 +25,21 @@ PERSISTED_FILE       = 'persisted.json'
 
 
 # —————————————————————————————
+# Internal: build creds from ENV
+# —————————————————————————————
+def get_sheet_creds():
+    b64 = os.getenv('SERVICE_ACCOUNT_B64', '')
+    if not b64:
+        raise RuntimeError('SERVICE_ACCOUNT_B64 not set')
+    info = json.loads(base64.b64decode(b64))
+    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+
+
+# —————————————————————————————
 # Helper: Fetch Production Orders
 # —————————————————————————————
 def fetch_from_sheets():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES
-    )
+    creds = get_sheet_creds()
     service = build('sheets', 'v4', credentials=creds)
     result = service.spreadsheets().values() \
         .get(spreadsheetId=SPREADSHEET_ID, range=ORDERS_RANGE) \
@@ -39,7 +49,6 @@ def fetch_from_sheets():
         return []
 
     headers = rows[0]
-
     def idx_any(candidates):
         for name in candidates:
             if name in headers:
@@ -52,12 +61,7 @@ def fetch_from_sheets():
     i_design    = idx_any(['Design'])
     i_qty       = idx_any(['Quantity'])
     i_due       = idx_any(['Due Date'])
-    i_due_type  = idx_any([
-        'Hard Date/Soft Date',
-        'Due Type',
-        'Hard Date',
-        'Soft Date'
-    ])
+    i_due_type  = idx_any(['Hard Date/Soft Date','Due Type','Hard Date','Soft Date'])
     i_sc        = idx_any(['Stitch Count'])
 
     orders = []
@@ -95,9 +99,7 @@ def fetch_from_sheets():
 # Helper: Fetch Embroidery List tab
 # —————————————————————————————
 def fetch_embroidery_list():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES
-    )
+    creds = get_sheet_creds()
     service = build('sheets', 'v4', credentials=creds)
     result = service.spreadsheets().values() \
         .get(spreadsheetId=SPREADSHEET_ID, range=EMBROIDERY_RANGE) \
@@ -154,25 +156,19 @@ def get_embroidery_list():
     try:
         rows = fetch_embroidery_list()
         return jsonify(rows)
-    except Exception as e:
-        app.logger.error('Error fetching Embroidery List', exc_info=e)
+    except Exception:
         return jsonify({'error': 'Unable to load embroidery list'}), 500
 
 
-# —————————————————————————————
-# Manual-state endpoints
-# —————————————————————————————
 @app.route('/api/manualState', methods=['GET'])
 @cross_origin()
 def get_manual_state():
-    """Return the saved manual placement state."""
     return jsonify(load_persisted())
 
 
 @app.route('/api/manualState', methods=['POST'])
 @cross_origin()
 def post_manual_state():
-    """Save the manual placement state."""
     data = request.get_json(force=True)
     save_persisted(data)
     return jsonify(success=True)
