@@ -4,57 +4,41 @@ import os
 import json
 import base64
 from flask import Flask, jsonify, request
-from flask_cors import CORS, cross_origin
+from flask_cors import CORS
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
-CORS(app)  # apply CORS to all routes
+CORS(app)
 
 # —————————————————————————————
-# Configuration
+# Configuration & Credentials
 # —————————————————————————————
-SCOPES             = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-SPREADSHEET_ID     = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-ORDERS_RANGE       = 'Production Orders!A:AC'
-EMBROIDERY_RANGE   = 'Embroidery List!A:ZZ'
-MANUAL_STATE_FILE  = 'manual_state.json'
-PERSISTED_FILE     = 'persisted.json'  # for order-specific updates
 
+SPREADSHEET_ID = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
+ORDERS_RANGE   = 'Production Orders!A:AC'
+EMBROIDERY_RANGE = 'Embroidery List!A:ZZ'
+PERSISTED_FILE = 'persisted.json'
 
-# —————————————————————————————
-# Helpers to load & save JSON files
-# —————————————————————————————
-def load_json(file, default):
-    if not os.path.exists(file):
-        return default
-    try:
-        with open(file) as f:
-            return json.load(f)
-    except:
-        return default
-
-def save_json(file, data):
-    with open(file, 'w') as f:
-        json.dump(data, f, indent=2)
-
+# Load service account creds from B64 env var if set, otherwise from file
+if os.getenv('SERVICE_ACCOUNT_B64'):
+    creds_json = base64.b64decode(os.getenv('SERVICE_ACCOUNT_B64'))
+    creds_info = json.loads(creds_json)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info,
+        scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
+    )
+else:
+    creds = service_account.Credentials.from_service_account_file(
+        'credentials.json',
+        scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
+    )
 
 # —————————————————————————————
-# Build Sheets credentials from SERVICE_ACCOUNT_B64
+# Helpers
 # —————————————————————————————
-def get_sheet_creds():
-    b64 = os.getenv('SERVICE_ACCOUNT_B64', '')
-    if not b64:
-        raise RuntimeError('SERVICE_ACCOUNT_B64 not set')
-    info = json.loads(base64.b64decode(b64))
-    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
-
-# —————————————————————————————
-# Fetch Production Orders
-# —————————————————————————————
 def fetch_from_sheets():
-    creds = get_sheet_creds()
     service = build('sheets', 'v4', credentials=creds)
     result = service.spreadsheets().values() \
         .get(spreadsheetId=SPREADSHEET_ID, range=ORDERS_RANGE) \
@@ -64,20 +48,18 @@ def fetch_from_sheets():
         return []
 
     headers = rows[0]
-    def idx_any(cands):
-        for c in cands:
-            if c in headers:
-                return headers.index(c)
-        return -1
+    def idx(name):
+        return headers.index(name) if name in headers else -1
 
-    i_id       = idx_any(['Order #'])
-    i_sched    = idx_any(['Schedule String'])
-    i_company  = idx_any(['Company Name'])
-    i_design   = idx_any(['Design'])
-    i_qty      = idx_any(['Quantity'])
-    i_due      = idx_any(['Due Date'])
-    i_due_type = idx_any(['Hard Date/Soft Date','Due Type','Hard Date','Soft Date'])
-    i_sc       = idx_any(['Stitch Count'])
+    # find the indices we need
+    i_id       = idx('Order #')
+    i_sched    = idx('Schedule String')
+    i_company  = idx('Company Name')
+    i_design   = idx('Design')
+    i_qty      = idx('Quantity')
+    i_due      = idx('Due Date')
+    i_due_type = idx('Hard Date/Soft Date') or idx('Due Type')
+    i_sc       = idx('Stitch Count')
 
     orders = []
     for row in rows[1:]:
@@ -88,19 +70,15 @@ def fetch_from_sheets():
         except:
             continue
 
-        due_type = ''
-        if 0 <= i_due_type < len(row):
-            due_type = row[i_due_type].strip()
-
         orders.append({
             'id':           oid,
             'title':        row[i_sched],
-            'company':      row[i_company]   if 0 <= i_company   < len(row) else '',
-            'design':       row[i_design]    if 0 <= i_design    < len(row) else '',
-            'quantity':     int(row[i_qty])  if 0 <= i_qty       < len(row) and row[i_qty].isdigit() else 1,
-            'due_date':     row[i_due]       if 0 <= i_due       < len(row) else '',
-            'due_type':     due_type,
-            'stitch_count': int(row[i_sc])   if 0 <= i_sc        < len(row) and row[i_sc].isdigit() else 30000,
+            'company':      row[i_company]  if 0 <= i_company  < len(row) else '',
+            'design':       row[i_design]   if 0 <= i_design   < len(row) else '',
+            'quantity':     int(row[i_qty]) if 0 <= i_qty      < len(row) and row[i_qty].isdigit() else 1,
+            'due_date':     row[i_due]      if 0 <= i_due      < len(row) else '',
+            'due_type':     row[i_due_type] if 0 <= i_due_type < len(row) else '',
+            'stitch_count': int(row[i_sc])  if 0 <= i_sc       < len(row) and row[i_sc].isdigit() else 30000,
             'machineId':    None,
             'start_date':   '',
             'end_date':     '',
@@ -109,12 +87,7 @@ def fetch_from_sheets():
 
     return orders
 
-
-# —————————————————————————————
-# Fetch Embroidery List
-# —————————————————————————————
 def fetch_embroidery_list():
-    creds = get_sheet_creds()
     service = build('sheets', 'v4', credentials=creds)
     result = service.spreadsheets().values() \
         .get(spreadsheetId=SPREADSHEET_ID, range=EMBROIDERY_RANGE) \
@@ -122,95 +95,80 @@ def fetch_embroidery_list():
     rows = result.get('values', [])
     if not rows:
         return []
-
     headers, *data_rows = rows
-    return [
-        { headers[i]: (row[i] if i < len(row) else '') for i in range(len(headers)) }
-        for row in data_rows
-    ]
+    json_rows = []
+    for row in data_rows:
+        entry = { headers[i]: (row[i] if i < len(row) else '') for i in range(len(headers)) }
+        json_rows.append(entry)
+    return json_rows
 
+def load_persisted():
+    if not os.path.exists(PERSISTED_FILE):
+        return []
+    try:
+        data = json.load(open(PERSISTED_FILE))
+        # only keep dicts with an 'id'
+        return [item for item in data if isinstance(item, dict) and 'id' in item]
+    except:
+        return []
+
+def save_persisted(data):
+    with open(PERSISTED_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
 
 # —————————————————————————————
 # Routes
 # —————————————————————————————
+
 @app.route('/api/orders', methods=['GET'])
-@cross_origin()
 def get_orders():
-    # 1) live data
-    live = fetch_from_sheets()
-    # 2) overlay persisted updates
-    persisted = load_json(PERSISTED_FILE, [])
-    by_id = {o['id']: o for o in live}
-    for p in persisted:
-        oid = p.get('id')
-        if oid in by_id:
-            by_id[oid].update(p)
-    return jsonify(list(by_id.values()))
-
-
-@app.route('/api/orders/<int:order_id>', methods=['PUT'])
-@cross_origin()
-def update_order(order_id):
-    # persist any fields the frontend sends (e.g. embroidery_start)
-    changes = request.get_json(force=True)
-    persisted = load_json(PERSISTED_FILE, [])
-    # remove old for this id
-    persisted = [p for p in persisted if p.get('id') != order_id]
-    entry = {'id': order_id}
-    entry.update(changes)
-    persisted.append(entry)
-    save_json(PERSISTED_FILE, persisted)
-    return jsonify(success=True)
-
+    try:
+        live = fetch_from_sheets()
+        persisted = load_persisted()
+        by_id = { o['id']: o for o in live }
+        for p in persisted:
+            oid = p.get('id')
+            if oid in by_id:
+                by_id[oid].update(p)
+        return jsonify(list(by_id.values()))
+    except Exception as e:
+        app.logger.exception(e)
+        return jsonify({ 'error': 'Unable to load orders' }), 500
 
 @app.route('/api/embroideryList', methods=['GET'])
-@cross_origin()
 def get_embroidery_list():
     try:
-        return jsonify(fetch_embroidery_list())
+        rows = fetch_embroidery_list()
+        return jsonify(rows)
     except Exception as e:
-        app.logger.error('Error fetching Embroidery List', exc_info=e)
-        return jsonify({'error': 'Unable to load embroidery list'}), 500
-
+        app.logger.exception(e)
+        return jsonify({ 'error': 'Unable to load embroidery list' }), 500
 
 @app.route('/api/manualState', methods=['GET'])
-@cross_origin()
 def get_manual_state():
-    return jsonify(load_json(MANUAL_STATE_FILE, { 'machine1': [], 'machine2': [] }))
-
+    return jsonify(load_persisted())
 
 @app.route('/api/manualState', methods=['POST'])
-@cross_origin()
 def post_manual_state():
     data = request.get_json(force=True)
-    save_json(MANUAL_STATE_FILE, data)
-    return jsonify(success=True)
+    if isinstance(data, list):
+        filtered = [item for item in data if isinstance(item, dict) and 'id' in item]
+        save_persisted(filtered)
+        return jsonify({ 'success': True })
+    return jsonify({ 'error': 'Invalid payload' }), 400
 
-
-# —————————————————————————————
-# Always include CORS headers
-# —————————————————————————————
-@app.after_request
-def apply_cors(response):
-    response.headers["Access-Control-Allow-Origin"]  = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-    return response
-
-
-# —————————————————————————————
-# Error handler to preserve CORS on errors
-# —————————————————————————————
-@app.errorhandler(Exception)
-def handle_all_errors(e):
-    code = getattr(e, "code", 500)
-    resp = jsonify({'error': str(e)})
-    resp.status_code = code
-    resp.headers["Access-Control-Allow-Origin"]  = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-    return resp
-
+@app.route('/api/orders/<int:order_id>', methods=['PUT'])
+def update_order(order_id):
+    data = request.get_json(force=True) or {}
+    persisted = load_persisted()
+    # remove any existing entry for this order_id
+    persisted = [p for p in persisted if p.get('id') != order_id]
+    # add our new data
+    entry = { 'id': order_id }
+    entry.update(data)
+    persisted.append(entry)
+    save_persisted(persisted)
+    return jsonify({ 'success': True })
 
 # —————————————————————————————
 # Main
