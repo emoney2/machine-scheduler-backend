@@ -14,18 +14,15 @@ CORS(app)  # allow CORS on all routes
 # —————————————————————————————
 # Configuration
 # —————————————————————————————
-# (no more SERVICE_ACCOUNT_FILE)
-SCOPES               = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-SPREADSHEET_ID       = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-
-ORDERS_RANGE         = 'Production Orders!A:AC'
-EMBROIDERY_RANGE     = 'Embroidery List!A:ZZ'
-
-PERSISTED_FILE       = 'persisted.json'
+SCOPES           = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+SPREADSHEET_ID   = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
+ORDERS_RANGE     = 'Production Orders!A:AC'
+EMBROIDERY_RANGE = 'Embroidery List!A:ZZ'
+PERSISTED_FILE   = 'persisted.json'
 
 
 # —————————————————————————————
-# Internal: build creds from ENV
+# Internal: build credentials from SERVICE_ACCOUNT_B64
 # —————————————————————————————
 def get_sheet_creds():
     b64 = os.getenv('SERVICE_ACCOUNT_B64', '')
@@ -55,14 +52,14 @@ def fetch_from_sheets():
                 return headers.index(name)
         return -1
 
-    i_id        = idx_any(['Order #'])
-    i_sched     = idx_any(['Schedule String'])
-    i_company   = idx_any(['Company Name'])
-    i_design    = idx_any(['Design'])
-    i_qty       = idx_any(['Quantity'])
-    i_due       = idx_any(['Due Date'])
-    i_due_type  = idx_any(['Hard Date/Soft Date','Due Type','Hard Date','Soft Date'])
-    i_sc        = idx_any(['Stitch Count'])
+    i_id       = idx_any(['Order #'])
+    i_sched    = idx_any(['Schedule String'])
+    i_company  = idx_any(['Company Name'])
+    i_design   = idx_any(['Design'])
+    i_qty      = idx_any(['Quantity'])
+    i_due      = idx_any(['Due Date'])
+    i_due_type = idx_any(['Hard Date/Soft Date', 'Due Type', 'Hard Date', 'Soft Date'])
+    i_sc       = idx_any(['Stitch Count'])
 
     orders = []
     for row in rows[1:]:
@@ -156,7 +153,8 @@ def get_embroidery_list():
     try:
         rows = fetch_embroidery_list()
         return jsonify(rows)
-    except Exception:
+    except Exception as e:
+        app.logger.error('Error fetching Embroidery List', exc_info=e)
         return jsonify({'error': 'Unable to load embroidery list'}), 500
 
 
@@ -173,6 +171,7 @@ def post_manual_state():
     save_persisted(data)
     return jsonify(success=True)
 
+
 # —————————————————————————————
 # Always add CORS headers
 # —————————————————————————————
@@ -182,6 +181,21 @@ def apply_cors(response):
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
     return response
+
+
+# —————————————————————————————
+# Global error handler to preserve CORS on exceptions
+# —————————————————————————————
+@app.errorhandler(Exception)
+def handle_all_errors(e):
+    code = getattr(e, "code", 500)
+    payload = {"error": str(e)}
+    resp = jsonify(payload)
+    resp.status_code = code
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    return resp
 
 
 # —————————————————————————————
