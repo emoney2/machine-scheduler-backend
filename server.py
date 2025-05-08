@@ -14,15 +14,15 @@ CORS(app)  # allow CORS on all routes
 # —————————————————————————————
 # Configuration
 # —————————————————————————————
-SCOPES           = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-SPREADSHEET_ID   = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-ORDERS_RANGE     = 'Production Orders!A:AC'
-EMBROIDERY_RANGE = 'Embroidery List!A:ZZ'
-PERSISTED_FILE   = 'persisted.json'
+SCOPES               = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+SPREADSHEET_ID       = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
+ORDERS_RANGE         = 'Production Orders!A:AC'
+EMBROIDERY_RANGE     = 'Embroidery List!A:ZZ'
+MANUAL_STATE_FILE    = 'manual_state.json'
 
 
 # —————————————————————————————
-# Internal: build credentials from SERVICE_ACCOUNT_B64
+# Build Google Sheets credentials from env
 # —————————————————————————————
 def get_sheet_creds():
     b64 = os.getenv('SERVICE_ACCOUNT_B64', '')
@@ -33,7 +33,7 @@ def get_sheet_creds():
 
 
 # —————————————————————————————
-# Helper: Fetch Production Orders
+# Fetch Production Orders
 # —————————————————————————————
 def fetch_from_sheets():
     creds = get_sheet_creds()
@@ -58,7 +58,7 @@ def fetch_from_sheets():
     i_design   = idx_any(['Design'])
     i_qty      = idx_any(['Quantity'])
     i_due      = idx_any(['Due Date'])
-    i_due_type = idx_any(['Hard Date/Soft Date', 'Due Type', 'Hard Date', 'Soft Date'])
+    i_due_type = idx_any(['Hard Date/Soft Date','Due Type','Hard Date','Soft Date'])
     i_sc       = idx_any(['Stitch Count'])
 
     orders = []
@@ -93,7 +93,7 @@ def fetch_from_sheets():
 
 
 # —————————————————————————————
-# Helper: Fetch Embroidery List tab
+# Fetch Embroidery List
 # —————————————————————————————
 def fetch_embroidery_list():
     creds = get_sheet_creds()
@@ -114,20 +114,20 @@ def fetch_embroidery_list():
 
 
 # —————————————————————————————
-# Persisted state helpers
+# Manual-state helpers (separate file)
 # —————————————————————————————
-def load_persisted():
-    if not os.path.exists(PERSISTED_FILE):
-        return []
+def load_manual_state():
+    if not os.path.exists(MANUAL_STATE_FILE):
+        return { 'machine1': [], 'machine2': [] }
     try:
-        with open(PERSISTED_FILE) as f:
+        with open(MANUAL_STATE_FILE) as f:
             return json.load(f)
     except json.JSONDecodeError:
-        return []
+        return { 'machine1': [], 'machine2': [] }
 
 
-def save_persisted(data):
-    with open(PERSISTED_FILE, 'w') as f:
+def save_manual_state(data):
+    with open(MANUAL_STATE_FILE, 'w') as f:
         json.dump(data, f, indent=2)
 
 
@@ -137,22 +137,14 @@ def save_persisted(data):
 @app.route('/api/orders', methods=['GET'])
 @cross_origin()
 def get_orders():
-    live = fetch_from_sheets()
-    persisted = load_persisted()
-    by_id = {o['id']: o for o in live}
-    for p in persisted:
-        oid = p.get('id')
-        if oid in by_id:
-            by_id[oid].update(p)
-    return jsonify(list(by_id.values()))
+    return jsonify(fetch_from_sheets())
 
 
 @app.route('/api/embroideryList', methods=['GET'])
 @cross_origin()
 def get_embroidery_list():
     try:
-        rows = fetch_embroidery_list()
-        return jsonify(rows)
+        return jsonify(fetch_embroidery_list())
     except Exception as e:
         app.logger.error('Error fetching Embroidery List', exc_info=e)
         return jsonify({'error': 'Unable to load embroidery list'}), 500
@@ -161,14 +153,14 @@ def get_embroidery_list():
 @app.route('/api/manualState', methods=['GET'])
 @cross_origin()
 def get_manual_state():
-    return jsonify(load_persisted())
+    return jsonify(load_manual_state())
 
 
 @app.route('/api/manualState', methods=['POST'])
 @cross_origin()
 def post_manual_state():
     data = request.get_json(force=True)
-    save_persisted(data)
+    save_manual_state(data)
     return jsonify(success=True)
 
 
