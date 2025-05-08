@@ -40,14 +40,12 @@ def fetch_from_sheets():
 
     headers = rows[0]
 
-    # Find the index of the first matching header name
     def idx_any(candidates):
         for name in candidates:
             if name in headers:
                 return headers.index(name)
         return -1
 
-    # locate each column
     i_id        = idx_any(['Order #'])
     i_sched     = idx_any(['Schedule String'])
     i_company   = idx_any(['Company Name'])
@@ -64,16 +62,13 @@ def fetch_from_sheets():
 
     orders = []
     for row in rows[1:]:
-        # skip if missing schedule string
         if i_sched < 0 or i_sched >= len(row) or not row[i_sched].strip():
             continue
-        # parse order ID
         try:
             oid = int(row[i_id])
         except:
             continue
 
-        # pull due_type string
         due_type = ''
         if 0 <= i_due_type < len(row):
             due_type = row[i_due_type].strip()
@@ -140,7 +135,6 @@ def save_persisted(data):
 # —————————————————————————————
 # Routes
 # —————————————————————————————
-
 @app.route('/api/orders', methods=['GET'])
 @cross_origin()
 def get_orders():
@@ -163,6 +157,25 @@ def get_embroidery_list():
     except Exception as e:
         app.logger.error('Error fetching Embroidery List', exc_info=e)
         return jsonify({'error': 'Unable to load embroidery list'}), 500
+
+
+# —————————————————————————————
+# Manual-state endpoints
+# —————————————————————————————
+@app.route('/api/manualState', methods=['GET'])
+@cross_origin()
+def get_manual_state():
+    """Return the saved manual placement state."""
+    return jsonify(load_persisted())
+
+
+@app.route('/api/manualState', methods=['POST'])
+@cross_origin()
+def post_manual_state():
+    """Save the manual placement state."""
+    data = request.get_json(force=True)
+    save_persisted(data)
+    return jsonify(success=True)
 
 
 # —————————————————————————————
