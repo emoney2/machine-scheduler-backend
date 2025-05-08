@@ -9,20 +9,38 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
-CORS(app)  # allow CORS on all routes
+CORS(app)  # apply CORS to all routes
 
 # —————————————————————————————
 # Configuration
 # —————————————————————————————
-SCOPES               = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-SPREADSHEET_ID       = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-ORDERS_RANGE         = 'Production Orders!A:AC'
-EMBROIDERY_RANGE     = 'Embroidery List!A:ZZ'
-MANUAL_STATE_FILE    = 'manual_state.json'
+SCOPES             = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+SPREADSHEET_ID     = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
+ORDERS_RANGE       = 'Production Orders!A:AC'
+EMBROIDERY_RANGE   = 'Embroidery List!A:ZZ'
+MANUAL_STATE_FILE  = 'manual_state.json'
+PERSISTED_FILE     = 'persisted.json'  # for order-specific updates
 
 
 # —————————————————————————————
-# Build Google Sheets credentials from env
+# Helpers to load & save JSON files
+# —————————————————————————————
+def load_json(file, default):
+    if not os.path.exists(file):
+        return default
+    try:
+        with open(file) as f:
+            return json.load(f)
+    except:
+        return default
+
+def save_json(file, data):
+    with open(file, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+# —————————————————————————————
+# Build Sheets credentials from SERVICE_ACCOUNT_B64
 # —————————————————————————————
 def get_sheet_creds():
     b64 = os.getenv('SERVICE_ACCOUNT_B64', '')
@@ -46,10 +64,10 @@ def fetch_from_sheets():
         return []
 
     headers = rows[0]
-    def idx_any(candidates):
-        for name in candidates:
-            if name in headers:
-                return headers.index(name)
+    def idx_any(cands):
+        for c in cands:
+            if c in headers:
+                return headers.index(c)
         return -1
 
     i_id       = idx_any(['Order #'])
@@ -106,29 +124,10 @@ def fetch_embroidery_list():
         return []
 
     headers, *data_rows = rows
-    json_rows = []
-    for row in data_rows:
-        entry = { headers[i]: (row[i] if i < len(row) else '') for i in range(len(headers)) }
-        json_rows.append(entry)
-    return json_rows
-
-
-# —————————————————————————————
-# Manual-state helpers (separate file)
-# —————————————————————————————
-def load_manual_state():
-    if not os.path.exists(MANUAL_STATE_FILE):
-        return { 'machine1': [], 'machine2': [] }
-    try:
-        with open(MANUAL_STATE_FILE) as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        return { 'machine1': [], 'machine2': [] }
-
-
-def save_manual_state(data):
-    with open(MANUAL_STATE_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+    return [
+        { headers[i]: (row[i] if i < len(row) else '') for i in range(len(headers)) }
+        for row in data_rows
+    ]
 
 
 # —————————————————————————————
@@ -137,7 +136,31 @@ def save_manual_state(data):
 @app.route('/api/orders', methods=['GET'])
 @cross_origin()
 def get_orders():
-    return jsonify(fetch_from_sheets())
+    # 1) live data
+    live = fetch_from_sheets()
+    # 2) overlay persisted updates
+    persisted = load_json(PERSISTED_FILE, [])
+    by_id = {o['id']: o for o in live}
+    for p in persisted:
+        oid = p.get('id')
+        if oid in by_id:
+            by_id[oid].update(p)
+    return jsonify(list(by_id.values()))
+
+
+@app.route('/api/orders/<int:order_id>', methods=['PUT'])
+@cross_origin()
+def update_order(order_id):
+    # persist any fields the frontend sends (e.g. embroidery_start)
+    changes = request.get_json(force=True)
+    persisted = load_json(PERSISTED_FILE, [])
+    # remove old for this id
+    persisted = [p for p in persisted if p.get('id') != order_id]
+    entry = {'id': order_id}
+    entry.update(changes)
+    persisted.append(entry)
+    save_json(PERSISTED_FILE, persisted)
+    return jsonify(success=True)
 
 
 @app.route('/api/embroideryList', methods=['GET'])
@@ -153,38 +176,37 @@ def get_embroidery_list():
 @app.route('/api/manualState', methods=['GET'])
 @cross_origin()
 def get_manual_state():
-    return jsonify(load_manual_state())
+    return jsonify(load_json(MANUAL_STATE_FILE, { 'machine1': [], 'machine2': [] }))
 
 
 @app.route('/api/manualState', methods=['POST'])
 @cross_origin()
 def post_manual_state():
     data = request.get_json(force=True)
-    save_manual_state(data)
+    save_json(MANUAL_STATE_FILE, data)
     return jsonify(success=True)
 
 
 # —————————————————————————————
-# Always add CORS headers
+# Always include CORS headers
 # —————————————————————————————
 @app.after_request
 def apply_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
     return response
 
 
 # —————————————————————————————
-# Global error handler to preserve CORS on exceptions
+# Error handler to preserve CORS on errors
 # —————————————————————————————
 @app.errorhandler(Exception)
 def handle_all_errors(e):
     code = getattr(e, "code", 500)
-    payload = {"error": str(e)}
-    resp = jsonify(payload)
+    resp = jsonify({'error': str(e)})
     resp.status_code = code
-    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
     return resp
