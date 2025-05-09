@@ -8,8 +8,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
-# Enable CORS for everything under /api/*
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# Enable CORS for every route, every method, every origin
+CORS(app)
 
 # —————————————————————————————
 # Configuration
