@@ -2,55 +2,66 @@
 
 import os
 import json
+import base64
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
-CORS(app)   # ← opens CORS on all routes
+CORS(app)   # ← full CORS
 
 # —————————————————————————————
 # Configuration
 # —————————————————————————————
-SERVICE_ACCOUNT_FILE = 'credentials.json'
-SCOPES               = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-SPREADSHEET_ID       = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
+SCOPES         = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+SPREADSHEET_ID = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
 
-ORDERS_RANGE         = 'Production Orders!A:AC'
-EMBROIDERY_RANGE     = 'Embroidery List!A:ZZ'
+ORDERS_RANGE     = 'Production Orders!A:AC'
+EMBROIDERY_RANGE = 'Embroidery List!A:ZZ'
 
-PERSISTED_FILE       = 'persisted.json'
+PERSISTED_FILE   = 'persisted.json'
 
 
 # —————————————————————————————
-# Sheets helpers
+# Auth helper: either from SERVICE_ACCOUNT_B64 or fallback to credentials.json
 # —————————————————————————————
-def get_sheets_service():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=SCOPES
+def get_credentials():
+    b64 = os.getenv('SERVICE_ACCOUNT_B64')
+    if b64:
+        # decode the JSON you pasted into SERVICE_ACCOUNT_B64
+        info = json.loads(base64.b64decode(b64).decode())
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    # fallback if you happen to have a credentials.json file
+    return service_account.Credentials.from_service_account_file(
+        'credentials.json', scopes=SCOPES
     )
+
+
+def sheets_values():
+    creds = get_credentials()
     return build('sheets', 'v4', credentials=creds).spreadsheets().values()
 
 
+# —————————————————————————————
+# Fetch orders from your sheet
+# —————————————————————————————
 def fetch_from_sheets():
-    result = get_sheets_service().get(
+    res = sheets_values().get(
         spreadsheetId=SPREADSHEET_ID,
         range=ORDERS_RANGE
     ).execute()
-    rows = result.get('values', [])
+    rows = res.get('values', [])
     if not rows:
         return []
-    headers = rows[0]
 
+    headers = rows[0]
     def idx_any(cands):
         for c in cands:
             if c in headers:
                 return headers.index(c)
         return -1
 
-    # find relevant columns
     i_id       = idx_any(['Order #'])
     i_sched    = idx_any(['Schedule String'])
     i_company  = idx_any(['Company Name'])
@@ -61,17 +72,17 @@ def fetch_from_sheets():
     i_sc       = idx_any(['Stitch Count'])
 
     if i_id < 0 or i_sched < 0:
-        raise RuntimeError(f"Missing required header. Found: {headers!r}")
+        raise RuntimeError(f"Sheet missing Order# or ScheduleString header: {headers!r}")
 
-    orders = []
+    out = []
     for row in rows[1:]:
         if i_sched >= len(row) or not row[i_sched].strip():
             continue
         try:
             oid = int(row[i_id])
-        except ValueError:
+        except:
             continue
-        orders.append({
+        out.append({
             'id':           oid,
             'title':        row[i_sched],
             'company':      row[i_company]   if 0 <= i_company  < len(row) else '',
@@ -85,15 +96,18 @@ def fetch_from_sheets():
             'end_date':     '',
             'delivery':     ''
         })
-    return orders
+    return out
 
 
+# —————————————————————————————
+# Fetch embroidery list
+# —————————————————————————————
 def fetch_embroidery_list():
-    result = get_sheets_service().get(
+    res = sheets_values().get(
         spreadsheetId=SPREADSHEET_ID,
         range=EMBROIDERY_RANGE
     ).execute()
-    rows = result.get('values', [])
+    rows = res.get('values', [])
     if not rows:
         return []
     headers, *data_rows = rows
@@ -107,7 +121,7 @@ def fetch_embroidery_list():
 
 
 # —————————————————————————————
-# Persisted state helpers
+# Persisted manual-state helpers
 # —————————————————————————————
 def load_persisted():
     if not os.path.exists(PERSISTED_FILE):
@@ -115,7 +129,7 @@ def load_persisted():
     try:
         data = json.load(open(PERSISTED_FILE))
         return data if isinstance(data, list) else []
-    except Exception:
+    except:
         return []
 
 
@@ -150,26 +164,23 @@ def get_orders():
 def manual_state():
     if request.method == 'GET':
         return jsonify(load_persisted())
-
-    # POST → save the JSON array
     data = request.get_json(force=True)
     if not isinstance(data, list):
-        return jsonify({ 'error': 'expected a JSON array' }), 400
+        return jsonify({ 'error': 'expected JSON array' }), 400
     save_persisted(data)
     return jsonify({ 'success': True })
 
 
 @app.route('/api/embroideryList', methods=['GET'])
-def get_embroidery_list():
+def embroidery_list():
     try:
-        rows = fetch_embroidery_list()
-        return jsonify(rows)
+        return jsonify(fetch_embroidery_list())
     except Exception as e:
         return jsonify({ 'error': str(e) }), 500
 
 
 # —————————————————————————————
-# Main entry
+# Run
 # —————————————————————————————
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
