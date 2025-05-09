@@ -2,56 +2,58 @@
 
 import os
 import json
-import base64
 from flask import Flask, jsonify, request
-from flask_cors import CORS
+from flask_cors import CORS, cross_origin
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
-CORS(app)   # ← full CORS
+# Allow CORS from anywhere on all /api/* routes
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# —————————————————————————————
+# ————————————————————————————
 # Configuration
-# —————————————————————————————
-SCOPES         = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-SPREADSHEET_ID = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
+# ————————————————————————————
+SERVICE_ACCOUNT_FILE = os.getenv('SERVICE_ACCOUNT_FILE', 'credentials.json')
+SCOPES               = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+SPREADSHEET_ID       = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
+ORDERS_RANGE         = 'Production Orders!A:AC'
+EMBROIDERY_RANGE     = 'Embroidery List!A:ZZ'
 
-ORDERS_RANGE     = 'Production Orders!A:AC'
-EMBROIDERY_RANGE = 'Embroidery List!A:ZZ'
-
-PERSISTED_FILE   = 'persisted.json'
-
-
-# —————————————————————————————
-# Auth helper: either from SERVICE_ACCOUNT_B64 or fallback to credentials.json
-# —————————————————————————————
-def get_credentials():
-    b64 = os.getenv('SERVICE_ACCOUNT_B64')
-    if b64:
-        # decode the JSON you pasted into SERVICE_ACCOUNT_B64
-        info = json.loads(base64.b64decode(b64).decode())
-        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    # fallback if you happen to have a credentials.json file
-    return service_account.Credentials.from_service_account_file(
-        'credentials.json', scopes=SCOPES
-    )
+# state files
+PERSISTED_FILE       = 'persisted.json'       # overlays order fields on individual jobs
+MANUAL_STATE_FILE    = 'manual_state.json'    # {"machine1":[id,...], "machine2":[id,...]}
+LINK_STATE_FILE      = 'link_state.json'      # { jobId: linkedJobId, ... }
 
 
-def sheets_values():
-    creds = get_credentials()
-    return build('sheets', 'v4', credentials=creds).spreadsheets().values()
+# ————————————————————————————
+# Helpers: load & save JSON safely
+# ————————————————————————————
+def _load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return default
+
+def _save_json(path, data):
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
 
 
-# —————————————————————————————
-# Fetch orders from your sheet
-# —————————————————————————————
+# ————————————————————————————
+# Helpers: Google Sheets fetching
+# ————————————————————————————
 def fetch_from_sheets():
-    res = sheets_values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=ORDERS_RANGE
-    ).execute()
-    rows = res.get('values', [])
+    creds = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    service = build('sheets', 'v4', credentials=creds)
+    resp = service.spreadsheets().values() \
+        .get(spreadsheetId=SPREADSHEET_ID, range=ORDERS_RANGE) \
+        .execute()
+    rows = resp.get('values', [])
     if not rows:
         return []
 
@@ -71,18 +73,16 @@ def fetch_from_sheets():
     i_due_type = idx_any(['Hard Date/Soft Date','Due Type','Hard/Soft Date'])
     i_sc       = idx_any(['Stitch Count'])
 
-    if i_id < 0 or i_sched < 0:
-        raise RuntimeError(f"Sheet missing Order# or ScheduleString header: {headers!r}")
-
-    out = []
+    orders = []
     for row in rows[1:]:
-        if i_sched >= len(row) or not row[i_sched].strip():
+        if i_sched < 0 or i_sched >= len(row) or not row[i_sched].strip():
             continue
         try:
             oid = int(row[i_id])
         except:
             continue
-        out.append({
+
+        orders.append({
             'id':           oid,
             'title':        row[i_sched],
             'company':      row[i_company]   if 0 <= i_company  < len(row) else '',
@@ -91,97 +91,164 @@ def fetch_from_sheets():
             'due_date':     row[i_due]       if 0 <= i_due      < len(row) else '',
             'due_type':     row[i_due_type]  if 0 <= i_due_type < len(row) else '',
             'stitch_count': int(row[i_sc])   if 0 <= i_sc       < len(row) and row[i_sc].isdigit() else 30000,
+            # these three fields can be overlaid/persisted or computed
             'machineId':    None,
             'start_date':   '',
             'end_date':     '',
             'delivery':     ''
         })
-    return out
+    return orders
 
-
-# —————————————————————————————
-# Fetch embroidery list
-# —————————————————————————————
 def fetch_embroidery_list():
-    res = sheets_values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=EMBROIDERY_RANGE
-    ).execute()
-    rows = res.get('values', [])
+    creds = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    service = build('sheets', 'v4', credentials=creds)
+    resp = service.spreadsheets().values() \
+        .get(spreadsheetId=SPREADSHEET_ID, range=EMBROIDERY_RANGE) \
+        .execute()
+    rows = resp.get('values', [])
     if not rows:
         return []
+
     headers, *data_rows = rows
-    out = []
+    json_rows = []
     for row in data_rows:
-        obj = {}
-        for i, h in enumerate(headers):
-            obj[h] = row[i] if i < len(row) else ''
-        out.append(obj)
-    return out
+        entry = { headers[i]: (row[i] if i < len(row) else '') for i in range(len(headers)) }
+        json_rows.append(entry)
+    return json_rows
 
 
-# —————————————————————————————
-# Persisted manual-state helpers
-# —————————————————————————————
+# ————————————————————————————
+# Persisted-overlay helpers
+# ————————————————————————————
 def load_persisted():
-    if not os.path.exists(PERSISTED_FILE):
-        return []
-    try:
-        data = json.load(open(PERSISTED_FILE))
-        return data if isinstance(data, list) else []
-    except:
-        return []
+    return _load_json(PERSISTED_FILE, [])
+
+def save_persisted(data):
+    _save_json(PERSISTED_FILE, data)
 
 
-def save_persisted(arr):
-    with open(PERSISTED_FILE, 'w') as f:
-        json.dump(arr, f, indent=2)
+# ————————————————————————————
+# Manual-state helpers
+# ————————————————————————————
+def load_manual_state():
+    return _load_json(MANUAL_STATE_FILE, {"machine1": [], "machine2": []})
+
+def save_manual_state(state):
+    _save_json(MANUAL_STATE_FILE, state)
 
 
-# —————————————————————————————
+# ————————————————————————————
+# Link-state helpers
+# ————————————————————————————
+def load_link_map():
+    return _load_json(LINK_STATE_FILE, {})
+
+def save_link_map(m):
+    _save_json(LINK_STATE_FILE, m)
+
+
+# ————————————————————————————
 # Routes
-# —————————————————————————————
+# ————————————————————————————
 
 @app.route('/api/orders', methods=['GET'])
+@cross_origin()
 def get_orders():
     try:
+        # 1) fetch live sheet data
         live = fetch_from_sheets()
-    except Exception as e:
-        return jsonify({ 'error': str(e) }), 500
 
-    persisted = load_persisted()
-    by_id = { o['id']: o for o in live }
-    for p in persisted:
-        if isinstance(p, dict):
+        # 2) overlay any persisted cell-level edits
+        persisted = load_persisted()
+        by_id     = {o['id']: o for o in live}
+        for p in persisted:
             oid = p.get('id')
             if oid in by_id:
                 by_id[oid].update(p)
+        orders = list(by_id.values())
 
-    return jsonify(list(by_id.values()))
+        # 3) apply manual ordering
+        manual = load_manual_state()
+        # build map: jobId -> jobObject
+        job_map = {o['id']: o for o in orders}
+        # for each machine, reorder
+        def apply_manual(col_id):
+            out = []
+            for oid in manual.get(col_id, []):
+                if oid in job_map:
+                    job_map[oid]['machineId'] = col_id
+                    out.append(job_map[oid])
+            # any that live in that col but not in manual list, append at end
+            for o in orders:
+                if o['machineId']==col_id and o not in out:
+                    out.append(o)
+            return out
 
+        # reset all machine assignments for those not in M1/M2
+        for o in orders:
+            if o['machineId'] not in ('machine1','machine2'):
+                o['machineId'] = 'queue'
 
-@app.route('/api/manualState', methods=['GET','POST'])
-def manual_state():
-    if request.method == 'GET':
-        return jsonify(load_persisted())
-    data = request.get_json(force=True)
-    if not isinstance(data, list):
-        return jsonify({ 'error': 'expected JSON array' }), 400
-    save_persisted(data)
-    return jsonify({ 'success': True })
+        # rebuild a single flat list in the three-column order
+        final = apply_manual('machine1') + apply_manual('machine2')
+        # queue is any remaining
+        queue_jobs = [o for o in orders if o['machineId']=='queue']
+        final += queue_jobs
+
+        # 4) attach linkedTo
+        links = load_link_map()
+        for o in final:
+            o['linkedTo'] = links.get(str(o['id'])) or None
+
+        return jsonify(final)
+    except Exception as e:
+        app.logger.error('Error in /api/orders', exc_info=e)
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/embroideryList', methods=['GET'])
-def embroidery_list():
+@cross_origin()
+def get_embroidery_list():
     try:
         return jsonify(fetch_embroidery_list())
     except Exception as e:
-        return jsonify({ 'error': str(e) }), 500
+        app.logger.error('Error in /api/embroideryList', exc_info=e)
+        return jsonify({'error': str(e)}), 500
 
 
-# —————————————————————————————
-# Run
-# —————————————————————————————
+@app.route('/api/manualState', methods=['GET'])
+@cross_origin()
+def get_manual_state():
+    return jsonify(load_manual_state())
+
+
+@app.route('/api/manualState', methods=['POST'])
+@cross_origin()
+def post_manual_state():
+    data = request.get_json(force=True)
+    save_manual_state(data)
+    return jsonify({'success': True})
+
+
+@app.route('/api/links', methods=['GET'])
+@cross_origin()
+def get_links():
+    return jsonify(load_link_map())
+
+
+@app.route('/api/links', methods=['POST'])
+@cross_origin()
+def post_links():
+    data = request.get_json(force=True)
+    # expect { jobId: linkedJobId, ... }
+    save_link_map({ str(k): str(v) for k,v in data.items() })
+    return jsonify({'success': True})
+
+
+# ————————————————————————————
+# Main
+# ————————————————————————————
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     app.run(debug=True, host='0.0.0.0', port=port)
