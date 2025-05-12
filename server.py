@@ -12,12 +12,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ——— Spreadsheet configuration ————————————————————————————
-ORDERS_SPREADSHEET_ID   = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-# NOTE: Make sure this sheet/tab name exactly matches yours, and use a valid A1 range
-ORDERS_RANGE            = 'Production Orders!A1:AM1000'
+# Make sure these sheet names exactly match your tabs!
+ORDERS_SPREADSHEET_ID     = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
+ORDERS_RANGE              = 'Production Orders!A:AM'
 
-EMBROIDERY_SPREADSHEET_ID = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-EMBROIDERY_RANGE          = 'Embroidery!A1:AM1000'
+EMBROIDERY_SPREADSHEET_ID = ORDERS_SPREADSHEET_ID
+EMBROIDERY_RANGE          = 'Embroidery List!A:AM'
 
 # ——— Google Sheets client setup —————————————————————————————
 creds = service_account.Credentials.from_service_account_file(
@@ -44,16 +44,22 @@ def fetch_sheet(spreadsheet_id, sheet_range):
     values = resp.get('values', [])
     if not values:
         return []
-    header = values.pop(0)
-    return [dict(zip(header, row)) for row in values]
+    header = values[0]
+    rows   = values[1:]
+    out = []
+    for row in rows:
+        # pad missing cells
+        row += [''] * (len(header) - len(row))
+        out.append(dict(zip(header, row)))
+    return out
 
 # ——— Endpoints ————————————————————————————————————————————
 
 @app.route('/api/orders', methods=['GET'])
 def get_orders():
     try:
-        rows = fetch_sheet(ORDERS_SPREADSHEET_ID, ORDERS_RANGE)
-        return jsonify(rows)
+        data = fetch_sheet(ORDERS_SPREADSHEET_ID, ORDERS_RANGE)
+        return jsonify(data)
     except HttpError as e:
         logger.error('Google Sheets API error on /api/orders', exc_info=e)
         return jsonify({'error': str(e)}), 500
@@ -61,8 +67,8 @@ def get_orders():
 @app.route('/api/embroideryList', methods=['GET'])
 def get_embroidery_list():
     try:
-        rows = fetch_sheet(EMBROIDERY_SPREADSHEET_ID, EMBROIDERY_RANGE)
-        return jsonify(rows)
+        data = fetch_sheet(EMBROIDERY_SPREADSHEET_ID, EMBROIDERY_RANGE)
+        return jsonify(data)
     except HttpError as e:
         logger.error('Google Sheets API error on /api/embroideryList', exc_info=e)
         return jsonify({'error': str(e)}), 500
@@ -70,7 +76,7 @@ def get_embroidery_list():
 @app.route('/api/manualState', methods=['GET','POST'])
 def manual_state():
     if request.method == 'POST':
-        state = request.get_json()
+        state = request.get_json(force=True)
         with open(PERSISTED_FILE, 'w') as f:
             json.dump(state, f)
         return jsonify(state), 200
@@ -80,9 +86,6 @@ def manual_state():
 
 # ——— Run the server ———————————————————————————————————————
 if __name__ == '__main__':
-    logger.info('Starting Flask on port %s', os.environ.get('PORT','10000'))
-    app.run(
-      host='0.0.0.0',
-      port=int(os.environ.get('PORT', '10000')),
-      debug=True
-    )
+    port = int(os.environ.get('PORT', 10000))
+    logger.info(f'Starting Flask on port {port}')
+    app.run(host='0.0.0.0', port=port, debug=True)
