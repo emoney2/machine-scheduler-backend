@@ -22,10 +22,10 @@ creds = Credentials.from_service_account_file(
 sheets = build('sheets', 'v4', credentials=creds)
 
 # ─── Spreadsheet IDs & Ranges ────────────────────────────────────────────────
-ORDERS_SPREADSHEET_ID      = os.environ.get('ORDERS_SPREADSHEET_ID', 'YOUR_ORDERS_SPREADSHEET_ID')
-ORDERS_RANGE              = os.environ.get('ORDERS_RANGE', 'Orders!A:ZZ')
-EMBROIDERY_SPREADSHEET_ID = os.environ.get('EMBROIDERY_SPREADSHEET_ID', 'YOUR_EMBROIDERY_SPREADSHEET_ID')
-EMBROIDERY_RANGE          = os.environ.get('EMBROIDERY_RANGE', 'Embroidery!A:ZZ')
+ORDERS_SPREADSHEET_ID      = os.environ.get('ORDERS_SPREADSHEET_ID', '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4')
+ORDERS_RANGE              = os.environ.get('ORDERS_RANGE', 'Prodution Orders!A:AM')
+EMBROIDERY_SPREADSHEET_ID = os.environ.get('EMBROIDERY_SPREADSHEET_ID', '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4')
+EMBROIDERY_RANGE          = os.environ.get('EMBROIDERY_RANGE', 'Embroidery!A:AM')
 
 # ─── Manual‐state persistence ────────────────────────────────────────────────
 MANUAL_STATE_FILE = 'manual_state.json'
