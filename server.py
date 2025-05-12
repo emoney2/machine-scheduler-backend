@@ -14,10 +14,10 @@ logger = logging.getLogger(__name__)
 # ——— Spreadsheet configuration ————————————————————————————
 ORDERS_SPREADSHEET_ID   = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
 # NOTE: Make sure this sheet/tab name exactly matches yours, and use a valid A1 range
-ORDERS_RANGE            = 'Production Orders!A1:AM10000'
+ORDERS_RANGE            = 'Production Orders!A1:AM1000'
 
 EMBROIDERY_SPREADSHEET_ID = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-EMBROIDERY_RANGE          = 'Embroidery!A1:AM10000'
+EMBROIDERY_RANGE          = 'Embroidery!A1:AM1000'
 
 # ——— Google Sheets client setup —————————————————————————————
 creds = service_account.Credentials.from_service_account_file(
