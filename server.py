@@ -1,3 +1,5 @@
+# File: server.py
+
 import os
 import json
 from flask import Flask, jsonify, request
@@ -6,29 +8,29 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
-# Enable CORS on all routes
+# enable CORS on all routes
 CORS(app)
 
 # —————————————————————————————
 # Configuration
 # —————————————————————————————
 SERVICE_ACCOUNT_FILE = 'credentials.json'
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-SPREADSHEET_ID = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
+SCOPES               = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+SPREADSHEET_ID       = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
 
 # Ranges in your sheet
-ORDERS_RANGE     = 'Production Orders!A:AC'
-EMBROIDERY_RANGE = 'Embroidery List!A:ZZ'
+ORDERS_RANGE         = 'Production Orders!A:AC'
+EMBROIDERY_RANGE     = 'Embroidery List!A:ZZ'
 
-# Persisted state files
-PERSISTED_FILE = 'persisted.json'
-MANUAL_FILE    = 'manual_state.json'
-LINKS_FILE     = 'job_links.json'
+# Where we persist the manualState overrides
+PERSISTED_FILE       = 'persisted.json'
+
 
 # —————————————————————————————
 # Helpers
 # —————————————————————————————
 def fetch_from_sheets():
+    """Fetch and parse the 'Production Orders' tab."""
     creds = service_account.Credentials.from_service_account_file(
         SERVICE_ACCOUNT_FILE, scopes=SCOPES
     )
@@ -55,12 +57,14 @@ def fetch_from_sheets():
 
     orders = []
     for row in rows[1:]:
+        # skip rows without a Schedule String
         if i_sched < 0 or i_sched >= len(row) or not row[i_sched].strip():
             continue
         try:
             oid = int(row[i_id])
         except:
             continue
+
         orders.append({
             'id':           oid,
             'title':        row[i_sched],
@@ -70,15 +74,18 @@ def fetch_from_sheets():
             'due_date':     row[i_due]      if 0 <= i_due      < len(row) else '',
             'due_type':     row[i_due_type] if 0 <= i_due_type < len(row) else '',
             'stitch_count': int(row[i_sc])  if 0 <= i_sc       < len(row) and row[i_sc].isdigit() else 30000,
+            # placeholders for manual state overlay
             'machineId':    None,
             'start_date':   '',
             'end_date':     '',
             'delivery':     ''
         })
+
     return orders
 
 
 def fetch_embroidery_list():
+    """Fetch the 'Embroidery List' tab as JSON rows."""
     creds = service_account.Credentials.from_service_account_file(
         SERVICE_ACCOUNT_FILE, scopes=SCOPES
     )
@@ -89,15 +96,20 @@ def fetch_embroidery_list():
     rows = result.get('values', [])
     if not rows:
         return []
+
     headers, *data_rows = rows
     json_rows = []
     for row in data_rows:
-        entry = { headers[i]: (row[i] if i < len(row) else '') for i in range(len(headers)) }
+        entry = {
+            headers[i]: (row[i] if i < len(row) else '')
+            for i in range(len(headers))
+        }
         json_rows.append(entry)
     return json_rows
 
 
 def load_persisted():
+    """Load manualState overrides from disk."""
     if not os.path.exists(PERSISTED_FILE):
         return []
     try:
@@ -108,38 +120,45 @@ def load_persisted():
 
 
 def save_persisted(data):
+    """Save manualState overrides to disk."""
     with open(PERSISTED_FILE, 'w') as f:
         json.dump(data, f, indent=2)
 
-# —————————————————————————————
-# Shared state helpers
-# —————————————————————————————
-def load_json(filename, default):
-    if not os.path.exists(filename):
-        return default
-    try:
-        with open(filename) as f:
-            return json.load(f)
-    except:
-        return default
-
-
-def save_json(filename, data):
-    with open(filename, 'w') as f:
-        json.dump(data, f, indent=2)
 
 # —————————————————————————————
 # Routes
 # —————————————————————————————
+
+@app.route('/api/manualState', methods=['GET'])
+@cross_origin()
+def get_manual_state():
+    try:
+        return jsonify(load_persisted())
+    except Exception as e:
+        app.logger.error('Error loading manual state', exc_info=e)
+        return jsonify({'error': 'Unable to load manual state'}), 500
+
+
+@app.route('/api/manualState', methods=['POST'])
+@cross_origin()
+def post_manual_state():
+    try:
+        payload = request.get_json(force=True)
+        save_persisted(payload)
+        return jsonify(payload)
+    except Exception as e:
+        app.logger.error('Error saving manual state', exc_info=e)
+        return jsonify({'error': 'Unable to save manual state'}), 500
+
+
 @app.route('/api/orders', methods=['GET'])
 @cross_origin()
 def get_orders():
+    """Return the live orders, with any manualState overlaid."""
     try:
-        # live sheet data
-        orders = fetch_from_sheets()
-        # overlay persisted updates if needed
+        live = fetch_from_sheets()
         persisted = load_persisted()
-        by_id = { o['id']: o for o in orders }
+        by_id = {o['id']: o for o in live}
         for p in persisted:
             oid = p.get('id')
             if oid in by_id:
@@ -152,7 +171,8 @@ def get_orders():
 
 @app.route('/api/embroideryList', methods=['GET'])
 @cross_origin()
-def get_embroidery_list():
+def get_embroidery_list_route():
+    """Return the raw Embroidery List rows as JSON."""
     try:
         return jsonify(fetch_embroidery_list())
     except Exception as e:
@@ -160,28 +180,10 @@ def get_embroidery_list():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/manualState', methods=['GET', 'POST'])
-@cross_origin()
-def manual_state():
-    if request.method == 'GET':
-        return jsonify(load_json(MANUAL_FILE, { 'machine1': [], 'machine2': [] }))
-    data = request.get_json(force=True)
-    save_json(MANUAL_FILE, data)
-    return jsonify(data)
-
-
-@app.route('/api/links', methods=['GET', 'POST'])
-@cross_origin()
-def links_state():
-    if request.method == 'GET':
-        return jsonify(load_json(LINKS_FILE, {}))
-    data = request.get_json(force=True)
-    save_json(LINKS_FILE, data)
-    return jsonify(data)
-
 # —————————————————————————————
 # Main
 # —————————————————————————————
 if __name__ == '__main__':
+    # in production your host/port may be overridden by Render
     port = int(os.getenv('PORT', 5000))
     app.run(debug=True, host='0.0.0.0', port=port)
