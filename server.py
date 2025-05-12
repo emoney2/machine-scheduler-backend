@@ -5,6 +5,11 @@ from flask_cors import CORS
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+print("🔍 CWD is", os.getcwd())
+print("🔍 files in CWD:", os.listdir())
+print("🔍 credentials.json readable?",
+      os.path.exists("credentials.json") and os.access("credentials.json", os.R_OK))
+
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
