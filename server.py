@@ -34,9 +34,9 @@ sheets = build('sheets', 'v4', credentials=credentials)
 
 # ——— Your sheet IDs & ranges — adjust these to your spreadsheet —————————
 ORDERS_SPREADSHEET_ID      = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-ORDERS_RANGE              = 'Production Orders!A:AZ'
+ORDERS_RANGE              = 'Production Orders!A:AM'
 EMBROIDERY_SPREADSHEET_ID = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-EMBROIDERY_RANGE          = 'Embroidery List!A:ASZ'
+EMBROIDERY_RANGE          = 'Embroidery List!A:AM'
 
 # ——— Flask app setup —————————————————————————————————————————————
 app = Flask(__name__)
