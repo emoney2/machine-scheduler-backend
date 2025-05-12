@@ -1,87 +1,97 @@
-import os
-import json
-from flask import Flask, jsonify, request
+# backend/server.py
+import os, json
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# ─── Configuration ──────────────────────────────────────────────────────────────
-SCOPES           = ['https://www.googleapis.com/auth/spreadsheets.readonly']
-SPREADSHEET_ID   = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-ORDERS_RANGE     = 'Production Orders!A:AC'
-EMBROIDERY_RANGE = 'Embroidery List!A:ZZ'
-PERSISTED_FILE   = 'persisted.json'   # where manualState is saved
-
 app = Flask(__name__)
-CORS(app)  # allow * from any origin on all routes
+CORS(app)  # <-- enable CORS on all routes
 
-# ─── Helpers ────────────────────────────────────────────────────────────────────
-def load_credentials():
-    """Load credentials.json from the same directory as this file."""
-    dirpath = os.path.dirname(os.path.abspath(__file__))
-    cred_path = os.path.join(dirpath, 'credentials.json')
-    info = json.load(open(cred_path, 'r'))
-    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+# --- CONFIG -------------------------------------------------
+# Path to the JSON file you will upload as a “Secret File” on Render:
+SERVICE_ACCOUNT_FILE = 'credentials.json'
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
 
-def fetch_from_sheets(range_name):
-    """Fetch a range from the spreadsheet and return list-of-dicts."""
-    creds   = load_credentials()
-    service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
-    sheet   = service.spreadsheets()
-    resp    = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=range_name).execute()
-    rows    = resp.get('values', [])
-    if not rows:
-        return []
-    headers = rows[0]
-    data    = []
-    for row in rows[1:]:
-        entry = {}
-        for idx, h in enumerate(headers):
-            entry[h] = row[idx] if idx < len(row) else ""
-        data.append(entry)
-    return data
+# Your spreadsheet ID needs to be set as an env var on Render:
+SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
+if not SPREADSHEET_ID:
+    raise RuntimeError("You must set SPREADSHEET_ID in your Render environment.")
 
-def load_persisted():
-    """Load manualState array from disk (or return empty list)."""
-    if os.path.exists(PERSISTED_FILE):
+# Manual state persistence (in-memory for now; optional: file-backed)
+_manual_state = []
+
+# --- HELPERS ------------------------------------------------
+def _get_sheets_service():
+    creds = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES
+    )
+    return build('sheets', 'v4', credentials=creds)
+
+def fetch_from_sheets():
+    svc = _get_sheets_service().spreadsheets().values()
+    # adjust your range names as needed
+    orders = svc.get(spreadsheetId=SPREADSHEET_ID, range='orders!A2:G').execute().get('values', [])
+    embroidery = svc.get(spreadsheetId=SPREADSHEET_ID, range='embroideryList!A2:B').execute().get('values', [])
+    # turn rows into objects:
+    orders_objs = []
+    for row in orders:
+        # expect [ id, company, design, quantity, stitch_count, due_date, due_type ]
         try:
-            return json.load(open(PERSISTED_FILE, 'r'))
+            orders_objs.append({
+                'id': int(row[0]),
+                'company': row[1],
+                'design': row[2],
+                'quantity': int(row[3]),
+                'stitch_count': int(row[4]),
+                'due_date': row[5],
+                'due_type': row[6]
+            })
         except:
-            pass
-    return []
+            continue
+    embroidery_objs = []
+    for row in embroidery:
+        # expect [ Order #, Embroidery Start Time ]
+        embroidery_objs.append({
+            'Order #': row[0],
+            'Embroidery Start Time': row[1]
+        })
+    return orders_objs, embroidery_objs
 
-def save_persisted(state):
-    """Save manualState array to disk."""
-    with open(PERSISTED_FILE, 'w') as f:
-        json.dump(state, f)
+# --- ROUTES -------------------------------------------------
+@app.route('/api/manualState', methods=['GET'])
+def get_manual_state():
+    return jsonify(_manual_state)
 
-# ─── Routes ─────────────────────────────────────────────────────────────────────
+@app.route('/api/manualState', methods=['POST'])
+def post_manual_state():
+    data = request.get_json(force=True)
+    if isinstance(data, list):
+        global _manual_state
+        _manual_state = data
+        return '', 204
+    return 'Bad payload', 400
+
 @app.route('/api/orders', methods=['GET'])
 def get_orders():
     try:
-        data = fetch_from_sheets(ORDERS_RANGE)
-        return jsonify(data)
+        orders, _ = fetch_from_sheets()
+        return jsonify(orders)
     except Exception as e:
-        return jsonify({ 'error': str(e) }), 500
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/embroideryList', methods=['GET'])
 def get_embroidery_list():
     try:
-        data = fetch_from_sheets(EMBROIDERY_RANGE)
-        return jsonify(data)
+        _, embroidery = fetch_from_sheets()
+        return jsonify(embroidery)
     except Exception as e:
-        return jsonify({ 'error': str(e) }), 500
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/manualState', methods=['GET', 'POST'])
-def manual_state():
-    if request.method == 'GET':
-        return jsonify(load_persisted())
-    else:
-        state = request.get_json(force=True)
-        save_persisted(state)
-        return jsonify(state)
+# catch-all to remind you
+@app.route('/')
+def idx():
+    return "Use /api/orders or /api/embroideryList", 404
 
-# ─── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
