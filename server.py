@@ -10,27 +10,27 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # === CONFIGURATION ===
-SPREADSHEET_ID     = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
-ORDERS_RANGE       = "Production Orders!A:AM"
-EMBROIDERY_RANGE   = "Embroidery List!A:AM"
-MANUAL_RANGE       = "Manual State!A2:B2"
-CREDENTIALS_FILE   = "credentials.json"   # must be present alongside this file
+SPREADSHEET_ID   = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
+ORDERS_RANGE     = "Production Orders!A:AM"
+EMBROIDERY_RANGE = "Embroidery List!A:AM"
+MANUAL_RANGE     = "Manual State!A2:B2"
+CREDENTIALS_FILE = "credentials.json"
 
 # === CACHING SETTINGS ===
-CACHE_TTL      = 300  # seconds (5 minutes)
-_orders_cache  = None
-_orders_ts     = 0
-_emb_cache     = None
-_emb_ts        = 0
+CACHE_TTL     = 300  # seconds
+_orders_cache = None
+_orders_ts    = 0
+_emb_cache    = None
+_emb_ts       = 0
 
 # === LINKS STORE (in-memory) ===
 _links_store = {}
 
-# Load service account credentials and build Sheets API client
+# Load Google credentials with full Sheets scope
 logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
 creds = service_account.Credentials.from_service_account_file(
     CREDENTIALS_FILE,
-    scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
 )
 sheets = build("sheets", "v4", credentials=creds).spreadsheets()
 
@@ -46,14 +46,14 @@ def apply_cors(response):
     return response
 
 def fetch_sheet(spreadsheet_id, sheet_range):
-    """Fetch a sheet range and return a list of rows (each row is a list of cells)."""
+    """Fetch a sheet range and return a list of rows."""
     result = sheets.values().get(
         spreadsheetId=spreadsheet_id,
         range=sheet_range
     ).execute()
     return result.get("values", [])
 
-# === ORDERS ENDPOINT WITH CACHING ===
+# === ORDERS ENDPOINT WITH CACHING (no filter) ===
 @app.route("/api/orders", methods=["GET"])
 def get_orders():
     global _orders_cache, _orders_ts
@@ -68,7 +68,7 @@ def get_orders():
         else:
             headers = rows[0]
             data = [dict(zip(headers, row)) for row in rows[1:]]
-            _orders_cache = [r for r in data if r.get("Order #")]
+            _orders_cache = data
     except Exception:
         logger.exception("Error fetching ORDERS_RANGE")
         if _orders_cache is not None:
@@ -91,7 +91,7 @@ def get_embroidery_list():
         else:
             headers = rows[0]
             data = [dict(zip(headers, row)) for row in rows[1:]]
-            _emb_cache = [r for r in data if r.get("Company Name")]
+            _emb_cache = data
     except Exception:
         logger.exception("Error fetching EMBROIDERY_RANGE")
         if _emb_cache is not None:
