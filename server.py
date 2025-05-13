@@ -7,8 +7,8 @@ from googleapiclient.discovery import build
 
 # ——— Configuration —————————————————————————————————————
 SPREADSHEET_ID      = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-ORDERS_RANGE        = 'Production Orders!A:AM'
-EMBROIDERY_RANGE    = 'Embroidery List!A:AM'
+ORDERS_RANGE        = 'Production Orders!A1:AM1000'
+EMBROIDERY_RANGE    = 'Embroidery List!A1:AM1000'
 PERSIST_FILE        = 'persisted.json'
 CREDS_FILE          = 'credentials.json'
 PORT                = int(os.environ.get('PORT', 10000))
