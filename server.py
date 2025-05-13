@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 SPREADSHEET_ID     = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
 ORDERS_RANGE       = "Production Orders!A:AM"
 EMBROIDERY_RANGE   = "Embroidery List!A:AM"
-CREDENTIALS_FILE   = "credentials.json"
+MANUAL_RANGE       = "Manual State!A2:B2"
+CREDENTIALS_FILE   = "credentials.json"   # must be present alongside this file
 
 # === CACHING SETTINGS ===
 CACHE_TTL      = 300  # seconds (5 minutes)
@@ -22,11 +23,10 @@ _orders_ts     = 0
 _emb_cache     = None
 _emb_ts        = 0
 
-# === LINKS & MANUAL-STATE STORES (in-memory) ===
-_links_store  = {}
-_manual_state = {"machine1": [], "machine2": []}
+# === LINKS STORE (in-memory) ===
+_links_store = {}
 
-# Load Google Sheets client
+# Load service account credentials and build Sheets API client
 logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
 creds = service_account.Credentials.from_service_account_file(
     CREDENTIALS_FILE,
@@ -46,18 +46,19 @@ def apply_cors(response):
     return response
 
 def fetch_sheet(spreadsheet_id, sheet_range):
-    return sheets.values().get(
+    """Fetch a sheet range and return a list of rows (each row is a list of cells)."""
+    result = sheets.values().get(
         spreadsheetId=spreadsheet_id,
         range=sheet_range
-    ).execute().get("values", [])
+    ).execute()
+    return result.get("values", [])
 
 # === ORDERS ENDPOINT WITH CACHING ===
 @app.route("/api/orders", methods=["GET"])
 def get_orders():
     global _orders_cache, _orders_ts
     now = time.time()
-    # use cache if fresh
-    if _orders_cache is not None and now - _orders_ts < CACHE_TTL:
+    if _orders_cache is not None and (now - _orders_ts) < CACHE_TTL:
         return jsonify(_orders_cache)
     try:
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
@@ -68,12 +69,11 @@ def get_orders():
             headers = rows[0]
             data = [dict(zip(headers, row)) for row in rows[1:]]
             _orders_cache = [r for r in data if r.get("Order #")]
-    except Exception as e:
-        logger.error("Error fetching ORDERS_RANGE", exc_info=True)
-        # return stale cache or empty
+    except Exception:
+        logger.exception("Error fetching ORDERS_RANGE")
         if _orders_cache is not None:
             return jsonify(_orders_cache)
-        return jsonify([]), 200
+        _orders_cache = []
     return jsonify(_orders_cache)
 
 # === EMBROIDERY LIST ENDPOINT WITH CACHING & FALLBACK ===
@@ -81,8 +81,7 @@ def get_orders():
 def get_embroidery_list():
     global _emb_cache, _emb_ts
     now = time.time()
-    # quick return if cached
-    if _emb_cache is not None and now - _emb_ts < CACHE_TTL:
+    if _emb_cache is not None and (now - _emb_ts) < CACHE_TTL:
         return jsonify(_emb_cache)
     try:
         rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
@@ -93,12 +92,11 @@ def get_embroidery_list():
             headers = rows[0]
             data = [dict(zip(headers, row)) for row in rows[1:]]
             _emb_cache = [r for r in data if r.get("Company Name")]
-    except Exception as e:
-        logger.error("Error fetching EMBROIDERY_RANGE", exc_info=True)
-        # return stale cache if available, else empty list
+    except Exception:
+        logger.exception("Error fetching EMBROIDERY_RANGE")
         if _emb_cache is not None:
             return jsonify(_emb_cache)
-        return jsonify([]), 200
+        _emb_cache = []
     return jsonify(_emb_cache)
 
 # === UPDATE ORDER (Embroidery Start) ===
@@ -108,9 +106,9 @@ def update_order(order_id):
         data = request.get_json() or {}
         logger.info(f"Received update for order {order_id}: {data}")
         return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        logger.error("Error in PUT /api/orders/<order_id>", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logger.exception("Error in PUT /api/orders/<order_id>")
+        return jsonify({"error": "Server error"}), 500
 
 # === LINKS ENDPOINTS ===
 @app.route("/api/links", methods=["GET"])
@@ -124,17 +122,41 @@ def save_links():
     logger.info(f"Links updated: {_links_store}")
     return jsonify({"status": "ok"}), 200
 
-# === MANUAL STATE ENDPOINTS ===
+# === MANUAL STATE ENDPOINTS (sheet-backed) ===
 @app.route("/api/manualState", methods=["GET"])
 def get_manual_state():
-    return jsonify(_manual_state), 200
+    try:
+        result = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=MANUAL_RANGE
+        ).execute().get("values", [])
+        row = result[0] if result else ["", ""]
+        ms1 = [s for s in row[0].split(",") if s]
+        ms2 = [s for s in row[1].split(",") if s]
+        return jsonify({"machine1": ms1, "machine2": ms2}), 200
+    except Exception:
+        logger.exception("Error reading manual state from sheet")
+        return jsonify({"machine1": [], "machine2": []}), 200
 
 @app.route("/api/manualState", methods=["POST"])
 def save_manual_state():
-    global _manual_state
-    _manual_state = request.get_json() or {"machine1": [], "machine2": []}
-    logger.info(f"Manual state updated: {_manual_state}")
-    return jsonify({"status": "ok"}), 200
+    try:
+        data = request.get_json() or {"machine1": [], "machine2": []}
+        row = [
+            ",".join(data.get("machine1", [])),
+            ",".join(data.get("machine2", []))
+        ]
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=MANUAL_RANGE,
+            valueInputOption="RAW",
+            body={"values": [row]}
+        ).execute()
+        logger.info(f"Manual state written to sheet: {row}")
+        return jsonify({"status": "ok"}), 200
+    except Exception:
+        logger.exception("Error writing manual state to sheet")
+        return jsonify({"error": "Server error"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
