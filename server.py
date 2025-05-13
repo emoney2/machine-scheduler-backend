@@ -8,7 +8,7 @@ from googleapiclient.errors import HttpError
 
 # ——— CONFIGURATION —————————————————————————————————————————————————————
 SPREADSHEET_ID    = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'  
-ORDERS_RANGE      = 'Prodution Orders!A1:AM1000'
+ORDERS_RANGE      = 'Production Orders!A1:AM1000'
 EMBROIDERY_RANGE  = 'Embroidery List!A1:AM1000'
 CREDENTIALS_FILE  = 'credentials.json'  # make sure this file is in your project root
 
