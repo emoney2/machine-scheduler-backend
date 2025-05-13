@@ -11,9 +11,9 @@ logger = logging.getLogger(__name__)
 
 # === CONFIGURATION ===
 SPREADSHEET_ID   = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
-ORDERS_RANGE     = "Production Orders!A:AM"
-EMBROIDERY_RANGE = "Embroidery List!A:AM"
-MANUAL_RANGE     = "Manual State!A2:B2"
+ORDERS_RANGE     = "'Production Orders'!A:AM"
+EMBROIDERY_RANGE = "'Embroidery List'!A:AM"
+MANUAL_RANGE     = "'Manual State'!A2:B2"
 CREDENTIALS_FILE = "credentials.json"
 
 # === CACHING SETTINGS ===
@@ -46,7 +46,6 @@ def apply_cors(response):
     return response
 
 def fetch_sheet(spreadsheet_id, sheet_range):
-    """Fetch a sheet range and return a list of rows."""
     result = sheets.values().get(
         spreadsheetId=spreadsheet_id,
         range=sheet_range
