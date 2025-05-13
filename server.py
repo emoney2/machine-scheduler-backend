@@ -1,10 +1,16 @@
 import os
 import logging
 import time
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from flask_socketio import SocketIO
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+import eventlet
+
+# === Monkey-patch for async support ===
+eventlet.monkey_patch()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,7 +32,7 @@ _emb_ts       = 0
 # === LINKS STORE (in-memory) ===
 _links_store = {}
 
-# Load Google credentials with full Sheets scope
+# === Initialize Google Sheets API client with write scope ===
 logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
 creds = service_account.Credentials.from_service_account_file(
     CREDENTIALS_FILE,
@@ -34,9 +40,10 @@ creds = service_account.Credentials.from_service_account_file(
 )
 sheets = build("sheets", "v4", credentials=creds).spreadsheets()
 
-# Initialize Flask
+# === Initialize Flask + CORS + SocketIO ===
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 @app.after_request
 def apply_cors(response):
@@ -46,13 +53,14 @@ def apply_cors(response):
     return response
 
 def fetch_sheet(spreadsheet_id, sheet_range):
+    """Fetch a sheet range and return a list of rows."""
     result = sheets.values().get(
         spreadsheetId=spreadsheet_id,
         range=sheet_range
     ).execute()
     return result.get("values", [])
 
-# === ORDERS ENDPOINT WITH CACHING (no filter) ===
+# === ORDERS ENDPOINT WITH CACHING ===
 @app.route("/api/orders", methods=["GET"])
 def get_orders():
     global _orders_cache, _orders_ts
@@ -66,8 +74,7 @@ def get_orders():
             _orders_cache = []
         else:
             headers = rows[0]
-            data = [dict(zip(headers, row)) for row in rows[1:]]
-            _orders_cache = data
+            _orders_cache = [dict(zip(headers, row)) for row in rows[1:]]
     except Exception:
         logger.exception("Error fetching ORDERS_RANGE")
         if _orders_cache is not None:
@@ -89,8 +96,7 @@ def get_embroidery_list():
             _emb_cache = []
         else:
             headers = rows[0]
-            data = [dict(zip(headers, row)) for row in rows[1:]]
-            _emb_cache = data
+            _emb_cache = [dict(zip(headers, row)) for row in rows[1:]]
     except Exception:
         logger.exception("Error fetching EMBROIDERY_RANGE")
         if _emb_cache is not None:
@@ -152,6 +158,9 @@ def save_manual_state():
             body={"values": [row]}
         ).execute()
         logger.info(f"Manual state written to sheet: {row}")
+
+        # broadcast to all connected clients
+        socketio.emit("manualStateUpdated", data, broadcast=True)
         return jsonify({"status": "ok"}), 200
     except Exception:
         logger.exception("Error writing manual state to sheet")
@@ -159,5 +168,5 @@ def save_manual_state():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    logger.info(f"Starting Flask server on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    logger.info(f"Starting Flask-SocketIO server on port {port}")
+    socketio.run(app, host="0.0.0.0", port=port, debug=True)

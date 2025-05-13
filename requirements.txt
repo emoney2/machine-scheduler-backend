@@ -2,3 +2,5 @@ Flask
 flask-cors
 google-auth
 google-api-python-client
+flask-socketio
+eventlet
