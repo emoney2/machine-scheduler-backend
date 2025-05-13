@@ -13,20 +13,20 @@ logger = logging.getLogger(__name__)
 SPREADSHEET_ID     = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
 ORDERS_RANGE       = "Production Orders!A:AM"
 EMBROIDERY_RANGE   = "Embroidery List!A:AM"
-CREDENTIALS_FILE   = "credentials.json"   # must be present alongside this file
+CREDENTIALS_FILE   = "credentials.json"
 
 # === CACHING SETTINGS ===
-CACHE_TTL      = 60  # seconds
+CACHE_TTL      = 300  # seconds (5 minutes)
 _orders_cache  = None
 _orders_ts     = 0
 _emb_cache     = None
 _emb_ts        = 0
 
 # === LINKS & MANUAL-STATE STORES (in-memory) ===
-_links_store       = {}
-_manual_state      = {"machine1": [], "machine2": []}
+_links_store  = {}
+_manual_state = {"machine1": [], "machine2": []}
 
-# Load service account credentials and build Sheets API client
+# Load Google Sheets client
 logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
 creds = service_account.Credentials.from_service_account_file(
     CREDENTIALS_FILE,
@@ -36,9 +36,8 @@ sheets = build("sheets", "v4", credentials=creds).spreadsheets()
 
 # Initialize Flask
 app = Flask(__name__)
-
-# Enable CORS on all /api/* endpoints
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+
 @app.after_request
 def apply_cors(response):
     response.headers["Access-Control-Allow-Origin"]  = "*"
@@ -47,52 +46,59 @@ def apply_cors(response):
     return response
 
 def fetch_sheet(spreadsheet_id, sheet_range):
-    result = sheets.values().get(
+    return sheets.values().get(
         spreadsheetId=spreadsheet_id,
         range=sheet_range
-    ).execute()
-    return result.get("values", [])
+    ).execute().get("values", [])
 
 # === ORDERS ENDPOINT WITH CACHING ===
 @app.route("/api/orders", methods=["GET"])
 def get_orders():
     global _orders_cache, _orders_ts
     now = time.time()
-    if _orders_cache is None or (now - _orders_ts) > CACHE_TTL:
-        try:
-            rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
-            _orders_ts = now
-            if not rows:
-                _orders_cache = []
-            else:
-                headers = rows[0]
-                data = [dict(zip(headers, row)) for row in rows[1:]]
-                data = [r for r in data if r.get("Order #")]
-                _orders_cache = data
-        except Exception as e:
-            logger.error("Error in /api/orders", exc_info=True)
-            return jsonify({"error": str(e)}), 500
+    # use cache if fresh
+    if _orders_cache is not None and now - _orders_ts < CACHE_TTL:
+        return jsonify(_orders_cache)
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+        _orders_ts = now
+        if not rows:
+            _orders_cache = []
+        else:
+            headers = rows[0]
+            data = [dict(zip(headers, row)) for row in rows[1:]]
+            _orders_cache = [r for r in data if r.get("Order #")]
+    except Exception as e:
+        logger.error("Error fetching ORDERS_RANGE", exc_info=True)
+        # return stale cache or empty
+        if _orders_cache is not None:
+            return jsonify(_orders_cache)
+        return jsonify([]), 200
     return jsonify(_orders_cache)
 
-# === EMBROIDERY LIST ENDPOINT WITH CACHING ===
+# === EMBROIDERY LIST ENDPOINT WITH CACHING & FALLBACK ===
 @app.route("/api/embroideryList", methods=["GET"])
 def get_embroidery_list():
     global _emb_cache, _emb_ts
     now = time.time()
-    if _emb_cache is None or (now - _emb_ts) > CACHE_TTL:
-        try:
-            rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
-            _emb_ts = now
-            if not rows:
-                _emb_cache = []
-            else:
-                headers = rows[0]
-                data = [dict(zip(headers, row)) for row in rows[1:]]
-                data = [r for r in data if r.get("Company Name")]
-                _emb_cache = data
-        except Exception as e:
-            logger.error("Error in /api/embroideryList", exc_info=True)
-            return jsonify({"error": str(e)}), 500
+    # quick return if cached
+    if _emb_cache is not None and now - _emb_ts < CACHE_TTL:
+        return jsonify(_emb_cache)
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
+        _emb_ts = now
+        if not rows:
+            _emb_cache = []
+        else:
+            headers = rows[0]
+            data = [dict(zip(headers, row)) for row in rows[1:]]
+            _emb_cache = [r for r in data if r.get("Company Name")]
+    except Exception as e:
+        logger.error("Error fetching EMBROIDERY_RANGE", exc_info=True)
+        # return stale cache if available, else empty list
+        if _emb_cache is not None:
+            return jsonify(_emb_cache)
+        return jsonify([]), 200
     return jsonify(_emb_cache)
 
 # === UPDATE ORDER (Embroidery Start) ===
