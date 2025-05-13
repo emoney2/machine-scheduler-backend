@@ -1,91 +1,103 @@
-import os
-import json
-import logging
+#!/usr/bin/env python3
+import os, json, logging
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+
+# ——— Configuration —————————————————————————————————————
+SPREADSHEET_ID      = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
+ORDERS_RANGE        = 'Production Orders!A:AM'
+EMBROIDERY_RANGE    = 'Embroidery List!A:AM'
+PERSIST_FILE        = 'persisted.json'
+CREDS_FILE          = 'credentials.json'
+PORT                = int(os.environ.get('PORT', 10000))
 
 # ——— Logging —————————————————————————————————————————————
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ——— Spreadsheet configuration ————————————————————————————
-# Make sure these sheet names exactly match your tabs!
-ORDERS_SPREADSHEET_ID     = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-ORDERS_RANGE              = 'Production Orders!A:AM'
+# ——— Flask + CORS ———————————————————————————————————————
+app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-EMBROIDERY_SPREADSHEET_ID = ORDERS_SPREADSHEET_ID
-EMBROIDERY_RANGE          = 'Embroidery List!A:AM'
+@app.after_request
+def _apply_cors(response):
+    response.headers.setdefault('Access-Control-Allow-Origin', '*')
+    response.headers.setdefault('Access-Control-Allow-Methods', 'GET,POST,OPTIONS,PUT,DELETE')
+    response.headers.setdefault('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    return response
 
-# ——— Google Sheets client setup —————————————————————————————
+# ——— Google Sheets client —————————————————————————————
+logger.info(f'Loading Google creds from file: {CREDS_FILE}')
 creds = service_account.Credentials.from_service_account_file(
-    'credentials.json',
+    CREDS_FILE,
     scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
 )
-sheets = build('sheets', 'v4', credentials=creds)
-
-# ——— Flask app + CORS —————————————————————————————————————
-app = Flask(__name__)
-CORS(app)
-
-# ——— manualState persistence —————————————————————————————
-PERSISTED_FILE = 'persisted.json'
-if not os.path.exists(PERSISTED_FILE):
-    with open(PERSISTED_FILE, 'w') as f:
-        json.dump({'machine1': [], 'machine2': []}, f)
+sheets = build('sheets', 'v4', credentials=creds).spreadsheets()
 
 def fetch_sheet(spreadsheet_id, sheet_range):
-    resp = sheets.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=sheet_range
-    ).execute()
-    values = resp.get('values', [])
-    if not values:
-        return []
-    header = values[0]
-    rows   = values[1:]
-    out = []
-    for row in rows:
-        # pad missing cells
-        row += [''] * (len(header) - len(row))
-        out.append(dict(zip(header, row)))
-    return out
+    return sheets.values().get(spreadsheetId=spreadsheet_id, range=sheet_range).execute().get('values', [])
 
-# ——— Endpoints ————————————————————————————————————————————
-
+# ——— /api/orders ———————————————————————————————————————
 @app.route('/api/orders', methods=['GET'])
 def get_orders():
     try:
-        data = fetch_sheet(ORDERS_SPREADSHEET_ID, ORDERS_RANGE)
+        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+        if not rows:
+            return jsonify([])
+        headers = rows[0]
+        data = []
+        for row in rows[1:]:
+            obj = { headers[i]: row[i] if i < len(row) else '' for i in range(len(headers)) }
+            data.append(obj)
         return jsonify(data)
-    except HttpError as e:
-        logger.error('Google Sheets API error on /api/orders', exc_info=e)
+    except Exception as e:
+        logger.exception('Error in /api/orders')
         return jsonify({'error': str(e)}), 500
 
+# ——— /api/embroideryList —————————————————————————————————
 @app.route('/api/embroideryList', methods=['GET'])
 def get_embroidery_list():
     try:
-        data = fetch_sheet(EMBROIDERY_SPREADSHEET_ID, EMBROIDERY_RANGE)
+        rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
+        if not rows:
+            return jsonify([])
+        headers = rows[0]
+        data = []
+        for row in rows[1:]:
+            obj = { headers[i]: row[i] if i < len(row) else '' for i in range(len(headers)) }
+            data.append(obj)
         return jsonify(data)
-    except HttpError as e:
-        logger.error('Google Sheets API error on /api/embroideryList', exc_info=e)
+    except Exception as e:
+        logger.exception('Error in /api/embroideryList')
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/manualState', methods=['GET','POST'])
-def manual_state():
-    if request.method == 'POST':
-        state = request.get_json(force=True)
-        with open(PERSISTED_FILE, 'w') as f:
-            json.dump(state, f)
-        return jsonify(state), 200
-    else:
-        with open(PERSISTED_FILE) as f:
-            return jsonify(json.load(f)), 200
+# ——— Manual-state persistence ————————————————————————————
+def load_manual_state():
+    try:
+        return json.load(open(PERSIST_FILE))
+    except:
+        return {'machine1': [], 'machine2': []}
 
-# ——— Run the server ———————————————————————————————————————
+def save_manual_state(state):
+    json.dump(state, open(PERSIST_FILE, 'w'))
+
+@app.route('/api/manualState', methods=['GET'])
+def get_manual_state():
+    return jsonify(load_manual_state())
+
+@app.route('/api/manualState', methods=['POST'])
+def post_manual_state():
+    try:
+        state = request.get_json()
+        save_manual_state(state)
+        return jsonify(state)
+    except Exception as e:
+        logger.exception('Error in /api/manualState')
+        return jsonify({'error': str(e)}), 500
+
+# ——— Run server ————————————————————————————————————————
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f'Starting Flask on port {port}')
-    app.run(host='0.0.0.0', port=port, debug=True)
+    logger.info(f'Starting Flask on port {PORT}')
+    app.run(host='0.0.0.0', port=PORT, debug=True)
