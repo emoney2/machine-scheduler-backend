@@ -28,9 +28,9 @@ _links_store = {}
 
 # Load service account credentials and build Sheets API client
 logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
-creds = service_account.Credentials.from_service_account_file(
-    CREDENTIALS_FILE,
-    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+ creds = service_account.Credentials.from_service_account_file(
+     CREDENTIALS_FILE,
+     scopes=["https://www.googleapis.com/auth/spreadsheets"],
 )
 sheets = build("sheets", "v4", credentials=creds).spreadsheets()
 
