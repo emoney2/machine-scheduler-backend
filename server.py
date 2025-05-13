@@ -22,6 +22,9 @@ _orders_ts     = 0
 _emb_cache     = None
 _emb_ts        = 0
 
+# === LINKS STORE (in-memory) ===
+_links_store = {}
+
 # Load service account credentials and build Sheets API client
 logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
 creds = service_account.Credentials.from_service_account_file(
@@ -62,12 +65,11 @@ def get_orders():
             _orders_ts = now
             if not rows:
                 _orders_cache = []
-                return jsonify([])
-            headers = rows[0]
-            data = [dict(zip(headers, row)) for row in rows[1:]]
-            # Filter out any blank entries (no Order #)
-            data = [r for r in data if r.get("Order #")]
-            _orders_cache = data
+            else:
+                headers = rows[0]
+                data = [dict(zip(headers, row)) for row in rows[1:]]
+                data = [r for r in data if r.get("Order #")]
+                _orders_cache = data
         except Exception as e:
             logger.error("Error in /api/orders", exc_info=True)
             return jsonify({"error": str(e)}), 500
@@ -84,12 +86,11 @@ def get_embroidery_list():
             _emb_ts = now
             if not rows:
                 _emb_cache = []
-                return jsonify([])
-            headers = rows[0]
-            data = [dict(zip(headers, row)) for row in rows[1:]]
-            # Filter out any blank entries (no Company Name)
-            data = [r for r in data if r.get("Company Name")]
-            _emb_cache = data
+            else:
+                headers = rows[0]
+                data = [dict(zip(headers, row)) for row in rows[1:]]
+                data = [r for r in data if r.get("Company Name")]
+                _emb_cache = data
         except Exception as e:
             logger.error("Error in /api/embroideryList", exc_info=True)
             return jsonify({"error": str(e)}), 500
@@ -118,19 +119,21 @@ def save_manual_state():
         logger.error("Error in POST /api/manualState", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
-# === SAVE LINKS ===
+# === LINKS ENDPOINTS ===
+@app.route("/api/links", methods=["GET"])
+def get_links():
+    """Return the current links map."""
+    return jsonify(_links_store), 200
+
 @app.route("/api/links", methods=["POST"])
 def save_links():
-    try:
-        links = request.get_json() or {}
-        logger.info(f"Received links: {links}")
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        logger.error("Error in POST /api/links", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+    """Save the posted links map into our in-memory store."""
+    global _links_store
+    _links_store = request.get_json() or {}
+    logger.info(f"Links updated: {_links_store}")
+    return jsonify({"status": "ok"}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"Starting Flask server on port {port}")
-    # Debug=True only in development
     app.run(host="0.0.0.0", port=port, debug=True)
