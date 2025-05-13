@@ -1,81 +1,76 @@
+# File: server.py
+
 import os
 import logging
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
-# ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── Google Sheets setup ────────────────────────────────────────────────────
-# Path to your JSON key file (make sure this matches what you've mounted in Render)
-CREDS_FILE = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', 'credentials.json')
-logger.info(f"Loading Google creds from file: {CREDS_FILE}")
+# === CONFIGURATION ===
+SPREADSHEET_ID     = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
+ORDERS_RANGE       = "Production Orders!A:AM"
+EMBROIDERY_RANGE   = "Embroidery List!A:AM"
+CREDENTIALS_FILE   = "credentials.json"   # must be present alongside this file
 
-credentials = service_account.Credentials.from_service_account_file(
-    CREDS_FILE,
-    scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
+# Load service account credentials and build Sheets API client
+logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
+creds = service_account.Credentials.from_service_account_file(
+    CREDENTIALS_FILE,
+    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
 )
-service = build('sheets', 'v4', credentials=credentials)
-sheets = service.spreadsheets()
+sheets = build("sheets", "v4", credentials=creds).spreadsheets()
 
-# ─── Constants ──────────────────────────────────────────────────────────────
-SPREADSHEET_ID    = '11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4'
-ORDERS_RANGE      = 'Production Orders!A1:AM1000'
-EMBROIDERY_RANGE  = 'Embroidery List!A1:Z1000'
-
-# ─── Flask app ──────────────────────────────────────────────────────────────
+# Initialize Flask
 app = Flask(__name__)
-CORS(app)  # <-- enables Access-Control-Allow-Origin: *
+CORS(app)  # Allow all origins; you can lock this down if desired
 
 def fetch_sheet(spreadsheet_id, sheet_range):
-    return sheets.values() \
-                 .get(spreadsheetId=spreadsheet_id, range=sheet_range) \
-                 .execute() \
-                 .get('values', [])
+    """Fetch a sheet range and return a list of rows (each row is a list of cells)."""
+    result = sheets.values().get(
+        spreadsheetId=spreadsheet_id,
+        range=sheet_range
+    ).execute()
+    return result.get("values", [])
 
-def rows_to_dicts(rows):
-    if not rows or len(rows) < 2:
-        return []
-    headers   = rows[0]
-    data_rows = rows[1:]
-    out = []
-    for row in data_rows:
-        item = {}
-        for i, h in enumerate(headers):
-            item[h] = row[i] if i < len(row) else ''
-        out.append(item)
-    return out
-
-@app.route('/api/orders', methods=['GET'])
+@app.route("/api/orders")
 def get_orders():
     try:
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
-        return jsonify(rows_to_dicts(rows))
-    except HttpError as e:
-        logger.error("Google Sheets API error on /api/orders", exc_info=e)
-        return jsonify({'error': str(e)}), 500
+        if not rows:
+            return jsonify([])
 
-@app.route('/api/embroideryList', methods=['GET'])
+        # First row is header
+        headers = rows[0]
+        data = [dict(zip(headers, row)) for row in rows[1:]]
+        # Filter out any blank entries (no Order #)
+        data = [r for r in data if r.get("Order #")]
+        return jsonify(data)
+    except Exception as e:
+        logger.error("Error in /api/orders", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/embroideryList")
 def get_embroidery_list():
     try:
         rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
-        return jsonify(rows_to_dicts(rows))
-    except HttpError as e:
-        logger.error("Google Sheets API error on /api/embroideryList", exc_info=e)
-        return jsonify({'error': str(e)}), 500
+        if not rows:
+            return jsonify([])
 
-@app.route('/api/manualState', methods=['GET','POST'])
-def manual_state():
-    # stubbed so frontend's POST /api/manualState works without 404
-    if request.method == 'GET':
-        return jsonify({})
-    else:
-        return jsonify({}), 200
+        headers = rows[0]
+        data = [dict(zip(headers, row)) for row in rows[1:]]
+        # Filter out any blank entries (no Company Name)
+        data = [r for r in data if r.get("Company Name")]
+        return jsonify(data)
+    except Exception as e:
+        logger.error("Error in /api/embroideryList", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(debug=True, host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    logger.info(f"Starting Flask server on port {port}")
+    # Debug=True only in development
+    app.run(host="0.0.0.0", port=port, debug=True)
