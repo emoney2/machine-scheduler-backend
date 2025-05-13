@@ -22,8 +22,9 @@ _orders_ts     = 0
 _emb_cache     = None
 _emb_ts        = 0
 
-# === LINKS STORE (in-memory) ===
-_links_store = {}
+# === LINKS & MANUAL-STATE STORES (in-memory) ===
+_links_store       = {}
+_manual_state      = {"machine1": [], "machine2": []}
 
 # Load service account credentials and build Sheets API client
 logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
@@ -38,7 +39,6 @@ app = Flask(__name__)
 
 # Enable CORS on all /api/* endpoints
 CORS(app, resources={r"/api/*": {"origins": "*"}})
-
 @app.after_request
 def apply_cors(response):
     response.headers["Access-Control-Allow-Origin"]  = "*"
@@ -47,7 +47,6 @@ def apply_cors(response):
     return response
 
 def fetch_sheet(spreadsheet_id, sheet_range):
-    """Fetch a sheet range and return a list of rows (each row is a list of cells)."""
     result = sheets.values().get(
         spreadsheetId=spreadsheet_id,
         range=sheet_range
@@ -101,36 +100,34 @@ def get_embroidery_list():
 def update_order(order_id):
     try:
         data = request.get_json() or {}
-        # In a full implementation, update the sheet here.
         logger.info(f"Received update for order {order_id}: {data}")
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         logger.error("Error in PUT /api/orders/<order_id>", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
-# === SAVE MANUAL STATE ===
-@app.route("/api/manualState", methods=["POST"])
-def save_manual_state():
-    try:
-        state = request.get_json() or {}
-        logger.info(f"Received manualState: {state}")
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        logger.error("Error in POST /api/manualState", exc_info=True)
-        return jsonify({"error": str(e)}), 500
-
 # === LINKS ENDPOINTS ===
 @app.route("/api/links", methods=["GET"])
 def get_links():
-    """Return the current links map."""
     return jsonify(_links_store), 200
 
 @app.route("/api/links", methods=["POST"])
 def save_links():
-    """Save the posted links map into our in-memory store."""
     global _links_store
     _links_store = request.get_json() or {}
     logger.info(f"Links updated: {_links_store}")
+    return jsonify({"status": "ok"}), 200
+
+# === MANUAL STATE ENDPOINTS ===
+@app.route("/api/manualState", methods=["GET"])
+def get_manual_state():
+    return jsonify(_manual_state), 200
+
+@app.route("/api/manualState", methods=["POST"])
+def save_manual_state():
+    global _manual_state
+    _manual_state = request.get_json() or {"machine1": [], "machine2": []}
+    logger.info(f"Manual state updated: {_manual_state}")
     return jsonify({"status": "ok"}), 200
 
 if __name__ == "__main__":
