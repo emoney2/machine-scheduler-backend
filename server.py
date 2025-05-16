@@ -37,6 +37,10 @@ logger.info(f"▶︎ CWD = {os.getcwd()}")
 logger.info(f"▶︎ Files here = {os.listdir('.')}")
 
 # ─── Google Sheets configuration ───────────────────────────────────────────────
+import httplib2
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
 SPREADSHEET_ID   = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
 ORDERS_RANGE     = "'Production Orders'!A:AM"
 EMBROIDERY_RANGE = "'Embroidery List'!A:AM"
@@ -49,15 +53,20 @@ else:
     size = os.path.getsize(CREDENTIALS_FILE)
     logger.info(f"✔️  {CREDENTIALS_FILE} exists, size {size} bytes")
 
-logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
+# load service-account credentials
 creds = service_account.Credentials.from_service_account_file(
     CREDENTIALS_FILE,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
 )
 logger.info("🔑 Service account email: %s", creds.service_account_email)
 
-sheets = build("sheets", "v4", credentials=creds).spreadsheets()
+# create an httplib2.Http transport with a 10 second timeout
+_http = httplib2.Http(timeout=10)
+_authed_http = creds.authorize(_http)
 
+# build the Sheets API client using that transport
+_service = build("sheets", "v4", http=_authed_http)
+sheets = _service.spreadsheets()
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
