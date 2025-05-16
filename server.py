@@ -34,7 +34,7 @@ sheet_lock = Semaphore(1)
 SPREADSHEET_ID   = os.environ.get("SPREADSHEET_ID")
 ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:Z")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:Z")
-MANUAL_RANGE     = os.environ.get("MANUAL_RANGE",     "Manual State!A1:Z")
+MANUAL_RANGE     = os.environ.get("MANUAL_RANGE",     "Manual State!A2:B2")
 
 CREDENTIALS_FILE = "credentials.json"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -229,17 +229,34 @@ def get_manual_state():
 
 @app.route("/api/manualState", methods=["POST"])
 def save_manual_state():
-    data = request.get_json()
-    try:
-        # … your existing code that writes into Sheets …
-        logger.info(f"Manual state written: {data}")
+    global _manual_state_cache, _manual_state_ts
+    data = request.get_json(silent=True) or {"machine1": [], "machine2": []}
+    row = [
+        ",".join(data.get("machine1", [])),
+        ",".join(data.get("machine2", []))
+    ]
 
-        # BROADCAST TO ALL CLIENTS (no 'broadcast' arg)
-        socketio.emit("manualStateUpdated", data)
-        logger.info(f"Broadcasted manualStateUpdated: {data}")
+    try:
+        # 1) write into your “Manual State” sheet
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=MANUAL_RANGE,
+            valueInputOption="RAW",
+            body={"values": [row]}
+        ).execute()
+        logger.info(f"Manual state written: {row}")
+
+        # 2) clear and reset the in-memory cache so next GET is fresh
+        _manual_state_cache = {"machine1": data["machine1"], "machine2": data["machine2"]}
+        _manual_state_ts    = time.time()
+
+        # 3) emit to ALL OTHER clients (not the one who dragged),
+        #    so they pick up the new order without re-bouncing yours
+        socketio.emit("manualStateUpdated", data, include_self=False)
+        logger.info(f"Broadcast manualStateUpdated (skip origin): {data}")
 
         return jsonify({"status": "ok"})
-    except Exception as e:
+    except Exception:
         logger.exception("Error writing manual state")
         return jsonify({"status": "error"}), 500
 
