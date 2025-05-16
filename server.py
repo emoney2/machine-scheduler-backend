@@ -61,10 +61,14 @@ logging.info("🔑 Service account email: %s", creds.service_account_email)
 _http = Http(timeout=10)
 authed_http = AuthorizedHttp(creds, http=_http)
 
-# build the Sheets client
-sheets = build("sheets", "v4", http=authed_http).spreadsheets()
-
-
+# build the Sheets client (disable discovery cache so updates are always fresh)
+service = build(
+    "sheets",
+    "v4",
+    credentials=creds,
+    cache_discovery=False
+)
+sheets = service.spreadsheets()
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
