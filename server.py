@@ -1,6 +1,11 @@
 import eventlet
 eventlet.monkey_patch()
 
+import eventlet.debug
+# allow multiple greenthreads to read the same socket
+eventlet.debug.hub_prevent_multiple_readers(False)
+
+
 import os
 import logging
 import time
@@ -205,7 +210,7 @@ def save_manual_state():
         logger.info(f"Manual state written: {row}")
         global _manual_state_cache
         _manual_state_cache = None
-        socketio.emit("manualStateUpdated", data)
+        socketio.emit("manualStateUpdated", data, broadcast=False)
         return jsonify({"status": "ok"}), 200
     except Exception:
         logger.exception("Error writing manual state")
