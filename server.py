@@ -229,31 +229,38 @@ def get_manual_state():
 
 @app.route("/api/manualState", methods=["POST"])
 def save_manual_state():
+    """
+    Persist the manual state to Google Sheets, update the in-memory cache,
+    and broadcast an update to all connected clients via Socket.IO.
+    """
     global _manual_state_cache, _manual_state_ts
+
+    # Parse incoming JSON payload (expecting {"machine1": [...], "machine2": [...]})
     data = request.get_json(silent=True) or {"machine1": [], "machine2": []}
+
+    # Prepare the row values for Google Sheets (comma-separated lists)
     row = [
         ",".join(data.get("machine1", [])),
         ",".join(data.get("machine2", []))
     ]
 
     try:
-        # 1) write into your “Manual State” sheet
+        # 1) Write the new order into row 2 of the "Manual State" sheet
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE,
+            range=MANUAL_RANGE,            # e.g. "Manual State!A2:B2"
             valueInputOption="RAW",
             body={"values": [row]}
         ).execute()
-        logger.info(f"Manual state written: {row}")
+        logger.info(f"Manual state written to Sheets: {row}")
 
-        # 2) clear and reset the in-memory cache so next GET is fresh
+        # 2) Update in-memory cache immediately so future GETs are fresh
         _manual_state_cache = {"machine1": data["machine1"], "machine2": data["machine2"]}
         _manual_state_ts    = time.time()
 
-        # 3) emit to ALL OTHER clients (not the one who dragged),
-         # broadcast to everyone (HTTP context has no sid to skip)
-         socketio.emit("manualStateUpdated", data)
-        logger.info(f"Broadcast manualStateUpdated (skip origin): {data}")
+        # 3) Broadcast to all clients so everyone re-fetches the new state
+        socketio.emit("manualStateUpdated", data)
+        logger.info(f"Broadcast manualStateUpdated: {data}")
 
         return jsonify({"status": "ok"})
     except Exception:
