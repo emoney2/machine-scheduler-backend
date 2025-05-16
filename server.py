@@ -7,41 +7,49 @@ import time
 import json
 from dotenv import load_dotenv
 
-# ─── Logging setup ─────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ─── Configuration ─────────────────────────────────────────────────────────────
-CREDENTIALS_FILE   = "credentials.json"
-SPREADSHEET_ID     = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
-ORDERS_RANGE       = "'Production Orders'!A:AM"
-EMBROIDERY_RANGE   = "'Embroidery List'!A:AM"
-MANUAL_RANGE       = "'Manual State'!A2:B2"
-
-# ─── Debug: verify credentials file is present ─────────────────────────────────
-load_dotenv()
-
-logger.info(f"▶︎ CWD = {os.getcwd()}")
-logger.info(f"▶︎ Files here = {os.listdir('.')}")
-if not os.path.exists(CREDENTIALS_FILE):
-    logger.error(f"⚠️  {CREDENTIALS_FILE} not found!")
-else:
-    size = os.path.getsize(CREDENTIALS_FILE)
-    logger.info(f"✔️  {CREDENTIALS_FILE} exists, size {size} bytes")
-
-# ─── Now imports that require monkey-patching to be in place ────────────────────
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# ─── Flask + CORS + SocketIO (Eventlet) ────────────────────────────────────────
+# Load environment variables from .env (if present)
+load_dotenv()
+
+# ─── Logging setup ─────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Debug: make sure we're in the right directory and see what files are present
+logger.info(f"▶︎ CWD = {os.getcwd()}")
+logger.info(f"▶︎ Files here = {os.listdir('.')}")
+
+# ─── Google Sheets configuration ───────────────────────────────────────────────
+SPREADSHEET_ID   = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
+ORDERS_RANGE     = "'Production Orders'!A:AM"
+EMBROIDERY_RANGE = "'Embroidery List'!A:AM"
+MANUAL_RANGE     = "'Manual State'!A2:B2"
+CREDENTIALS_FILE = "credentials.json"
+
+if not os.path.exists(CREDENTIALS_FILE):
+    logger.error(f"⚠️  {CREDENTIALS_FILE} not found!")
+else:
+    size = os.path.getsize(CREDENTIALS_FILE)
+    logger.info(f"✔️  {CREDENTIALS_FILE} exists, size {size} bytes")
+
+logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
+creds = service_account.Credentials.from_service_account_file(
+    CREDENTIALS_FILE,
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+)
+sheets = build("sheets", "v4", credentials=creds).spreadsheets()
+
+# ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-# ─── In-memory caches & settings ───────────────────────────────────────────────
+# ─── In-memory caches & settings ────────────────────────────────────────────────
 CACHE_TTL           = 300   # seconds
 _orders_cache       = None
 _orders_ts          = 0
@@ -50,7 +58,7 @@ _emb_ts             = 0
 _manual_state_cache = None
 _manual_state_ts    = 0
 
-# ─── In-memory links store ─────────────────────────────────────────────────────
+# ─── In-memory links store ──────────────────────────────────────────────────────
 _links_store = {}
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -130,11 +138,8 @@ def update_order(order_id):
             valueInputOption="RAW",
             body={"values": [[ data.get("embroidery_start", "") ]]}
         ).execute()
-        logger.info(f"Order {order_id} updated in sheet")
-
         socketio.emit("orderUpdated", {"orderId": order_id})
         return jsonify({"status": "ok"}), 200
-
     except Exception:
         logger.exception(f"Failed to update order {order_id}")
         return jsonify({"error": "Server error"}), 500
@@ -168,11 +173,9 @@ def get_manual_state():
         row = vals[0] if vals else ["", ""]
         if len(row) < 2:
             row += [""] * (2 - len(row))
-
         ms1 = [s for s in row[0].split(",") if s]
         ms2 = [s for s in row[1].split(",") if s]
         result = {"machine1": ms1, "machine2": ms2}
-
         _manual_state_cache = result
         _manual_state_ts    = now
         return jsonify(result), 200
@@ -198,13 +201,10 @@ def save_manual_state():
             body={"values": [row]}
         ).execute()
         logger.info(f"Manual state written: {row}")
-
         global _manual_state_cache
         _manual_state_cache = None
-
         socketio.emit("manualStateUpdated", data)
         return jsonify({"status": "ok"}), 200
-
     except Exception:
         logger.exception("Error writing manual state")
         return jsonify({"error": "Server error"}), 500
