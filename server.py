@@ -13,6 +13,7 @@ import logging
 import time
 import json
 from dotenv import load_dotenv
+from threading import Semaphore
 
 from eventlet.semaphore import Semaphore
 from flask import Flask, jsonify, request
