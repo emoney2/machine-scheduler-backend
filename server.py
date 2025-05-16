@@ -50,8 +50,9 @@ else:
     logger.info(f"✔️  {CREDENTIALS_FILE} exists, size {size} bytes")
 
 logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
-creds = service_account.Credentials.from_service_account_file(
-    CREDENTIALS_FILE,
+creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+creds = service_account.Credentials.from_service_account_info(
+    creds_info,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
 )
 logger.info("🔑 Service account email: %s", creds.service_account_email)
