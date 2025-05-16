@@ -2,11 +2,14 @@ import eventlet
 eventlet.monkey_patch()
 
 import eventlet.debug
+# allow multiple greenthreads to read the same socket
 eventlet.debug.hub_prevent_multiple_readers(False)
 
-from eventlet import semaphore
-sheet_lock = Semaphore()
-
+# -------------------------------------------------------------------
+# add this import *before* you use Semaphore()
+from eventlet.semaphore import Semaphore
+# (or: from threading import Semaphore)
+# -------------------------------------------------------------------
 
 import os
 import logging
