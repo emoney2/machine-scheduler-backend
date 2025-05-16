@@ -210,7 +210,9 @@ def save_manual_state():
         logger.info(f"Manual state written: {row}")
         global _manual_state_cache
         _manual_state_cache = None
-        socketio.emit("manualStateUpdated", data, broadcast=False)
+        global _manual_state_ts
+        _manual_state_ts = 0
+        socketio.emit("manualStateUpdated", data, broadcast=True)
         return jsonify({"status": "ok"}), 200
     except Exception:
         logger.exception("Error writing manual state")
