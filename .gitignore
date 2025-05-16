@@ -3,3 +3,4 @@ creds.b64
 # local environment variables
 .env
 
+"credentials.json" 
