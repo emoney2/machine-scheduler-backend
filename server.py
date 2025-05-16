@@ -42,6 +42,8 @@ creds = service_account.Credentials.from_service_account_file(
     CREDENTIALS_FILE,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
 )
+logger.info("🔑 Service account email: %s", creds.service_account_email)
+
 sheets = build("sheets", "v4", credentials=creds).spreadsheets()
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
