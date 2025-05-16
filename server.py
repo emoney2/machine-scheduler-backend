@@ -7,32 +7,34 @@ import time
 import json
 from dotenv import load_dotenv
 
+# ─── Logging setup ─────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ─── Configuration ─────────────────────────────────────────────────────────────
+CREDENTIALS_FILE   = "credentials.json"
+SPREADSHEET_ID     = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
+ORDERS_RANGE       = "'Production Orders'!A:AM"
+EMBROIDERY_RANGE   = "'Embroidery List'!A:AM"
+MANUAL_RANGE       = "'Manual State'!A2:B2"
+
+# ─── Debug: verify credentials file is present ─────────────────────────────────
+load_dotenv()
+
+logger.info(f"▶︎ CWD = {os.getcwd()}")
+logger.info(f"▶︎ Files here = {os.listdir('.')}")
+if not os.path.exists(CREDENTIALS_FILE):
+    logger.error(f"⚠️  {CREDENTIALS_FILE} not found!")
+else:
+    size = os.path.getsize(CREDENTIALS_FILE)
+    logger.info(f"✔️  {CREDENTIALS_FILE} exists, size {size} bytes")
+
+# ─── Now imports that require monkey-patching to be in place ────────────────────
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-
-# Load environment variables from .env (if present)
-load_dotenv()
-
-# ─── Logging setup ─────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ─── Google Sheets configuration ───────────────────────────────────────────────
-SPREADSHEET_ID   = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
-ORDERS_RANGE     = "'Production Orders'!A:AM"
-EMBROIDERY_RANGE = "'Embroidery List'!A:AM"
-MANUAL_RANGE     = "'Manual State'!A2:B2"
-CREDENTIALS_FILE = "credentials.json"
-
-logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
-creds = service_account.Credentials.from_service_account_file(
-    CREDENTIALS_FILE,
-    scopes=["https://www.googleapis.com/auth/spreadsheets"]
-)
-sheets = build("sheets", "v4", credentials=creds).spreadsheets()
 
 # ─── Flask + CORS + SocketIO (Eventlet) ────────────────────────────────────────
 app = Flask(__name__)
