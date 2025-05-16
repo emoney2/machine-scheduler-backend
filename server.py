@@ -1,71 +1,56 @@
-import eventlet
-eventlet.monkey_patch()
-
-import eventlet.debug
-# allow multiple greenthreads to read the same socket
-eventlet.debug.hub_prevent_multiple_readers(False)
-
-# -------------------------------------------------------------------
-# add this import *before* you use Semaphore()
-from eventlet.semaphore import Semaphore
-# (or: from threading import Semaphore)
-# -------------------------------------------------------------------
-
+# ─── Imports ─────────────────────────────────────────────────────────────
 import os
+import json
 import logging
 import time
-import json
 from dotenv import load_dotenv
-from threading import Semaphore
 
+# add this import before you use Semaphore()
 from eventlet.semaphore import Semaphore
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-
-# Load environment variables from .env (if present)
-load_dotenv()
-
-# ─── Logging setup ─────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Debug: make sure we're in the right directory and see what files are present
-logger.info(f"▶︎ CWD = {os.getcwd()}")
-logger.info(f"▶︎ Files here = {os.listdir('.')}")
-
-# ─── Google Sheets configuration ───────────────────────────────────────────────
-SPREADSHEET_ID   = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
-ORDERS_RANGE     = "'Production Orders'!A:AM"
-EMBROIDERY_RANGE = "'Embroidery List'!A:AM"
-MANUAL_RANGE     = "'Manual State'!A2:B2"
-CREDENTIALS_FILE = "credentials.json"
-
-if not os.path.exists(CREDENTIALS_FILE):
-    logger.error(f"⚠️  {CREDENTIALS_FILE} not found!")
-else:
-    size = os.path.getsize(CREDENTIALS_FILE)
-    logger.info(f"✔️  {CREDENTIALS_FILE} exists, size {size} bytes")
-
-logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
-creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
-creds = service_account.Credentials.from_service_account_info(
-    creds_info,
-    scopes=["https://www.googleapis.com/auth/spreadsheets"]
-)
-logger.info("🔑 Service account email: %s", creds.service_account_email)
-
-# wrap httplib2.Http to enforce a timeout
 from httplib2 import Http
 from google_auth_httplib2 import AuthorizedHttp
 
-_http = Http(timeout=10)                      # adjust timeout as needed
+# ─── Load .env ────────────────────────────────────────────────────────────
+load_dotenv()
+
+# ─── Semaphore for serializing sheet calls ────────────────────────────────
+sheet_lock = Semaphore(1)
+
+# ─── Google Sheets credentials ─────────────────────────────────────────────
+CREDENTIALS_FILE = "credentials.json"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+if os.environ.get("GOOGLE_CREDENTIALS"):
+    # in production: credentials JSON is stored in env var
+    creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+    creds = service_account.Credentials.from_service_account_info(
+        creds_info,
+        scopes=SCOPES
+    )
+else:
+    # local dev: read from credentials.json on disk
+    if not os.path.exists(CREDENTIALS_FILE):
+        logging.error(f"⚠️  {CREDENTIALS_FILE} not found!")
+    creds = service_account.Credentials.from_service_account_file(
+        CREDENTIALS_FILE,
+        scopes=SCOPES
+    )
+
+logging.info("🔑 Service account email: %s", creds.service_account_email)
+
+# wrap httplib2.Http to enforce a timeout
+_http = Http(timeout=10)
 authed_http = AuthorizedHttp(creds, http=_http)
 
-# build the Sheets client with our authorized, timed-out HTTP
+# build the Sheets client
 sheets = build("sheets", "v4", http=authed_http).spreadsheets()
+
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -100,6 +85,7 @@ def fetch_sheet(spreadsheet_id, sheet_range):
             range=sheet_range
         ).execute()
     return res.get("values", [])
+
 
 
 # ─── ORDERS ENDPOINT ───────────────────────────────────────────────────────────
