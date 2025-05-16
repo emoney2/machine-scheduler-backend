@@ -1,24 +1,9 @@
-import eventlet
-eventlet.monkey_patch()
-
-import eventlet.debug
-# allow multiple greenthreads to read the same socket
-eventlet.debug.hub_prevent_multiple_readers(False)
-
-# -------------------------------------------------------------------
-# add this import *before* you use Semaphore()
-from eventlet.semaphore import Semaphore
-# (or: from threading import Semaphore)
-# -------------------------------------------------------------------
-
 import os
 import logging
 import time
 import json
 from dotenv import load_dotenv
-from threading import Semaphore
 
-from eventlet.semaphore import Semaphore
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
@@ -32,10 +17,6 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Debug: make sure we're in the right directory and see what files are present
-logger.info(f"▶︎ CWD = {os.getcwd()}")
-logger.info(f"▶︎ Files here = {os.listdir('.')}")
-
 # ─── Google Sheets configuration ───────────────────────────────────────────────
 SPREADSHEET_ID   = "11s5QahOgGsDRFWFX6diXvonG5pESRE1ak79V-8uEbb4"
 ORDERS_RANGE     = "'Production Orders'!A:AM"
@@ -43,35 +24,19 @@ EMBROIDERY_RANGE = "'Embroidery List'!A:AM"
 MANUAL_RANGE     = "'Manual State'!A2:B2"
 CREDENTIALS_FILE = "credentials.json"
 
-if not os.path.exists(CREDENTIALS_FILE):
-    logger.error(f"⚠️  {CREDENTIALS_FILE} not found!")
-else:
-    size = os.path.getsize(CREDENTIALS_FILE)
-    logger.info(f"✔️  {CREDENTIALS_FILE} exists, size {size} bytes")
-
 logger.info(f"Loading Google credentials from {CREDENTIALS_FILE}")
 creds = service_account.Credentials.from_service_account_file(
     CREDENTIALS_FILE,
     scopes=["https://www.googleapis.com/auth/spreadsheets"]
 )
-logger.info("🔑 Service account email: %s", creds.service_account_email)
+sheets = build("sheets", "v4", credentials=creds).spreadsheets()
 
-# wrap httplib2.Http to enforce a timeout
-from httplib2 import Http
-from google_auth_httplib2 import AuthorizedHttp
-
-_http = Http(timeout=10)                      # adjust timeout as needed
-authed_http = AuthorizedHttp(creds, http=_http)
-
-# build the Sheets client with our authorized, timed-out HTTP
-sheets = build("sheets", "v4", http=authed_http).spreadsheets()
-
-# ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
+# ─── Flask + CORS + SocketIO (Eventlet) ────────────────────────────────────────
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-# ─── In-memory caches & settings ────────────────────────────────────────────────
+# ─── In-memory caches & settings ───────────────────────────────────────────────
 CACHE_TTL           = 300   # seconds
 _orders_cache       = None
 _orders_ts          = 0
@@ -80,7 +45,7 @@ _emb_ts             = 0
 _manual_state_cache = None
 _manual_state_ts    = 0
 
-# ─── In-memory links store ──────────────────────────────────────────────────────
+# ─── In-memory links store ─────────────────────────────────────────────────────
 _links_store = {}
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -93,36 +58,59 @@ def apply_cors(response):
 app.after_request(apply_cors)
 
 def fetch_sheet(spreadsheet_id, sheet_range):
-    with sheet_lock:
-        res = sheets.values().get(
-            spreadsheetId=spreadsheet_id,
-            range=sheet_range
-        ).execute()
+    res = sheets.values().get(
+        spreadsheetId=spreadsheet_id,
+        range=sheet_range
+    ).execute()
     return res.get("values", [])
 
-
+# ─── ORDERS ENDPOINT ───────────────────────────────────────────────────────────
 # ─── ORDERS ENDPOINT ───────────────────────────────────────────────────────────
 @app.route("/api/orders", methods=["GET"])
 def get_orders():
     global _orders_cache, _orders_ts
     now = time.time()
+    # Cache‐hit?
     if _orders_cache is not None and (now - _orders_ts) < CACHE_TTL:
         return jsonify(_orders_cache), 200
 
     try:
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
         _orders_ts = now
-        if not rows:
+
+        if not rows or len(rows) < 2:
             _orders_cache = []
         else:
             headers = rows[0]
-            _orders_cache = [dict(zip(headers, r)) for r in rows[1:]]
+            # find exactly the Hard/Soft header index once
+            try:
+                due_idx = headers.index("Hard Date/Soft Date")
+            except ValueError:
+                due_idx = None
+
+            orders = []
+            for r in rows[1:]:
+                # zip whatever columns you have
+                order = dict(zip(headers, r))
+                # pull the “Hard Date/Soft Date” cell into .due_type
+                if due_idx is not None and due_idx < len(r):
+                    order["due_type"] = r[due_idx].strip()
+                else:
+                    order["due_type"] = ""
+                orders.append(order)
+
+            _orders_cache = orders
+
     except Exception:
         logger.exception("Error fetching orders sheet")
+        # on error, fall back to last‐good if available
         if _orders_cache is not None:
             return jsonify(_orders_cache), 200
         _orders_cache = []
+
     return jsonify(_orders_cache), 200
+
+
 
 # ─── EMBROIDERY LIST ENDPOINT ──────────────────────────────────────────────────
 @app.route("/api/embroideryList", methods=["GET"])
@@ -139,6 +127,7 @@ def get_embroidery_list():
             _emb_cache = []
         else:
             headers = rows[0]
+            logger.info(f"Orders sheet headers: {headers}")
             _emb_cache = [dict(zip(headers, r)) for r in rows[1:]]
     except Exception:
         logger.exception("Error fetching embroidery sheet")
@@ -156,21 +145,22 @@ def update_order(order_id):
 
     logger.info(f"Received update for order {order_id}: {data!r}")
     try:
-        # serialize this write too
-        with sheet_lock:
-            sheets.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Production Orders!H{order_id}",
-                valueInputOption="RAW",
-                body={"values": [[ data.get("embroidery_start", "") ]]}
-            ).execute()
+        # Example: write embroidery_start back into column H of the orders sheet.
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!H{order_id}",
+            valueInputOption="RAW",
+            body={"values": [[ data.get("embroidery_start", "") ]]}
+        ).execute()
+        logger.info(f"Order {order_id} updated in sheet")
+
+        # Notify all clients to re-fetch orders/manual state
         socketio.emit("orderUpdated", {"orderId": order_id})
         return jsonify({"status": "ok"}), 200
 
     except Exception:
         logger.exception(f"Failed to update order {order_id}")
         return jsonify({"error": "Server error"}), 500
-
 
 # ─── LINKS ENDPOINTS ───────────────────────────────────────────────────────────
 @app.route("/api/links", methods=["GET"])
@@ -186,19 +176,10 @@ def save_links():
     return jsonify({"status": "ok"}), 200
 
 # ─── MANUAL STATE ENDPOINTS ───────────────────────────────────────────────────
-# at the very top, after your other imports:
-from eventlet.semaphore import Semaphore
-
-# just below your creds setup:
-sheet_lock = Semaphore(1)
-
-
-# ─── MANUAL STATE ENDPOINTS ───────────────────────────────────────────────────
 @app.route("/api/manualState", methods=["GET"])
 def get_manual_state():
     global _manual_state_cache, _manual_state_ts
     now = time.time()
-    # serve from cache while fresh
     if _manual_state_cache is not None and (now - _manual_state_ts) < CACHE_TTL:
         return jsonify(_manual_state_cache), 200
 
@@ -207,9 +188,8 @@ def get_manual_state():
             spreadsheetId=SPREADSHEET_ID,
             range=MANUAL_RANGE
         ).execute().get("values", [])
-
         row = vals[0] if vals else ["", ""]
-        # ensure two columns
+        # pad if missing
         if len(row) < 2:
             row += [""] * (2 - len(row))
 
@@ -234,7 +214,6 @@ def save_manual_state():
         ",".join(data.get("machine1", [])),
         ",".join(data.get("machine2", []))
     ]
-
     try:
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
@@ -244,19 +223,17 @@ def save_manual_state():
         ).execute()
         logger.info(f"Manual state written: {row}")
 
-        # clear cache so next GET fetches fresh
-        global _manual_state_cache, _manual_state_ts
+        # invalidate cache
+        global _manual_state_cache
         _manual_state_cache = None
-        _manual_state_ts = 0
 
-        # broadcast live update to all connected clients
-        socketio.emit("manualStateUpdated", data, broadcast=True)
+        # broadcast new state
+        socketio.emit("manualStateUpdated", data)
         return jsonify({"status": "ok"}), 200
 
     except Exception:
         logger.exception("Error writing manual state")
         return jsonify({"error": "Server error"}), 500
-
 
 # ─── SOCKET.IO CONNECTION LOGS ────────────────────────────────────────────────
 @socketio.on("connect")
