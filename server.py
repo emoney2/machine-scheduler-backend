@@ -1,9 +1,12 @@
 import eventlet
 eventlet.monkey_patch()
-from eventlet import semaphore
 
-# serialize all Sheets API calls so Eventlet never does simultaneous reads
-sheet_lock = semaphore.Semaphore(1)
+import eventlet.debug
+eventlet.debug.hub_prevent_multiple_readers(False)
+
+from eventlet import semaphore
+sheet_lock = Semaphore()
+
 
 import os
 import logging
@@ -79,7 +82,6 @@ def apply_cors(response):
 app.after_request(apply_cors)
 
 def fetch_sheet(spreadsheet_id, sheet_range):
-    # serialize .execute() calls so Eventlet never does two reads on the same socket
     with sheet_lock:
         res = sheets.values().get(
             spreadsheetId=spreadsheet_id,
@@ -185,21 +187,25 @@ sheet_lock = Semaphore(1)
 def get_manual_state():
     global _manual_state_cache, _manual_state_ts
     now = time.time()
+    # serve from cache while fresh
     if _manual_state_cache is not None and (now - _manual_state_ts) < CACHE_TTL:
         return jsonify(_manual_state_cache), 200
 
     try:
-        with sheet_lock:
-            raw = sheets.values().get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=MANUAL_RANGE
-            ).execute().get("values", [])
-        row = raw[0] if raw else ["", ""]
+        vals = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=MANUAL_RANGE
+        ).execute().get("values", [])
+
+        row = vals[0] if vals else ["", ""]
+        # ensure two columns
         if len(row) < 2:
             row += [""] * (2 - len(row))
+
         ms1 = [s for s in row[0].split(",") if s]
         ms2 = [s for s in row[1].split(",") if s]
         result = {"machine1": ms1, "machine2": ms2}
+
         _manual_state_cache = result
         _manual_state_ts    = now
         return jsonify(result), 200
@@ -210,7 +216,6 @@ def get_manual_state():
             return jsonify(_manual_state_cache), 200
         return jsonify({"machine1": [], "machine2": []}), 200
 
-
 @app.route("/api/manualState", methods=["POST"])
 def save_manual_state():
     data = request.get_json(silent=True) or {"machine1": [], "machine2": []}
@@ -218,19 +223,22 @@ def save_manual_state():
         ",".join(data.get("machine1", [])),
         ",".join(data.get("machine2", []))
     ]
+
     try:
-        with sheet_lock:
-            sheets.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=MANUAL_RANGE,
-                valueInputOption="RAW",
-                body={"values": [row]}
-            ).execute()
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=MANUAL_RANGE,
+            valueInputOption="RAW",
+            body={"values": [row]}
+        ).execute()
         logger.info(f"Manual state written: {row}")
-        # invalidate cache so next GET fetches fresh
+
+        # clear cache so next GET fetches fresh
         global _manual_state_cache, _manual_state_ts
         _manual_state_cache = None
-        _manual_state_ts    = 0
+        _manual_state_ts = 0
+
+        # broadcast live update to all connected clients
         socketio.emit("manualStateUpdated", data, broadcast=True)
         return jsonify({"status": "ok"}), 200
 
