@@ -11,6 +11,7 @@ import time
 import json
 from dotenv import load_dotenv
 
+from eventlet.semaphore import Semaphore
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
@@ -172,6 +173,14 @@ def save_links():
     return jsonify({"status": "ok"}), 200
 
 # ─── MANUAL STATE ENDPOINTS ───────────────────────────────────────────────────
+# at the very top, after your other imports:
+from eventlet.semaphore import Semaphore
+
+# just below your creds setup:
+sheet_lock = Semaphore(1)
+
+
+# ─── MANUAL STATE ENDPOINTS ───────────────────────────────────────────────────
 @app.route("/api/manualState", methods=["GET"])
 def get_manual_state():
     global _manual_state_cache, _manual_state_ts
@@ -181,11 +190,11 @@ def get_manual_state():
 
     try:
         with sheet_lock:
-            vals = sheets.values().get(
+            raw = sheets.values().get(
                 spreadsheetId=SPREADSHEET_ID,
                 range=MANUAL_RANGE
             ).execute().get("values", [])
-        row = vals[0] if vals else ["", ""]
+        row = raw[0] if raw else ["", ""]
         if len(row) < 2:
             row += [""] * (2 - len(row))
         ms1 = [s for s in row[0].split(",") if s]
@@ -218,6 +227,7 @@ def save_manual_state():
                 body={"values": [row]}
             ).execute()
         logger.info(f"Manual state written: {row}")
+        # invalidate cache so next GET fetches fresh
         global _manual_state_cache, _manual_state_ts
         _manual_state_cache = None
         _manual_state_ts    = 0
