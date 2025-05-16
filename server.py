@@ -31,6 +31,11 @@ sheet_lock = Semaphore(1)
 
 
 # ─── Google Sheets credentials ─────────────────────────────────────────────
+SPREADSHEET_ID   = os.environ.get("SPREADSHEET_ID")
+ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:Z")
+EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:Z")
+MANUAL_RANGE     = os.environ.get("MANUAL_RANGE",     "Manual State!A1:Z")
+
 CREDENTIALS_FILE = "credentials.json"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
