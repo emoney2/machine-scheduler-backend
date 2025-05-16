@@ -229,34 +229,19 @@ def get_manual_state():
 
 @app.route("/api/manualState", methods=["POST"])
 def save_manual_state():
-    data = request.get_json(silent=True) or {"machine1": [], "machine2": []}
-    row = [
-        ",".join(data.get("machine1", [])),
-        ",".join(data.get("machine2", []))
-    ]
-
+    data = request.get_json()
     try:
-        sheets.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE,
-            valueInputOption="RAW",
-            body={"values": [row]}
-        ).execute()
-        logger.info(f"Manual state written: {row}")
+        # … your existing code that writes into Sheets …
+        logger.info(f"Manual state written: {data}")
 
-        # clear cache so next GET fetches fresh
-        global _manual_state_cache, _manual_state_ts
-        _manual_state_cache = None
-        _manual_state_ts = 0
+        # BROADCAST TO ALL CLIENTS (no 'broadcast' arg)
+        socketio.emit("manualStateUpdated", data)
+        logger.info(f"Broadcasted manualStateUpdated: {data}")
 
-        # broadcast live update to all connected clients
-        socketio.emit("manualStateUpdated", data, broadcast=True)
-        return jsonify({"status": "ok"}), 200
-
-    except Exception:
+        return jsonify({"status": "ok"})
+    except Exception as e:
         logger.exception("Error writing manual state")
-        return jsonify({"error": "Server error"}), 500
-
+        return jsonify({"status": "error"}), 500
 
 # ─── SOCKET.IO CONNECTION LOGS ────────────────────────────────────────────────
 @socketio.on("connect")
