@@ -251,8 +251,8 @@ def save_manual_state():
         _manual_state_ts    = time.time()
 
         # 3) emit to ALL OTHER clients (not the one who dragged),
-        #    so they pick up the new order without re-bouncing yours
-        socketio.emit("manualStateUpdated", data, include_self=False)
+         # broadcast to everyone (HTTP context has no sid to skip)
+         socketio.emit("manualStateUpdated", data)
         logger.info(f"Broadcast manualStateUpdated (skip origin): {data}")
 
         return jsonify({"status": "ok"})
