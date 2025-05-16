@@ -32,8 +32,8 @@ sheet_lock = Semaphore(1)
 
 # ─── Google Sheets credentials ─────────────────────────────────────────────
 SPREADSHEET_ID   = os.environ.get("SPREADSHEET_ID")
-ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:Z")
-EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:Z")
+ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
+EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE     = os.environ.get("MANUAL_RANGE",     "Manual State!A2:B2")
 
 CREDENTIALS_FILE = "credentials.json"
