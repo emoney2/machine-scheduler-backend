@@ -1,9 +1,16 @@
-# ─── Imports ─────────────────────────────────────────────────────────────
+# ─── Imports & Logger Setup ─────────────────────────────────────────────────
 import os
 import json
 import logging
 import time
 from dotenv import load_dotenv
+
+# configure root logger
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # add this import before you use Semaphore()
 from eventlet.semaphore import Semaphore
@@ -21,6 +28,7 @@ load_dotenv()
 
 # ─── Semaphore for serializing sheet calls ────────────────────────────────
 sheet_lock = Semaphore(1)
+
 
 # ─── Google Sheets credentials ─────────────────────────────────────────────
 CREDENTIALS_FILE = "credentials.json"
