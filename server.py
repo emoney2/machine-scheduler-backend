@@ -1,10 +1,9 @@
 import eventlet
 eventlet.monkey_patch()
+from eventlet import semaphore
 
-import eventlet.debug
-# allow multiple greenthreads to read the same socket
-eventlet.debug.hub_prevent_multiple_readers(False)
-
+# serialize all Sheets API calls so Eventlet never does simultaneous reads
+sheet_lock = semaphore.Semaphore(1)
 
 import os
 import logging
@@ -51,6 +50,7 @@ logger.info("🔑 Service account email: %s", creds.service_account_email)
 
 sheets = build("sheets", "v4", credentials=creds).spreadsheets()
 
+
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -78,11 +78,14 @@ def apply_cors(response):
 app.after_request(apply_cors)
 
 def fetch_sheet(spreadsheet_id, sheet_range):
-    res = sheets.values().get(
-        spreadsheetId=spreadsheet_id,
-        range=sheet_range
-    ).execute()
+    # serialize .execute() calls so Eventlet never does two reads on the same socket
+    with sheet_lock:
+        res = sheets.values().get(
+            spreadsheetId=spreadsheet_id,
+            range=sheet_range
+        ).execute()
     return res.get("values", [])
+
 
 # ─── ORDERS ENDPOINT ───────────────────────────────────────────────────────────
 @app.route("/api/orders", methods=["GET"])
@@ -139,17 +142,21 @@ def update_order(order_id):
 
     logger.info(f"Received update for order {order_id}: {data!r}")
     try:
-        sheets.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Production Orders!H{order_id}",
-            valueInputOption="RAW",
-            body={"values": [[ data.get("embroidery_start", "") ]]}
-        ).execute()
+        # serialize this write too
+        with sheet_lock:
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!H{order_id}",
+                valueInputOption="RAW",
+                body={"values": [[ data.get("embroidery_start", "") ]]}
+            ).execute()
         socketio.emit("orderUpdated", {"orderId": order_id})
         return jsonify({"status": "ok"}), 200
+
     except Exception:
         logger.exception(f"Failed to update order {order_id}")
         return jsonify({"error": "Server error"}), 500
+
 
 # ─── LINKS ENDPOINTS ───────────────────────────────────────────────────────────
 @app.route("/api/links", methods=["GET"])
@@ -173,10 +180,11 @@ def get_manual_state():
         return jsonify(_manual_state_cache), 200
 
     try:
-        vals = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE
-        ).execute().get("values", [])
+        with sheet_lock:
+            vals = sheets.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=MANUAL_RANGE
+            ).execute().get("values", [])
         row = vals[0] if vals else ["", ""]
         if len(row) < 2:
             row += [""] * (2 - len(row))
@@ -193,6 +201,7 @@ def get_manual_state():
             return jsonify(_manual_state_cache), 200
         return jsonify({"machine1": [], "machine2": []}), 200
 
+
 @app.route("/api/manualState", methods=["POST"])
 def save_manual_state():
     data = request.get_json(silent=True) or {"machine1": [], "machine2": []}
@@ -201,22 +210,24 @@ def save_manual_state():
         ",".join(data.get("machine2", []))
     ]
     try:
-        sheets.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE,
-            valueInputOption="RAW",
-            body={"values": [row]}
-        ).execute()
+        with sheet_lock:
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=MANUAL_RANGE,
+                valueInputOption="RAW",
+                body={"values": [row]}
+            ).execute()
         logger.info(f"Manual state written: {row}")
-        global _manual_state_cache
+        global _manual_state_cache, _manual_state_ts
         _manual_state_cache = None
-        global _manual_state_ts
-        _manual_state_ts = 0
+        _manual_state_ts    = 0
         socketio.emit("manualStateUpdated", data, broadcast=True)
         return jsonify({"status": "ok"}), 200
+
     except Exception:
         logger.exception("Error writing manual state")
         return jsonify({"error": "Server error"}), 500
+
 
 # ─── SOCKET.IO CONNECTION LOGS ────────────────────────────────────────────────
 @socketio.on("connect")
