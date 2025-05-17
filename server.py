@@ -75,7 +75,8 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # ─── In-memory caches & settings ────────────────────────────────────────────────
-CACHE_TTL           = 300   # seconds
+# with CACHE_TTL = 0, every GET will hit Sheets directly
+CACHE_TTL           = 0   
 _orders_cache       = None
 _orders_ts          = 0
 _emb_cache          = None
