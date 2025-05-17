@@ -190,6 +190,17 @@ def save_links():
     socketio.emit("linksUpdated", _links_store)
     return jsonify({"status": "ok"}), 200
 
+# ─── PLACEHOLDERS SOCKET.IO RELAY ────────────────────────────────────────────
+@socketio.on("placeholdersUpdated")
+def handle_placeholders_updated(data):
+    """
+    When any client emits 'placeholdersUpdated', broadcast it back to everyone
+    so they can re-fetch and see the new placeholder immediately.
+    """
+    logger.info(f"Received placeholdersUpdated: {data}")
+    socketio.emit("placeholdersUpdated", data, broadcast=True)
+
+
 # ─── MANUAL STATE ENDPOINTS ───────────────────────────────────────────────────
 # at the very top, after your other imports:
 from eventlet.semaphore import Semaphore
