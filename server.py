@@ -34,6 +34,11 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.a
 from flask import Flask, request
 
 app = Flask(__name__)
+# allow our frontend to receive & send this cookie cross‐site
+app.config.update(
+    SESSION_COOKIE_SAMESITE="None",
+    SESSION_COOKIE_SECURE=True,
+)
 
 # Only allow your Netlify front-end and support cookies
 from flask_cors import CORS
