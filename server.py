@@ -157,6 +157,33 @@ def fetch_sheet(spreadsheet_id, sheet_range):
         res = sheets.values().get(spreadsheetId=spreadsheet_id, range=sheet_range).execute()
     return res.get("values", [])
 
+# ─── AUTHENTICATION ENDPOINTS ─────────────────────────────────────────────────
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    """
+    Expects JSON { username: "...", password: "..." }.
+    If valid, stores session['user'] and returns 200, else 401.
+    """
+    data = request.get_json() or {}
+    user = data.get("username", "")
+    pw   = data.get("password", "")
+    if user in users and check_password_hash(users[user], pw):
+        session["user"] = user
+        return jsonify({"status": "ok"}), 200
+    return jsonify({"error": "Invalid credentials"}), 401
+
+@app.route("/api/whoami", methods=["GET"])
+def api_whoami():
+    """
+    Returns { user: session user } if logged in, else 401.
+    Frontend can poll this to know whether to show login screen.
+    """
+    if session.get("user"):
+        return jsonify({"user": session["user"]}), 200
+    return jsonify({}), 401
+
+
 # ─── ORDERS ENDPOINT ───────────────────────────────────────────────────────────
 @app.route("/api/orders", methods=["GET"])
 @login_required_session
