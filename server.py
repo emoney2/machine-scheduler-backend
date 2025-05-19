@@ -26,10 +26,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Flask & CORS & SocketIO ────────────────────────────────────────────────
+# ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
+from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string
+from flask_cors import CORS
+
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+
+# only allow your deployed frontend to talk to this API, and allow credentials (cookies)
+FRONTEND_ORIGIN = "https://machineschedule.netlify.app"  # <-- change if you host somewhere else
+CORS(
+    app,
+    resources={r"/api/*": {"origins": FRONTEND_ORIGIN}},
+    supports_credentials=True
+)
+
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=FRONTEND_ORIGIN,
+    async_mode="eventlet"
+)
 
 # ─── SESSION / SECRET KEY ─────────────────────────────────────────────────────
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
