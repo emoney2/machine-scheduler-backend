@@ -72,7 +72,7 @@ service = build(
 sheets = service.spreadsheets()
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # ─── In-memory caches & settings ────────────────────────────────────────────────
