@@ -102,6 +102,23 @@ authed_http = AuthorizedHttp(creds, http=_http)
 service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 sheets  = service.spreadsheets()
 
+# ─── In-memory caches & settings ────────────────────────────────────────────
+# with CACHE_TTL = 0, every GET will hit Sheets directly
+CACHE_TTL           = 0
+
+# orders cache + timestamp
+_orders_cache       = None
+_orders_ts          = 0
+
+# embroidery list cache + timestamp
+_emb_cache          = None
+_emb_ts             = 0
+
+# manualState cache + timestamp (for placeholders & machine assignments)
+_manual_state_cache = None
+_manual_state_ts    = 0
+
+
 def fetch_sheet(spreadsheet_id, sheet_range):
     with sheet_lock:
         res = sheets.values().get(
