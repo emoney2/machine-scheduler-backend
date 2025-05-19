@@ -34,7 +34,7 @@ sheet_lock = Semaphore(1)
 SPREADSHEET_ID   = os.environ.get("SPREADSHEET_ID")
 ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
-MANUAL_RANGE     = os.environ.get("MANUAL_RANGE",     "Manual State!A2:B2")
+MANUAL_RANGE     = os.environ.get("MANUAL_RANGE", "Manual State!A2:H2")
 
 CREDENTIALS_FILE = "credentials.json"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -210,6 +210,10 @@ sheet_lock = Semaphore(1)
 
 
 # ─── MANUAL STATE ENDPOINTS ───────────────────────────────────────────────────
+# ─── Use C–H to hold one placeholder record ──────────────────────────────────
+MANUAL_RANGE     = os.environ.get("MANUAL_RANGE", "Manual State!A2:H2")
+
+# ─── MANUAL STATE ENDPOINTS ───────────────────────────────────────────────────
 @app.route("/api/manualState", methods=["GET"])
 def get_manual_state():
     global _manual_state_cache, _manual_state_ts
@@ -224,14 +228,29 @@ def get_manual_state():
             range=MANUAL_RANGE
         ).execute().get("values", [])
 
-        row = vals[0] if vals else ["", ""]
-        # ensure two columns
-        if len(row) < 2:
-            row += [""] * (2 - len(row))
+        # ensure we have exactly 8 columns
+        row = vals[0] if vals else [""] * 8
+        if len(row) < 8:
+            row += [""] * (8 - len(row))
 
+        # A2 → machine1, B2 → machine2
         ms1 = [s for s in row[0].split(",") if s]
         ms2 = [s for s in row[1].split(",") if s]
-        result = {"machine1": ms1, "machine2": ms2}
+
+        # C–H → first placeholder (id, company, quantity, stitchCount, inHand, dueType)
+        placeholders = []
+        fields = row[2:8]
+        if any(fields):
+            placeholders.append({
+                "id":          fields[0],
+                "company":     fields[1],
+                "quantity":    fields[2],
+                "stitchCount": fields[3],
+                "inHand":      fields[4],
+                "dueType":     fields[5],
+            })
+
+        result = {"machine1": ms1, "machine2": ms2, "placeholders": placeholders}
 
         _manual_state_cache = result
         _manual_state_ts    = now
@@ -241,44 +260,54 @@ def get_manual_state():
         logger.exception("Error reading manual state")
         if _manual_state_cache is not None:
             return jsonify(_manual_state_cache), 200
-        return jsonify({"machine1": [], "machine2": []}), 200
+        return jsonify({"machine1": [], "machine2": [], "placeholders": []}), 200
+
 
 @app.route("/api/manualState", methods=["POST"])
 def save_manual_state():
     """
-    Persist the manual state to Google Sheets, update the in-memory cache,
-    and broadcast an update to all connected clients via Socket.IO.
+    Expects JSON:
+      { machine1: [...], machine2: [...],
+        placeholders: [ { id, company, quantity, stitchCount, inHand, dueType }, … ] }
     """
     global _manual_state_cache, _manual_state_ts
 
-    # Parse incoming JSON payload (expecting {"machine1": [...], "machine2": [...]})
-    data = request.get_json(silent=True) or {"machine1": [], "machine2": []}
+    data = request.get_json(silent=True) or {}
+    m1 = data.get("machine1", [])
+    m2 = data.get("machine2", [])
+    phs = data.get("placeholders", [])
 
-    # Prepare the row values for Google Sheets (comma-separated lists)
+    # build the eight columns
+    # A2,B2 are comma-lists; C–H are the first placeholder fields (or blank)
     row = [
-        ",".join(data.get("machine1", [])),
-        ",".join(data.get("machine2", []))
+      ",".join(m1),
+      ",".join(m2),
+      *(phs and [
+        phs[0].get("id",""),
+        phs[0].get("company",""),
+        phs[0].get("quantity",""),
+        phs[0].get("stitchCount",""),
+        phs[0].get("inHand",""),
+        phs[0].get("dueType",""),
+      ] or ["","","","","",""])
     ]
 
     try:
-        # 1) Write the new order into row 2 of the "Manual State" sheet
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE,            # e.g. "Manual State!A2:B2"
+            range=MANUAL_RANGE,
             valueInputOption="RAW",
             body={"values": [row]}
         ).execute()
-        logger.info(f"Manual state written to Sheets: {row}")
 
-        # 2) Update in-memory cache immediately so future GETs are fresh
-        _manual_state_cache = {"machine1": data["machine1"], "machine2": data["machine2"]}
+        # update cache & timestamp
+        _manual_state_cache = {"machine1": m1, "machine2": m2, "placeholders": phs}
         _manual_state_ts    = time.time()
 
-        # 3) Broadcast to all clients so everyone re-fetches the new state
-        socketio.emit("manualStateUpdated", data)
-        logger.info(f"Broadcast manualStateUpdated: {data}")
+        # broadcast so all clients re-fetch
+        socketio.emit("manualStateUpdated", _manual_state_cache)
+        return jsonify({"status": "ok"}), 200
 
-        return jsonify({"status": "ok"})
     except Exception:
         logger.exception("Error writing manual state")
         return jsonify({"status": "error"}), 500
