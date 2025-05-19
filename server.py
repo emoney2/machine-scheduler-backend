@@ -27,27 +27,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
-from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string
-from flask_cors import CORS
-
 app = Flask(__name__)
-# only allow your Netlify frontend, and support credentials
+app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
+
+# Only allow your Netlify frontend and support credentials
 CORS(
     app,
     resources={ r"/api/*": {"origins": "https://machineschedule.netlify.app"} },
     supports_credentials=True
 )
-socketio = SocketIO(app, cors_allowed_origins="https://machineschedule.netlify.app", async_mode="eventlet")
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="https://machineschedule.netlify.app",
+    async_mode="eventlet"
+)
 
 # ─── After-request CORS headers ────────────────────────────────────────────────
 @app.after_request
 def apply_cors(response):
     origin = request.headers.get("Origin")
     if origin == "https://machineschedule.netlify.app":
-        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Origin"]      = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+        response.headers["Access-Control-Allow-Headers"]     = "Content-Type,Authorization"
+        response.headers["Access-Control-Allow-Methods"]     = "GET,POST,PUT,OPTIONS"
     return response
 
 # ─── SESSION / SECRET KEY ─────────────────────────────────────────────────────
