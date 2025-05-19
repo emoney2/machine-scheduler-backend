@@ -26,11 +26,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
+# ─── Flask + CORS + SocketIO ────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
-
-# Only allow your Netlify frontend and support credentials
+# only allow your Netlify origin, and support credentials
 CORS(
     app,
     resources={ r"/api/*": {"origins": "https://machineschedule.netlify.app"} },
@@ -52,6 +50,7 @@ def apply_cors(response):
         response.headers["Access-Control-Allow-Headers"]     = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"]     = "GET,POST,PUT,OPTIONS"
     return response
+
 
 # ─── SESSION / SECRET KEY ─────────────────────────────────────────────────────
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
