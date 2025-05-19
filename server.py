@@ -279,8 +279,11 @@ def get_manual_state():
 def save_manual_state():
     """
     Expects JSON:
-      { machine1: [...], machine2: [...],
-        placeholders: [ { id, company, quantity, stitchCount, inHand, dueType } ] }
+      {
+        machine1: [...],
+        machine2: [...],
+        placeholders: [ { id, company, quantity, stitchCount, inHand, dueType }, … ]
+      }
     """
     global _manual_state_cache, _manual_state_ts
 
@@ -289,18 +292,27 @@ def save_manual_state():
     m2  = data.get("machine2", [])
     phs = data.get("placeholders", [])
 
-    # build an 8-cell row: A,B are comma-lists; C–H are the first placeholder’s fields or blanks
+    # build an 8-cell row:
+    #  • A,B = comma-lists
+    #  • C–H = the first placeholder’s six fields, or blanks
+    if phs and isinstance(phs[0], dict):
+        first = phs[0]
+        fields = [
+            first.get("id", ""),
+            first.get("company", ""),
+            first.get("quantity", ""),
+            first.get("stitchCount", ""),
+            first.get("inHand", ""),
+            first.get("dueType", "")
+        ]
+    else:
+        # either no placeholders or they were strings
+        fields = [""] * 6
+
     row = [
-      ",".join(m1),
-      ",".join(m2),
-      *(phs and [
-        phs[0].get("id",""),
-        phs[0].get("company",""),
-        phs[0].get("quantity",""),
-        phs[0].get("stitchCount",""),
-        phs[0].get("inHand",""),
-        phs[0].get("dueType",""),
-      ] or ["","","","","",""])
+        ",".join(m1),
+        ",".join(m2),
+        *fields
     ]
 
     try:
@@ -308,18 +320,18 @@ def save_manual_state():
             spreadsheetId=SPREADSHEET_ID,
             range=MANUAL_RANGE,
             valueInputOption="RAW",
-            body={"values": [row]}
+            body={"values": [ row ]}
         ).execute()
 
-        # update cache & timestamp
+        # cache & timestamp
         _manual_state_cache = {
-          "machine1":    m1,
-          "machine2":    m2,
-          "placeholders": phs
+            "machine1":     m1,
+            "machine2":     m2,
+            "placeholders": phs if isinstance(phs, list) else []
         }
         _manual_state_ts    = time.time()
 
-        # notify all clients
+        # broadcast
         socketio.emit("manualStateUpdated", _manual_state_cache)
         return jsonify({"status": "ok"}), 200
 
