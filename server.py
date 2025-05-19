@@ -3,73 +3,106 @@ import os
 import json
 import logging
 import time
+from functools import wraps
 from dotenv import load_dotenv
 
-# configure root logger
+from eventlet.semaphore import Semaphore
+from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string
+from flask_cors import CORS
+from flask_socketio import SocketIO
+from werkzeug.security import check_password_hash, generate_password_hash
+from flask_httpauth import HTTPBasicAuth
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from httplib2 import Http
+from google_auth_httplib2 import AuthorizedHttp
+
+# ─── Load .env & Logger ─────────────────────────────────────────────────────
+load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# add this import before you use Semaphore()
-from eventlet.semaphore import Semaphore
+# ─── Flask & CORS & SocketIO ────────────────────────────────────────────────
+app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from flask_socketio import SocketIO
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from httplib2 import Http
-from google_auth_httplib2 import AuthorizedHttp
+# ─── SESSION / SECRET KEY ─────────────────────────────────────────────────────
+app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 
-# ─── Load .env ────────────────────────────────────────────────────────────
-load_dotenv()
+# ─── HTTP BASIC AUTH (for future use, optional) ──────────────────────────────
+auth = HTTPBasicAuth()
+users = {
+    "admin": generate_password_hash(os.environ.get("ADMIN_PW", "changeme"))
+}
+@auth.verify_password
+def verify_password(username, password):
+    if username in users and check_password_hash(users[username], password):
+        return username
+    return None
 
-# ─── Semaphore for serializing sheet calls ────────────────────────────────
+# ─── Sheets Credentials & Semaphore ──────────────────────────────────────────
 sheet_lock = Semaphore(1)
-
-
-# ─── Google Sheets credentials ─────────────────────────────────────────────
-SPREADSHEET_ID   = os.environ.get("SPREADSHEET_ID")
+SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
 ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE     = os.environ.get("MANUAL_RANGE",     "Manual State!A2:Z2")
 
-
-CREDENTIALS_FILE = "credentials.json"
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-if os.environ.get("GOOGLE_CREDENTIALS"):
-    # in production: credentials JSON is stored in env var
-    creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
-    creds = service_account.Credentials.from_service_account_info(
-        creds_info,
-        scopes=SCOPES
-    )
+creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+if creds_json:
+    info = json.loads(creds_json)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
 else:
-    # local dev: read from credentials.json on disk
-    if not os.path.exists(CREDENTIALS_FILE):
-        logging.error(f"⚠️  {CREDENTIALS_FILE} not found!")
-    creds = service_account.Credentials.from_service_account_file(
-        CREDENTIALS_FILE,
-        scopes=SCOPES
-    )
-
-logging.info("🔑 Service account email: %s", creds.service_account_email)
-
-# wrap httplib2.Http to enforce a timeout
+    creds = service_account.Credentials.from_service_account_file("credentials.json", scopes=["https://www.googleapis.com/auth/spreadsheets"])
 _http = Http(timeout=10)
 authed_http = AuthorizedHttp(creds, http=_http)
-
-# build the Sheets client (disable discovery cache so updates are always fresh)
-service = build(
-    "sheets",
-    "v4",
-    credentials=creds,
-    cache_discovery=False
-)
+service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 sheets = service.spreadsheets()
+# ─── Minimal Login Form ──────────────────────────────────────────────────────
+_login_page = """
+<!doctype html>
+<title>Login</title>
+<h2>Please log in</h2>
+<form method=post>
+  <input name=username placeholder="Username" required>
+  <input name=password type=password placeholder="Password" required>
+  <button type=submit>Log In</button>
+</form>
+{% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+"""
+
+@app.route("/login", methods=["GET","POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        u = request.form["username"]
+        p = request.form["password"]
+        if u in users and check_password_hash(users[u], p):
+            session["user"] = u
+            return redirect(request.args.get("next") or "/")
+        error = "Invalid credentials"
+    return render_template_string(_login_page, error=error)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+# ─── Session-Required Decorator ──────────────────────────────────────────────
+def login_required_session(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("user"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error":"authentication required"}), 401
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return decorated
+
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
@@ -88,27 +121,23 @@ _manual_state_ts    = 0
 # ─── In-memory links store ──────────────────────────────────────────────────────
 _links_store = {}
 
-# ─── Helpers ───────────────────────────────────────────────────────────────────
+# ─── CORS AFTER-REQUEST ───────────────────────────────────────────────────────
 def apply_cors(response):
     response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
     return response
-
 app.after_request(apply_cors)
 
+# ─── Helper to fetch from Sheets under lock ──────────────────────────────────
 def fetch_sheet(spreadsheet_id, sheet_range):
     with sheet_lock:
-        res = sheets.values().get(
-            spreadsheetId=spreadsheet_id,
-            range=sheet_range
-        ).execute()
+        res = sheets.values().get(spreadsheetId=spreadsheet_id, range=sheet_range).execute()
     return res.get("values", [])
-
-
 
 # ─── ORDERS ENDPOINT ───────────────────────────────────────────────────────────
 @app.route("/api/orders", methods=["GET"])
+@login_required_session
 def get_orders():
     global _orders_cache, _orders_ts
     now = time.time()
@@ -132,6 +161,7 @@ def get_orders():
 
 # ─── EMBROIDERY LIST ENDPOINT ──────────────────────────────────────────────────
 @app.route("/api/embroideryList", methods=["GET"])
+@login_required_session
 def get_embroidery_list():
     global _emb_cache, _emb_ts
     now = time.time()
@@ -155,6 +185,7 @@ def get_embroidery_list():
 
 # ─── UPDATE SINGLE ORDER ───────────────────────────────────────────────────────
 @app.route("/api/orders/<order_id>", methods=["PUT"])
+@login_required_session
 def update_order(order_id):
     data = request.get_json(silent=True)
     if not data:
@@ -180,10 +211,12 @@ def update_order(order_id):
 
 # ─── LINKS ENDPOINTS ───────────────────────────────────────────────────────────
 @app.route("/api/links", methods=["GET"])
+@login_required_session
 def get_links():
     return jsonify(_links_store), 200
 
 @app.route("/api/links", methods=["POST"])
+@login_required_session
 def save_links():
     global _links_store
     _links_store = request.get_json() or {}
@@ -217,6 +250,7 @@ MANUAL_RANGE     = os.environ.get("MANUAL_RANGE", "Manual State!A2:H2")
 # ─── MANUAL STATE ENDPOINTS ───────────────────────────────────────────────────
 # ─── MANUAL STATE ENDPOINTS ───────────────────────────────────────────────────
 @app.route("/api/manualState", methods=["GET"])
+@login_required_session
 def get_manual_state():
     """
     Returns JSON:
@@ -276,6 +310,7 @@ def get_manual_state():
 
 
 @app.route("/api/manualState", methods=["POST"])
+@login_required_session
 def save_manual_state():
     """
     Expects JSON:
