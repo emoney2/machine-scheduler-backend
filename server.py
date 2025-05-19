@@ -26,21 +26,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Flask + CORS + SocketIO ────────────────────────────────────────────
+# ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
+from flask import Flask, request
+
 app = Flask(__name__)
-# only allow your Netlify origin, and support credentials
+
+# Only allow your Netlify front-end and support cookies
+from flask_cors import CORS
 CORS(
     app,
     resources={ r"/api/*": {"origins": "https://machineschedule.netlify.app"} },
     supports_credentials=True
 )
+
+from flask_socketio import SocketIO
 socketio = SocketIO(
     app,
     cors_allowed_origins="https://machineschedule.netlify.app",
     async_mode="eventlet"
 )
 
-# ─── After-request CORS headers ────────────────────────────────────────────────
+# After-request, echo back the exact Origin
 @app.after_request
 def apply_cors(response):
     origin = request.headers.get("Origin")
@@ -123,11 +129,6 @@ def login_required_session(f):
             return redirect(url_for("login", next=request.path))
         return f(*args, **kwargs)
     return decorated
-
-# ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
-app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # ─── In-memory caches & settings ────────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
