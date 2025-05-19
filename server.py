@@ -31,20 +31,24 @@ from flask import Flask, jsonify, request, session, redirect, url_for, render_te
 from flask_cors import CORS
 
 app = Flask(__name__)
-
-# only allow your deployed frontend to talk to this API, and allow credentials (cookies)
-FRONTEND_ORIGIN = "https://machineschedule.netlify.app"  # <-- change if you host somewhere else
+# only allow your Netlify frontend, and support credentials
 CORS(
     app,
-    resources={r"/api/*": {"origins": FRONTEND_ORIGIN}},
+    resources={ r"/api/*": {"origins": "https://machineschedule.netlify.app"} },
     supports_credentials=True
 )
+socketio = SocketIO(app, cors_allowed_origins="https://machineschedule.netlify.app", async_mode="eventlet")
 
-socketio = SocketIO(
-    app,
-    cors_allowed_origins=FRONTEND_ORIGIN,
-    async_mode="eventlet"
-)
+# ─── After-request CORS headers ────────────────────────────────────────────────
+@app.after_request
+def apply_cors(response):
+    origin = request.headers.get("Origin")
+    if origin == "https://machineschedule.netlify.app":
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+    return response
 
 # ─── SESSION / SECRET KEY ─────────────────────────────────────────────────────
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
