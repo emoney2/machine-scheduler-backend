@@ -5,4 +5,6 @@ google-api-python-client
 flask-socketio
 eventlet
 python-dotenv
+flask-httpauth
+
 
