@@ -215,8 +215,17 @@ sheet_lock = Semaphore(1)
 MANUAL_RANGE     = os.environ.get("MANUAL_RANGE", "Manual State!A2:H2")
 
 # ─── MANUAL STATE ENDPOINTS ───────────────────────────────────────────────────
+# ─── MANUAL STATE ENDPOINTS ───────────────────────────────────────────────────
 @app.route("/api/manualState", methods=["GET"])
 def get_manual_state():
+    """
+    Returns JSON:
+      {
+        "machine1": [...],
+        "machine2": [...],
+        "placeholders": [ { id, company, quantity, stitchCount, inHand, dueType }, … ]
+      }
+    """
     global _manual_state_cache, _manual_state_ts
     now = time.time()
 
@@ -230,29 +239,29 @@ def get_manual_state():
             range=MANUAL_RANGE
         ).execute().get("values", [])
 
-        row = vals[0] if vals else []
-        # ensure we have 8 columns (A–H)
-        row += [""] * (8 - len(row))
+        # A2,B2 = machine lists; C–H = first placeholder (if any)
+        row = vals[0] if vals else ["", ""]
+        while len(row) < 8:
+            row.append("")
 
         ms1 = [s for s in row[0].split(",") if s]
         ms2 = [s for s in row[1].split(",") if s]
 
-        # if there's a placeholder in C–H, unpack it
-        ph = None
-        if any(row[2:]):  # any non-empty
-            ph = {
-                "id":         row[2],
-                "company":    row[3],
-                "quantity":   row[4],
-                "stitchCount":row[5],
-                "inHand":     row[6],
-                "dueType":    row[7]
-            }
+        # reconstruct the single placeholder (you can extend this to multiple)
+        ph = {
+          "id":          row[2],
+          "company":     row[3],
+          "quantity":    row[4],
+          "stitchCount": row[5],
+          "inHand":      row[6],
+          "dueType":     row[7]
+        }
+        phs = row[2] and [ph] or []
 
         result = {
-            "machine1":    ms1,
-            "machine2":    ms2,
-            "placeholders": ph and [ph] or []
+          "machine1":     ms1,
+          "machine2":     ms2,
+          "placeholders": phs
         }
 
         _manual_state_cache = result
