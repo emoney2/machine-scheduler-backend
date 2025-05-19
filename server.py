@@ -209,55 +209,75 @@ def handle_placeholders_updated(data):
 MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 
+# ─── MANUAL STATE ENDPOINT (GET) ───────────────────────────────────────────────
 @app.route("/api/manualState", methods=["GET"])
 @login_required_session
 def get_manual_state():
     """
     Returns JSON:
       {
-        "machine1": [...],           # from A2 (comma-list)
-        "machine2": [...],           # from B2 (comma-list)
-        "placeholders": [            # every row where col C (id) is non-empty
-          { id, company, quantity, stitchCount, inHand, dueType }, …
+        machine1: [...],
+        machine2: [...],
+        placeholders: [
+          { id, company, quantity, stitchCount, inHand, dueType },
+          … up to however many rows you have …
         ]
       }
     """
+    global _manual_state_cache, _manual_state_ts
+    now = time.time()
+
+    if _manual_state_cache is not None and (now - _manual_state_ts) < CACHE_TTL:
+        return jsonify(_manual_state_cache), 200
+
     try:
-        rows = sheets.values().get(
+        # read columns A–H from row 2 down
+        resp = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE
-        ).execute().get("values", [])
+            range=MANUAL_RANGE  # e.g. "Manual State!A2:H50"
+        ).execute()
+        rows = resp.get("values", [])
+
+        # first row contains A2/B2 lists + first placeholder C–H
+        first = rows[0] if rows else []
+        while len(first) < 8:
+            first.append("")
+
+        ms1 = [s for s in first[0].split(",") if s]
+        ms2 = [s for s in first[1].split(",") if s]
+
+        phs = []
+        for r in rows:
+            # placeholder columns are indices 2–7 (C–H)
+            if len(r) >= 3 and r[2].strip():
+                ph = {
+                    "id":          r[2],
+                    "company":     r[3] if len(r) > 3 else "",
+                    "quantity":    r[4] if len(r) > 4 else "",
+                    "stitchCount": r[5] if len(r) > 5 else "",
+                    "inHand":      r[6] if len(r) > 6 else "",
+                    "dueType":     r[7] if len(r) > 7 else ""
+                }
+                phs.append(ph)
+
+        result = {
+            "machine1":     ms1,
+            "machine2":     ms2,
+            "placeholders": phs
+        }
+
+        _manual_state_cache = result
+        _manual_state_ts    = now
+        return jsonify(result), 200
+
     except Exception:
-        logger.exception("Error fetching manualState")
+        logger.exception("Error reading manual state")
+        if _manual_state_cache:
+            return jsonify(_manual_state_cache), 200
         return jsonify({"machine1": [], "machine2": [], "placeholders": []}), 200
 
-    if not rows:
-        return jsonify({"machine1": [], "machine2": [], "placeholders": []}), 200
 
-    # first row drives machine lists
-    first = rows[0] + ["", ""]  # pad to at least 2 cols
-    ms1 = [s for s in first[0].split(",") if s]
-    ms2 = [s for s in first[1].split(",") if s]
-
-    # every row (including first) with a non-empty ID in col C
-    phs = []
-    for row in rows:
-        # pad so we can index 0..7 safely
-        r = (row + [""] * 8)[:8]
-        if r[2].strip():
-            phs.append({
-                "id": r[2],
-                "company":     r[3],
-                "quantity":    r[4],
-                "stitchCount": r[5],
-                "inHand":      r[6],
-                "dueType":     r[7]
-            })
-
-    result = {"machine1": ms1, "machine2": ms2, "placeholders": phs}
-    return jsonify(result), 200
-
-
+# ─── MANUAL STATE ENDPOINT (POST) ──────────────────────────────────────────────
 @app.route("/api/manualState", methods=["POST"])
 @login_required_session
 def save_manual_state():
@@ -266,70 +286,83 @@ def save_manual_state():
       {
         machine1: [...],
         machine2: [...],
-        placeholders: [ { id, company, quantity, stitchCount, inHand, dueType }, … ]
+        placeholders: [
+          { id, company, quantity, stitchCount, inHand, dueType },
+          …
+        ]
       }
-    Overwrites Manual State!A2:H with rows:
-      • row2: [A2]=csv(machine1), [B2]=csv(machine2), [C2-H2]=first ph
-      • row3+:      [C-H]=subsequent phs
+    Writes back:
+      - A2 = comma-joined machine1
+      - B2 = comma-joined machine2
+      - C2:H2 = placeholders[0]
+      - C3:H3 = placeholders[1], etc.
     """
+    global _manual_state_cache, _manual_state_ts
+
     data = request.get_json(silent=True) or {}
     m1  = data.get("machine1", [])
     m2  = data.get("machine2", [])
     phs = data.get("placeholders", [])
 
-    # Build the 2D array of values to write
-    values = []
+    # build the 2D array of rows to write
+    rows = []
+    # first row: machines + first placeholder (if any)
+    first_fields = [""] * 6
     if phs:
-        # first row includes A/B
         first = phs[0]
-        values.append([
-            ",".join(m1),
-            ",".join(m2),
-            first.get("id",""),
-            first.get("company",""),
-            first.get("quantity",""),
-            first.get("stitchCount",""),
-            first.get("inHand",""),
-            first.get("dueType",""),
+        first_fields = [
+            first.get("id", ""),
+            first.get("company", ""),
+            first.get("quantity", ""),
+            first.get("stitchCount", ""),
+            first.get("inHand", ""),
+            first.get("dueType", "")
+        ]
+    rows.append([
+        ",".join(m1),
+        ",".join(m2),
+        *first_fields
+    ])
+
+    # subsequent placeholder rows
+    for ph in phs[1:]:
+        rows.append([
+            "", "",
+            ph.get("id",""),
+            ph.get("company",""),
+            ph.get("quantity",""),
+            ph.get("stitchCount",""),
+            ph.get("inHand",""),
+            ph.get("dueType","")
         ])
-        # any additional placeholders go on their own rows, with blank A/B
-        for ph in phs[1:]:
-            values.append([
-                "", "",           # fill A/B empty
-                ph.get("id",""),
-                ph.get("company",""),
-                ph.get("quantity",""),
-                ph.get("stitchCount",""),
-                ph.get("inHand",""),
-                ph.get("dueType",""),
-            ])
-    else:
-        # no placeholders: still need to write machine lists row2, then nothing else
-        values.append([ ",".join(m1), ",".join(m2), "", "", "", "", "", "" ])
+
+    # determine how many rows to write (at least 1)
+    num_rows = max(1, len(rows))
+    end_row  = 2 + num_rows - 1  # row 2 through row end_row
+
+    write_range = f"{MANUAL_RANGE.split('!')[0]}!A2:H{end_row}"
 
     try:
-        # 1) clear out the old area
-        sheets.values().clear(
-            spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_CLEAR_RANGE
-        ).execute()
-
-        # 2) write the new block
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE,
+            range=write_range,
             valueInputOption="RAW",
-            body={"values": values}
+            body={"values": rows}
         ).execute()
 
-        # 3) broadcast so clients re-fetch
-        new_state = {"machine1": m1, "machine2": m2, "placeholders": phs}
-        socketio.emit("manualStateUpdated", new_state, broadcast=True)
-        return jsonify({"status":"ok"}), 200
+        _manual_state_cache = {
+            "machine1":     m1,
+            "machine2":     m2,
+            "placeholders": phs
+        }
+        _manual_state_ts = time.time()
+
+        socketio.emit("manualStateUpdated", _manual_state_cache)
+        return jsonify({"status": "ok"}), 200
 
     except Exception:
-        logger.exception("Error writing manualState")
-        return jsonify({"status":"error"}), 500
+        logger.exception("Error writing manual state")
+        return jsonify({"status": "error"}), 500
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
