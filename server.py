@@ -219,6 +219,7 @@ MANUAL_RANGE     = os.environ.get("MANUAL_RANGE", "Manual State!A2:H2")
 def get_manual_state():
     global _manual_state_cache, _manual_state_ts
     now = time.time()
+
     # serve from cache while fresh
     if _manual_state_cache is not None and (now - _manual_state_ts) < CACHE_TTL:
         return jsonify(_manual_state_cache), 200
@@ -229,29 +230,30 @@ def get_manual_state():
             range=MANUAL_RANGE
         ).execute().get("values", [])
 
-        # ensure we have exactly 8 columns
-        row = vals[0] if vals else [""] * 8
-        if len(row) < 8:
-            row += [""] * (8 - len(row))
+        row = vals[0] if vals else []
+        # ensure we have 8 columns (A–H)
+        row += [""] * (8 - len(row))
 
-        # A2 → machine1, B2 → machine2
         ms1 = [s for s in row[0].split(",") if s]
         ms2 = [s for s in row[1].split(",") if s]
 
-        # C–H → first placeholder (id, company, quantity, stitchCount, inHand, dueType)
-        placeholders = []
-        fields = row[2:8]
-        if any(fields):
-            placeholders.append({
-                "id":          fields[0],
-                "company":     fields[1],
-                "quantity":    fields[2],
-                "stitchCount": fields[3],
-                "inHand":      fields[4],
-                "dueType":     fields[5],
-            })
+        # if there's a placeholder in C–H, unpack it
+        ph = None
+        if any(row[2:]):  # any non-empty
+            ph = {
+                "id":         row[2],
+                "company":    row[3],
+                "quantity":   row[4],
+                "stitchCount":row[5],
+                "inHand":     row[6],
+                "dueType":    row[7]
+            }
 
-        result = {"machine1": ms1, "machine2": ms2, "placeholders": placeholders}
+        result = {
+            "machine1":    ms1,
+            "machine2":    ms2,
+            "placeholders": ph and [ph] or []
+        }
 
         _manual_state_cache = result
         _manual_state_ts    = now
@@ -269,17 +271,16 @@ def save_manual_state():
     """
     Expects JSON:
       { machine1: [...], machine2: [...],
-        placeholders: [ { id, company, quantity, stitchCount, inHand, dueType }, … ] }
+        placeholders: [ { id, company, quantity, stitchCount, inHand, dueType } ] }
     """
     global _manual_state_cache, _manual_state_ts
 
     data = request.get_json(silent=True) or {}
-    m1 = data.get("machine1", [])
-    m2 = data.get("machine2", [])
+    m1  = data.get("machine1", [])
+    m2  = data.get("machine2", [])
     phs = data.get("placeholders", [])
 
-    # build the eight columns
-    # A2,B2 are comma-lists; C–H are the first placeholder fields (or blank)
+    # build an 8-cell row: A,B are comma-lists; C–H are the first placeholder’s fields or blanks
     row = [
       ",".join(m1),
       ",".join(m2),
@@ -302,10 +303,14 @@ def save_manual_state():
         ).execute()
 
         # update cache & timestamp
-        _manual_state_cache = {"machine1": m1, "machine2": m2, "placeholders": phs}
+        _manual_state_cache = {
+          "machine1":    m1,
+          "machine2":    m2,
+          "placeholders": phs
+        }
         _manual_state_ts    = time.time()
 
-        # broadcast so all clients re-fetch
+        # notify all clients
         socketio.emit("manualStateUpdated", _manual_state_cache)
         return jsonify({"status": "ok"}), 200
 
