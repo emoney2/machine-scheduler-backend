@@ -26,6 +26,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# your frontend’s “base” URL, used for login redirects
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+
+
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 from flask import Flask, request
 
@@ -110,9 +114,12 @@ def login():
         p = request.form["password"]
         if u in users and check_password_hash(users[u], p):
             session["user"] = u
-            return redirect(request.args.get("next") or "/")
+            # redirect back to your React app, not to the Flask root
+            nxt = request.args.get("next") or ""
+            return redirect(f"{FRONTEND_URL}{nxt}")
         error = "Invalid credentials"
     return render_template_string(_login_page, error=error)
+
 
 @app.route("/logout")
 def logout():
