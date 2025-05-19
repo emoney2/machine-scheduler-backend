@@ -83,7 +83,8 @@ sheet_lock = Semaphore(1)
 SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
 ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
-MANUAL_RANGE     = os.environ.get("MANUAL_RANGE",     "Manual State!A2:Z2")
+MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
+MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 
 creds_json = os.environ.get("GOOGLE_CREDENTIALS")
 if creds_json:
@@ -204,47 +205,128 @@ def save_links():
 def handle_placeholders_updated(data):
     socketio.emit("placeholdersUpdated", data, broadcast=True)
 
+# ─── MANUAL STATE ENDPOINTS (multi-row placeholders) ─────────────────────────
+MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
+MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
+
 @app.route("/api/manualState", methods=["GET"])
 @login_required_session
 def get_manual_state():
+    """
+    Returns JSON:
+      {
+        "machine1": [...],           # from A2 (comma-list)
+        "machine2": [...],           # from B2 (comma-list)
+        "placeholders": [            # every row where col C (id) is non-empty
+          { id, company, quantity, stitchCount, inHand, dueType }, …
+        ]
+      }
+    """
     try:
-        vals = sheets.values().get(
+        rows = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
             range=MANUAL_RANGE
         ).execute().get("values", [])
-        row = vals[0] if vals else ["",""]
-        while len(row)<8: row.append("")
-        ms1 = [s for s in row[0].split(",") if s]
-        ms2 = [s for s in row[1].split(",") if s]
-        ph = {"id":row[2],"company":row[3],"quantity":row[4],
-              "stitchCount":row[5],"inHand":row[6],"dueType":row[7]}
-        phs = [ph] if row[2] else []
-        return jsonify({"machine1":ms1, "machine2":ms2, "placeholders":phs}), 200
     except Exception:
-        logger.exception("Error reading manualState")
-        return jsonify({"machine1":[], "machine2":[], "placeholders":[]} ), 200
+        logger.exception("Error fetching manualState")
+        return jsonify({"machine1": [], "machine2": [], "placeholders": []}), 200
+
+    if not rows:
+        return jsonify({"machine1": [], "machine2": [], "placeholders": []}), 200
+
+    # first row drives machine lists
+    first = rows[0] + ["", ""]  # pad to at least 2 cols
+    ms1 = [s for s in first[0].split(",") if s]
+    ms2 = [s for s in first[1].split(",") if s]
+
+    # every row (including first) with a non-empty ID in col C
+    phs = []
+    for row in rows:
+        # pad so we can index 0..7 safely
+        r = (row + [""] * 8)[:8]
+        if r[2].strip():
+            phs.append({
+                "id": r[2],
+                "company":     r[3],
+                "quantity":    r[4],
+                "stitchCount": r[5],
+                "inHand":      r[6],
+                "dueType":     r[7]
+            })
+
+    result = {"machine1": ms1, "machine2": ms2, "placeholders": phs}
+    return jsonify(result), 200
+
 
 @app.route("/api/manualState", methods=["POST"])
 @login_required_session
 def save_manual_state():
+    """
+    Expects JSON:
+      {
+        machine1: [...],
+        machine2: [...],
+        placeholders: [ { id, company, quantity, stitchCount, inHand, dueType }, … ]
+      }
+    Overwrites Manual State!A2:H with rows:
+      • row2: [A2]=csv(machine1), [B2]=csv(machine2), [C2-H2]=first ph
+      • row3+:      [C-H]=subsequent phs
+    """
     data = request.get_json(silent=True) or {}
-    m1, m2, phs = data.get("machine1",[]), data.get("machine2",[]), data.get("placeholders",[])
-    # build A,B + C–H
-    if phs and isinstance(phs[0],dict):
-        f = phs[0]
-        fields = [f.get(k,"") for k in ("id","company","quantity","stitchCount","inHand","dueType")]
+    m1  = data.get("machine1", [])
+    m2  = data.get("machine2", [])
+    phs = data.get("placeholders", [])
+
+    # Build the 2D array of values to write
+    values = []
+    if phs:
+        # first row includes A/B
+        first = phs[0]
+        values.append([
+            ",".join(m1),
+            ",".join(m2),
+            first.get("id",""),
+            first.get("company",""),
+            first.get("quantity",""),
+            first.get("stitchCount",""),
+            first.get("inHand",""),
+            first.get("dueType",""),
+        ])
+        # any additional placeholders go on their own rows, with blank A/B
+        for ph in phs[1:]:
+            values.append([
+                "", "",           # fill A/B empty
+                ph.get("id",""),
+                ph.get("company",""),
+                ph.get("quantity",""),
+                ph.get("stitchCount",""),
+                ph.get("inHand",""),
+                ph.get("dueType",""),
+            ])
     else:
-        fields = [""]*6
-    row = [",".join(m1), ",".join(m2), *fields]
+        # no placeholders: still need to write machine lists row2, then nothing else
+        values.append([ ",".join(m1), ",".join(m2), "", "", "", "", "", "" ])
+
     try:
+        # 1) clear out the old area
+        sheets.values().clear(
+            spreadsheetId=SPREADSHEET_ID,
+            range=MANUAL_CLEAR_RANGE
+        ).execute()
+
+        # 2) write the new block
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=MANUAL_RANGE,
             valueInputOption="RAW",
-            body={"values":[row]}
+            body={"values": values}
         ).execute()
-        socketio.emit("manualStateUpdated", {"machine1":m1,"machine2":m2,"placeholders":phs})
+
+        # 3) broadcast so clients re-fetch
+        new_state = {"machine1": m1, "machine2": m2, "placeholders": phs}
+        socketio.emit("manualStateUpdated", new_state, broadcast=True)
         return jsonify({"status":"ok"}), 200
+
     except Exception:
         logger.exception("Error writing manualState")
         return jsonify({"status":"error"}), 500
