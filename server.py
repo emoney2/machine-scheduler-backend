@@ -10,7 +10,6 @@ from eventlet.semaphore import Semaphore
 from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string
 from flask_cors import CORS
 from flask_socketio import SocketIO
-from werkzeug.security import check_password_hash, generate_password_hash
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -62,11 +61,6 @@ def apply_cors(response):
 
 # ─── Session & Auth Helpers ──────────────────────────────────────────────────
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
-
-# in-memory user store (just one admin)
-users = {
-    "admin": generate_password_hash(os.environ.get("ADMIN_PW", "changeme"))
-}
 
 def login_required_session(f):
     @wraps(f)
@@ -127,6 +121,19 @@ def fetch_sheet(spreadsheet_id, sheet_range):
         ).execute()
     return res.get("values", [])
 
+def get_sheet_password():
+    """
+    Loads whatever is in cell J2 of Manual State and returns it as a string.
+    Falls back to empty string if anything goes wrong.
+    """
+    try:
+        vals = fetch_sheet(SPREADSHEET_ID, "Manual State!J2:J2")
+        return vals[0][0] if vals and vals[0] else ""
+    except Exception:
+        logger.exception("Failed to fetch sheet password")
+        return ""
+
+
 # ─── Minimal Login Page (HTML) ───────────────────────────────────────────────
 _login_page = """
 <!doctype html>
@@ -143,15 +150,16 @@ _login_page = """
 @app.route("/login", methods=["GET","POST"])
 def login():
     error = None
+    sheet_pw = get_sheet_password()
     if request.method == "POST":
-        u = request.form["username"]
-        p = request.form["password"]
-        if u in users and check_password_hash(users[u], p):
-            session["user"] = u
+        form_pw = request.form["password"]
+        if form_pw == sheet_pw:
+            session["user"] = "admin"
             nxt = request.args.get("next") or ""
             return redirect(f"{FRONTEND_URL}{nxt}")
         error = "Invalid credentials"
     return render_template_string(_login_page, error=error)
+
 
 @app.route("/logout")
 def logout():
