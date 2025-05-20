@@ -150,14 +150,17 @@ _login_page = """
 @app.route("/login", methods=["GET","POST"])
 def login():
     error = None
+    # grab the sheet-stored password
     sheet_pw = get_sheet_password()
+
     if request.method == "POST":
         form_pw = request.form["password"]
-         if form_pw == sheet_pw:
-             session["user"] = "admin"
-             # always send them to the React app root
-             return redirect(FRONTEND_URL)
+        if form_pw == sheet_pw:
+            session["user"] = "admin"
+            # always send back to your React root
+            return redirect(FRONTEND_URL)
         error = "Invalid credentials"
+
     return render_template_string(_login_page, error=error)
 
 
