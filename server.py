@@ -153,10 +153,10 @@ def login():
     sheet_pw = get_sheet_password()
     if request.method == "POST":
         form_pw = request.form["password"]
-        if form_pw == sheet_pw:
-            session["user"] = "admin"
-            nxt = request.args.get("next") or ""
-            return redirect(f"{FRONTEND_URL}{nxt}")
+         if form_pw == sheet_pw:
+             session["user"] = "admin"
+             # always send them to the React app root
+             return redirect(FRONTEND_URL)
         error = "Invalid credentials"
     return render_template_string(_login_page, error=error)
 
