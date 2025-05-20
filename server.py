@@ -30,6 +30,9 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.a
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
+@app.before_request
+ def _debug_session():
+     logger.info("🔑 Session data for %s → %s", request.path, dict(session))
 # allow cross-site cookies
 app.config.update(
     SESSION_COOKIE_SAMESITE="None",
