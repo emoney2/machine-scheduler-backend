@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
 
+# ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
 # allow cross-site cookies
 app.config.update(
@@ -34,10 +35,10 @@ app.config.update(
     SESSION_COOKIE_SECURE=True,
 )
 
-# only allow our Netlify front-end on /api/*
+# only allow our Netlify front-end on /api/* and support cookies
 CORS(
     app,
-    resources={r"/api/*": {"origins": FRONTEND_URL}},
+    resources={ r"/api/*": {"origins": FRONTEND_URL} },
     supports_credentials=True
 )
 
@@ -48,7 +49,7 @@ socketio = SocketIO(
     async_mode="eventlet"
 )
 
-# echo back the real Origin so withCredentials can work
+# After-request, echo back the real Origin so withCredentials can work
 @app.after_request
 def apply_cors(response):
     origin = request.headers.get("Origin")
