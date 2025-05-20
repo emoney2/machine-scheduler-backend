@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from eventlet.semaphore import Semaphore
 from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string
+from flask import make_response
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
@@ -48,6 +49,13 @@ socketio = SocketIO(
     cors_allowed_origins=FRONTEND_URL,
     async_mode="eventlet"
 )
+
+from flask import session  # (if not already imported)
+
+@app.before_request
+def _debug_session():
+    logger.info("🔑 Session data for %s → %s", request.path, dict(session))
+
 
 # After-request, echo back the real Origin so withCredentials can work
 @app.after_request
@@ -154,10 +162,11 @@ def login():
         # pull the live password from J2
         sheet_pw = get_sheet_password()
 
-        # only "admin" + exact sheet password unlocks
-        if u == "admin" and p == sheet_pw:
-            session["user"] = u
-            return redirect(FRONTEND_URL)
+         if u == "admin" and p == sheet_pw:
+             session["user"] = u
+             session.permanent = True                     # ← ensure Flask emits a Set-Cookie
+             resp = make_response(redirect(FRONTEND_URL)) # ← make sure cookie goes with the 302
+             return resp
 
         error = "Invalid credentials"
     return render_template_string(_login_page, error=error)
