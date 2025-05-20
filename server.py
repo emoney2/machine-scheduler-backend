@@ -123,10 +123,6 @@ def fetch_sheet(spreadsheet_id, sheet_range):
     return res.get("values", [])
 
 def get_sheet_password():
-    """
-    Loads whatever is in cell J2 of Manual State and returns it as a string.
-    Falls back to empty string if anything goes wrong.
-    """
     try:
         vals = fetch_sheet(SPREADSHEET_ID, "Manual State!J2:J2")
         return vals[0][0] if vals and vals[0] else ""
@@ -151,18 +147,22 @@ _login_page = """
 @app.route("/login", methods=["GET","POST"])
 def login():
     error = None
-    # grab the sheet-stored password
-    sheet_pw = get_sheet_password()
-
     if request.method == "POST":
-        form_pw = request.form["password"]
-        if form_pw == sheet_pw:
-            session["user"] = "admin"
-            # always send back to your React root
-            return redirect(FRONTEND_URL)
-        error = "Invalid credentials"
+        u = request.form["username"]
+        p = request.form["password"]
 
+        # pull the live password from J2
+        sheet_pw = get_sheet_password()
+
+        # only "admin" + exact sheet password unlocks
+        if u == "admin" and p == sheet_pw:
+            session["user"] = u
+            return redirect(FRONTEND_URL)
+
+        error = "Invalid credentials"
     return render_template_string(_login_page, error=error)
+
+
 
 
 @app.route("/logout")
