@@ -158,20 +158,14 @@ def login():
     if request.method == "POST":
         u = request.form["username"]
         p = request.form["password"]
-
         # pull the live password from J2
         sheet_pw = get_sheet_password()
-
-         if u == "admin" and p == sheet_pw:
-             session["user"] = u
-             session.permanent = True                     # ← ensure Flask emits a Set-Cookie
-             resp = make_response(redirect(FRONTEND_URL)) # ← make sure cookie goes with the 302
-             return resp
-
+        # only "admin" + exact sheet password unlocks
+        if u == "admin" and p == sheet_pw:
+            session["user"] = u
+            return redirect(FRONTEND_URL)
         error = "Invalid credentials"
     return render_template_string(_login_page, error=error)
-
-
 
 
 @app.route("/logout")
