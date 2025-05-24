@@ -17,7 +17,6 @@ from googleapiclient.discovery import build
 from httplib2 import Http
 from google_auth_httplib2 import AuthorizedHttp
 
-from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.http         import MediaIoBaseUpload
 from datetime                      import datetime
 
