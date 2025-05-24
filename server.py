@@ -17,6 +17,11 @@ from googleapiclient.discovery import build
 from httplib2 import Http
 from google_auth_httplib2 import AuthorizedHttp
 
+from oauth2client.service_account import ServiceAccountCredentials
+from googleapiclient.http         import MediaIoBaseUpload
+from datetime                      import datetime
+
+
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
 logging.basicConfig(
@@ -27,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+# where new order folders will live
+PARENT_FOLDER_ID = "1yvYwK077sm5YoS8I9RrwJbrjfmi5BKc0"
+
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -42,7 +50,10 @@ app.config.update(
 # only allow our Netlify front-end on /api/* and support cookies
 CORS(
     app,
-    resources={ r"/api/*": {"origins": FRONTEND_URL} },
+    resources={
+      r"/api/*":    {"origins": FRONTEND_URL},
+      r"/submit":   {"origins": FRONTEND_URL}
+    },
     supports_credentials=True
 )
 
@@ -100,8 +111,12 @@ if creds_json:
     )
 else:
     creds = service_account.Credentials.from_service_account_file(
-        "credentials.json", scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
+    "credentials.json",
+    scopes=[
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/drive"
+    ]
+)
 
 _http = Http(timeout=10)
 authed_http = AuthorizedHttp(creds, http=_http)
@@ -398,6 +413,111 @@ def save_manual_state():
     except Exception:
         logger.exception("Error writing manual state")
         return jsonify({"status": "error"}), 500
+
+# ─────────────────────────────────────────────
+@app.route("/submit", methods=["OPTIONS","POST"])
+def submit_order():
+    if request.method == "OPTIONS":
+        return make_response("", 204)
+
+    try:
+        data       = request.form
+        prod_files = request.files.getlist("prodFiles")
+        print_files= request.files.getlist("printFiles")
+
+        # find next empty row in col A
+        col_a = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Production Orders!A:A"
+        ).execute().get("values", [])
+        next_row   = len(col_a) + 1
+        prev_order = int(col_a[-1][0]) if len(col_a)>1 else 0
+        new_order  = prev_order + 1
+
+        # timestamp + template cells from row 2
+        ts = datetime.now().strftime("%-m/%-d/%Y %H:%M:%S")
+        def tpl(cell):
+            return sheets.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!{cell}2"
+            ).execute().get("values",[[""]])[0][0]
+
+        preview      = tpl("C")
+        stage        = tpl("I")
+        ship_date    = tpl("V")
+        stitch_count = tpl("W")
+        reenter      = tpl("AA")
+        schedule_str = tpl("AC")
+
+        # create Drive folder for this order
+        drive = build("drive","v3",credentials=creds)
+        folder = drive.files().create(
+            body={
+              "name":str(new_order),
+              "mimeType":"application/vnd.google-apps.folder",
+              "parents":[PARENT_FOLDER_ID]
+            },fields="id"
+        ).execute().get("id")
+
+        # upload production files
+        prod_links = []
+        for f in prod_files:
+            m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+            up = drive.files().create(
+                body={"name":f.filename,"parents":[folder]},
+                media_body=m, fields="webViewLink"
+            ).execute()
+            prod_links.append(up["webViewLink"])
+
+        # upload print files (if present)
+        print_links = ""
+        if print_files:
+            pf = drive.files().create(
+                body={"name":"Print Files","mimeType":"application/vnd.google-apps.folder","parents":[folder]},
+                fields="id"
+            ).execute().get("id")
+            links = []
+            for f in print_files:
+                m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+                up = drive.files().create(
+                    body={"name":f.filename,"parents":[pf]},
+                    media_body=m, fields="webViewLink"
+                ).execute()
+                links.append(up["webViewLink"])
+            print_links = ",".join(links)
+
+        # assemble row A→AC
+        row = [
+          new_order, ts, preview,
+          data.get("company"), data.get("designName"), data.get("quantity"),
+          "",  # shipped
+          data.get("product"), stage, data.get("price"),
+          data.get("dueDate"), ("PRINT" if print_files else "NO"),
+          *data.getlist("materials"),  # M–Q
+          data.get("backMaterial"), data.get("furColor"),
+          data.get("embBacking",""), "",  # top stitch blank
+          ship_date, stitch_count,
+          data.get("notes"),
+          ",".join(prod_links),
+          print_links,
+          reenter,
+          data.get("dateType"),
+          schedule_str
+        ]
+
+        sheets.values().update(
+          spreadsheetId=SPREADSHEET_ID,
+          range=f"Production Orders!A{next_row}:AC{next_row}",
+          valueInputOption="RAW",
+          body={"values":[row]}
+        ).execute()
+
+        return jsonify({"status":"ok","order":new_order}), 200
+
+    except Exception:
+        logger.exception("Error in /submit")
+        return jsonify({"error":"Internal server error"}), 500
+
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
