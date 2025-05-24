@@ -31,9 +31,6 @@ logger = logging.getLogger(__name__)
 
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
-# where new order folders will live
-PARENT_FOLDER_ID = "1yvYwK077sm5YoS8I9RrwJbrjfmi5BKc0"
-
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -450,12 +447,13 @@ def submit_order():
 
         # create Drive folder for this order
         drive = build("drive","v3",credentials=creds)
+        folder_meta = {
+            "name": str(new_order),
+            "mimeType": "application/vnd.google-apps.folder"
+        }
         folder = drive.files().create(
-            body={
-              "name":str(new_order),
-              "mimeType":"application/vnd.google-apps.folder",
-              "parents":[PARENT_FOLDER_ID]
-            },fields="id"
+            body=folder_meta,
+            fields="id"
         ).execute().get("id")
 
         # upload production files
