@@ -430,6 +430,16 @@ def submit_order():
         prev_order = int(col_a[-1][0]) if len(col_a)>1 else 0
         new_order  = prev_order + 1
 
+        # helper: copy the formula from row 2 of <cell> and rewrite “2” → new row
+        def tpl_formula(cell):
+            resp = sheets.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!{cell}2",
+                valueRenderOption="FORMULA"
+            ).execute()
+            raw = resp.get("values", [[""]])[0][0] or ""
+            return raw.replace("2", str(next_row))
+
         # timestamp + template cells from row 2
         ts = datetime.now().strftime("%-m/%-d/%Y %H:%M:%S")
         def tpl(cell):
