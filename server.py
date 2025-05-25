@@ -448,12 +448,12 @@ def submit_order():
                 range=f"Production Orders!{cell}2"
             ).execute().get("values",[[""]])[0][0]
 
-        preview      = tpl("C")
-        stage        = tpl("I")
-        ship_date    = tpl("V")
-        stitch_count = tpl("W")
+        preview      = tpl_formula("C")
+        stage        = tpl_formula("I")
+        ship_date    = tpl_formula("V")
+        stitch_count = tpl_formula("W")
         reenter      = tpl("AA")
-        schedule_str = tpl("AC")
+        schedule_str = tpl_formula("AC")
 
         # create Drive folder for this order
         drive = build("drive","v3",credentials=creds)
