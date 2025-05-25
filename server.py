@@ -465,33 +465,46 @@ def submit_order():
             body=folder_meta,
             fields="id"
         ).execute().get("id")
+        make_public(folder)
+
+
+        # helper: grant “anyone with link” reader access
+        def make_public(file_id):
+            drive.permissions().create(
+                fileId=file_id,
+                body={"type": "anyone", "role": "reader"}
+            ).execute()
 
         # upload production files
         prod_links = []
         for f in prod_files:
             m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
             up = drive.files().create(
-                body={"name":f.filename,"parents":[folder]},
-                media_body=m, fields="webViewLink"
+                body={"name": f.filename, "parents": [folder]},
+                media_body=media,
+                fields="id, webViewLink"
             ).execute()
+            make_public(up["id"])
             prod_links.append(up["webViewLink"])
 
         # upload print files (if present)
         print_links = ""
         if print_files:
             pf = drive.files().create(
-                body={"name":"Print Files","mimeType":"application/vnd.google-apps.folder","parents":[folder]},
+                body={…},
                 fields="id"
             ).execute().get("id")
+            make_public(pf)
             links = []
             for f in print_files:
                 m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
                 up = drive.files().create(
-                    body={"name":f.filename,"parents":[pf]},
-                    media_body=m, fields="webViewLink"
+                    body={"name": f.filename, "parents": [pf]},
+                    media_body=media,
+                    fields="id, webViewLink"
                 ).execute()
+                make_public(up["id"])
                 links.append(up["webViewLink"])
-            print_links = ",".join(links)
 
         # assemble row A→AC
         row = [
