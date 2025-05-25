@@ -515,7 +515,7 @@ def submit_order():
         sheets.values().update(
           spreadsheetId=SPREADSHEET_ID,
           range=f"Production Orders!A{next_row}:AC{next_row}",
-          valueInputOption="RAW",
+          valueInputOption="USER_ENTERED",
           body={"values":[row]}
         ).execute()
 
