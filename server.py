@@ -491,7 +491,11 @@ def submit_order():
         print_links = ""
         if print_files:
             pf = drive.files().create(
-                body={…},
+                body={
+                  "name": "Print Files",
+                  "mimeType": "application/vnd.google-apps.folder",
+                  "parents": [folder]
+                },
                 fields="id"
             ).execute().get("id")
             make_public(pf)
@@ -500,7 +504,7 @@ def submit_order():
                 m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
                 up = drive.files().create(
                     body={"name": f.filename, "parents": [pf]},
-                    media_body=media,
+                    media_body=MediaIoBaseUpload(f.stream, mimetype=f.mimetype),
                     fields="id, webViewLink"
                 ).execute()
                 make_public(up["id"])
