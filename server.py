@@ -457,6 +457,12 @@ def submit_order():
 
         # create Drive folder for this order
         drive = build("drive","v3",credentials=creds)
+        # helper: grant “anyone with link” reader access
+        def make_public(file_id):
+            drive.permissions().create(
+                fileId=file_id,
+                body={"type":"anyone","role":"reader"}
+            ).execute()
         folder_meta = {
             "name": str(new_order),
             "mimeType": "application/vnd.google-apps.folder"
