@@ -549,6 +549,23 @@ def submit_order():
         return jsonify({"error":"Internal server error"}), 500
 
 
+@app.route("/api/directory", methods=["GET"])
+@login_required_session
+def get_directory():
+    """
+    Returns JSON array of company names from the 'Directory' sheet.
+    """
+    try:
+        # read column A (Company Name) from row 2 down
+        rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A")
+        # flatten and filter out empty cells
+        companies = [r[0] for r in rows if r and r[0].strip()]
+        return jsonify(companies), 200
+    except Exception:
+        logger.exception("Error fetching directory")
+        return jsonify([]), 200
+
+
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
