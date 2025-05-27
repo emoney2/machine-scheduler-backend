@@ -452,7 +452,7 @@ def submit_order():
         stage        = tpl_formula("I")
         ship_date    = tpl_formula("V")
         stitch_count = tpl_formula("W")
-        reenter      = tpl("AA")
+        reenter      = False
         schedule_str = tpl_formula("AC")
 
         # create Drive folder for this order
