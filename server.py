@@ -614,6 +614,61 @@ def add_directory_entry():
     except Exception:
         logger.exception("Error adding new company")
         return jsonify({"error": "Failed to add company"}), 500
+@app.route("/api/materials", methods=["POST"])
+@login_required_session
+def add_material():
+    """
+    Appends a new row to the Material Inventory sheet.
+    Expects JSON with:
+      materialName, unit, minInv, reorder, cost
+    """
+    data = request.get_json(silent=True) or {}
+    name = data.get("materialName", "").strip()
+    unit = data.get("unit", "").strip()
+    min_inv = data.get("minInv", "").strip()
+    reorder = data.get("reorder", "").strip()
+    cost = data.get("cost", "").strip()
+    try:
+        # 1) Determine next row index
+        existing = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!A2:A"
+        ).execute().get("values", [])
+        next_row = len(existing) + 2  # because A2 is row 2
+
+        # 2) Grab row-2 formulas for B, C, H
+        fmt_B2 = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID, range="Material Inventory!B2:B2"
+        ).execute()["values"][0][0]
+        fmt_C2 = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID, range="Material Inventory!C2:C2"
+        ).execute()["values"][0][0]
+        fmt_H2 = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID, range="Material Inventory!H2:H2"
+        ).execute()["values"][0][0]
+
+        # 3) Update formulas to reference new row
+        row_ref = str(next_row)
+        formulaB = fmt_B2.replace("2", row_ref)
+        formulaC = fmt_C2.replace("2", row_ref)
+        formulaH = fmt_H2.replace("2", row_ref)
+
+        # 4) Build and append the row A→H
+        row = [name, formulaB, formulaC, unit, min_inv, reorder, cost, formulaH]
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!A2:H",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception:
+        logger.exception("Error adding new material")
+        return jsonify({"error": "Failed to add material"}), 500
+
 
 
 @app.route("/api/fur-colors", methods=["GET"])
