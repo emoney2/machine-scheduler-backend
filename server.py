@@ -548,36 +548,37 @@ def submit_order():
             valueInputOption="USER_ENTERED",
             body={"values":[row]}
         ).execute()
-         # now turn that one cell into a checkbox
-         meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-         orders_sheet = next(
-             s for s in meta["sheets"]
-             if s["properties"]["title"] == "Production Orders"
-         )
-         sheet_id = orders_sheet["properties"]["sheetId"]
-         service.spreadsheets().batchUpdate(
-             spreadsheetId=SPREADSHEET_ID,
-             body={
-                 "requests": [{
-                     "setDataValidation": {
-                         "range": {
-                             "sheetId": sheet_id,
-                             "startRowIndex": next_row - 1,
-                             "endRowIndex": next_row,
-                             "startColumnIndex": 28,
-                             "endColumnIndex": 29
-                         },
-                         "rule": {
-                             "condition": {"type": "BOOLEAN"},
-                             "showCustomUi": True,
-                             "strict": False
-                         }
-                     }
-                 }]
-             }
-         ).execute()
 
-         return jsonify({"status":"ok","order":new_order}), 200
+        # now turn that one cell into a checkbox
+        meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        orders_sheet = next(
+            s for s in meta["sheets"]
+            if s["properties"]["title"] == "Production Orders"
+        )
+        sheet_id = orders_sheet["properties"]["sheetId"]
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={
+                "requests": [{
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": next_row - 1,
+                            "endRowIndex": next_row,
+                            "startColumnIndex": 28,
+                            "endColumnIndex": 29
+                        },
+                        "rule": {
+                            "condition": {"type": "BOOLEAN"},
+                            "showCustomUi": True,
+                            "strict": False
+                        }
+                    }
+                }]
+            }
+        ).execute()
+
+        return jsonify({"status":"ok","order":new_order}), 200
 
     except Exception as e:
         import traceback
