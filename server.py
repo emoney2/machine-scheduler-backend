@@ -754,7 +754,7 @@ def get_fur_colors():
     """
     try:
         # Adjust the range to grab column H
-        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!H2:H")
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!I2:I")
         fur_colors = [r[0] for r in rows if r and r[0].strip()]
         return jsonify(fur_colors), 200
     except Exception:
