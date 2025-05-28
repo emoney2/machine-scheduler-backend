@@ -487,7 +487,7 @@ def submit_order():
             m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
             up = drive.files().create(
                 body={"name": f.filename, "parents": [folder]},
-                media_body=media,
+                media_body=m,
                 fields="id, webViewLink"
             ).execute()
             make_public(up["id"])
