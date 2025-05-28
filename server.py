@@ -538,13 +538,12 @@ def submit_order():
           ",".join(prod_links),
           print_links,
           reenter,
-          data.get("dateType"),
           schedule_str
         ]
 
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"Production Orders!A{next_row}:AC{next_row}",
+            range=f"Production Orders!A{next_row}:AB{next_row}",
             valueInputOption="USER_ENTERED",
             body={"values":[row]}
         ).execute()
