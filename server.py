@@ -565,6 +565,23 @@ def get_directory():
         logger.exception("Error fetching directory")
         return jsonify([]), 200
 
+@app.route("/api/fur-colors", methods=["GET"])
+@login_required_session
+def get_fur_colors():
+    """
+    Returns JSON array of fur color names from the
+    'Material Inventory' sheet, Column H (cells H2:H).
+    """
+    try:
+        # Adjust the range to grab column H
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!H2:H")
+        fur_colors = [r[0] for r in rows if r and r[0].strip()]
+        return jsonify(fur_colors), 200
+    except Exception:
+        logger.exception("Error fetching fur colors")
+        return jsonify([]), 200
+
+
 @app.route("/api/materials", methods=["GET"])
 @login_required_session
 def get_materials():
