@@ -3,6 +3,9 @@ import os
 import json
 import logging
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from functools import wraps
 from dotenv import load_dotenv
 
@@ -441,7 +444,7 @@ def submit_order():
             return raw.replace("2", str(next_row))
 
         # timestamp + template cells from row 2
-        ts = datetime.now().strftime("%-m/%-d/%Y %H:%M:%S")
+        ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
         def tpl(cell):
             return sheets.values().get(
                 spreadsheetId=SPREADSHEET_ID,
