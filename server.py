@@ -209,7 +209,7 @@ def login():
             session["pwd_at_login"] = sheet_pw
             # track last activity for idle timeout
             session["last_activity"] = datetime.utcnow().isoformat()
-            return redirect(FRONTEND_URL))
+            return redirect(FRONTEND_URL)
 
 
 @app.route("/logout")
