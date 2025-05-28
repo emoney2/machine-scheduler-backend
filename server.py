@@ -565,6 +565,22 @@ def get_directory():
         logger.exception("Error fetching directory")
         return jsonify([]), 200
 
+@app.route("/api/products", methods=["GET"])
+@login_required_session
+def get_products():
+    """
+    Returns JSON array of product names from the 'Table' sheet (column A).
+    """
+    try:
+        # read column A (products) from row 2 down
+        rows = fetch_sheet(SPREADSHEET_ID, "Table!A2:A")
+        products = [r[0] for r in rows if r and r[0].strip()]
+        return jsonify(products), 200
+    except Exception:
+        logger.exception("Error fetching products")
+        return jsonify([]), 200
+
+
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
