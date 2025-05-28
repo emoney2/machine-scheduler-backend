@@ -3,7 +3,7 @@ import os
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from functools import wraps
@@ -84,15 +84,39 @@ def apply_cors(response):
 # ─── Session & Auth Helpers ──────────────────────────────────────────────────
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 
+
 def login_required_session(f):
     @wraps(f)
     def decorated(*args, **kwargs):
+        # 1) Must be logged in
         if not session.get("user"):
             if request.path.startswith("/api/"):
                 return jsonify({"error":"authentication required"}), 401
             return redirect(url_for("login", next=request.path))
+
+        # 2) Immediate logout on password change
+        current_pw = get_sheet_password()
+        if session.get("pwd_at_login") != current_pw:
+            session.clear()
+            return redirect(url_for("login", next=request.path))
+
+        # 3) Idle‐timeout: 3 hours of inactivity
+        last = session.get("last_activity")
+        if last:
+            last_dt = datetime.fromisoformat(last)
+            if datetime.utcnow() - last_dt > timedelta(hours=3):
+                session.clear()
+                return redirect(url_for("login", next=request.path))
+        else:
+            # if somehow never set, force a fresh login
+            session.clear()
+            return redirect(url_for("login", next=request.path))
+
+        # 4) All good — update last_activity and proceed
+        session["last_activity"] = datetime.utcnow().isoformat()
         return f(*args, **kwargs)
     return decorated
+
 
 # ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
 sheet_lock = Semaphore(1)
@@ -179,10 +203,13 @@ def login():
         sheet_pw = get_sheet_password()
         # only "admin" + exact sheet password unlocks
         if u == "admin" and p == sheet_pw:
-            session["user"] = u
-            return redirect(FRONTEND_URL)
-        error = "Invalid credentials"
-    return render_template_string(_login_page, error=error)
+            # fresh login: clear any old session data
+            session.clear()
+            session["user"]         = u
+            session["pwd_at_login"] = sheet_pw
+            # track last activity for idle timeout
+            session["last_activity"] = datetime.utcnow().isoformat()
+            return redirect(FRONTEND_URL))
 
 
 @app.route("/logout")
