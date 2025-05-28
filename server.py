@@ -210,6 +210,9 @@ def login():
             # track last activity for idle timeout
             session["last_activity"] = datetime.utcnow().isoformat()
             return redirect(FRONTEND_URL)
+        error = "Invalid credentials"
+    # For GET requests, or POST with bad creds, show the login form
+    return render_template_string(_login_page, error=error)
 
 
 @app.route("/logout")
