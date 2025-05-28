@@ -800,6 +800,56 @@ def get_inventory():
     data    = [dict(zip(headers, r)) for r in rows[1:]] if rows else []
     return jsonify({ "headers": headers, "rows": data }), 200
 
+@app.route("/api/threadInventory", methods=["POST"])
+@login_required_session
+def submit_thread_inventory():
+    entries = request.get_json(silent=True) or []
+    rows = []
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y")
+    for e in entries:
+        if e.get("color") and e.get("action") and e.get("quantity"):
+            rows.append([
+                now,
+                "Thread",
+                e["color"],
+                e["action"],
+                e["quantity"]
+            ])
+    if rows:
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Log!A1:E",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows}
+        ).execute()
+    return jsonify({"added": len(rows)}), 200
+
+@app.route("/api/materialInventory", methods=["POST"])
+@login_required_session
+def submit_material_inventory():
+    entries = request.get_json(silent=True) or []
+    rows = []
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y")
+    for e in entries:
+        if e.get("materialName") and e.get("action") and e.get("quantity"):
+            rows.append([
+                now,
+                "Material",
+                e["materialName"],
+                e["action"],
+                e["quantity"]
+            ])
+    if rows:
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Log!A1:E",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows}
+        ).execute()
+    return jsonify({"added": len(rows)}), 200
+
 @app.route("/api/inventoryOrdered", methods=["GET"])
 @login_required_session
 def get_inventory_ordered():
