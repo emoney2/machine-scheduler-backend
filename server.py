@@ -565,6 +565,20 @@ def get_directory():
         logger.exception("Error fetching directory")
         return jsonify([]), 200
 
+@app.route("/api/materials", methods=["GET"])
+@login_required_session
+def get_materials():
+    """
+    Returns JSON array of material names from the 'Material Inventory' sheet (column A).
+    """
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
+        materials = [r[0] for r in rows if r and r[0].strip()]
+        return jsonify(materials), 200
+    except Exception:
+        logger.exception("Error fetching materials")
+        return jsonify([]), 200
+
 @app.route("/api/products", methods=["GET"])
 @login_required_session
 def get_products():
