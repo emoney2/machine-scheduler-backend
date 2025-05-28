@@ -544,9 +544,15 @@ def submit_order():
 
         return jsonify({"status":"ok","order":new_order}), 200
 
-    except Exception:
-        logger.exception("Error in /submit")
-        return jsonify({"error":"Internal server error"}), 500
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        logger.error("Error in /submit:\n%s", tb)
+        # return the exception message and stack to the client (for now)
+        return jsonify({
+            "error": str(e),
+            "trace": tb
+        }), 500
 
 
 @app.route("/api/directory", methods=["GET"])
