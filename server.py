@@ -493,34 +493,33 @@ def submit_order():
             make_public(up["id"])
             prod_links.append(up["webViewLink"])
 
-        # upload print files (if present)
+        # upload print files (if present) — link to the “Print Files” folder
         print_links = ""
         if print_files:
-            # first create the “Print Files” folder under the job folder
-            pf = drive.files().create(
+            # 1) create the “Print Files” folder under the job folder, and get its link
+            pf_res = drive.files().create(
                 body={
                   "name": "Print Files",
                   "mimeType": "application/vnd.google-apps.folder",
                   "parents": [folder]
                 },
-                fields="id"
-            ).execute().get("id")
-            make_public(pf)
+                fields="id, webViewLink"
+            ).execute()
+            pf_id = pf_res["id"]
+            pf_link = pf_res["webViewLink"]
+            make_public(pf_id)
 
-            # upload each print file into that folder
-            links = []
+            # 2) upload each print file into that folder (we don't need their individual links)
             for f in print_files:
                 m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
-                up = drive.files().create(
-                    body={"name": f.filename, "parents": [pf]},
+                drive.files().create(
+                    body={"name": f.filename, "parents": [pf_id]},
                     media_body=m,
-                    fields="id, webViewLink"
+                    fields="id"
                 ).execute()
-                make_public(up["id"])
-                links.append(up["webViewLink"])
 
-            # **assign the comma-joined URLs** so they get written to the sheet
-            print_links = ",".join(links)
+            # 3) write only the folder’s public link into the sheet
+            print_links = pf_link
 
 
         # assemble row A→AC
