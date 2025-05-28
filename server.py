@@ -565,6 +565,51 @@ def get_directory():
         logger.exception("Error fetching directory")
         return jsonify([]), 200
 
+@app.route("/api/directory", methods=["POST"])
+@login_required_session
+def add_directory_entry():
+    """
+    Appends a new row to the Directory sheet.
+    Expects JSON with keys:
+      companyName,
+      contactFirstName,
+      contactLastName,
+      contactEmailAddress,
+      streetAddress1,
+      streetAddress2,
+      city,
+      state,
+      zipCode,
+      phoneNumber
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        # build the row in the same order as your sheet columns A→J
+        row = [
+            data.get("companyName", ""),
+            data.get("contactFirstName", ""),
+            data.get("contactLastName", ""),
+            data.get("contactEmailAddress", ""),
+            data.get("streetAddress1", ""),
+            data.get("streetAddress2", ""),
+            data.get("city", ""),
+            data.get("state", ""),
+            data.get("zipCode", ""),
+            data.get("phoneNumber", ""),
+        ]
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Directory!A2:J",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
+        return jsonify({"status": "ok"}), 200
+    except Exception:
+        logger.exception("Error adding new company")
+        return jsonify({"error": "Failed to add company"}), 500
+
+
 @app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
 def get_fur_colors():
