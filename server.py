@@ -452,7 +452,7 @@ def submit_order():
         stage        = tpl_formula("I")
         ship_date    = tpl_formula("V")
         stitch_count = tpl_formula("W")
-        reenter      = False
+        reenter      = "FALSE"
         schedule_str = tpl_formula("AC")
 
         # create Drive folder for this order
@@ -496,6 +496,7 @@ def submit_order():
         # upload print files (if present)
         print_links = ""
         if print_files:
+            # first create the “Print Files” folder under the job folder
             pf = drive.files().create(
                 body={
                   "name": "Print Files",
@@ -505,16 +506,22 @@ def submit_order():
                 fields="id"
             ).execute().get("id")
             make_public(pf)
+
+            # upload each print file into that folder
             links = []
             for f in print_files:
                 m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
                 up = drive.files().create(
                     body={"name": f.filename, "parents": [pf]},
-                    media_body=MediaIoBaseUpload(f.stream, mimetype=f.mimetype),
+                    media_body=m,
                     fields="id, webViewLink"
                 ).execute()
                 make_public(up["id"])
                 links.append(up["webViewLink"])
+
+            # **assign the comma-joined URLs** so they get written to the sheet
+            print_links = ",".join(links)
+
 
         # assemble row A→AC
         row = [
