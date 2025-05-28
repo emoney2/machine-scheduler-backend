@@ -638,13 +638,19 @@ def add_material():
 
         # 2) Grab row-2 formulas for B, C, H
         fmt_B2 = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID, range="Material Inventory!B2:B2"
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!B2:B2",
+            valueRenderOption="FORMULA"
         ).execute()["values"][0][0]
         fmt_C2 = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID, range="Material Inventory!C2:C2"
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!C2:C2",
+            valueRenderOption="FORMULA"
         ).execute()["values"][0][0]
         fmt_H2 = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID, range="Material Inventory!H2:H2"
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!H2:H2",
+            valueRenderOption="FORMULA"
         ).execute()["values"][0][0]
 
         # 3) Update formulas to reference new row
