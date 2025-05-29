@@ -860,28 +860,35 @@ def get_inventory():
 def submit_thread_inventory():
     entries = request.get_json(silent=True) or []
 
-    # timestamp in NY time (including time)
-    ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+    # timestamp in NY time (including hours:minutes:seconds)
+    ts = datetime.now(ZoneInfo("America/New_York")) \
+          .strftime("%-m/%-d/%Y %H:%M:%S")
 
     rows = []
     for e in entries:
-        # your front-end sends { value, action, quantity }
         color  = e.get("value", "").strip()
         action = e.get("action", "").strip()
-        qty    = e.get("quantity", "").strip()
-        if color and action and qty:
-            # E: cones * 5500 (meters) × 3.28084 → feet
-            formula = f"={qty}*5500*3.28084"
-            rows.append([
-                ts,          # A: timestamp
-                "",          # B: blank
-                color,       # C: thread color
-                "",          # D: blank
-                formula,     # E: calculated feet
-                "",          # F: blank
-                "IN",        # G: literal "IN"
-                action       # H: O/R field
-            ])
+        qty_str= e.get("quantity", "").strip()
+        if not (color and action and qty_str):
+            continue
+
+        # compute yards: cones × 5500
+        try:
+            qty   = float(qty_str)
+        except ValueError:
+            qty = 0
+        yards = qty * 5500
+
+        rows.append([
+            ts,       # A: timestamp
+            "",       # B: blank
+            color,    # C: thread color
+            "",       # D: blank
+            yards,    # E: numeric yardage
+            "",       # F: blank
+            "IN",     # G: literal "IN"
+            action    # H: O/R field
+        ])
 
     if rows:
         sheets.values().append(
