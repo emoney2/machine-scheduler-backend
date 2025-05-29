@@ -876,47 +876,45 @@ def get_inventory():
 @login_required_session
 def submit_thread_inventory():
     entries = request.get_json(silent=True) or []
+    now     = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+    to_log  = []
 
-    # timestamp in NY time (including hours:minutes:seconds)
-    ts = datetime.now(ZoneInfo("America/New_York")) \
-          .strftime("%-m/%-d/%Y %H:%M:%S")
-
-    rows = []
     for e in entries:
-        color  = e.get("value", "").strip()
-        action = e.get("action", "").strip()
-        qty_str= e.get("quantity", "").strip()
-        if not (color and action and qty_str):
+        color     = e.get("color",    "").strip()
+        action    = e.get("action",   "").strip()
+        qty_cones = e.get("quantity", "").strip()
+        if not (color and action and qty_cones):
             continue
 
-        # compute yards: cones × 5500
+        # compute feet: cones × 5500 (yards) × 3 (feet per yard)
         try:
-            qty   = float(qty_str)
-        except ValueError:
-            qty = 0
-        yards = qty * 5500
+            cones = int(qty_cones)
+            yards = cones * 5500
+            feet  = yards * 3
+        except:
+            feet = 0
 
-        rows.append([
-            ts,       # A: timestamp
-            "",       # B: blank
-            color,    # C: thread color
-            "",       # D: blank
-            yards,    # E: numeric yardage
-            "",       # F: blank
-            "IN",     # G: literal "IN"
-            action    # H: O/R field
+        to_log.append([
+            now,     # A: timestamp
+            "",      # B
+            color,   # C: Thread Color
+            "",      # D
+            feet,    # E: feet
+            action,  # F: action (Ordered/Received)
+            "IN",    # G: fixed “IN”
+            ""       # H
         ])
 
-    if rows:
+    if to_log:
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Thread Data!A2:H",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": rows}
+            body={"values": to_log}
         ).execute()
 
-    return jsonify({"added": len(rows)}), 200
+    return jsonify({"added": len(to_log)}), 200
 
 @app.route("/api/materialInventory", methods=["POST"])
 @login_required_session
