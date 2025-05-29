@@ -859,25 +859,39 @@ def get_inventory():
 @login_required_session
 def submit_thread_inventory():
     entries = request.get_json(silent=True) or []
+
+    # timestamp in NY time (including time)
+    ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+
     rows = []
-    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y")
     for e in entries:
-        if e.get("color") and e.get("action") and e.get("quantity"):
+        # your front-end sends { value, action, quantity }
+        color  = e.get("value", "").strip()
+        action = e.get("action", "").strip()
+        qty    = e.get("quantity", "").strip()
+        if color and action and qty:
+            # E: cones * 5500 (meters) × 3.28084 → feet
+            formula = f"={qty}*5500*3.28084"
             rows.append([
-                now,
-                "Thread",
-                e["color"],
-                e["action"],
-                e["quantity"]
+                ts,          # A: timestamp
+                "",          # B: blank
+                color,       # C: thread color
+                "",          # D: blank
+                formula,     # E: calculated feet
+                "",          # F: blank
+                "IN",        # G: literal "IN"
+                action       # H: O/R field
             ])
+
     if rows:
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Log!A1:E",
+            range="Thread Data!A2:H",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": rows}
         ).execute()
+
     return jsonify({"added": len(rows)}), 200
 
 @app.route("/api/materialInventory", methods=["POST"])
