@@ -798,18 +798,17 @@ def add_thread():
     ).execute().get("values", [])
     next_row = len(resp) + 2  # since I2 is row 2
 
-    # 2) Helper to copy row-2 formula and update its row reference
-    def tpl_formula(col):
-        r = sheets.values().get(
+    # 2) Copy J & K formulas from row 4 (as-is), and O from row 2
+    def tpl_formula_at(col, src_row):
+        return sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"Material Inventory!{col}2",
+            range=f"Material Inventory!{col}{src_row}",
             valueRenderOption="FORMULA"
         ).execute().get("values", [[""]])[0][0] or ""
-        return r.replace("2", str(next_row))
-
-    formulaJ = tpl_formula("J")
-    formulaK = tpl_formula("K")
-    formulaO = tpl_formula("O")
+ 
+    formulaJ = tpl_formula_at("J", 4)
+    formulaK = tpl_formula_at("K", 4)
+    formulaO = tpl_formula_at("O", 2)
 
     # 3) Build and append the new row I→O
     #    [ color, formulaJ, formulaK, min_inv, reorder, cost, formulaO ]
