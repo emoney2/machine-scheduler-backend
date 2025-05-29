@@ -782,56 +782,48 @@ def get_materials():
 @app.route("/api/threads", methods=["POST"])
 @login_required_session
 def add_thread():
-    """
-    Appends a new Thread entry into the 'Material Inventory' sheet,
-    columns I→O, copying row-2 formulas for J,K and O.
-    Expects JSON with:
-      threadColor, minInv, reorder, cost
-    """
-    data = request.get_json(silent=True) or {}
-    color   = data.get("threadColor", "").strip()
-    min_inv = data.get("minInv", "").strip()
-    reorder = data.get("reorder", "").strip()
-    cost    = data.get("cost", "").strip()
+    try:
+        color   = request.json.get("threadColor", "").strip()
+        min_inv = request.json.get("minInv", "").strip()
+        reorder = request.json.get("reorder", "").strip()
+        cost    = request.json.get("cost", "").strip()
 
-    # 1) Determine next row index in column I
-    resp = sheets.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Material Inventory!I2:I"
-    ).execute().get("values", [])
-    next_row = len(resp) + 2  # since I2 is row 2
-
-    # 2) Copy J & K formulas from row 4 (as-is), and O from row 2
-    def tpl_formula_at(col, src_row):
-        return sheets.values().get(
+        # 1) Determine next row index …
+        resp = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"Material Inventory!{col}{src_row}",
-            valueRenderOption="FORMULA"
-        ).execute().get("values", [[""]])[0][0] or ""
- 
-    formulaJ = tpl_formula_at("J", 4)
-    formulaK = tpl_formula_at("K", 4)
-    formulaO = tpl_formula_at("O", 2)
+            range="Material Inventory!I2:I"
+        ).execute().get("values", [])
+        next_row = len(resp) + 2
 
-    # 3) Build and append the new row I→O
-    #    [ color, formulaJ, formulaK, min_inv, reorder, cost, formulaO ]
-    sheets.values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"Material Inventory!I{next_row}:O{next_row}",
-        valueInputOption="USER_ENTERED",
-        body={"values": [[
-            color,
-            formulaJ,
-            formulaK,
-            min_inv,
-            reorder,
-            cost,
-            formulaO
-        ]]}
-    ).execute()
+        # 2) Copy formulas…
+        def tpl(col, src_row):
+            return sheets.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!{col}{src_row}",
+                valueRenderOption="FORMULA"
+            ).execute().get("values", [[""]])[0][0] or ""
 
-    return jsonify({"status": "ok"}), 200
+        formulaJ = tpl("J", 4)
+        formulaK = tpl("K", 4)
+        formulaO = tpl("O", 2)
 
+        # 3) Write the row I→O
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Material Inventory!I{next_row}:O{next_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values":[[
+                color, formulaJ, formulaK,
+                min_inv, reorder, cost,
+                formulaO
+            ]]}
+        ).execute()
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as e:
+        # any error will now return JSON + CORS header
+        return jsonify({"error": str(e)}), 400
 
 @app.route("/api/products", methods=["GET"])
 @login_required_session
