@@ -813,11 +813,10 @@ def add_thread():
 
     # 3) Build and append the new row I→O
     #    [ color, formulaJ, formulaK, min_inv, reorder, cost, formulaO ]
-    sheets.values().append(
+    sheets.values().update(
         spreadsheetId=SPREADSHEET_ID,
-        range="Material Inventory!I2:O",
+        range=f"Material Inventory!I{next_row}:O{next_row}",
         valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
         body={"values": [[
             color,
             formulaJ,
