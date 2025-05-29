@@ -827,8 +827,9 @@ def add_thread():
                 formulaO
             ]]}
         ).execute()
-            added += 1
-            next_row += 1
+
+        added += 1
+        next_row += 1
 
         return jsonify({"added": added}), 200
 
