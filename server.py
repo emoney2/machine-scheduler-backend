@@ -13,6 +13,7 @@ from eventlet.semaphore import Semaphore
 from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string
 from flask import make_response
 from flask_cors import CORS
+from flask_cors import CORS, cross_origin
 from flask_socketio import SocketIO
 
 from google.oauth2 import service_account
@@ -777,6 +778,7 @@ def get_materials():
         logger.exception("Error fetching materials")
         return jsonify([]), 200
 
+@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @app.route("/api/threads", methods=["POST"])
 @login_required_session
 def add_thread():
