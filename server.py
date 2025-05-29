@@ -776,6 +776,62 @@ def get_materials():
         logger.exception("Error fetching materials")
         return jsonify([]), 200
 
+@app.route("/api/threads", methods=["POST"])
+@login_required_session
+def add_thread():
+    """
+    Appends a new Thread entry into the 'Material Inventory' sheet,
+    columns I→O, copying row-2 formulas for J,K and O.
+    Expects JSON with:
+      threadColor, minInv, reorder, cost
+    """
+    data = request.get_json(silent=True) or {}
+    color   = data.get("threadColor", "").strip()
+    min_inv = data.get("minInv", "").strip()
+    reorder = data.get("reorder", "").strip()
+    cost    = data.get("cost", "").strip()
+
+    # 1) Determine next row index in column I
+    resp = sheets.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Material Inventory!I2:I"
+    ).execute().get("values", [])
+    next_row = len(resp) + 2  # since I2 is row 2
+
+    # 2) Helper to copy row-2 formula and update its row reference
+    def tpl_formula(col):
+        r = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Material Inventory!{col}2",
+            valueRenderOption="FORMULA"
+        ).execute().get("values", [[""]])[0][0] or ""
+        return r.replace("2", str(next_row))
+
+    formulaJ = tpl_formula("J")
+    formulaK = tpl_formula("K")
+    formulaO = tpl_formula("O")
+
+    # 3) Build and append the new row I→O
+    #    [ color, formulaJ, formulaK, min_inv, reorder, cost, formulaO ]
+    sheets.values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Material Inventory!I2:O",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [[
+            color,
+            formulaJ,
+            formulaK,
+            min_inv,
+            reorder,
+            cost,
+            formulaO
+        ]]}
+    ).execute()
+
+    return jsonify({"status": "ok"}), 200
+
+
 @app.route("/api/products", methods=["GET"])
 @login_required_session
 def get_products():
