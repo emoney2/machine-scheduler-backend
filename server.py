@@ -783,18 +783,18 @@ def get_materials():
 @login_required_session
 def add_thread():
     try:
-        # 1) Parse incoming JSON (either single obj or list of them)
+        # 1) Parse incoming JSON (single dict or list of dicts)
         raw   = request.get_json(silent=True) or []
         items = raw if isinstance(raw, list) else [raw]
 
-        # 2) Find next empty row in col I of Material Inventory
+        # 2) Determine next empty row in Material Inventory col I
         resp     = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
             range="Material Inventory!I2:I"
         ).execute().get("values", [])
         next_row = len(resp) + 2
 
-        # 3) Fetch raw formulas
+        # 3) Helper to fetch raw formula text
         def tpl(col, src_row):
             return sheets.values().get(
                 spreadsheetId=SPREADSHEET_ID,
@@ -802,36 +802,71 @@ def add_thread():
                 valueRenderOption="FORMULA"
             ).execute().get("values", [[""]])[0][0] or ""
 
-        formulaJ = tpl("J", 4)
-        rawK     = tpl("K", 4)
-        rawO     = tpl("O", 2)
+        # 4) Copy raw formulas from J4, K4 and O2
+        rawJ = tpl("J", 4)
+        rawK = tpl("K", 4)
+        rawO = tpl("O", 2)
 
-        # 4) Rewrite only the row references
+        # 5) Rewrite only the row references:
+        #    - in rawJ: leave I4 as-is (J doesn’t reference I)
+        #    - in rawK: replace "I4"→"I{next_row}"
+        #    - in rawO: replace "2"→"{next_row}"
+        formulaJ = rawJ
         formulaK = rawK.replace("I4", f"I{next_row}")
         formulaO = rawO.replace("2", str(next_row))
 
-        # 5) Loop through each item and write its row I→O
+        # 6) Prepare timestamp for Thread Data
+        now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+
         added = 0
         for item in items:
-            threadColor = item.get("threadColor", "").strip()
-            minInv      = item.get("minInv",      "").strip()
-            reorder     = item.get("reorder",     "").strip()
-            cost        = item.get("cost",        "").strip()
-            if not threadColor:
+            color   = item.get("threadColor", "").strip()
+            minInv  = item.get("minInv",      "").strip()
+            reorder = item.get("reorder",     "").strip()
+            cost    = item.get("cost",        "").strip()
+            action  = item.get("action",      "IN")  # default IN
+            if not color:
                 continue
 
+            # ─── Write to Material Inventory I→O ────────────────────────
             sheets.values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Material Inventory!I{next_row}:O{next_row}",
                 valueInputOption="USER_ENTERED",
                 body={"values":[[
-                    threadColor,
+                    color,
                     formulaJ,
                     formulaK,
                     minInv,
                     reorder,
                     cost,
                     formulaO
+                ]]}
+            ).execute()
+
+            # ─── Compute feet and append to Thread Data A→H ─────────────
+            #    quantity (# of cones) × 5500 → yards; then yards × 3 → feet
+            try:
+                qty   = int(minInv)
+                yards = qty * 5500
+                feet  = yards * 3
+            except:
+                feet = 0
+
+            sheets.values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Thread Data!A2:H",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values":[[
+                    now,        # A: timestamp
+                    "",         # B: empty
+                    color,      # C: Thread Color
+                    "",         # D: empty
+                    feet,       # E: feet
+                    action,     # F: IN/Ordered/Received
+                    "IN",       # G: fixed "IN"
+                    ""          # H: leave blank or use if needed
                 ]]}
             ).execute()
 
