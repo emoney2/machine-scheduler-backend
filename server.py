@@ -783,17 +783,18 @@ def get_materials():
 @login_required_session
 def add_thread():
     try:
-        raw = request.get_json(silent=True) or []
-        # Allow either a single dict or a list of them
+        # 1) Parse incoming JSON (either single obj or list of them)
+        raw   = request.get_json(silent=True) or []
         items = raw if isinstance(raw, list) else [raw]
 
-        # Find next row in Material Inventory column I
-        resp = sheets.values().get(
+        # 2) Find next empty row in col I of Material Inventory
+        resp     = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
             range="Material Inventory!I2:I"
         ).execute().get("values", [])
         next_row = len(resp) + 2
 
+        # 3) Fetch raw formulas
         def tpl(col, src_row):
             return sheets.values().get(
                 spreadsheetId=SPREADSHEET_ID,
@@ -801,35 +802,41 @@ def add_thread():
                 valueRenderOption="FORMULA"
             ).execute().get("values", [[""]])[0][0] or ""
 
-        # 1) Copy the raw formulas
-        formulaJ = tpl("J", 4)  # column J stays as-is
-        rawK     = tpl("K", 4)  # this formula likely contains an I4 reference
-        rawO     = tpl("O", 2)  # you can grab from row 2
+        formulaJ = tpl("J", 4)
+        rawK     = tpl("K", 4)
+        rawO     = tpl("O", 2)
 
-        # 2) Rewrite only the row numbers in those formulas
-        #    – In rawK, replace "I4" → "I<next_row>"
-        #    – In rawO, replace any "2" → "<next_row>"
-        formulaK = rawK.replace(f"I4", f"I{next_row}")
-        formulaO = rawO.replace(f"2", str(next_row))
+        # 4) Rewrite only the row references
+        formulaK = rawK.replace("I4", f"I{next_row}")
+        formulaO = rawO.replace("2", str(next_row))
 
-        # … then when you build each row, use formulaJ, formulaK, formulaO …
-        sheets.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Material Inventory!I{next_row}:O{next_row}",
-            valueInputOption="USER_ENTERED",
-            body={"values":[[
-                color,
-                formulaJ,
-                formulaK,
-                min_inv,
-                reorder,
-                cost,
-                formulaO
-            ]]}
-        ).execute()
+        # 5) Loop through each item and write its row I→O
+        added = 0
+        for item in items:
+            threadColor = item.get("threadColor", "").strip()
+            minInv      = item.get("minInv",      "").strip()
+            reorder     = item.get("reorder",     "").strip()
+            cost        = item.get("cost",        "").strip()
+            if not threadColor:
+                continue
 
-        added += 1
-        next_row += 1
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!I{next_row}:O{next_row}",
+                valueInputOption="USER_ENTERED",
+                body={"values":[[
+                    threadColor,
+                    formulaJ,
+                    formulaK,
+                    minInv,
+                    reorder,
+                    cost,
+                    formulaO
+                ]]}
+            ).execute()
+
+            added    += 1
+            next_row += 1
 
         return jsonify({"added": added}), 200
 
