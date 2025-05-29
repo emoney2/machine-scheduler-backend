@@ -898,12 +898,12 @@ def submit_thread_inventory():
         to_log.append([
             now,     # A: timestamp
             "",      # B
-            color,   # C
+            color,   # C: Thread Color
             "",      # D
             feet,    # E: feet
-            action,  # F
-            "IN",    # G
-            ""       # H
+            "",      # F: empty
+            "IN",    # G: fixed “IN”
+            action   # H: action (Ordered/Received)
         ])
 
     if to_log:
