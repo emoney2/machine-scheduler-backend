@@ -50,8 +50,9 @@ app.config.update(
 CORS(
     app,
     resources={
-      r"/api/*":    {"origins": FRONTEND_URL},
-      r"/submit":   {"origins": FRONTEND_URL}
+        r"/api/*":        {"origins": FRONTEND_URL},
+        r"/api/threads":  {"origins": FRONTEND_URL},
+        r"/submit":       {"origins": FRONTEND_URL}
     },
     supports_credentials=True
 )
