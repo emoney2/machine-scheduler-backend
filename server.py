@@ -783,19 +783,17 @@ def get_materials():
 @login_required_session
 def add_thread():
     try:
-        color   = request.json.get("threadColor", "").strip()
-        min_inv = request.json.get("minInv", "").strip()
-        reorder = request.json.get("reorder", "").strip()
-        cost    = request.json.get("cost", "").strip()
+        raw = request.get_json(silent=True) or []
+        # Allow either a single dict or a list of them
+        items = raw if isinstance(raw, list) else [raw]
 
-        # 1) Determine next row index …
+        # Find next row in Material Inventory column I
         resp = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
             range="Material Inventory!I2:I"
         ).execute().get("values", [])
         next_row = len(resp) + 2
 
-        # 2) Copy formulas…
         def tpl(col, src_row):
             return sheets.values().get(
                 spreadsheetId=SPREADSHEET_ID,
@@ -807,22 +805,33 @@ def add_thread():
         formulaK = tpl("K", 4)
         formulaO = tpl("O", 2)
 
-        # 3) Write the row I→O
-        sheets.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Material Inventory!I{next_row}:O{next_row}",
-            valueInputOption="USER_ENTERED",
-            body={"values":[[
-                color, formulaJ, formulaK,
-                min_inv, reorder, cost,
-                formulaO
-            ]]}
-        ).execute()
+        added = 0
+        # Loop through each item and write its row
+        for data in items:
+            color   = data.get("threadColor", "").strip()
+            min_inv = data.get("minInv", "").strip()
+            reorder = data.get("reorder", "").strip()
+            cost    = data.get("cost", "").strip()
+            if not color:
+                continue
 
-        return jsonify({"status": "ok"}), 200
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!I{next_row}:O{next_row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[
+                    color, formulaJ, formulaK,
+                    min_inv, reorder, cost,
+                    formulaO
+                ]]}
+            ).execute()
+
+            added += 1
+            next_row += 1
+
+        return jsonify({"added": added}), 200
 
     except Exception as e:
-        # any error will now return JSON + CORS header
         return jsonify({"error": str(e)}), 400
 
 @app.route("/api/products", methods=["GET"])
