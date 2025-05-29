@@ -801,31 +801,32 @@ def add_thread():
                 valueRenderOption="FORMULA"
             ).execute().get("values", [[""]])[0][0] or ""
 
-        formulaJ = tpl("J", 4)
-        formulaK = tpl("K", 4)
-        formulaO = tpl("O", 2)
+        # 1) Copy the raw formulas
+        formulaJ = tpl("J", 4)  # column J stays as-is
+        rawK     = tpl("K", 4)  # this formula likely contains an I4 reference
+        rawO     = tpl("O", 2)  # you can grab from row 2
 
-        added = 0
-        # Loop through each item and write its row
-        for data in items:
-            color   = data.get("threadColor", "").strip()
-            min_inv = data.get("minInv", "").strip()
-            reorder = data.get("reorder", "").strip()
-            cost    = data.get("cost", "").strip()
-            if not color:
-                continue
+        # 2) Rewrite only the row numbers in those formulas
+        #    – In rawK, replace "I4" → "I<next_row>"
+        #    – In rawO, replace any "2" → "<next_row>"
+        formulaK = rawK.replace(f"I4", f"I{next_row}")
+        formulaO = rawO.replace(f"2", str(next_row))
 
-            sheets.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Material Inventory!I{next_row}:O{next_row}",
-                valueInputOption="USER_ENTERED",
-                body={"values": [[
-                    color, formulaJ, formulaK,
-                    min_inv, reorder, cost,
-                    formulaO
-                ]]}
-            ).execute()
-
+        # … then when you build each row, use formulaJ, formulaK, formulaO …
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Material Inventory!I{next_row}:O{next_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values":[[
+                color,
+                formulaJ,
+                formulaK,
+                min_inv,
+                reorder,
+                cost,
+                formulaO
+            ]]}
+        ).execute()
             added += 1
             next_row += 1
 
