@@ -880,7 +880,8 @@ def submit_thread_inventory():
     to_log  = []
 
     for e in entries:
-        color     = e.get("color",    "").strip()
+        # ← change here: read e["value"] not e["color"]
+        color     = e.get("value",    "").strip()
         action    = e.get("action",   "").strip()
         qty_cones = e.get("quantity", "").strip()
         if not (color and action and qty_cones):
@@ -897,11 +898,11 @@ def submit_thread_inventory():
         to_log.append([
             now,     # A: timestamp
             "",      # B
-            color,   # C: Thread Color
+            color,   # C
             "",      # D
             feet,    # E: feet
-            action,  # F: action (Ordered/Received)
-            "IN",    # G: fixed “IN”
+            action,  # F
+            "IN",    # G
             ""       # H
         ])
 
