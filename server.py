@@ -778,16 +778,17 @@ def get_materials():
         logger.exception("Error fetching materials")
         return jsonify([]), 200
 
+# ─── Add /api/threads endpoint with dynamic formulas ────────────────────────
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @app.route("/api/threads", methods=["POST"])
 @login_required_session
 def add_thread():
     try:
-        # 1) Parse incoming JSON (single dict or list of dicts)
+        # 1) Parse incoming JSON (single dict or list)
         raw   = request.get_json(silent=True) or []
         items = raw if isinstance(raw, list) else [raw]
 
-        # 2) Determine next empty row in Material Inventory col I
+        # 2) Find next empty row in Material Inventory column I
         resp     = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
             range="Material Inventory!I2:I"
@@ -808,65 +809,34 @@ def add_thread():
         rawO = tpl("O", 2)
 
         # 5) Rewrite only the row references:
-        #    - in rawJ: leave I4 as-is (J doesn’t reference I)
-        #    - in rawK: replace "I4"→"I{next_row}"
-        #    - in rawO: replace "2"→"{next_row}"
-        formulaJ = rawJ
+        formulaJ = rawJ.replace("I4", f"I{next_row}")
         formulaK = rawK.replace("I4", f"I{next_row}")
         formulaO = rawO.replace("2", str(next_row))
 
-        # 6) Prepare timestamp for Thread Data
-        now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
-
+        # 6) Loop through each item and write its row I→O
         added = 0
         for item in items:
-            color   = item.get("threadColor", "").strip()
-            minInv  = item.get("minInv",      "").strip()
-            reorder = item.get("reorder",     "").strip()
-            cost    = item.get("cost",        "").strip()
-            action  = item.get("action",      "IN")  # default IN
-            if not color:
+            threadColor = item.get("threadColor", "").strip()
+            minInv      = item.get("minInv",      "").strip()
+            reorder     = item.get("reorder",     "").strip()
+            cost        = item.get("cost",        "").strip()
+
+            # skip any empty entries
+            if not threadColor:
                 continue
 
-            # ─── Write to Material Inventory I→O ────────────────────────
             sheets.values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Material Inventory!I{next_row}:O{next_row}",
                 valueInputOption="USER_ENTERED",
-                body={"values":[[
-                    color,
+                body={"values": [[
+                    threadColor,
                     formulaJ,
                     formulaK,
                     minInv,
                     reorder,
                     cost,
                     formulaO
-                ]]}
-            ).execute()
-
-            # ─── Compute feet and append to Thread Data A→H ─────────────
-            #    quantity (# of cones) × 5500 → yards; then yards × 3 → feet
-            try:
-                qty   = int(minInv)
-                yards = qty * 5500
-                feet  = yards * 3
-            except:
-                feet = 0
-
-            sheets.values().append(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Thread Data!A2:H",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values":[[
-                    now,        # A: timestamp
-                    "",         # B: empty
-                    color,      # C: Thread Color
-                    "",         # D: empty
-                    feet,       # E: feet
-                    action,     # F: IN/Ordered/Received
-                    "IN",       # G: fixed "IN"
-                    ""          # H: leave blank or use if needed
                 ]]}
             ).execute()
 
