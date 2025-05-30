@@ -690,79 +690,89 @@ def add_directory_entry():
         return jsonify({"error": "Failed to add company"}), 500
 
 # ─── Submit Material Inventory ─────────────────────────────────────────────
-@app.route("/api/materials", methods=["OPTIONS", "POST"])
+@app.route("/api/materials", methods=["GET", "OPTIONS", "POST"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
-def add_material():
-    # 1) Handle CORS preflight
+def materials_endpoint():
+    # 1) CORS preflight
     if request.method == "OPTIONS":
         return make_response("", 204)
 
-    # 2) Parse incoming JSON
-    data      = request.get_json(silent=True) or {}
-    name      = data.get("materialName", "").strip()
-    unit      = data.get("unit", "").strip()
-    min_inv   = data.get("minInv", "").strip()
-    reorder   = data.get("reorder", "").strip()
-    cost      = data.get("cost", "").strip()
+    # 2) GET — return list of existing materials
+    if request.method == "GET":
+        try:
+            rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
+            materials = [r[0] for r in rows if r and r[0].strip()]
+            return jsonify(materials), 200
+        except Exception:
+            logger.exception("Error fetching materials")
+            return jsonify([]), 200
 
-    # 3) Determine next empty row in Material Inventory (column A)
-    existing = sheets.values().get(
+    # 3) POST — append new material(s) to Material Inventory
+    #    Expects JSON array of:
+    #      { materialName, unit, minInv, reorder, cost }
+    data = request.get_json(silent=True) or []
+    items = data if isinstance(data, list) else [data]
+
+    # 4) find next row in column A
+    resp = sheets.values().get(
         spreadsheetId=SPREADSHEET_ID,
         range="Material Inventory!A2:A"
     ).execute().get("values", [])
-    next_row = len(existing) + 2  # because A2 is row 2
+    next_row = len(resp) + 2  # because A2 is row 2
 
-    try:
-        # 4) Fetch row-2 formulas for B, C, H
-        fmt_B2 = sheets.values().get(
+    # 5) helper to fetch a formula from row 2
+    def tpl(col):
+        return sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!B2:B2",
+            range=f"Material Inventory!{col}2",
             valueRenderOption="FORMULA"
-        ).execute()["values"][0][0]
-        fmt_C2 = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!C2:C2",
-            valueRenderOption="FORMULA"
-        ).execute()["values"][0][0]
-        fmt_H2 = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!H2:H2",
-            valueRenderOption="FORMULA"
-        ).execute()["values"][0][0]
+        ).execute().get("values", [[""]])[0][0] or ""
 
-        # 5) Rewrite those formulas to point at next_row
-        row_ref  = str(next_row)
-        formulaB = fmt_B2.replace("2", row_ref)
-        formulaC = fmt_C2.replace("2", row_ref)
-        formulaH = fmt_H2.replace("2", row_ref)
+    rawB2 = tpl("B")
+    rawC2 = tpl("C")
+    rawH2 = tpl("H")
 
-        # 6) Build the new row A→H
-        new_row = [
-            name,
-            formulaB,
-            formulaC,
-            unit,
-            min_inv,
-            reorder,
-            cost,
-            formulaH
+    added = 0
+    for item in items:
+        name    = item.get("materialName","").strip()
+        unit    = item.get("unit","").strip()
+        min_inv = item.get("minInv","").strip()
+        reorder = item.get("reorder","").strip()
+        cost    = item.get("cost","").strip()
+        if not name:
+            continue
+
+        # update formulas to point at this row
+        row_ref = str(next_row)
+        formulaB = rawB2.replace("2", row_ref)
+        formulaC = rawC2.replace("2", row_ref)
+        formulaH = rawH2.replace("2", row_ref)
+
+        # build the A→H row
+        row = [
+            name,       # A
+            formulaB,   # B
+            formulaC,   # C
+            unit,       # D
+            min_inv,    # E
+            reorder,    # F
+            cost,       # G
+            formulaH    # H
         ]
 
-        # 7) Append it
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Material Inventory!A2:H",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": [new_row]},
+            body={"values": [row]}
         ).execute()
 
-        return jsonify({"status": "ok"}), 200
+        added += 1
+        next_row += 1
 
-    except Exception:
-        logger.exception("Error adding new material")
-        return jsonify({"error": "Failed to add material"}), 500
+    return jsonify({"added": added}), 200
 
 @app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
