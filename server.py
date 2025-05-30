@@ -690,50 +690,72 @@ def add_directory_entry():
         return jsonify({"error": "Failed to add company"}), 500
 
 # ─── Submit Material Inventory ─────────────────────────────────────────────
-@app.route("/api/materialInventory", methods=["OPTIONS", "POST"])
+@app.route("/api/materials", methods=["OPTIONS", "POST"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
-def submit_material_inventory():
+def add_material():
     # 1) Handle CORS preflight
     if request.method == "OPTIONS":
         return make_response("", 204)
 
-    # 2) Parse incoming entries
-    entries = request.get_json(silent=True) or []
-    to_log  = []
-    now     = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+    # 2) Parse incoming JSON
+    data    = request.get_json(silent=True) or {}
+    name    = data.get("materialName", "").strip()
+    unit    = data.get("unit",         "").strip()
+    min_inv = data.get("minInv",       "").strip()
+    reorder = data.get("reorder",      "").strip()
+    cost    = data.get("cost",         "").strip()
 
-    # 3) Build rows for the Material Log sheet
-    for e in entries:
-        material = e.get("value",    "").strip()
-        action   = e.get("action",   "").strip()
-        qty      = e.get("quantity", "").strip()
-        if material and action and qty:
-            to_log.append([
-                now,       # A: timestamp
-                "",        # B
-                "",        # C
-                "",        # D
-                "",        # E
-                material,  # F: Material name
-                qty,       # G: Quantity
-                "IN",      # H: fixed “IN”
-                action     # I: Ordered/Received
-            ])
+    if not name:
+        return jsonify({"error": "Missing materialName"}), 400
 
-    # 4) Append to the sheet if we have any rows
-    if to_log:
+    try:
+        # 3) Find next row in Material Inventory sheet
+        resp     = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!A2:A"
+        ).execute().get("values", [])
+        next_row = len(resp) + 2  # because A2 is row 2
+
+        # 4) Helper to grab a formula from row 2
+        def tpl_formula(col):
+            return sheets.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!{col}2",
+                valueRenderOption="FORMULA"
+            ).execute().get("values", [[""]])[0][0] or ""
+
+        # 5) Copy formulas from B2, C2 and H2, updating the "2" → next_row
+        fmtB2 = tpl_formula("B").replace("2", str(next_row))
+        fmtC2 = tpl_formula("C").replace("2", str(next_row))
+        fmtH2 = tpl_formula("H").replace("2", str(next_row))
+
+        # 6) Build the row A→H
+        row = [
+            name,      # A: materialName
+            fmtB2,     # B: copied formula
+            fmtC2,     # C: copied formula
+            unit,      # D: unit
+            min_inv,   # E: minInv
+            reorder,   # F: reorder
+            cost,      # G: cost
+            fmtH2      # H: copied formula
+        ]
+
+        # 7) Append it
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Log!A2:I",
+            range="Material Inventory!A2:H",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": to_log}
+            body={"values": [row]}
         ).execute()
 
-    # 5) Return how many rows we added
-    return jsonify({"added": len(to_log)}), 200
+        return jsonify({"status": "ok", "added": 1}), 200
 
+    except Exception as e:
+        logger.exception("Error adding material")
+        return jsonify({"error": str(e)}), 500
 @app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
 def get_fur_colors():
