@@ -705,7 +705,7 @@ def submit_material_inventory():
 
     # 3) Build each row A→I for "Material Log"
     for e in entries:
-        material = e.get("value",    "").strip()
+        material = e.get("materialName", "").strip()
         action   = e.get("action",   "").strip()   # O/R
         qty      = e.get("quantity", "").strip()
         if not (material and action and qty):
