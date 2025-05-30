@@ -891,14 +891,15 @@ def submit_material_inventory():
 
         # build the log row: columns A–H of Material Log
         log_rows.append([
-            now,       # A: timestamp
-            "",        # B
-            name,      # C: Material
-            "",        # D
-            qty,       # E: Quantity
-            "",        # F
-            action,    # G: O/R
-            notes      # H: optional notes
+            now,    # A: Timestamp
+            "",     # B
+            "",     # C
+            "",     # D
+            "",     # E
+            name,   # F: Material name
+            qty,    # G: Quantity
+            "IN",   # H: fixed “IN”
+            action  # I: O/R (“Ordered” or “Received”)
         ])
 
     if log_rows:
