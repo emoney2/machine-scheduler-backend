@@ -918,34 +918,33 @@ def submit_thread_inventory():
     return jsonify({"added": len(to_log)}), 200
 
 
-@app.route("/api/materialInventory", methods=["OPTIONS","POST"])
-@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
+@app.route("/api/materialInventory", methods=["POST"])
 @login_required_session
+@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 def submit_material_inventory():
-    # short‐circuit the preflight
-    if request.method == "OPTIONS":
-        return make_response("", 204)
-
     entries = request.get_json(silent=True) or []
     to_log  = []
     now     = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
 
     for e in entries:
-        material = e.get("value",    "").strip()
-        action   = e.get("action",   "").strip()
-        qty      = e.get("quantity", "").strip()
-        if material and action and qty:
-            to_log.append([
-                now,        # A: timestamp
-                "",         # B
-                "",         # C
-                "",         # D
-                "",         # E
-                material,   # F
-                qty,        # G
-                "IN",       # H: fixed
-                action      # I: Ordered/Received
-            ])
+        material = e.get("materialName", "").strip()
+        action   = e.get("action",       "").strip()  # O/R field
+        qty      = e.get("quantity",     "").strip()
+        if not (material and action and qty):
+            continue
+
+        # build a 9-cell row: A,B,C,D,E,F ,G ,H ,I
+        to_log.append([
+            now,        # A: timestamp
+            "",         # B
+            "",         # C
+            "",         # D
+            "",         # E
+            material,   # F
+            qty,        # G
+            "IN",       # H
+            action      # I
+        ])
 
     if to_log:
         sheets.values().append(
