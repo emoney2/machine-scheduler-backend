@@ -795,14 +795,13 @@ def get_materials():
         logger.exception("Error fetching materials")
         return jsonify([]), 200
 
-# ─── MATERIAL INVENTORY POST & LOGGING ────────────────────────────────────
-
+# ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
 @app.route("/api/materialInventory", methods=["OPTIONS"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
-def material_inventory_options():
-    # Preflight support
+def material_inventory_preflight():
     return make_response("", 204)
 
+# ─── MATERIAL-LOG POST ────────────────────────────────────────────────────
 @app.route("/api/materialInventory", methods=["POST"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
@@ -815,12 +814,10 @@ def submit_material_inventory():
     then logs the same entries into Material Log.
     """
     entries = request.get_json(silent=True) or []
-    # normalize to list
-    items = entries if isinstance(entries, list) else [entries]
+    items   = entries if isinstance(entries, list) else [entries]
 
     now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
-    inv_rows = []
-    log_rows = []
+    inv_rows, log_rows = [], []
 
     for it in items:
         name    = it.get("materialName","").strip()
@@ -834,25 +831,22 @@ def submit_material_inventory():
         if not name or not action or not qty:
             continue
 
-        # 1) Prepare inventory sheet row: A–H
-        #    [ Name, Unit, MinInv, Reorder, Cost, "", "", "" ]
+        # Prepare inventory sheet row A–H
         inv_rows.append([name, unit, mininv, reorder, cost, "", action, qty])
 
-        # 2) Prepare material log row. Adjust columns to match your sheet:
-        #    e.g. [ Date, "", Material, "", Quantity, "", O/R, Action ]
+        # Prepare material log row A–H
         log_rows.append([
-            now,           # A: Timestamp
-            "",            # B
-            name,          # C: Material
-            "",            # D
-            qty,           # E: Quantity
-            "",            # F
-            action,        # G: O/R or blank?
-            it.get("notes","")  # H or adjust if you have a Notes column
+            now,            # A: Timestamp
+            "",             # B
+            name,           # C: Material
+            "",             # D
+            qty,            # E: Quantity
+            "",             # F
+            action,         # G: O/R
+            it.get("notes","")
         ])
 
     # Append to Material Inventory
-    added_inv = 0
     if inv_rows:
         try:
             sheets.values().append(
@@ -862,12 +856,10 @@ def submit_material_inventory():
                 insertDataOption="INSERT_ROWS",
                 body={"values": inv_rows}
             ).execute()
-            added_inv = len(inv_rows)
         except Exception:
             logger.exception("Error appending to Material Inventory")
 
     # Append to Material Log
-    added_log = 0
     if log_rows:
         try:
             sheets.values().append(
@@ -877,14 +869,10 @@ def submit_material_inventory():
                 insertDataOption="INSERT_ROWS",
                 body={"values": log_rows}
             ).execute()
-            added_log = len(log_rows)
         except Exception:
             logger.exception("Error appending to Material Log")
 
-    return jsonify({
-        "inventoryAdded": added_inv,
-        "logEntriesAdded": added_log
-    }), 200
+    return jsonify({"status":"ok"}), 200
 
 
 
