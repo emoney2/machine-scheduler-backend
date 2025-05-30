@@ -689,89 +689,50 @@ def add_directory_entry():
         logger.exception("Error adding new company")
         return jsonify({"error": "Failed to add company"}), 500
 
-# ─── Submit Material Inventory ─────────────────────────────────────────────
-# ─── Materials CRUD (GET for dropdown, POST for bulk-create) ─────────────────
-@app.route("/api/materials", methods=["OPTIONS","GET","POST"])
+# —── Submit Material Inventory → Material Log ─────────────────────────────
+@app.route("/api/materialInventory", methods=["OPTIONS", "POST"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
-def materials_endpoint():
-    # 1) CORS pre-flight
+def submit_material_inventory():
+    # 1) Handle CORS preflight
     if request.method == "OPTIONS":
         return make_response("", 204)
 
-    # 2) GET → return the list of material names
-    if request.method == "GET":
-        try:
-            rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
-            names = [r[0] for r in rows if r and r[0].strip()]
-            return jsonify(names), 200
-        except Exception:
-            logger.exception("Error fetching materials")
-            return jsonify([]), 200
+    # 2) Parse incoming entries (now using 'materialName' to match your client)
+    entries = request.get_json(silent=True) or []
+    to_log  = []
+    now     = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
 
-    # 3) POST → append one or more new materials
-    data  = request.get_json(silent=True) or []
-    items = data if isinstance(data, list) else [data]
+    # 3) Build rows for the Material Log sheet
+    for e in entries:
+        material = e.get("materialName", "").strip()
+        action   = e.get("action",       "").strip()
+        qty      = e.get("quantity",     "").strip()
+        if material and action and qty:
+            to_log.append([
+                now,        # A: timestamp
+                "",         # B
+                "",         # C
+                "",         # D
+                "",         # E
+                material,   # F: Material name
+                qty,        # G: Quantity
+                "IN",       # H: fixed “IN”
+                action      # I: Ordered/Received
+            ])
 
-    # 4) figure out next row in col A
-    resp     = sheets.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Material Inventory!A2:A"
-    ).execute().get("values", [])
-    next_row = len(resp) + 2  # A2 is row 2
-
-    # 5) grab the row-2 formulas for B, C and H
-    def tpl(col):
-        return sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Material Inventory!{col}2",
-            valueRenderOption="FORMULA"
-        ).execute().get("values", [[""]])[0][0] or ""
-
-    rawB2 = tpl("B")
-    rawC2 = tpl("C")
-    rawH2 = tpl("H")
-
-    added = 0
-    for item in items:
-        name    = item.get("materialName","").strip()
-        unit    = item.get("unit","").strip()
-        minInv  = item.get("minInv","").strip()
-        reorder = item.get("reorder","").strip()
-        cost    = item.get("cost","").strip()
-        if not name:
-            continue
-
-        # adjust formulas to use this new row
-        ref     = str(next_row)
-        formulaB = rawB2.replace("2", ref)
-        formulaC = rawC2.replace("2", ref)
-        formulaH = rawH2.replace("2", ref)
-
-        # build A→H
-        row = [
-          name,      # A
-          formulaB,  # B
-          formulaC,  # C
-          unit,      # D
-          minInv,    # E
-          reorder,   # F
-          cost,      # G
-          formulaH   # H
-        ]
-
+    # 4) Append to the sheet if we have any rows
+    if to_log:
         sheets.values().append(
-          spreadsheetId=SPREADSHEET_ID,
-          range="Material Inventory!A2:H",
-          valueInputOption="USER_ENTERED",
-          insertDataOption="INSERT_ROWS",
-          body={"values":[row]}
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Log!A2:I",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": to_log}
         ).execute()
 
-        added    += 1
-        next_row += 1
-
-    return jsonify({"added": added}), 200
+    # 5) Return how many rows we added
+    return jsonify({"added": len(to_log)}), 200
 
 @app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
