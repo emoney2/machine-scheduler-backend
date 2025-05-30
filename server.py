@@ -694,22 +694,20 @@ def add_directory_entry():
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
 def add_materials():
-    # 1) Handle CORS pre-flight
+    # 1) CORS pre-flight
     if request.method == "OPTIONS":
         return make_response("", 204)
 
-    # 2) Parse incoming JSON (single object or list)
+    # 2) Parse JSON
     raw = request.get_json(silent=True) or []
     items = raw if isinstance(raw, list) else [raw]
 
-    # 3) Determine next empty row in Material Inventory column A
-    resp = sheets.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Material Inventory!A2:A"
+    # 3) Find next row in Material Inventory (col A), then fetch row-2 formulas for B,C,H
+    inv_vals = sheets.values().get(
+        spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A2:A"
     ).execute().get("values", [])
-    next_row = len(resp) + 2  # because A2 is row 2
+    next_inv_row = len(inv_vals) + 2
 
-    # 4) Fetch the raw formulas from row 2 for columns B, C & H
     def tpl(col):
         return sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
@@ -721,63 +719,65 @@ def add_materials():
     rawC2 = tpl("C")
     rawH2 = tpl("H")
 
-    to_append = []
-    row_ref = str(next_row)
+    inv_append = []
+    log_append = []
+    inv_row_ref = str(next_inv_row)
+
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
 
     for item in items:
-        name    = item.get("materialName", "").strip()
-        unit    = item.get("unit",         "").strip()
-        minInv  = item.get("minInv",       "").strip()
-        reorder = item.get("reorder",      "").strip()
-        cost    = item.get("cost",         "").strip()
-
+        name    = item.get("materialName","").strip()
+        unit    = item.get("unit","").strip()
+        minInv  = item.get("minInv","").strip()
+        reorder = item.get("reorder","").strip()
+        cost    = item.get("cost","").strip()
         if not name:
             continue
 
-        # update the row-reference in each formula
-        formulaB = rawB2.replace("2", row_ref)
-        formulaC = rawC2.replace("2", row_ref)
-        formulaH = rawH2.replace("2", row_ref)
-
-        to_append.append([
-            name,       # A: Material name
-            formulaB,   # B: formula copied from B2 → B{next_row}
-            formulaC,   # C: formula copied from C2 → C{next_row}
-            unit,       # D: unit from form
-            minInv,     # E: minInv from form
-            reorder,    # F: reorder from form
-            cost,       # G: cost from form
-            formulaH    # H: formula copied from H2 → H{next_row}
+        # 4) Build Inventory-sheet row A→H
+        formulaB = rawB2.replace("2", inv_row_ref)
+        formulaC = rawC2.replace("2", inv_row_ref)
+        formulaH = rawH2.replace("2", inv_row_ref)
+        inv_append.append([
+            name, formulaB, formulaC,
+            unit, minInv, reorder, cost, formulaH
         ])
-        next_row += 1
-        row_ref = str(next_row)
-    # end for
 
-    # 5) Append all rows at once
-    if to_append:
+        # 5) Also build a Material-Log row A→I:
+        #    A: timestamp, B–E blank, F= material, G= minInv? or quantity?
+        #    H="IN", I="Ordered" (or cost? but per spec, O/R)
+        log_append.append([
+            now, "", "", "", "",
+            name,    # F
+            item.get("quantity", minInv),  # use posted quantity or minInv
+            "IN",
+            item.get("action","Ordered")
+        ])
+
+        next_inv_row += 1
+        inv_row_ref = str(next_inv_row)
+
+    # 6) Batch-append to Material Inventory
+    if inv_append:
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Material Inventory!A2:H",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": to_append}
+            body={"values": inv_append}
         ).execute()
 
-    return jsonify({"added": len(to_append)}), 200@app.route("/api/fur-colors", methods=["GET"])
-@login_required_session
-def get_fur_colors():
-    """
-    Returns JSON array of fur color names from the
-    'Material Inventory' sheet, Column H (cells H2:H).
-    """
-    try:
-        # Adjust the range to grab column H
-        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!I2:I")
-        fur_colors = [r[0] for r in rows if r and r[0].strip()]
-        return jsonify(fur_colors), 200
-    except Exception:
-        logger.exception("Error fetching fur colors")
-        return jsonify([]), 200
+    # 7) Batch-append to Material Log
+    if log_append:
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Log!A2:I",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": log_append}
+        ).execute()
+
+    return jsonify({"added": len(inv_append)}), 200
 
 
 @app.route("/api/materials", methods=["GET"])
