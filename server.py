@@ -689,89 +689,7 @@ def add_directory_entry():
         logger.exception("Error adding new company")
         return jsonify({"error": "Failed to add company"}), 500
 
-# —── Submit Material Inventory → Material Log ─────────────────────────────
-# ─── Materials list & creation endpoint ─────────────────────────────────────
-@app.route("/api/materials", methods=["GET", "OPTIONS", "POST"])
-@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
-@login_required_session
-def materials_endpoint():
-    # 1) CORS preflight
-    if request.method == "OPTIONS":
-        return make_response("", 204)
 
-    # 2) GET — return list of existing materials
-    if request.method == "GET":
-        try:
-            rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
-            materials = [r[0] for r in rows if r and r[0].strip()]
-            return jsonify(materials), 200
-        except Exception:
-            logger.exception("Error fetching materials")
-            return jsonify([]), 200
-
-    # 3) POST — append new material(s) to Material Inventory
-    data = request.get_json(silent=True) or []
-    items = data if isinstance(data, list) else [data]
-
-    # 4) find next row in column A
-    resp = sheets.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Material Inventory!A2:A"
-    ).execute().get("values", [])
-    next_row = len(resp) + 2  # because A2 is row 2
-
-    # 5) helper to fetch a formula from row 2
-    def tpl(col):
-        return sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Material Inventory!{col}2",
-            valueRenderOption="FORMULA"
-        ).execute().get("values", [[""]])[0][0] or ""
-
-    rawB2 = tpl("B")
-    rawC2 = tpl("C")
-    rawH2 = tpl("H")
-
-    added = 0
-    for item in items:
-        name    = item.get("materialName", "").strip()
-        unit    = item.get("unit", "").strip()
-        min_inv = item.get("minInv", "").strip()
-        reorder = item.get("reorder", "").strip()
-        cost    = item.get("cost", "").strip()
-        if not name:
-            continue
-
-        # update formulas to point at this row
-        row_ref  = str(next_row)
-        formulaB = rawB2.replace("2", row_ref)
-        formulaC = rawC2.replace("2", row_ref)
-        formulaH = rawH2.replace("2", row_ref)
-
-        # build the A→H row
-        row = [
-            name,       # A: material name
-            formulaB,   # B
-            formulaC,   # C
-            unit,       # D
-            min_inv,    # E
-            reorder,    # F
-            cost,       # G
-            formulaH    # H
-        ]
-
-        sheets.values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A2:H",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": [row]}
-        ).execute()
-
-        added += 1
-        next_row += 1
-
-    return jsonify({"added": added}), 200
 
 @app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
@@ -853,6 +771,71 @@ def add_thread():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+# ─── MATERIALS ENDPOINTS ────────────────────────────────────────────────
+
+from flask import make_response  # if not already imported
+
+# allow CORS pre-flights for the POST
+@app.route("/api/materials", methods=["OPTIONS"])
+@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
+@login_required_session
+def materials_options():
+    return make_response("", 204)
+
+# GET list of all known materials (for your typeahead)
+@app.route("/api/materials", methods=["GET"])
+@login_required_session
+def get_materials():
+    try:
+        # read column A (Material Name) from row 2 down
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
+        names = [r[0] for r in rows if r and r[0].strip()]
+        return jsonify(names), 200
+    except Exception:
+        logger.exception("Error fetching materials")
+        return jsonify([]), 200
+
+# POST new materials into Material Inventory
+@app.route("/api/materials", methods=["POST"])
+@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
+@login_required_session
+def add_materials():
+    """
+    Expects a JSON array of items with keys:
+      materialName, unit, minInv, reorder, cost
+    """
+    items = request.get_json(silent=True) or []
+    if not isinstance(items, list):
+        items = [items]
+
+    to_append = []
+    for it in items:
+        name   = it.get("materialName", "").strip()
+        unit   = it.get("unit",         "").strip()
+        mininv = it.get("minInv",       "").strip()
+        reorder= it.get("reorder",      "").strip()
+        cost   = it.get("cost",         "").strip()
+        if name:
+            to_append.append([name, unit, mininv, reorder, cost])
+
+    if not to_append:
+        return jsonify({"added": 0}), 200
+
+    # append under A2:E
+    try:
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!A2:E",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": to_append}
+        ).execute()
+        return jsonify({"added": len(to_append)}), 200
+    except Exception:
+        logger.exception("Error adding materials")
+        return jsonify({"error": "Failed to add materials"}), 500
+
 
 @app.route("/api/products", methods=["GET"])
 @login_required_session
