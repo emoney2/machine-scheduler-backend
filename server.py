@@ -802,15 +802,19 @@ def get_materials():
 @login_required_session
 def add_materials():
     """
+    - Adds new materials into Material Inventory!A2:H
+    - Then logs the same entry into Material Log!A2:H
     Expects JSON array (or single object) with:
       materialName, unit, minInv, reorder, cost,
-      action (Ordered/Received), quantity
+      action (Ordered/Received), quantity, notes?
     """
-    raw = request.get_json(silent=True) or []
+    raw   = request.get_json(silent=True) or []
     items = raw if isinstance(raw, list) else [raw]
 
-    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+    now      = datetime.now(ZoneInfo("America/New_York"))\
+                    .strftime("%-m/%-d/%Y %H:%M:%S")
     inv_rows = []
+    log_rows = []
 
     for it in items:
         name    = it.get("materialName","").strip()
@@ -820,29 +824,38 @@ def add_materials():
         cost    = it.get("cost","").strip()
         action  = it.get("action","").strip()
         qty     = it.get("quantity","").strip()
+        notes   = it.get("notes","").strip()
 
-        # skip incomplete
         if not (name and action and qty):
             continue
 
-        # Append into columns A–H of Material Inventory
-        inv_rows.append([name, unit, mininv, reorder, cost, "", action, qty])
+        # 1) Material Inventory!A–H
+        inv_rows.append([ name, unit, mininv, reorder, cost, "", action, qty ])
 
+        # 2) Material Log!A–H
+        log_rows.append([ now, "", name, "", qty, "", action, notes ])
+
+    # Append to Inventory
     if inv_rows:
-        try:
-            sheets.values().append(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Material Inventory!A2:H",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values": inv_rows}
-            ).execute()
-        except Exception:
-            logger.exception("Error appending new materials")
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!A2:H",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": inv_rows}
+        ).execute()
 
-    # Return a simple “submitted” confirmation
-    return jsonify({"status": "submitted"}), 200
+    # Append to Log
+    if log_rows:
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Log!A2:H",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": log_rows}
+        ).execute()
 
+    return jsonify({"status":"submitted"}), 200
 
 # ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
 @app.route("/api/materialInventory", methods=["OPTIONS"])
@@ -856,75 +869,48 @@ def material_inventory_preflight():
 @login_required_session
 def submit_material_inventory():
     """
-    Expects JSON array of items, each with:
-      materialName, unit, minInv, reorder, cost, 
-      action (Ordered/Received), quantity
-    Appends new materials to Material Inventory A–H,
-    then logs the same entries into Material Log.
+    Only appends entries to Material Log!A2:H
+    Expects JSON array (or single object) with:
+      materialName, action (Ordered/Received), quantity, notes?
     """
-    entries = request.get_json(silent=True) or []
-    items   = entries if isinstance(entries, list) else [entries]
+    raw   = request.get_json(silent=True) or []
+    items = raw if isinstance(raw, list) else [raw]
 
-    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
-    inv_rows, log_rows = [], []
+    now      = datetime.now(ZoneInfo("America/New_York"))\
+                    .strftime("%-m/%-d/%Y %H:%M:%S")
+    log_rows = []
 
     for it in items:
-        name    = it.get("materialName","").strip()
-        unit    = it.get("unit","").strip()
-        mininv  = it.get("minInv","").strip()
-        reorder = it.get("reorder","").strip()
-        cost    = it.get("cost","").strip()
-        action  = it.get("action","").strip()
-        qty     = it.get("quantity","").strip()
+        name   = it.get("materialName","").strip()
+        action = it.get("action","").strip()
+        qty    = it.get("quantity","").strip()
+        notes  = it.get("notes","").strip()
 
-        if not name or not action or not qty:
+        if not (name and action and qty):
             continue
 
-        # Prepare inventory sheet row A–H
-        inv_rows.append([name, unit, mininv, reorder, cost, "", action, qty])
-
-        # Prepare material log row A–H
+        # build the log row: columns A–H of Material Log
         log_rows.append([
-            now,            # A: Timestamp
-            "",             # B
-            "",             # C: Material
-            "",             # D
-            "",             # E: Quantity
-            name,           # F
-            qty,            # G: O/R
-            "IN",           # H
-            action,         # I
-            it.get("notes","")
+            now,       # A: timestamp
+            "",        # B
+            name,      # C: Material
+            "",        # D
+            qty,       # E: Quantity
+            "",        # F
+            action,    # G: O/R
+            notes      # H: optional notes
         ])
 
-    # Append to Material Inventory
-    if inv_rows:
-        try:
-            sheets.values().append(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Material Inventory!A2:H",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values": inv_rows}
-            ).execute()
-        except Exception:
-            logger.exception("Error appending to Material Inventory")
-
-    # Append to Material Log
     if log_rows:
-        try:
-            sheets.values().append(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Material Log!A2:H",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values": log_rows}
-            ).execute()
-        except Exception:
-            logger.exception("Error appending to Material Log")
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Log!A2:H",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": log_rows}
+        ).execute()
 
-    return jsonify({"status":"ok"}), 200
-
+    return jsonify({"status":"submitted"}), 200
 
 
 @app.route("/api/products", methods=["GET"])
