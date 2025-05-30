@@ -688,6 +688,8 @@ def add_directory_entry():
     except Exception:
         logger.exception("Error adding new company")
         return jsonify({"error": "Failed to add company"}), 500
+
+@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @app.route("/api/materials", methods=["POST"])
 @login_required_session
 def add_material():
