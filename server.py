@@ -917,6 +917,7 @@ def submit_thread_inventory():
 
     return jsonify({"added": len(to_log)}), 200
 
+@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @app.route("/api/materialInventory", methods=["POST"])
 @login_required_session
 def submit_material_inventory():
