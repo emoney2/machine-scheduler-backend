@@ -690,38 +690,26 @@ def add_directory_entry():
         return jsonify({"error": "Failed to add company"}), 500
 
 # ─── Submit Material Inventory ─────────────────────────────────────────────
-@app.route("/api/materials", methods=["GET", "OPTIONS", "POST"])
+@app.route("/api/materials", methods=["OPTIONS", "POST"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
-def materials_endpoint():
-    # 1) CORS pre-flight
+def add_materials():
+    # 1) Handle CORS pre-flight
     if request.method == "OPTIONS":
         return make_response("", 204)
 
-    # 2) GET — return list of existing materials
-    if request.method == "GET":
-        try:
-            rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
-            materials = [r[0] for r in rows if r and r[0].strip()]
-            return jsonify(materials), 200
-        except Exception:
-            logger.exception("Error fetching materials")
-            return jsonify([]), 200
+    # 2) Parse incoming JSON (single object or list)
+    raw = request.get_json(silent=True) or []
+    items = raw if isinstance(raw, list) else [raw]
 
-    # 3) POST — append new material(s) to Material Inventory
-    #    Expects JSON array of:
-    #      { materialName, unit, minInv, reorder, cost }
-    data = request.get_json(silent=True) or []
-    items = data if isinstance(data, list) else [data]
-
-    # 4) find next row in column A
+    # 3) Determine next empty row in Material Inventory column A
     resp = sheets.values().get(
         spreadsheetId=SPREADSHEET_ID,
         range="Material Inventory!A2:A"
     ).execute().get("values", [])
     next_row = len(resp) + 2  # because A2 is row 2
 
-    # 5) helper to fetch a formula from row 2
+    # 4) Fetch the raw formulas from row 2 for columns B, C & H
     def tpl(col):
         return sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
@@ -733,47 +721,49 @@ def materials_endpoint():
     rawC2 = tpl("C")
     rawH2 = tpl("H")
 
-    added = 0
+    to_append = []
+    row_ref = str(next_row)
+
     for item in items:
-        name    = item.get("materialName","").strip()
-        unit    = item.get("unit","").strip()
-        min_inv = item.get("minInv","").strip()
-        reorder = item.get("reorder","").strip()
-        cost    = item.get("cost","").strip()
+        name    = item.get("materialName", "").strip()
+        unit    = item.get("unit",         "").strip()
+        minInv  = item.get("minInv",       "").strip()
+        reorder = item.get("reorder",      "").strip()
+        cost    = item.get("cost",         "").strip()
+
         if not name:
             continue
 
-        # update formulas to point at this row
-        row_ref  = str(next_row)
+        # update the row-reference in each formula
         formulaB = rawB2.replace("2", row_ref)
         formulaC = rawC2.replace("2", row_ref)
         formulaH = rawH2.replace("2", row_ref)
 
-        # build the A→H row
-        row = [
-            name,       # A
-            formulaB,   # B
-            formulaC,   # C
-            unit,       # D
-            min_inv,    # E
-            reorder,    # F
-            cost,       # G
-            formulaH    # H
-        ]
+        to_append.append([
+            name,       # A: Material name
+            formulaB,   # B: formula copied from B2 → B{next_row}
+            formulaC,   # C: formula copied from C2 → C{next_row}
+            unit,       # D: unit from form
+            minInv,     # E: minInv from form
+            reorder,    # F: reorder from form
+            cost,       # G: cost from form
+            formulaH    # H: formula copied from H2 → H{next_row}
+        ])
+        next_row += 1
+        row_ref = str(next_row)
+    # end for
 
+    # 5) Append all rows at once
+    if to_append:
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Material Inventory!A2:H",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": [row]}
+            body={"values": to_append}
         ).execute()
 
-        added += 1
-        next_row += 1
-
-    return jsonify({"added": added}), 200
-@app.route("/api/fur-colors", methods=["GET"])
+    return jsonify({"added": len(to_append)}), 200@app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
 def get_fur_colors():
     """
