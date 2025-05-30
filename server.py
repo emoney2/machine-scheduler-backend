@@ -925,26 +925,17 @@ def submit_material_inventory():
     now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
 
     for e in entries:
-        mat    = e.get("materialName", "").strip()
-        action = e.get("action",       "").strip()
-        qty    = e.get("quantity",     "").strip()
-        if not (mat and action and qty):
-            continue
-
-        # build a row A→I:
-        # A: timestamp
-        # B–E: blank
-        # F: material
-        # G: quantity
-        # H: "IN"
-        # I: action (Ordered/Received)
-        to_log.append([
-            now, "", "", "", "",
-            mat,
-            qty,
-            "IN",
-            action
-        ])
+        color = e.get("value", "").strip()
+        action = e.get("action", "").strip()
+        qty    = e.get("quantity", "").strip()
+        if color and action and qty:
+            rows.append([
+                now,
+                "Material",
+                color,
+                action,
+                qty
+            ])
 
     if to_log:
         sheets.values().append(
