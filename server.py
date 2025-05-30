@@ -1032,7 +1032,7 @@ def get_inventory_ordered():
         hdr     = mat[0]
         i_dt    = hdr.index("Date")
         i_or    = hdr.index("O/R")
-        qty_idx = i_or - 1              # Quantity is one column left of O/R
+        qty_idx = i_or - 2              # Quantity is one column left of O/R
         i_mat   = hdr.index("Material")
 
         for idx, row in enumerate(mat[1:], start=2):
