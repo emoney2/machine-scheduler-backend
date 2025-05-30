@@ -969,7 +969,7 @@ def get_inventory_ordered():
         i_or  = hdr.index("O/R")
         i_dt  = hdr.index("Date")
         i_mat = hdr.index("Material")
-        i_yds = hdr.index("Yards")
+        i_yds = hdr.index("Quantity")
         for idx, row in enumerate(mat[1:], start=2):
             if len(row)>i_or and row[i_or].strip().lower()=="ordered":
                 orders.append({
