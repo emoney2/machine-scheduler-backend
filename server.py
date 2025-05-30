@@ -90,6 +90,10 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 def login_required_session(f):
     @wraps(f)
     def decorated(*args, **kwargs):
+
+        if request.method == "OPTIONS":
+            return make_response("", 204)
+
         # 1) Must be logged in
         if not session.get("user"):
             if request.path.startswith("/api/"):
