@@ -690,49 +690,88 @@ def add_directory_entry():
         return jsonify({"error": "Failed to add company"}), 500
 
 # —── Submit Material Inventory → Material Log ─────────────────────────────
-@app.route("/api/materialInventory", methods=["OPTIONS", "POST"])
+# ─── Materials list & creation endpoint ─────────────────────────────────────
+@app.route("/api/materials", methods=["GET", "OPTIONS", "POST"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
-def submit_material_inventory():
-    # 1) Handle CORS preflight
+def materials_endpoint():
+    # 1) CORS preflight
     if request.method == "OPTIONS":
         return make_response("", 204)
 
-    # 2) Parse incoming entries (now using 'materialName' to match your client)
-    entries = request.get_json(silent=True) or []
-    to_log  = []
-    now     = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+    # 2) GET — return list of existing materials
+    if request.method == "GET":
+        try:
+            rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
+            materials = [r[0] for r in rows if r and r[0].strip()]
+            return jsonify(materials), 200
+        except Exception:
+            logger.exception("Error fetching materials")
+            return jsonify([]), 200
 
-    # 3) Build rows for the Material Log sheet
-    for e in entries:
-        material = e.get("materialName", "").strip()
-        action   = e.get("action",       "").strip()
-        qty      = e.get("quantity",     "").strip()
-        if material and action and qty:
-            to_log.append([
-                now,        # A: timestamp
-                "",         # B
-                "",         # C
-                "",         # D
-                "",         # E
-                material,   # F: Material name
-                qty,        # G: Quantity
-                "IN",       # H: fixed “IN”
-                action      # I: Ordered/Received
-            ])
+    # 3) POST — append new material(s) to Material Inventory
+    data = request.get_json(silent=True) or []
+    items = data if isinstance(data, list) else [data]
 
-    # 4) Append to the sheet if we have any rows
-    if to_log:
+    # 4) find next row in column A
+    resp = sheets.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Material Inventory!A2:A"
+    ).execute().get("values", [])
+    next_row = len(resp) + 2  # because A2 is row 2
+
+    # 5) helper to fetch a formula from row 2
+    def tpl(col):
+        return sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Material Inventory!{col}2",
+            valueRenderOption="FORMULA"
+        ).execute().get("values", [[""]])[0][0] or ""
+
+    rawB2 = tpl("B")
+    rawC2 = tpl("C")
+    rawH2 = tpl("H")
+
+    added = 0
+    for item in items:
+        name    = item.get("materialName", "").strip()
+        unit    = item.get("unit", "").strip()
+        min_inv = item.get("minInv", "").strip()
+        reorder = item.get("reorder", "").strip()
+        cost    = item.get("cost", "").strip()
+        if not name:
+            continue
+
+        # update formulas to point at this row
+        row_ref  = str(next_row)
+        formulaB = rawB2.replace("2", row_ref)
+        formulaC = rawC2.replace("2", row_ref)
+        formulaH = rawH2.replace("2", row_ref)
+
+        # build the A→H row
+        row = [
+            name,       # A: material name
+            formulaB,   # B
+            formulaC,   # C
+            unit,       # D
+            min_inv,    # E
+            reorder,    # F
+            cost,       # G
+            formulaH    # H
+        ]
+
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Log!A2:I",
+            range="Material Inventory!A2:H",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": to_log}
+            body={"values": [row]}
         ).execute()
 
-    # 5) Return how many rows we added
-    return jsonify({"added": len(to_log)}), 200
+        added += 1
+        next_row += 1
+
+    return jsonify({"added": added}), 200
 
 @app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
@@ -743,21 +782,6 @@ def get_fur_colors():
         return jsonify(colors), 200
     except Exception:
         logger.exception("Error fetching fur colors")
-        return jsonify([]), 200
-
-
-@app.route("/api/materials", methods=["GET"])
-@login_required_session
-def get_materials():
-    """
-    Returns JSON array of material names from the 'Material Inventory' sheet (column A).
-    """
-    try:
-        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
-        materials = [r[0] for r in rows if r and r[0].strip()]
-        return jsonify(materials), 200
-    except Exception:
-        logger.exception("Error fetching materials")
         return jsonify([]), 200
 
 # ─── Add /api/threads endpoint with dynamic formulas ────────────────────────
