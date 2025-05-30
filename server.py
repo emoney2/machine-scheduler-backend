@@ -920,45 +920,42 @@ def submit_thread_inventory():
 @app.route("/api/materialInventory", methods=["POST"])
 @login_required_session
 def submit_material_inventory():
-    # 1) Parse JSON payload (array of { value, action, quantity })
     entries = request.get_json(silent=True) or []
-
-    # 2) Build timestamp
+    to_log = []
     now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
 
-    rows = []
     for e in entries:
-        mat    = e.get("value",    "").strip()    # material name
-        action = e.get("action",   "").strip()    # O/R field
-        qty    = e.get("quantity", "").strip()    # quantity
+        mat    = e.get("materialName", "").strip()
+        action = e.get("action",       "").strip()
+        qty    = e.get("quantity",     "").strip()
         if not (mat and action and qty):
             continue
 
-        rows.append([
-            now,    # A: timestamp
-            "",     # B
-            "",     # C
-            "",     # D
-            "",     # E
-            mat,    # F: material
-            qty,    # G: quantity
-            "IN",   # H: fixed “IN”
-            action  # I: original O/R value
+        # build a row A→I:
+        # A: timestamp
+        # B–E: blank
+        # F: material
+        # G: quantity
+        # H: "IN"
+        # I: action (Ordered/Received)
+        to_log.append([
+            now, "", "", "", "",
+            mat,
+            qty,
+            "IN",
+            action
         ])
 
-    # 3) Append to “Material Log”!A2:I
-    if rows:
+    if to_log:
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Material Log!A2:I",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": rows}
+            body={"values": to_log}
         ).execute()
 
-    # 4) Return how many we added
-    return jsonify({"added": len(rows)}), 200
-
+    return jsonify({"added": len(to_log)}), 200
 
 @app.route("/api/inventoryOrdered", methods=["GET"])
 @login_required_session
