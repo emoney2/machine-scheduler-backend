@@ -694,7 +694,7 @@ def add_directory_entry():
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
 def materials_endpoint():
-    # 1) CORS preflight
+    # 1) CORS pre-flight
     if request.method == "OPTIONS":
         return make_response("", 204)
 
@@ -744,7 +744,7 @@ def materials_endpoint():
             continue
 
         # update formulas to point at this row
-        row_ref = str(next_row)
+        row_ref  = str(next_row)
         formulaB = rawB2.replace("2", row_ref)
         formulaC = rawC2.replace("2", row_ref)
         formulaH = rawH2.replace("2", row_ref)
@@ -773,7 +773,6 @@ def materials_endpoint():
         next_row += 1
 
     return jsonify({"added": added}), 200
-
 @app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
 def get_fur_colors():
