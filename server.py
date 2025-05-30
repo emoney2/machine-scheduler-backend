@@ -920,75 +920,44 @@ def submit_thread_inventory():
 @app.route("/api/materialInventory", methods=["POST"])
 @login_required_session
 def submit_material_inventory():
+    # 1) Parse JSON payload (array of { value, action, quantity })
     entries = request.get_json(silent=True) or []
+
+    # 2) Build timestamp
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+
     rows = []
-    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y")
     for e in entries:
-        if e.get("materialName") and e.get("action") and e.get("quantity"):
-            rows.append([
-                now,
-                "Material",
-                e["materialName"],
-                e["action"],
-                e["quantity"]
-            ])
+        mat    = e.get("value",    "").strip()    # material name
+        action = e.get("action",   "").strip()    # O/R field
+        qty    = e.get("quantity", "").strip()    # quantity
+        if not (mat and action and qty):
+            continue
+
+        rows.append([
+            now,    # A: timestamp
+            "",     # B
+            "",     # C
+            "",     # D
+            "",     # E
+            mat,    # F: material
+            qty,    # G: quantity
+            "IN",   # H: fixed “IN”
+            action  # I: original O/R value
+        ])
+
+    # 3) Append to “Material Log”!A2:I
     if rows:
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Log!A1:E",
+            range="Material Log!A2:I",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": rows}
         ).execute()
+
+    # 4) Return how many we added
     return jsonify({"added": len(rows)}), 200
-
-@app.route("/api/inventoryOrdered", methods=["GET"])
-@login_required_session
-def get_inventory_ordered():
-    orders = []
-
-    # 1) Material Log sheet
-    mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
-    if mat:
-        hdr = mat[0]
-        i_or  = hdr.index("O/R")
-        i_dt  = hdr.index("Date")
-        i_mat = hdr.index("Material")
-        i_yds = hdr.index("Yards")
-        for idx, row in enumerate(mat[1:], start=2):
-            if len(row)>i_or and row[i_or].strip().lower()=="ordered":
-                orders.append({
-                  "row": idx,
-                  "date": row[i_dt] if len(row)>i_dt else "",
-                  "type": "Material",
-                  "name": row[i_mat] if len(row)>i_mat else "",
-                  "quantity": row[i_yds] if len(row)>i_yds else ""
-                })
-
-    # 2) Thread Data sheet
-    th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
-    if th:
-        hdr = th[0]
-        i_or    = hdr.index("O/R")
-        i_dt    = hdr.index("Date")
-        i_col   = hdr.index("Color")
-        i_len   = hdr.index("Length (ft)")
-        for idx, row in enumerate(th[1:], start=2):
-            if len(row)>i_or and row[i_or].strip().lower()=="ordered":
-                qty = row[i_len] if len(row)>i_len else ""
-                try:
-                    qty = f"{float(qty)/16500:.2f} cones"
-                except:
-                    pass
-                orders.append({
-                  "row": idx,
-                  "date": row[i_dt] if len(row)>i_dt else "",
-                  "type": "Thread",
-                  "name": row[i_col] if len(row)>i_col else "",
-                  "quantity": qty
-                })
-
-    return jsonify(orders), 200
 
 
 
