@@ -776,24 +776,73 @@ def add_thread():
 
 from flask import make_response  # if not already imported
 
-# allow CORS pre-flights for the POST
+# ─── MATERIALS ENDPOINTS ────────────────────────────────────────────────
+
+# 1) Preflight for /api/materials
 @app.route("/api/materials", methods=["OPTIONS"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
-def material_inventory_options():
+def materials_preflight():
     return make_response("", 204)
 
-# GET list of all known materials (for your typeahead)
+# 2) GET list for your typeahead
 @app.route("/api/materials", methods=["GET"])
 @login_required_session
 def get_materials():
     try:
-        # read column A (Material Name) from row 2 down
         rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
         names = [r[0] for r in rows if r and r[0].strip()]
         return jsonify(names), 200
     except Exception:
         logger.exception("Error fetching materials")
         return jsonify([]), 200
+
+# 3) POST new material(s) into Material Inventory!A–H
+@app.route("/api/materials", methods=["POST"])
+@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
+@login_required_session
+def add_materials():
+    """
+    Expects JSON array (or single object) with:
+      materialName, unit, minInv, reorder, cost,
+      action (Ordered/Received), quantity
+    """
+    raw = request.get_json(silent=True) or []
+    items = raw if isinstance(raw, list) else [raw]
+
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+    inv_rows = []
+
+    for it in items:
+        name    = it.get("materialName","").strip()
+        unit    = it.get("unit","").strip()
+        mininv  = it.get("minInv","").strip()
+        reorder = it.get("reorder","").strip()
+        cost    = it.get("cost","").strip()
+        action  = it.get("action","").strip()
+        qty     = it.get("quantity","").strip()
+
+        # skip incomplete
+        if not (name and action and qty):
+            continue
+
+        # Append into columns A–H of Material Inventory
+        inv_rows.append([name, unit, mininv, reorder, cost, "", action, qty])
+
+    if inv_rows:
+        try:
+            sheets.values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Material Inventory!A2:H",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": inv_rows}
+            ).execute()
+        except Exception:
+            logger.exception("Error appending new materials")
+
+    # Return a simple “submitted” confirmation
+    return jsonify({"status": "submitted"}), 200
+
 
 # ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
 @app.route("/api/materialInventory", methods=["OPTIONS"])
