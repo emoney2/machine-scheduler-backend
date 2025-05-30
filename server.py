@@ -779,8 +779,7 @@ from flask import make_response  # if not already imported
 # allow CORS pre-flights for the POST
 @app.route("/api/materials", methods=["OPTIONS"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
-@login_required_session
-def materials_options():
+def material_inventory_options():
     return make_response("", 204)
 
 # GET list of all known materials (for your typeahead)
@@ -800,7 +799,7 @@ def get_materials():
 @app.route("/api/materials", methods=["POST"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
-def add_materials():
+def submit_material_inventory():
     """
     Expects a JSON array of items with keys:
       materialName, unit, minInv, reorder, cost
