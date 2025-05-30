@@ -778,7 +778,6 @@ from flask import make_response  # if not already imported
 
 # ─── MATERIALS ENDPOINTS ────────────────────────────────────────────────
 
-# 1) Preflight for /api/materials
 @app.route("/api/materials", methods=["OPTIONS"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 def materials_preflight():
@@ -802,14 +801,25 @@ def get_materials():
 @login_required_session
 def add_materials():
     """
-    - Adds new materials into Material Inventory!A2:H
-    - Then logs the same entry into Material Log!A2:H
-    Expects JSON array (or single object) with:
-      materialName, unit, minInv, reorder, cost,
-      action (Ordered/Received), quantity, notes?
+    Adds new materials to Material Inventory, then logs to Material Log.
+    Expects JSON array of objects with:
+      materialName, unit, minInv, reorder, cost, action, quantity, notes?
     """
     raw   = request.get_json(silent=True) or []
     items = raw if isinstance(raw, list) else [raw]
+
+    # 1) Fetch the formulas from row 2, columns B, C, H
+    def get_formula(col):
+        resp = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Material Inventory!{col}2",
+            valueRenderOption="FORMULA"
+        ).execute()
+        return resp.get("values", [[""]])[0][0] or ""
+
+    fmtB = get_formula("B")
+    fmtC = get_formula("C")
+    fmtH = get_formula("H")
 
     now      = datetime.now(ZoneInfo("America/New_York"))\
                     .strftime("%-m/%-d/%Y %H:%M:%S")
@@ -826,16 +836,36 @@ def add_materials():
         qty     = it.get("quantity","").strip()
         notes   = it.get("notes","").strip()
 
+        # skip incomplete entries
         if not (name and action and qty):
             continue
 
-        # 1) Material Inventory!A–H
-        inv_rows.append([ name, unit, mininv, reorder, cost, "", action, qty ])
+        # 2) Build the inventory row A–H
+        inv_rows.append([
+            name,   # A
+            fmtB,   # B (formula from B2)
+            fmtC,   # C (formula from C2)
+            unit,   # D
+            mininv, # E
+            reorder,# F
+            cost,   # G
+            fmtH    # H (formula from H2)
+        ])
 
-        # 2) Material Log!A–H
-        log_rows.append([ now, "", name, "", qty, "", action, notes ])
+        # 3) Build the log row A–I
+        log_rows.append([
+            now,    # A: timestamp
+            "",     # B
+            "",     # C
+            "",     # D
+            "",     # E
+            name,   # F: material
+            qty,    # G: quantity
+            "IN",   # H
+            action  # I: O/R
+        ])
 
-    # Append to Inventory
+    # 4) Append to Material Inventory
     if inv_rows:
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
@@ -845,18 +875,17 @@ def add_materials():
             body={"values": inv_rows}
         ).execute()
 
-    # Append to Log
+    # 5) Append to Material Log
     if log_rows:
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Log!A2:H",
+            range="Material Log!A2:I",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": log_rows}
         ).execute()
 
     return jsonify({"status":"submitted"}), 200
-
 # ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
 @app.route("/api/materialInventory", methods=["OPTIONS"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
