@@ -88,40 +88,8 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 
 
 def login_required_session(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-
-        if request.method == "OPTIONS":
-            return make_response("", 204)
-
-        # 1) Must be logged in
-        if not session.get("user"):
-            if request.path.startswith("/api/"):
-                return jsonify({"error":"authentication required"}), 401
-            return redirect(url_for("login", next=request.path))
-
-        # 2) Immediate logout on password change
-        current_pw = get_sheet_password()
-        if session.get("pwd_at_login") != current_pw:
-            session.clear()
-            return redirect(url_for("login", next=request.path))
-
-        # 3) Idle‐timeout: 3 hours of inactivity
-        last = session.get("last_activity")
-        if last:
-            last_dt = datetime.fromisoformat(last)
-            if datetime.utcnow() - last_dt > timedelta(hours=3):
-                session.clear()
-                return redirect(url_for("login", next=request.path))
-        else:
-            # if somehow never set, force a fresh login
-            session.clear()
-            return redirect(url_for("login", next=request.path))
-
-        # 4) All good — update last_activity and proceed
-        session["last_activity"] = datetime.utcnow().isoformat()
-        return f(*args, **kwargs)
-    return decorated
+    # No-op decorator: calls f() immediately, no auth checks
+    return f
 
 
 # ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
