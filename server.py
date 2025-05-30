@@ -699,47 +699,54 @@ def add_material():
         return make_response("", 204)
 
     # 2) Parse incoming JSON
-    data    = request.get_json(silent=True) or {}
-    name    = data.get("materialName", "").strip()
-    unit    = data.get("unit",         "").strip()
-    min_inv = data.get("minInv",       "").strip()
-    reorder = data.get("reorder",      "").strip()
-    cost    = data.get("cost",         "").strip()
+    data      = request.get_json(silent=True) or {}
+    name      = data.get("materialName", "").strip()
+    unit      = data.get("unit", "").strip()
+    min_inv   = data.get("minInv", "").strip()
+    reorder   = data.get("reorder", "").strip()
+    cost      = data.get("cost", "").strip()
 
-    if not name:
-        return jsonify({"error": "Missing materialName"}), 400
+    # 3) Determine next empty row in Material Inventory (column A)
+    existing = sheets.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Material Inventory!A2:A"
+    ).execute().get("values", [])
+    next_row = len(existing) + 2  # because A2 is row 2
 
     try:
-        # 3) Find next row in Material Inventory sheet
-        resp     = sheets.values().get(
+        # 4) Fetch row-2 formulas for B, C, H
+        fmt_B2 = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A2:A"
-        ).execute().get("values", [])
-        next_row = len(resp) + 2  # because A2 is row 2
+            range="Material Inventory!B2:B2",
+            valueRenderOption="FORMULA"
+        ).execute()["values"][0][0]
+        fmt_C2 = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!C2:C2",
+            valueRenderOption="FORMULA"
+        ).execute()["values"][0][0]
+        fmt_H2 = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!H2:H2",
+            valueRenderOption="FORMULA"
+        ).execute()["values"][0][0]
 
-        # 4) Helper to grab a formula from row 2
-        def tpl_formula(col):
-            return sheets.values().get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Material Inventory!{col}2",
-                valueRenderOption="FORMULA"
-            ).execute().get("values", [[""]])[0][0] or ""
+        # 5) Rewrite those formulas to point at next_row
+        row_ref  = str(next_row)
+        formulaB = fmt_B2.replace("2", row_ref)
+        formulaC = fmt_C2.replace("2", row_ref)
+        formulaH = fmt_H2.replace("2", row_ref)
 
-        # 5) Copy formulas from B2, C2 and H2, updating the "2" → next_row
-        fmtB2 = tpl_formula("B").replace("2", str(next_row))
-        fmtC2 = tpl_formula("C").replace("2", str(next_row))
-        fmtH2 = tpl_formula("H").replace("2", str(next_row))
-
-        # 6) Build the row A→H
-        row = [
-            name,      # A: materialName
-            fmtB2,     # B: copied formula
-            fmtC2,     # C: copied formula
-            unit,      # D: unit
-            min_inv,   # E: minInv
-            reorder,   # F: reorder
-            cost,      # G: cost
-            fmtH2      # H: copied formula
+        # 6) Build the new row A→H
+        new_row = [
+            name,
+            formulaB,
+            formulaC,
+            unit,
+            min_inv,
+            reorder,
+            cost,
+            formulaH
         ]
 
         # 7) Append it
@@ -748,14 +755,15 @@ def add_material():
             range="Material Inventory!A2:H",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": [row]}
+            body={"values": [new_row]},
         ).execute()
 
-        return jsonify({"status": "ok", "added": 1}), 200
+        return jsonify({"status": "ok"}), 200
 
-    except Exception as e:
-        logger.exception("Error adding material")
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logger.exception("Error adding new material")
+        return jsonify({"error": "Failed to add material"}), 500
+
 @app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
 def get_fur_colors():
