@@ -1062,6 +1062,56 @@ def get_inventory_ordered():
 
     return jsonify(orders), 200
 
+@app.route("/api/inventoryOrdered", methods=["PUT"])
+@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
+@login_required_session
+def mark_inventory_received():
+    """
+    Expects JSON:
+      { type: "Material"|"Thread", row: <number> }
+    Updates:
+      - Column A (Date) to now
+      - O/R column to "Received" (I for Material, H for Thread)
+    """
+    data      = request.get_json(silent=True) or {}
+    sheetType = data.get("type")
+    row       = data.get("row")
+
+    try:
+        row = int(row)
+    except:
+        return jsonify({"error":"invalid row"}), 400
+
+    # choose sheet & O/R column
+    if sheetType == "Material":
+        sheet   = "Material Log"
+        col_or  = "I"
+    else:
+        sheet   = "Thread Data"
+        col_or  = "H"
+
+    # timestamp in A
+    now = datetime.now(ZoneInfo("America/New_York"))\
+              .strftime("%-m/%-d/%Y %H:%M:%S")
+
+    # 1) Update the Date cell (col A)
+    sheets.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet}!A{row}",
+        valueInputOption="USER_ENTERED",
+        body={"values":[[now]]}
+    ).execute()
+
+    # 2) Update the O/R cell to "Received"
+    sheets.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet}!{col_or}{row}",
+        valueInputOption="USER_ENTERED",
+        body={"values":[["Received"]]}
+    ).execute()
+
+    return jsonify({"status":"ok"}), 200
+
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
