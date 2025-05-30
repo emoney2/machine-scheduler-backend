@@ -838,11 +838,13 @@ def submit_material_inventory():
         log_rows.append([
             now,            # A: Timestamp
             "",             # B
-            name,           # C: Material
+            "",             # C: Material
             "",             # D
-            qty,            # E: Quantity
-            "",             # F
-            action,         # G: O/R
+            "",             # E: Quantity
+            name,           # F
+            qty,            # G: O/R
+            "IN",           # H
+            action,         # I
             it.get("notes","")
         ])
 
