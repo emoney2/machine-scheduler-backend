@@ -734,12 +734,6 @@ def submit_material_inventory():
     # 5) Return how many rows we added
     return jsonify({"added": len(to_log)}), 200
 
-    except Exception:
-        logger.exception("Error adding new material")
-        return jsonify({"error": "Failed to add material"}), 500
-
-
-
 @app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
 def get_fur_colors():
