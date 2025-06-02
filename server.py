@@ -82,7 +82,10 @@ def _debug_session():
 # After-request, echo back the real Origin so withCredentials can work
 @app.after_request
 def apply_cors(response):
+    # 1) Grab whatever Origin header the browser sent
     origin = request.headers.get("Origin", "").strip()
+
+    # 2) If it matches exactly our FRONTEND_URL, expose CORS headers
     if origin == FRONTEND_URL:
         response.headers["Access-Control-Allow-Origin"]      = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
