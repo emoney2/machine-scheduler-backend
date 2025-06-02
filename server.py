@@ -50,9 +50,13 @@ app.config.update(
 # only allow our Netlify front-end on /api/* and support cookies
 CORS(
     app,
-    origins=[FRONTEND_URL],        # allow only your Netlify frontend
-    supports_credentials=True,     # send cookies (Flask session) on each request
-    methods=["GET","POST","PUT","OPTIONS"]
+    resources={
+        r"/":             {"origins": FRONTEND_URL},
+        r"/api/*":        {"origins": FRONTEND_URL},
+        r"/api/threads":  {"origins": FRONTEND_URL},
+        r"/submit":       {"origins": FRONTEND_URL},
+    },
+    supports_credentials=True
 )
 
 # Socket.IO (same origin)
