@@ -34,10 +34,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+ raw_frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+ FRONTEND_URL = raw_frontend.strip()
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"status": "ok", "message": "Backend is running"}), 200
+
 @app.before_request
 def _debug_session():
      logger.info("🔑 Session data for %s → %s", request.path, dict(session))
@@ -62,7 +68,7 @@ CORS(
 # Socket.IO (same origin)
 socketio = SocketIO(
     app,
-    cors_allowed_origins=FRONTEND_URL,
+    cors_allowed_origins=[FRONTEND_URL],
     async_mode="eventlet"
 )
 
@@ -76,13 +82,14 @@ def _debug_session():
 # After-request, echo back the real Origin so withCredentials can work
 @app.after_request
 def apply_cors(response):
-    origin = request.headers.get("Origin")
+    origin = request.headers.get("Origin", "").strip()
     if origin == FRONTEND_URL:
         response.headers["Access-Control-Allow-Origin"]      = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Headers"]     = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"]     = "GET,POST,PUT,OPTIONS"
     return response
+
 
 # ─── Session & Auth Helpers ──────────────────────────────────────────────────
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
