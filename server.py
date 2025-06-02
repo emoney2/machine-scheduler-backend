@@ -34,8 +34,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
- raw_frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
- FRONTEND_URL = raw_frontend.strip()
+raw_frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+FRONTEND_URL = raw_frontend.strip()
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
