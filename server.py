@@ -238,7 +238,7 @@ def login():
             # Instead of pwd_at_login, store token_at_login:
             session["token_at_login"] = ADMIN_TOKEN
             session["last_activity"]  = datetime.utcnow().isoformat()
-            return redirect(request.args.get("next") or FRONTEND_URL)
+            return redirect(FRONTEND_URL)
         else:
             error = "Invalid credentials"
     return render_template_string(_login_page, error=error)
