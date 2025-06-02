@@ -94,16 +94,34 @@ def login_required_session(f):
         if request.method == "OPTIONS":
             return make_response("", 204)
 
-        # 2) Must be logged in
+        # 2) Must be logged in at all
         if not session.get("user"):
             if request.path.startswith("/api/"):
                 return jsonify({"error": "authentication required"}), 401
             return redirect(url_for("login", next=request.path))
 
-        # 3) Idle timeout: 3 hours of inactivity
+        # 3) Token‐match check: 
+        #    “token_at_login” must equal the current ADMIN_TOKEN, 
+        #    otherwise we immediately log out.
+        ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+        token_at_login = session.get("token_at_login", "")
+        if token_at_login != ADMIN_TOKEN:
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "session invalidated"}), 401
+            return redirect(url_for("login", next=request.path))
+
+        # 4) Idle timeout: 3 hours of inactivity
         last = session.get("last_activity")
         if last:
-            last_dt = datetime.fromisoformat(last)
+            try:
+                last_dt = datetime.fromisoformat(last)
+            except:
+                session.clear()
+                if request.path.startswith("/api/"):
+                    return jsonify({"error": "authentication required"}), 401
+                return redirect(url_for("login", next=request.path))
+
             if datetime.utcnow() - last_dt > timedelta(hours=3):
                 session.clear()
                 if request.path.startswith("/api/"):
@@ -116,7 +134,7 @@ def login_required_session(f):
                 return jsonify({"error": "authentication required"}), 401
             return redirect(url_for("login", next=request.path))
 
-        # 4) All good—update last_activity and proceed
+        # 5) All good—update last_activity and proceed
         session["last_activity"] = datetime.utcnow().isoformat()
         return f(*args, **kwargs)
     return decorated
@@ -203,19 +221,20 @@ def login():
     if request.method == "POST":
         u = request.form["username"]
         p = request.form["password"]
-        # read a fixed admin password from the environment
-        ADMIN_PW = os.environ.get("ADMIN_PASSWORD", "")
+        ADMIN_PW    = os.environ.get("ADMIN_PASSWORD", "")
+        ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
         if u == "admin" and p == ADMIN_PW:
             session.clear()
-            session["user"]         = u
-            # we no longer need "pwd_at_login" from the sheet—just store the static PW
-            session["pwd_at_login"] = ADMIN_PW
-            session["last_activity"] = datetime.utcnow().isoformat()
-            return redirect(FRONTEND_URL)
+            session["user"]           = u
+            # Instead of pwd_at_login, store token_at_login:
+            session["token_at_login"] = ADMIN_TOKEN
+            session["last_activity"]  = datetime.utcnow().isoformat()
+            return redirect(request.args.get("next") or FRONTEND_URL)
         else:
             error = "Invalid credentials"
-    # For GET requests, or POST with bad creds, show the login form
     return render_template_string(_login_page, error=error)
+
 
 
 @app.route("/logout")
