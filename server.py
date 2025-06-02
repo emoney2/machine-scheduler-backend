@@ -88,8 +88,38 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 
 
 def login_required_session(f):
-    # No-op decorator: calls f() immediately, no auth checks
-    return f
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # 1) OPTIONS are always allowed (CORS preflight)
+        if request.method == "OPTIONS":
+            return make_response("", 204)
+
+        # 2) Must be logged in
+        if not session.get("user"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "authentication required"}), 401
+            return redirect(url_for("login", next=request.path))
+
+        # 3) Idle timeout: 3 hours of inactivity
+        last = session.get("last_activity")
+        if last:
+            last_dt = datetime.fromisoformat(last)
+            if datetime.utcnow() - last_dt > timedelta(hours=3):
+                session.clear()
+                if request.path.startswith("/api/"):
+                    return jsonify({"error": "session expired"}), 401
+                return redirect(url_for("login", next=request.path))
+        else:
+            # if no "last_activity" for whatever reason, force login
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "authentication required"}), 401
+            return redirect(url_for("login", next=request.path))
+
+        # 4) All good—update last_activity and proceed
+        session["last_activity"] = datetime.utcnow().isoformat()
+        return f(*args, **kwargs)
+    return decorated
 
 
 # ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
@@ -173,18 +203,17 @@ def login():
     if request.method == "POST":
         u = request.form["username"]
         p = request.form["password"]
-        # pull the live password from J2
-        sheet_pw = get_sheet_password()
-        # only "admin" + exact sheet password unlocks
-        if u == "admin" and p == sheet_pw:
-            # fresh login: clear any old session data
+        # read a fixed admin password from the environment
+        ADMIN_PW = os.environ.get("ADMIN_PASSWORD", "")
+        if u == "admin" and p == ADMIN_PW:
             session.clear()
             session["user"]         = u
-            session["pwd_at_login"] = sheet_pw
-            # track last activity for idle timeout
+            # we no longer need "pwd_at_login" from the sheet—just store the static PW
+            session["pwd_at_login"] = ADMIN_PW
             session["last_activity"] = datetime.utcnow().isoformat()
             return redirect(FRONTEND_URL)
-        error = "Invalid credentials"
+        else:
+            error = "Invalid credentials"
     # For GET requests, or POST with bad creds, show the login form
     return render_template_string(_login_page, error=error)
 
