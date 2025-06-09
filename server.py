@@ -318,64 +318,54 @@ def handle_placeholders_updated(data):
     socketio.emit("placeholdersUpdated", data, broadcast=True)
 
 # ─── MANUAL STATE ENDPOINTS (multi-row placeholders) ─────────────────────────
-MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
-MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
+MANUAL_RANGE       = "Manual State!A2:Z"
+MANUAL_CLEAR_RANGE = "Manual State!A2:Z"
 
 # ─── MANUAL STATE ENDPOINT (GET) ───────────────────────────────────────────────
 @app.route("/api/manualState", methods=["GET"])
 @login_required_session
 def get_manual_state():
-    """
-    Returns JSON:
-      {
-        machine1: [...],
-        machine2: [...],
-        placeholders: [
-          { id, company, quantity, stitchCount, inHand, dueType },
-          … up to however many rows you have …
-        ]
-      }
-    """
     global _manual_state_cache, _manual_state_ts
     now = time.time()
-
     if _manual_state_cache is not None and (now - _manual_state_ts) < CACHE_TTL:
         return jsonify(_manual_state_cache), 200
 
     try:
-        # read columns A–H from row 2 down
+        # fetch A2:Z...
         resp = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE  # e.g. "Manual State!A2:H50"
+            range=MANUAL_RANGE  # "Manual State!A2:Z"
         ).execute()
         rows = resp.get("values", [])
 
-        # first row contains A2/B2 lists + first placeholder C–H
-        first = rows[0] if rows else []
-        while len(first) < 8:
-            first.append("")
+        # pad each row to 26 cols (A–Z)
+        for i in range(len(rows)):
+            while len(rows[i]) < 26:
+                rows[i].append("")
 
-        ms1 = [s for s in first[0].split(",") if s]
-        ms2 = [s for s in first[1].split(",") if s]
+        # first row: machine lists in I–Z (cols 8–25)
+        first = rows[0] if rows else [""] * 26
+        machines = first[8:26]
+        machine_columns = [[s for s in col.split(",") if s] for col in machines]
 
+        # rest: placeholders from A–H (cols 0–7)
         phs = []
         for r in rows:
-            # placeholder columns are indices 2–7 (C–H)
-            if len(r) >= 3 and r[2].strip():
-                ph = {
-                    "id":          r[2],
-                    "company":     r[3] if len(r) > 3 else "",
-                    "quantity":    r[4] if len(r) > 4 else "",
-                    "stitchCount": r[5] if len(r) > 5 else "",
-                    "inHand":      r[6] if len(r) > 6 else "",
-                    "dueType":     r[7] if len(r) > 7 else ""
-                }
-                phs.append(ph)
+            if r[0].strip():  # only if ID in col A
+                phs.append({
+                    "id":          r[0],
+                    "company":     r[1],
+                    "quantity":    r[2],
+                    "stitchCount": r[3],
+                    "inHand":      r[4],
+                    "dueType":     r[5],
+                    "fieldG":      r[6],
+                    "fieldH":      r[7]
+                })
 
         result = {
-            "machine1":     ms1,
-            "machine2":     ms2,
-            "placeholders": phs
+            "machineColumns": machine_columns,
+            "placeholders":   phs
         }
 
         _manual_state_cache = result
@@ -386,73 +376,73 @@ def get_manual_state():
         logger.exception("Error reading manual state")
         if _manual_state_cache:
             return jsonify(_manual_state_cache), 200
-        return jsonify({"machine1": [], "machine2": [], "placeholders": []}), 200
+        return jsonify({"machineColumns": [], "placeholders": []}), 200
 
 
 # ─── MANUAL STATE ENDPOINT (POST) ──────────────────────────────────────────────
 @app.route("/api/manualState", methods=["POST"])
 @login_required_session
 def save_manual_state():
-    """
-    Expects JSON:
-      {
-        machine1: [...],
-        machine2: [...],
-        placeholders: [...]
-      }
-    Clears A2:H then writes machine arrays and placeholders top-down with no gaps.
-    """
     global _manual_state_cache, _manual_state_ts
 
     try:
         data = request.get_json(silent=True) or {}
+        phs  = data.get("placeholders", [])
         m1   = data.get("machine1", [])
         m2   = data.get("machine2", [])
-        phs  = data.get("placeholders", [])
 
-        # 1) Clear the existing manual-state rows (A2:H)
+        # 1) Clear A2:Z
         sheets.values().clear(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_CLEAR_RANGE  # e.g. "Manual State!A2:H"
+            range=MANUAL_CLEAR_RANGE  # "Manual State!A2:Z"
         ).execute()
 
-        # 2) Build the new rows array
+        # 2) Build new rows
         rows = []
 
-        # First row: machine lists + first placeholder (if any)
-        first = [ ",".join(m1), ",".join(m2) ]
+        # --- first row: placeholders[0] in A–H, machines in I & J, rest blank
+        first = []
         if phs:
             p0 = phs[0]
             first += [
-                p0.get("id", ""),
-                p0.get("company", ""),
-                str(p0.get("quantity", "")),
-                str(p0.get("stitchCount", "")),
-                p0.get("inHand", ""),
-                p0.get("dueType", "")
+                p0.get("id",""),
+                p0.get("company",""),
+                str(p0.get("quantity","")),
+                str(p0.get("stitchCount","")),
+                p0.get("inHand",""),
+                p0.get("dueType",""),
+                p0.get("fieldG",""),
+                p0.get("fieldH","")
             ]
         else:
-            first += [""] * 6
+            first += [""] * 8
+        # columns I & J
+        first.append(",".join(m1))
+        first.append(",".join(m2))
+        # columns K–Z blank
+        first += [""] * (26 - len(first))
         rows.append(first)
 
-        # Subsequent placeholder rows
+        # --- subsequent placeholders in A–H, I–Z blank
         for p in phs[1:]:
-            rows.append([
-                "", "",
-                p.get("id", ""),
-                p.get("company", ""),
-                str(p.get("quantity", "")),
-                str(p.get("stitchCount", "")),
-                p.get("inHand", ""),
-                p.get("dueType", "")
-            ])
+            row = [
+                p.get("id",""),
+                p.get("company",""),
+                str(p.get("quantity","")),
+                str(p.get("stitchCount","")),
+                p.get("inHand",""),
+                p.get("dueType",""),
+                p.get("fieldG",""),
+                p.get("fieldH","")
+            ]
+            row += [""] * 18  # fill cols I–Z
+            rows.append(row)
 
-        # 3) Write them back starting at A2:H{end_row}
-        num_rows   = max(1, len(rows))
-        end_row    = 2 + num_rows - 1
+        # 3) Write back A2:Z{end_row}
+        num = max(1, len(rows))
+        end_row = 2 + num - 1
         sheet_name = MANUAL_CLEAR_RANGE.split("!")[0]
-        write_range = f"{sheet_name}!A2:H{end_row}"
-
+        write_range = f"{sheet_name}!A2:Z{end_row}"
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=write_range,
@@ -460,9 +450,12 @@ def save_manual_state():
             body={"values": rows}
         ).execute()
 
-        # 4) Update cache & notify clients
-        _manual_state_cache = {"machine1": m1, "machine2": m2, "placeholders": phs}
-        _manual_state_ts    = time.time()
+        # 4) Update cache & broadcast
+        _manual_state_cache = {
+            "machineColumns": [m1, m2],  # still expose as list-of-lists
+            "placeholders": phs
+        }
+        _manual_state_ts = time.time()
         socketio.emit("manualStateUpdated", _manual_state_cache)
 
         return jsonify({"status": "ok"}), 200
