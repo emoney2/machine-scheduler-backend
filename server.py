@@ -609,6 +609,21 @@ def submit_order():
             valueInputOption="USER_ENTERED",
             body={"values":[row]}
         ).execute()
+ 
+         # ─── COPY AF2 FORMULA DOWN TO AF<next_row> ─────────────────
+         resp = sheets.values().get(
+             spreadsheetId=SPREADSHEET_ID,
+             range="Production Orders!AF2",
+             valueRenderOption="FORMULA"
+         ).execute()
+         raw_formula = resp.get("values", [[""]])[0][0] or ""
+         new_formula = raw_formula.replace("2", str(next_row))
+         sheets.values().update(
+             spreadsheetId=SPREADSHEET_ID,
+             range=f"Production Orders!AF{next_row}",
+             valueInputOption="FORMULA",
+             body={"values": [[new_formula]]}
+         ).execute()
 
         # now turn that one cell into a checkbox
         meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
