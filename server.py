@@ -403,75 +403,79 @@ def save_manual_state():
           …
         ]
       }
-    Writes back:
-      - A2 = comma-joined machine1
-      - B2 = comma-joined machine2
-      - C2:H2 = placeholders[0]
-      - C3:H3 = placeholders[1], etc.
+    Clears rows A2:H, then writes:
+      A2 = comma-joined machine1
+      B2 = comma-joined machine2
+      C2:H2 = placeholders[0] (or blanks)
+      C3:H3 = placeholders[1], etc.
     """
     global _manual_state_cache, _manual_state_ts
 
     data = request.get_json(silent=True) or {}
-    m1  = data.get("machine1", [])
-    m2  = data.get("machine2", [])
-    phs = data.get("placeholders", [])
+    m1   = data.get("machine1", [])
+    m2   = data.get("machine2", [])
+    phs  = data.get("placeholders", [])
 
-    # build the 2D array of rows to write
+    # 1) Clear the existing manual-state rows (A2:H)
+    sheets.values().clear(
+        spreadsheetId=SPREADSHEET_ID,
+        range=MANUAL_CLEAR_RANGE  # e.g. "Manual State!A2:H"
+    ).execute()
+
+    # 2) Build the new rows array
     rows = []
-    # first row: machines + first placeholder (if any)
-    first_fields = [""] * 6
-    if phs:
-        first = phs[0]
-        first_fields = [
-            first.get("id", ""),
-            first.get("company", ""),
-            first.get("quantity", ""),
-            first.get("stitchCount", ""),
-            first.get("inHand", ""),
-            first.get("dueType", "")
-        ]
-    rows.append([
-        ",".join(m1),
-        ",".join(m2),
-        *first_fields
-    ])
 
-    # subsequent placeholder rows
-    for ph in phs[1:]:
+    # First row: machine lists + first placeholder (if any)
+    first = [ ",".join(m1), ",".join(m2) ]
+    if phs:
+        p0 = phs[0]
+        first += [
+            p0.get("id", ""),
+            p0.get("company", ""),
+            str(p0.get("quantity", "")),
+            str(p0.get("stitchCount", "")),
+            p0.get("inHand", ""),
+            p0.get("dueType", "")
+        ]
+    else:
+        # no placeholders → pad with six blanks
+        first += [""] * 6
+    rows.append(first)
+
+    # Subsequent placeholders
+    for p in phs[1:]:
         rows.append([
-            "", "",
-            ph.get("id",""),
-            ph.get("company",""),
-            ph.get("quantity",""),
-            ph.get("stitchCount",""),
-            ph.get("inHand",""),
-            ph.get("dueType","")
+            "", "",                     # keep A/B blank
+            p.get("id", ""),
+            p.get("company", ""),
+            str(p.get("quantity", "")),
+            str(p.get("stitchCount", "")),
+            p.get("inHand", ""),
+            p.get("dueType", "")
         ])
 
-    # determine how many rows to write (at least 1)
+    # 3) Write them back starting at A2:H{end_row}
     num_rows = max(1, len(rows))
-    end_row  = 2 + num_rows - 1  # row 2 through row end_row
+    end_row  = 2 + num_rows - 1
+    write_range = f"{MANUAL_CLEAR_RANGE.split('!')[0]}!A2:H{end_row}"
 
-    write_range = f"{MANUAL_RANGE.split('!')[0]}!A2:H{end_row}"
+    sheets.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=write_range,
+        valueInputOption="RAW",
+        body={"values": rows}
+    ).execute()
 
-    try:
-        sheets.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=write_range,
-            valueInputOption="RAW",
-            body={"values": rows}
-        ).execute()
+    # 4) Update cache and broadcast
+    _manual_state_cache = {
+        "machine1":     m1,
+        "machine2":     m2,
+        "placeholders": phs
+    }
+    _manual_state_ts = time.time()
+    socketio.emit("manualStateUpdated", _manual_state_cache)
 
-        _manual_state_cache = {
-            "machine1":     m1,
-            "machine2":     m2,
-            "placeholders": phs
-        }
-        _manual_state_ts = time.time()
-
-        socketio.emit("manualStateUpdated", _manual_state_cache)
-        return jsonify({"status": "ok"}), 200
-
+    return jsonify({"status": "ok"}), 200
     except Exception:
         logger.exception("Error writing manual state")
         return jsonify({"status": "error"}), 500
