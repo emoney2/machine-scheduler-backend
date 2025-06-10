@@ -146,6 +146,43 @@ def login_required_session(f):
         return f(*args, **kwargs)
     return decorated
 
+# Socket.IO (same origin)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=[FRONTEND_URL],
+    async_mode="eventlet"
+)
+
+
+
+# ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
+sheet_lock = Semaphore(1)
+SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
+ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
+EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
+MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
+MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
+
+creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+if creds_json:
+    info = json.loads(creds_json)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+else:
+    creds = service_account.Credentials.from_service_account_file(
+    "credentials.json",
+    scopes=[
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/drive"
+    ]
+)
+
+_http = Http(timeout=10)
+authed_http = AuthorizedHttp(creds, http=_http)
+service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+sheets  = service.spreadsheets()
+
 # ─── Update Embroidery Start Time ────────────────────────────────────────────
 @app.route("/api/updateStartTime", methods=["OPTIONS","POST"])
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
@@ -184,44 +221,6 @@ def update_start_time():
     # 5) Notify clients via Socket.IO (optional)
     socketio.emit("orderUpdated", {"orderId": job_id})
     return jsonify(success=True), 200
-
-
-# Socket.IO (same origin)
-socketio = SocketIO(
-    app,
-    cors_allowed_origins=[FRONTEND_URL],
-    async_mode="eventlet"
-)
-
-
-
-# ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
-sheet_lock = Semaphore(1)
-SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
-ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
-EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
-MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
-MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
-
-creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-if creds_json:
-    info = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-else:
-    creds = service_account.Credentials.from_service_account_file(
-    "credentials.json",
-    scopes=[
-      "https://www.googleapis.com/auth/spreadsheets",
-      "https://www.googleapis.com/auth/drive"
-    ]
-)
-
-_http = Http(timeout=10)
-authed_http = AuthorizedHttp(creds, http=_http)
-service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-sheets  = service.spreadsheets()
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
