@@ -220,7 +220,13 @@ def update_start_time():
 
     # 5) Notify clients via Socket.IO (optional)
     socketio.emit("orderUpdated", {"orderId": job_id})
-    return jsonify(success=True), 200
+
+    # 6) Build response with explicit CORS headers
+    response = jsonify(success=True)
+    response.status_code = 200
+    response.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
