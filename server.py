@@ -1207,6 +1207,17 @@ def mark_inventory_received():
 
     return jsonify({"status":"ok"}), 200
 
+@app.errorhandler(Exception)
+def handle_exception(e):
+    # Log the full stack for debugging
+    logger.exception("Unhandled exception in request:")
+    # Return a JSON error and CORS
+    resp = jsonify(error=str(e))
+    resp.status_code = 500
+    resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
