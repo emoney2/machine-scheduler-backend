@@ -199,12 +199,17 @@ def update_start_time():
     start_ts = data.get("startTime", "")
 
     # 2) ONLY fetch column A (Order IDs), skipping the header row
-    result = sheets.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Embroidery List!A2:A",
-        majorDimension="COLUMNS"
-    ).execute()
-    id_column = result.get("values", [[]])[0]  # 1D list of every ID
+    global _id_cache, _id_ts
+    now = time.time()
+    if _id_cache is None or (now - _id_ts) > CACHE_TTL:
+        result = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Embroidery List!A2:A",
+            majorDimension="COLUMNS"
+        ).execute()
+        _id_cache = result.get("values", [[]])[0]
+        _id_ts    = now
+    id_column = _id_cache
 
     # 3) Find which row matches our job_id
     sheet_row = None
@@ -225,6 +230,10 @@ def update_start_time():
             valueInputOption="USER_ENTERED",
             body={"values": [[ start_ts ]]}
         ).execute()
+
+    # ─── Invalidate ID cache ───────────────────────────────────
+    _id_cache = None
+
     except Exception as e:
         logger.exception("❌ Failed writing startTime to row %s", sheet_row)
         return jsonify({
@@ -246,7 +255,7 @@ def update_start_time():
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
-CACHE_TTL           = 0
+CACHE_TTL           = 10
 
 # orders cache + timestamp
 _orders_cache       = None
@@ -259,6 +268,10 @@ _emb_ts             = 0
 # manualState cache + timestamp (for placeholders & machine assignments)
 _manual_state_cache = None
 _manual_state_ts    = 0
+
+# ID-column cache for updateStartTime
+_id_cache           = None
+_id_ts              = 0
 
 
 def fetch_sheet(spreadsheet_id, sheet_range):
