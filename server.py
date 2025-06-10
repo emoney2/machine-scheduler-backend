@@ -274,7 +274,9 @@ def get_embroidery_list():
     try:
         rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
         headers = rows[0] if rows else []
-        data    = [dict(zip(headers,r)) for r in rows[1:]] if rows else []
+        data = [dict(zip(headers, r)) for r in rows[1:]] if rows else []
+        for row in data:
+            row["startTime"] = row.get("Start Time", "")
         return jsonify(data), 200
     except Exception:
         logger.exception("Error fetching embroidery list")
