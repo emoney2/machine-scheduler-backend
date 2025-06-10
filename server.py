@@ -24,6 +24,7 @@ from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.http         import MediaIoBaseUpload
 from datetime                      import datetime
 
+START_TIME_COL_INDEX = 27
 
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
