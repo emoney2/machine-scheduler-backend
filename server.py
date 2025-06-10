@@ -336,23 +336,28 @@ def get_orders():
 @login_required_session
 def get_embroidery_list():
     try:
-    # 1) only fetch column A (order IDs) to find the matching row
-        result = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Embroidery List!A2:A",           # just IDs, skip header
-            majorDimension="COLUMNS"
-        ).execute()
-        id_column = result.get("values", [[]])[0]  # list of all IDs
-    
-        # Reconstruct a rows-like structure for your loop:
-        #   row_idx = position in id_column + 2
-        #   id_column[i] corresponds to sheet row (i+2)
-        rows = id_column
-        headers = rows[0] if rows else []
-        data = [dict(zip(headers, r)) for r in rows[1:]] if rows else []
+        # ─── Spot A: CACHE CHECK ────────────────────────────────────
+        global _emb_cache, _emb_ts
+        now = time.time()
+        if _emb_cache is not None and (now - _emb_ts) < 10:
+            return jsonify(_emb_cache), 200
+
+        # ─── Fetch the full sheet ──────────────────────────────────
+        rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
+        if not rows:
+            return jsonify([]), 200
+
+        headers = rows[0]
+        data    = [dict(zip(headers, r)) for r in rows[1:]]
         for row in data:
             row["startTime"] = row.get("Start Time", "")
+
+        # ─── Spot B: CACHE STORE ───────────────────────────────────
+        _emb_cache = data
+        _emb_ts    = now
+
         return jsonify(data), 200
+
     except Exception:
         logger.exception("Error fetching embroidery list")
         return jsonify([]), 200
