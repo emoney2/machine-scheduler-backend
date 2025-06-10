@@ -40,8 +40,7 @@ FRONTEND_URL = raw_frontend.strip()
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
-
-CORS(app, origins=FRONTEND_URL, supports_credentials=True)
+CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
 
 @app.route("/", methods=["GET"])
 def index():
