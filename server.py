@@ -230,9 +230,8 @@ def update_start_time():
             valueInputOption="USER_ENTERED",
             body={"values": [[ start_ts ]]}
         ).execute()
-
-    # ─── Invalidate ID cache ───────────────────────────────────
-    _id_cache = None
+        # ─── Invalidate ID cache ───────────────────────────────────
+        _id_cache = None
 
     except Exception as e:
         logger.exception("❌ Failed writing startTime to row %s", sheet_row)
