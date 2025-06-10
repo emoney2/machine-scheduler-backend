@@ -336,7 +336,7 @@ def get_orders():
 @login_required_session
 def get_embroidery_list():
     try:
-        +    # 1) only fetch column A (order IDs) to find the matching row
+    # 1) only fetch column A (order IDs) to find the matching row
         result = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
             range="Embroidery List!A2:A",           # just IDs, skip header
