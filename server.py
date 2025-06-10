@@ -215,12 +215,22 @@ def update_start_time():
     for sheet_row, row in enumerate(rows[1:], start=2):
         if len(row) > id_idx and str(row[id_idx]).strip() == job_id:
             # 4) Write the new startTime into column AA (27)
-            sheets.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Embroidery List!AA{sheet_row}",
-                valueInputOption="USER_ENTERED",
-                body={"values":[[ start_ts ]]}
-            ).execute()
+            logger.info("✏️  Writing startTime %r to Embroidery List!AA%s", start_ts, sheet_row)
+            try:
+                sheets.values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"Embroidery List!AA{sheet_row}",
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[ start_ts ]]}
+                ).execute()
+            except Exception as e:
+                logger.exception("❌ Failed writing startTime to row %s", sheet_row)
+                return jsonify({
+                    "error":          "sheet write failed",
+                    "row":            sheet_row,
+                    "attemptedValue": start_ts,
+                    "detail":         str(e)
+                }), 500
             break
 
     # 5) Notify clients via Socket.IO (optional)
