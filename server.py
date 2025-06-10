@@ -99,7 +99,12 @@ def login_required_session(f):
     def decorated(*args, **kwargs):
         # 1) OPTIONS are always allowed (CORS preflight)
         if request.method == "OPTIONS":
-            return make_response("", 204)
+            response = make_response("", 204)
+            response.headers["Access-Control-Allow-Origin"]      = FRONTEND_URL
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Allow-Headers"]     = "Content-Type,Authorization"
+            response.headers["Access-Control-Allow-Methods"]     = "GET,POST,PUT,OPTIONS"
+            return response
 
         # 2) Must be logged in at all
         if not session.get("user"):
