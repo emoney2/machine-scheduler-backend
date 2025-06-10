@@ -198,48 +198,49 @@ def update_start_time():
     job_id   = str(data.get("id", "")).strip()
     start_ts = data.get("startTime", "")
 
-    # 2) Read entire Embroidery List sheet (headers + rows)
-    #    EMBROIDERY_RANGE is "Embroidery List!A1:AM"
-    rows     = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
-    if not rows or len(rows) < 2:
-        return jsonify({"error":"no data"}), 400
+    # 2) ONLY fetch column A (Order IDs), skipping the header row
+    result = sheets.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Embroidery List!A2:A",
+        majorDimension="COLUMNS"
+    ).execute()
+    id_column = result.get("values", [[]])[0]  # 1D list of every ID
 
-    headers  = rows[0]
-    try:
-        # find which column is "Order #" (zero-based index in the row array)
-        id_idx = headers.index("Order #")
-    except ValueError:
-        return jsonify({"error":"no Order # header"}), 500
-
-    # 3) Scan data rows (starting at sheet row 2) for our job_id
-    for sheet_row, row in enumerate(rows[1:], start=2):
-        if len(row) > id_idx and str(row[id_idx]).strip() == job_id:
-            # 4) Write the new startTime into column AA (27)
-            logger.info("✏️  Writing startTime %r to Embroidery List!AA%s", start_ts, sheet_row)
-            try:
-                sheets.values().update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"Embroidery List!AA{sheet_row}",
-                    valueInputOption="USER_ENTERED",
-                    body={"values": [[ start_ts ]]}
-                ).execute()
-            except Exception as e:
-                logger.exception("❌ Failed writing startTime to row %s", sheet_row)
-                return jsonify({
-                    "error":          "sheet write failed",
-                    "row":            sheet_row,
-                    "attemptedValue": start_ts,
-                    "detail":         str(e)
-                }), 500
+    # 3) Find which row matches our job_id
+    sheet_row = None
+    for idx, this_id in enumerate(id_column, start=2):
+        if str(this_id).strip() == job_id:
+            sheet_row = idx
             break
+
+    if sheet_row is None:
+        return jsonify({"error": "job ID not found"}), 404
+
+    # 4) Write the new startTime into column AA of that row
+    logger.info("✏️ Writing startTime %r to Embroidery List!AA%s", start_ts, sheet_row)
+    try:
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Embroidery List!AA{sheet_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[ start_ts ]]}
+        ).execute()
+    except Exception as e:
+        logger.exception("❌ Failed writing startTime to row %s", sheet_row)
+        return jsonify({
+            "error":          "sheet write failed",
+            "row":            sheet_row,
+            "attemptedValue": start_ts,
+            "detail":         str(e)
+        }), 500
 
     # 5) Notify clients via Socket.IO (optional)
     socketio.emit("orderUpdated", {"orderId": job_id})
 
-    # 6) Build response with explicit CORS headers
+    # 6) Return success with CORS headers
     response = jsonify(success=True)
     response.status_code = 200
-    response.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    response.headers["Access-Control-Allow-Origin"]      = FRONTEND_URL
     response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
@@ -335,7 +336,18 @@ def get_orders():
 @login_required_session
 def get_embroidery_list():
     try:
-        rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
+        +    # 1) only fetch column A (order IDs) to find the matching row
+        result = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Embroidery List!A2:A",           # just IDs, skip header
+            majorDimension="COLUMNS"
+        ).execute()
+        id_column = result.get("values", [[]])[0]  # list of all IDs
+    
+        # Reconstruct a rows-like structure for your loop:
+        #   row_idx = position in id_column + 2
+        #   id_column[i] corresponds to sheet row (i+2)
+        rows = id_column
         headers = rows[0] if rows else []
         data = [dict(zip(headers, r)) for r in rows[1:]] if rows else []
         for row in data:
