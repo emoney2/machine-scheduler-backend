@@ -287,22 +287,39 @@ def get_embroidery_list():
 @cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
 def update_start_time():
+    # 1) Parse incoming JSON
     data     = request.get_json(silent=True) or {}
-    job_id   = data.get("id")
-    start_ts = data.get("startTime")
+    job_id   = str(data.get("id", "")).strip()
+    start_ts = data.get("startTime", "")
 
-    # Open the Embroidery List sheet
-    sheet = open_sheet().worksheet("Embroidery List")
-    rows  = sheet.get_all_records()
+    # 2) Read entire Embroidery List sheet (headers + rows)
+    #    EMBROIDERY_RANGE is "Embroidery List!A1:AM"
+    rows     = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
+    if not rows or len(rows) < 2:
+        return jsonify({"error":"no data"}), 400
 
-    # Find the row whose “Order #” matches job_id and write into AA (col 27)
-    for idx, row in enumerate(rows, start=2):
-        if str(row.get("Order #")) == str(job_id):
-            sheet.update_cell(idx, START_TIME_COL_INDEX, start_ts)
+    headers  = rows[0]
+    try:
+        # find which column is "Order #" (zero-based index in the row array)
+        id_idx = headers.index("Order #")
+    except ValueError:
+        return jsonify({"error":"no Order # header"}), 500
+
+    # 3) Scan data rows (starting at sheet row 2) for our job_id
+    for sheet_row, row in enumerate(rows[1:], start=2):
+        if len(row) > id_idx and str(row[id_idx]).strip() == job_id:
+            # 4) Write the new startTime into column AA (27)
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Embroidery List!AA{sheet_row}",
+                valueInputOption="USER_ENTERED",
+                body={"values":[[ start_ts ]]}
+            ).execute()
             break
 
+    # 5) Notify clients via Socket.IO (optional)
+    socketio.emit("orderUpdated", {"orderId": job_id})
     return jsonify(success=True), 200
-
 
 @app.route("/api/orders/<order_id>", methods=["PUT"])
 @login_required_session
