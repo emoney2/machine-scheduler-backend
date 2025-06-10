@@ -282,6 +282,28 @@ def get_embroidery_list():
         logger.exception("Error fetching embroidery list")
         return jsonify([]), 200
 
+# ─── Update Embroidery Start Time ────────────────────────────────────────────
+@app.route("/api/updateStartTime", methods=["OPTIONS","POST"])
+@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
+@login_required_session
+def update_start_time():
+    data     = request.get_json(silent=True) or {}
+    job_id   = data.get("id")
+    start_ts = data.get("startTime")
+
+    # Open the Embroidery List sheet
+    sheet = open_sheet().worksheet("Embroidery List")
+    rows  = sheet.get_all_records()
+
+    # Find the row whose “Order #” matches job_id and write into AA (col 27)
+    for idx, row in enumerate(rows, start=2):
+        if str(row.get("Order #")) == str(job_id):
+            sheet.update_cell(idx, START_TIME_COL_INDEX, start_ts)
+            break
+
+    return jsonify(success=True), 200
+
+
 @app.route("/api/orders/<order_id>", methods=["PUT"])
 @login_required_session
 def update_order(order_id):
