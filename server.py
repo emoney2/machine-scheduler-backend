@@ -41,6 +41,8 @@ FRONTEND_URL = raw_frontend.strip()
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
 
+CORS(app, origins=FRONTEND_URL, supports_credentials=True)
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({"status": "ok", "message": "Backend is running"}), 200
@@ -190,7 +192,6 @@ sheets  = service.spreadsheets()
 
 # ─── Update Embroidery Start Time ────────────────────────────────────────────
 @app.route("/api/updateStartTime", methods=["OPTIONS","POST"])
-@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
 def update_start_time():
     # 1) Parse incoming JSON
@@ -791,7 +792,6 @@ def get_fur_colors():
         return jsonify([]), 200
 
 # ─── Add /api/threads endpoint with dynamic formulas ────────────────────────
-@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @app.route("/api/threads", methods=["POST"])
 @login_required_session
 def add_thread():
@@ -867,7 +867,6 @@ from flask import make_response  # if not already imported
 # ─── MATERIALS ENDPOINTS ────────────────────────────────────────────────
 
 @app.route("/api/materials", methods=["OPTIONS"])
-@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 def materials_preflight():
     return make_response("", 204)
 
@@ -885,7 +884,6 @@ def get_materials():
 
 # 3) POST new material(s) into Material Inventory!A–H
 @app.route("/api/materials", methods=["POST"])
-@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
 def add_materials():
     """
@@ -976,13 +974,11 @@ def add_materials():
     return jsonify({"status":"submitted"}), 200
 # ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
 @app.route("/api/materialInventory", methods=["OPTIONS"])
-@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 def material_inventory_preflight():
     return make_response("", 204)
 
 # ─── MATERIAL-LOG POST ────────────────────────────────────────────────────
 @app.route("/api/materialInventory", methods=["POST"])
-@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
 def submit_material_inventory():
     """
@@ -1163,7 +1159,6 @@ def get_inventory_ordered():
     return jsonify(orders), 200
 
 @app.route("/api/inventoryOrdered", methods=["PUT"])
-@cross_origin(origins=FRONTEND_URL, supports_credentials=True)
 @login_required_session
 def mark_inventory_received():
     """
