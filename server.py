@@ -243,7 +243,10 @@ def update_start_time():
         }), 500
 
     # 5) Notify clients via Socket.IO (optional)
-    socketio.emit("orderUpdated", {"orderId": job_id})
+    socketio.emit("startTimeUpdated", {
+        "orderId":  job_id,
+        "startTime": start_ts
+    })
 
     # 6) Return success with CORS headers
     response = jsonify(success=True)
