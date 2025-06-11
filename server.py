@@ -189,71 +189,48 @@ authed_http = AuthorizedHttp(creds, http=_http)
 service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 sheets  = service.spreadsheets()
 
-# ─── Update Embroidery Start Time ────────────────────────────────────────────
 @app.route("/api/updateStartTime", methods=["OPTIONS","POST"])
 @login_required_session
 def update_start_time():
     # 1) Parse incoming JSON
-    data     = request.get_json(silent=True) or {}
-    job_id   = str(data.get("id", "")).strip()
+    data = request.get_json(silent=True) or {}
+    # Expect the client to send the exact sheet row number
+    try:
+        sheet_row = int(data.get("row"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid or missing row"}), 400
+
     start_ts = data.get("startTime", "")
 
-    # 2) ONLY fetch column A (Order IDs), skipping the header row
-    global _id_cache, _id_ts
-    now = time.time()
-    if _id_cache is None or (now - _id_ts) > CACHE_TTL:
-        result = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Embroidery List!A2:A",
-            majorDimension="COLUMNS"
-        ).execute()
-        _id_cache = result.get("values", [[]])[0]
-        _id_ts    = now
-    id_column = _id_cache
-
-    # 3) Find which row matches our job_id
-    sheet_row = None
-    for idx, this_id in enumerate(id_column, start=2):
-        if str(this_id).strip() == job_id:
-            sheet_row = idx
-            break
-
-    if sheet_row is None:
-        return jsonify({"error": "job ID not found"}), 404
-
-    # 4) Write the new startTime into column AA of that row
+    # 2) Directly write to AA{row}, no reads
     logger.info("✏️ Writing startTime %r to Embroidery List!AA%s", start_ts, sheet_row)
     try:
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"Embroidery List!AA{sheet_row}",
             valueInputOption="USER_ENTERED",
-            body={"values": [[ start_ts ]]}
+            body={"values": [[start_ts]]}
         ).execute()
-        # ─── Invalidate ID cache ───────────────────────────────────
-        _id_cache = None
-
     except Exception as e:
         logger.exception("❌ Failed writing startTime to row %s", sheet_row)
         return jsonify({
-            "error":          "sheet write failed",
-            "row":            sheet_row,
-            "attemptedValue": start_ts,
-            "detail":         str(e)
+            "error": "sheet write failed",
+            "row": sheet_row,
+            "detail": str(e)
         }), 500
 
-    # 5) Notify clients via Socket.IO (optional)
+    # 3) Emit only the startTime change
     socketio.emit("startTimeUpdated", {
-        "orderId":  job_id,
+        "row":       sheet_row,
         "startTime": start_ts
     })
 
-    # 6) Return success with CORS headers
-    response = jsonify(success=True)
-    response.status_code = 200
-    response.headers["Access-Control-Allow-Origin"]      = FRONTEND_URL
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
+    # 4) Return success
+    resp = jsonify(success=True)
+    resp.headers["Access-Control-Allow-Origin"]      = FRONTEND_URL
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp, 200
+
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
