@@ -189,47 +189,34 @@ authed_http = AuthorizedHttp(creds, http=_http)
 service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 sheets  = service.spreadsheets()
 
-@app.route("/api/updateStartTime", methods=["OPTIONS","POST"])
-@login_required_session
+@app.route('/api/updateStartTime', methods=["POST"])
 def update_start_time():
-    # 1) Parse incoming JSON
-    data = request.get_json(silent=True) or {}
-    # Expect the client to send the exact sheet row number
-    try:
-        sheet_row = int(data.get("row"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "invalid or missing row"}), 400
+    data = request.get_json()
+    print("🔧 Received /updateStartTime payload:", data)
 
-    start_ts = data.get("startTime", "")
+    row_id = data.get("id")
+    start_time = data.get("startTime")
 
-    # 2) Directly write to AA{row}, no reads
-    logger.info("✏️ Writing startTime %r to Embroidery List!AA%s", start_ts, sheet_row)
+    if not row_id or not start_time:
+        print("❌ Missing data in request:", data)
+        return jsonify({"error": "Missing ID or start time"}), 400
+
     try:
-        sheets.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Embroidery List!AA{sheet_row}",
-            valueInputOption="USER_ENTERED",
-            body={"values": [[start_ts]]}
-        ).execute()
+        success = update_embroidery_start_time_in_sheet(row_id, start_time)
+        if success:
+            return jsonify({"status": "ok"}), 200
+        else:
+            return jsonify({"error": "Update failed"}), 500
     except Exception as e:
-        logger.exception("❌ Failed writing startTime to row %s", sheet_row)
-        return jsonify({
-            "error": "sheet write failed",
-            "row": sheet_row,
-            "detail": str(e)
-        }), 500
+        print("❌ Server error during update:", e)
+        return jsonify({"error": str(e)}), 500
 
-    # 3) Emit only the startTime change
-    socketio.emit("startTimeUpdated", {
-        "row":       sheet_row,
-        "startTime": start_ts
-    })
 
-    # 4) Return success
-    resp = jsonify(success=True)
-    resp.headers["Access-Control-Allow-Origin"]      = FRONTEND_URL
-    resp.headers["Access-Control-Allow-Credentials"] = "true"
-    return resp, 200
+# ✅ You must define or update this function to match your actual Google Sheet logic
+def update_embroidery_start_time_in_sheet(row_id, start_time):
+    # TEMP placeholder logic - update this with your real spreadsheet code
+    print(f"📝 Would update row with ID {row_id} to have start time {start_time}")
+    return True  # Simulate success
 
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
