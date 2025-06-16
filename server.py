@@ -214,10 +214,43 @@ def update_start_time():
 
 # ✅ You must define or update this function to match your actual Google Sheet logic
 def update_embroidery_start_time_in_sheet(row_id, start_time):
-    # TEMP placeholder logic - update this with your real spreadsheet code
-    print(f"📝 Would update row with ID {row_id} to have start time {start_time}")
-    return True  # Simulate success
+    """
+    Updates the 'Embroidery List' sheet, column AA (index 26), for the given row ID.
+    """
+    sheet = service.spreadsheets()
+    sheet_name = 'Embroidery List'
 
+    # Find the row that matches the job ID
+    result = sheet.values().get(
+        spreadsheetId=SHEET_ID,
+        range=f"{sheet_name}!A2:Z",
+    ).execute()
+    values = result.get('values', [])
+
+    target_row_index = None
+    for idx, row in enumerate(values, start=2):  # row number in Sheets is idx+2 (1-based + header)
+        if row and row[0] == str(row_id):  # assuming ID is in column A
+            target_row_index = idx
+            break
+
+    if target_row_index is None:
+        print(f"❌ No row found with ID {row_id}")
+        return False
+
+    range_to_update = f"{sheet_name}!AA{target_row_index}"
+    print(f"✅ Writing start time {start_time} to {range_to_update}")
+
+    try:
+        sheet.values().update(
+            spreadsheetId=SHEET_ID,
+            range=range_to_update,
+            valueInputOption="RAW",
+            body={"values": [[start_time]]}
+        ).execute()
+        return True
+    except Exception as e:
+        print("❌ Error updating sheet:", e)
+        return False
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
