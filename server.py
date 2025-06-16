@@ -28,9 +28,10 @@ from datetime                      import datetime
 START_TIME_COL_INDEX = 27
 
 def get_sheets_service():
+    scopes = ['https://www.googleapis.com/auth/spreadsheets']
     credentials = service_account.Credentials.from_service_account_file(
-        "creds.json",
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
+        scopes=scopes
     )
     return build("sheets", "v4", credentials=credentials)
 
@@ -222,49 +223,25 @@ def update_start_time():
 # ✅ You must define or update this function to match your actual Google Sheet logic
 import traceback
 
-def update_embroidery_start_time_in_sheet(row_id, start_time):
-    print(f"📌 update_embroidery_start_time_in_sheet called with row_id={row_id}, start_time={start_time}")
+def update_embroidery_start_time_in_sheet(row_id, start_time_iso):
     try:
         service = get_sheets_service()
         sheet = service.spreadsheets()
 
-        # Pull the job IDs from Embroidery List column A
-        result = sheet.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Embroidery List!A2:A",
-            majorDimension="COLUMNS"
-        ).execute()
-
-        job_ids = result.get("values", [[]])[0]
-        print(f"🧵 Loaded job IDs from Embroidery List, total: {len(job_ids)}")
-
-        if row_id not in job_ids:
-            print(f"❌ Job ID {row_id} not found in Embroidery List")
-            return False
-
-        row_index = job_ids.index(row_id) + 2  # because we start at A2
-        cell_range = f"Embroidery List!AA{row_index}"
-        print(f"✏️ Writing start time to: {cell_range}")
-
-        update_body = {
-            "range": cell_range,
-            "majorDimension": "ROWS",
-            "values": [[start_time]]
-        }
+        range_to_update = f"Embroidery List!AA{row_id}"
+        values = [[start_time_iso]]
 
         result = sheet.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=cell_range,
+            range=range_to_update,
             valueInputOption="RAW",
-            body=update_body
+            body={"values": values}
         ).execute()
 
-        print(f"✅ Write complete: {result}")
+        print(f"✅ Updated Embroidery List row {row_id} with start time {start_time_iso}")
         return True
-
     except Exception as e:
-        print("❌ Exception occurred while writing embroidery start time:")
-        traceback.print_exc()
+        print(f"❌ Failed to update embroidery start time: {e}")
         return False
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
