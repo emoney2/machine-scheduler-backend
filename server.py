@@ -198,7 +198,6 @@ def update_start_time():
     start_time = data.get("startTime")
 
     if not row_id or not start_time:
-        print("❌ Missing data in request:", data)
         return jsonify({"error": "Missing ID or start time"}), 400
 
     try:
@@ -208,7 +207,9 @@ def update_start_time():
         else:
             return jsonify({"error": "Update failed"}), 500
     except Exception as e:
-        print("❌ Server error during update:", e)
+        import traceback
+        print("❌ Server error:", e)
+        traceback.print_exc()  # <-- Add this to show the exact crash line
         return jsonify({"error": str(e)}), 500
 
 
