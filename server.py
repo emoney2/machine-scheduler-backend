@@ -201,15 +201,21 @@ def update_start_time():
         return jsonify({"error": "Missing ID or start time"}), 400
 
     try:
-        success = update_embroidery_start_time_in_sheet(row_id, start_time)
-        if success:
-            return jsonify({"status": "ok"}), 200
-        else:
-            return jsonify({"error": "Update failed"}), 500
+        sheet = service.spreadsheets()
+        row_num = int(row_id) + 2  # A2 = ID 0
+
+        result = sheet.values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"Embroidery List!AA{row_num}",
+            valueInputOption="RAW",
+            body={"values": [[start_time]]}
+        ).execute()
+
+        print(f"✅ Embroidery start time updated at AA{row_num}: {start_time}")
+        return jsonify({"status": "ok"}), 200
+
     except Exception as e:
-        import traceback
-        print("❌ Server error:", e)
-        traceback.print_exc()  # <-- Add this to show the exact crash line
+        print("❌ Error updating embroidery start time:", e)
         return jsonify({"error": str(e)}), 500
 
 
