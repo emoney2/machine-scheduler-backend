@@ -205,7 +205,7 @@ def update_start_time():
         row_num = int(row_id) + 2  # A2 = ID 0
 
         result = sheet.values().update(
-            spreadsheetId=SHEET_ID,
+            spreadsheetId=SPREADSHEET_ID,
             range=f"Embroidery List!AA{row_num}",
             valueInputOption="RAW",
             body={"values": [[start_time]]}
