@@ -223,26 +223,37 @@ def update_start_time():
 # ✅ You must define or update this function to match your actual Google Sheet logic
 import traceback
 
-def update_embroidery_start_time_in_sheet(row_id, start_time_iso):
-    try:
-        service = get_sheets_service()
-        sheet = service.spreadsheets()
+def update_embroidery_start_time_in_sheet(job_id, start_time):
+    """
+    Finds the row in 'Embroidery List' where column A matches job_id,
+    then writes start_time to column AA (27th column).
+    """
+    service = get_sheets_service()
+    sheet = service.spreadsheets()
 
-        range_to_update = f"Embroidery List!AA{row_id}"
-        values = [[start_time_iso]]
+    # Fetch column A (Job IDs) from Embroidery List
+    result = sheet.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Embroidery List!A2:A"
+    ).execute()
 
-        result = sheet.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=range_to_update,
-            valueInputOption="RAW",
-            body={"values": values}
-        ).execute()
+    values = result.get("values", [])
 
-        print(f"✅ Updated Embroidery List row {row_id} with start time {start_time_iso}")
-        return True
-    except Exception as e:
-        print(f"❌ Failed to update embroidery start time: {e}")
-        return False
+    # Find the matching row
+    for i, row in enumerate(values, start=2):  # A2 = row 2
+        if str(row[0]) == str(job_id):
+            target_range = f"Embroidery List!AA{i}"
+            sheet.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=target_range,
+                valueInputOption="RAW",
+                body={"values": [[start_time]]}
+            ).execute()
+            print(f"✅ Updated embroidery_start for job {job_id} at {target_range}")
+            return True
+
+    print(f"❌ Job ID {job_id} not found in Embroidery List column A")
+    return False
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
