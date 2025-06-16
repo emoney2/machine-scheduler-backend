@@ -27,6 +27,13 @@ from datetime                      import datetime
 
 START_TIME_COL_INDEX = 27
 
+def get_sheets_service():
+    credentials = service_account.Credentials.from_service_account_file(
+        "creds.json",
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return build("sheets", "v4", credentials=credentials)
+
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
 logging.basicConfig(
