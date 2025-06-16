@@ -3,6 +3,7 @@ import os
 import json
 import logging
 import time
+import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -212,14 +213,15 @@ def update_start_time():
 
 
 # ✅ You must define or update this function to match your actual Google Sheet logic
+import traceback
+
 def update_embroidery_start_time_in_sheet(row_id, start_time):
     print(f"📌 update_embroidery_start_time_in_sheet called with row_id={row_id}, start_time={start_time}")
-
     try:
         service = get_sheets_service()
         sheet = service.spreadsheets()
 
-        # Read Embroidery List to find the row number for this job ID
+        # Pull the job IDs from Embroidery List column A
         result = sheet.values().get(
             spreadsheetId=SPREADSHEET_ID,
             range="Embroidery List!A2:A",
@@ -227,37 +229,35 @@ def update_embroidery_start_time_in_sheet(row_id, start_time):
         ).execute()
 
         job_ids = result.get("values", [[]])[0]
-        print(f"🧵 Loaded Embroidery List job IDs: {job_ids[:5]}... total={len(job_ids)}")
+        print(f"🧵 Loaded job IDs from Embroidery List, total: {len(job_ids)}")
 
         if row_id not in job_ids:
-            print(f"❌ Job ID {row_id} not found in Embroidery List column A.")
+            print(f"❌ Job ID {row_id} not found in Embroidery List")
             return False
 
-        row_index = job_ids.index(row_id) + 2  # +2 because A2:A and 1-based index
-        print(f"✅ Found job ID at row {row_index}")
-
-        # Update column AA (column 27)
-        update_range = f"Embroidery List!AA{row_index}"
-        print(f"📝 Writing to range: {update_range}")
+        row_index = job_ids.index(row_id) + 2  # because we start at A2
+        cell_range = f"Embroidery List!AA{row_index}"
+        print(f"✏️ Writing start time to: {cell_range}")
 
         update_body = {
-            "range": update_range,
+            "range": cell_range,
             "majorDimension": "ROWS",
             "values": [[start_time]]
         }
 
         result = sheet.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=update_range,
+            range=cell_range,
             valueInputOption="RAW",
             body=update_body
         ).execute()
 
-        print(f"✅ Successfully wrote start time: {result}")
+        print(f"✅ Write complete: {result}")
         return True
 
     except Exception as e:
-        print(f"❌ Exception in update_embroidery_start_time_in_sheet: {e}")
+        print("❌ Exception occurred while writing embroidery start time:")
+        traceback.print_exc()
         return False
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
