@@ -212,44 +212,53 @@ def update_start_time():
 
 
 # ✅ You must define or update this function to match your actual Google Sheet logic
-def update_embroidery_start_time_in_sheet(order_id, start_time):
-    # Define the tab and columns
-    SHEET_NAME = "Embroidery List"
-    RANGE = f"{SHEET_NAME}!A2:AE"
+def update_embroidery_start_time_in_sheet(row_id, start_time):
+    print(f"📌 update_embroidery_start_time_in_sheet called with row_id={row_id}, start_time={start_time}")
 
-    # Fetch the sheet
-    sheet = get_sheets_service().spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=RANGE
-    ).execute()
+    try:
+        service = get_sheets_service()
+        sheet = service.spreadsheets()
 
-    values = sheet.get("values", [])
+        # Read Embroidery List to find the row number for this job ID
+        result = sheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Embroidery List!A2:A",
+            majorDimension="COLUMNS"
+        ).execute()
 
-    # Find the matching row by ID (column A)
-    for i, row in enumerate(values):
-        if len(row) >= 1 and row[0] == str(order_id):
-            row_index = i + 2  # Because of header and 0-index
-            target_cell = f"{SHEET_NAME}!AA{row_index}"
+        job_ids = result.get("values", [[]])[0]
+        print(f"🧵 Loaded Embroidery List job IDs: {job_ids[:5]}... total={len(job_ids)}")
 
-            update_body = {
-                "range": target_cell,
-                "values": [[start_time]],
-                "majorDimension": "ROWS"
-            }
+        if row_id not in job_ids:
+            print(f"❌ Job ID {row_id} not found in Embroidery List column A.")
+            return False
 
-            result = get_sheets_service().spreadsheets().values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=target_cell,
-                valueInputOption="RAW",
-                body=update_body
-            ).execute()
+        row_index = job_ids.index(row_id) + 2  # +2 because A2:A and 1-based index
+        print(f"✅ Found job ID at row {row_index}")
 
-            print(f"✅ Updated start time for ID {order_id} to {start_time} in {target_cell}")
-            return True
+        # Update column AA (column 27)
+        update_range = f"Embroidery List!AA{row_index}"
+        print(f"📝 Writing to range: {update_range}")
 
-    print(f"⚠️ ID {order_id} not found in Embroidery List")
-    return False
+        update_body = {
+            "range": update_range,
+            "majorDimension": "ROWS",
+            "values": [[start_time]]
+        }
 
+        result = sheet.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=update_range,
+            valueInputOption="RAW",
+            body=update_body
+        ).execute()
+
+        print(f"✅ Successfully wrote start time: {result}")
+        return True
+
+    except Exception as e:
+        print(f"❌ Exception in update_embroidery_start_time_in_sheet: {e}")
+        return False
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
