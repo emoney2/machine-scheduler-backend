@@ -201,63 +201,55 @@ def update_start_time():
         return jsonify({"error": "Missing ID or start time"}), 400
 
     try:
-        sheet = service.spreadsheets()
-        row_num = int(row_id) + 2  # A2 = ID 0
-
-        result = sheet.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Embroidery List!AA{row_num}",
-            valueInputOption="RAW",
-            body={"values": [[start_time]]}
-        ).execute()
-
-        print(f"✅ Embroidery start time updated at AA{row_num}: {start_time}")
-        return jsonify({"status": "ok"}), 200
-
+        success = update_embroidery_start_time_in_sheet(row_id, start_time)
+        if success:
+            return jsonify({"status": "ok"}), 200
+        else:
+            return jsonify({"error": "Update failed"}), 500
     except Exception as e:
-        print("❌ Error updating embroidery start time:", e)
+        print("❌ Server error:", e)
         return jsonify({"error": str(e)}), 500
 
 
 # ✅ You must define or update this function to match your actual Google Sheet logic
-def update_embroidery_start_time_in_sheet(row_id, start_time):
-    """
-    Updates the 'Embroidery List' sheet, column AA (index 26), for the given row ID.
-    """
-    sheet = service.spreadsheets()
-    sheet_name = 'Embroidery List'
+def update_embroidery_start_time_in_sheet(order_id, start_time):
+    # Define the tab and columns
+    SHEET_NAME = "Embroidery List"
+    RANGE = f"{SHEET_NAME}!A2:AE"
 
-    # Find the row that matches the job ID
-    result = sheet.values().get(
-        spreadsheetId=SHEET_ID,
-        range=f"{sheet_name}!A2:Z",
+    # Fetch the sheet
+    sheet = get_sheets_service().spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=RANGE
     ).execute()
-    values = result.get('values', [])
 
-    target_row_index = None
-    for idx, row in enumerate(values, start=2):  # row number in Sheets is idx+2 (1-based + header)
-        if row and row[0] == str(row_id):  # assuming ID is in column A
-            target_row_index = idx
-            break
+    values = sheet.get("values", [])
 
-    if target_row_index is None:
-        print(f"❌ No row found with ID {row_id}")
-        return False
+    # Find the matching row by ID (column A)
+    for i, row in enumerate(values):
+        if len(row) >= 1 and row[0] == str(order_id):
+            row_index = i + 2  # Because of header and 0-index
+            target_cell = f"{SHEET_NAME}!AA{row_index}"
 
-    range_to_update = f"{sheet_name}!AA{target_row_index}"
-    print(f"✅ Writing start time {start_time} to {range_to_update}")
+            update_body = {
+                "range": target_cell,
+                "values": [[start_time]],
+                "majorDimension": "ROWS"
+            }
 
-    try:
-        sheet.values().update(
-            spreadsheetId=SHEET_ID,
-            range=range_to_update,
-            valueInputOption="RAW",
-            body={"values": [[start_time]]}
-        ).execute()
-        return True
-    except Exception as e:
-        print("❌ Error updating sheet:", e)
-        return False
+            result = get_sheets_service().spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=target_cell,
+                valueInputOption="RAW",
+                body=update_body
+            ).execute()
+
+            print(f"✅ Updated start time for ID {order_id} to {start_time} in {target_cell}")
+            return True
+
+    print(f"⚠️ ID {order_id} not found in Embroidery List")
+    return False
+
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
