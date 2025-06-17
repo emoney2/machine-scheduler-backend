@@ -452,7 +452,7 @@ def jobs_for_company():
 
     for row in prod_data[1:]:
         row_dict = dict(zip(headers, row))
-        row_company = str(row_dict.get("Company", "")).strip().lower()
+        row_company = str(row_dict.get("Company Name", "")).strip().lower()
         stage = str(row_dict.get("Stage", "")).strip().lower()
 
         if row_company == company:
