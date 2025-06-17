@@ -438,6 +438,49 @@ def prepare_shipment():
         "boxes": boxes
     })
 
+@app.route("/api/set-volume", methods=["POST"])
+@login_required_session
+def set_volume():
+    data = request.get_json()
+    product = data.get("product", "").strip()
+    volume = data.get("volume")
+
+    if not product or not volume:
+        return jsonify({"error": "Missing product or volume"}), 400
+
+    try:
+        volume = float(volume)
+    except:
+        return jsonify({"error": "Volume must be a number"}), 400
+
+    # Fetch the full Table tab A:Z
+    table_data = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
+    headers = table_data[0]
+
+    # Find the row where product name matches column A
+    for idx, row in enumerate(table_data[1:], start=2):  # Row 2 = sheet row 2
+        if len(row) >= 1 and row[0].strip().lower() == product.lower():
+            target_range = f"Table!N{idx}"  # Column N = Volume
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=target_range,
+                valueInputOption="RAW",
+                body={"values": [[volume]]}
+            ).execute()
+            return jsonify({"status": "ok", "updated_row": idx}), 200
+
+    # If product not found, append it to A and N
+    sheets.values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Table!A2:N",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [[product] + [""] * 12 + [volume]]}
+    ).execute()
+
+    return jsonify({"status": "added"}), 200
+
+
 @app.route("/api/embroideryList", methods=["GET"])
 @login_required_session
 def get_embroidery_list():
