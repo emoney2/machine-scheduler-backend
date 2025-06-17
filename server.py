@@ -370,7 +370,16 @@ def prepare_shipment():
             prod_rows.append(row_dict)
 
     # Step 2: Create product→volume lookup
-    table_map = {r[0]: float(r[1]) for r in table_data[1:] if len(r) >= 2 and r[0] and r[1]}
+    table_map = {}
+    for r in table_data[1:]:
+        if len(r) >= 2:
+            product = r[0]
+            volume_str = r[1]
+            try:
+                volume = float(volume_str)
+                table_map[product] = volume
+            except:
+                continue
 
     # Step 3: Check for missing volume data
     missing_products = []
