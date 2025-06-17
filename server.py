@@ -438,6 +438,30 @@ def prepare_shipment():
         "status": "ok",
         "boxes": boxes
     })
+@app.route("/api/jobs-for-company")
+@login_required_session
+def jobs_for_company():
+    company = request.args.get("company", "").strip().lower()
+    if not company:
+        return jsonify({"error": "Missing company parameter"}), 400
+
+    prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
+    headers = prod_data[0]
+    jobs = []
+
+    for row in prod_data[1:]:
+        row_dict = dict(zip(headers, row))
+        row_company = str(row_dict.get("Company", "")).strip().lower()
+        status = str(row_dict.get("Status", "")).strip().lower()
+        if row_company == company and status != "complete":
+            jobs.append({
+                "orderId": str(row_dict.get("Order #", "")).strip(),
+                "product": str(row_dict.get("Product", "")).strip(),
+                "company": row_dict.get("Company", "").strip()
+            })
+
+    return jsonify({"jobs": jobs})
+
 
 @app.route("/api/set-volume", methods=["POST"])
 @login_required_session
