@@ -452,8 +452,8 @@ def jobs_for_company():
     for row in prod_data[1:]:
         row_dict = dict(zip(headers, row))
         row_company = str(row_dict.get("Company", "")).strip().lower()
-        status = str(row_dict.get("Status", "")).strip().lower()
-        if row_company == company and status != "complete":
+        stage = str(row_dict.get("Stage", "")).strip().lower()
+        if row_company == company and stage != "complete":
             jobs.append({
                 "orderId": str(row_dict.get("Order #", "")).strip(),
                 "product": str(row_dict.get("Product", "")).strip(),
