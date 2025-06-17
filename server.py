@@ -347,6 +347,88 @@ def get_orders():
         logger.exception("Error fetching orders")
         return jsonify([]), 200
 
+@app.route("/api/prepare-shipment", methods=["POST"])
+@login_required_session
+def prepare_shipment():
+    data = request.get_json()
+    order_ids = data.get("order_ids", [])
+    if not order_ids:
+        return jsonify({"error": "No order IDs provided"}), 400
+
+    # Fetch both Production Orders and Table tabs
+    prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
+    table_data = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
+
+    prod_headers = prod_data[0]
+    table_headers = table_data[0]
+
+    # Step 1: Find orders that match the given Order #
+    prod_rows = []
+    for row in prod_data[1:]:
+        row_dict = dict(zip(prod_headers, row))
+        if str(row_dict.get("Order #")) in order_ids:
+            prod_rows.append(row_dict)
+
+    # Step 2: Create product→volume lookup
+    table_map = {r[0]: float(r[1]) for r in table_data[1:] if len(r) >= 2 and r[0] and r[1]}
+
+    # Step 3: Check for missing volume data
+    missing_products = []
+    jobs = []
+
+    for row in prod_rows:
+        order_id = str(row["Order #"])
+        product = row.get("Product")
+        volume = table_map.get(product)
+
+        if volume is None:
+            missing_products.append(product)
+        else:
+            jobs.append({
+                "order_id": order_id,
+                "product": product,
+                "volume": volume
+            })
+
+    if missing_products:
+        return jsonify({
+            "error": "Missing volume data",
+            "missing_products": list(set(missing_products))
+        }), 400
+
+    # Step 4: Pack jobs into boxes using greedy volume fit
+    box_sizes = {
+        "Small": 1000,
+        "Medium": 2197,
+        "Large": 8000,
+    }
+
+    boxes = []
+    remaining = jobs.copy()
+
+    while remaining:
+        used_volume = 0
+        box_jobs = []
+
+        for job in remaining[:]:
+            if used_volume + job["volume"] <= box_sizes["Large"]:
+                used_volume += job["volume"]
+                box_jobs.append(job)
+                remaining.remove(job)
+
+        for size, cap in box_sizes.items():
+            if used_volume <= cap:
+                boxes.append({
+                    "size": size,
+                    "jobs": [j["order_id"] for j in box_jobs]
+                })
+                break
+
+    return jsonify({
+        "status": "ok",
+        "boxes": boxes
+    })
+
 @app.route("/api/embroideryList", methods=["GET"])
 @login_required_session
 def get_embroidery_list():
