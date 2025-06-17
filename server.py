@@ -448,17 +448,32 @@ def jobs_for_company():
     prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
     headers = prod_data[0]
     jobs = []
+    debug_rows = []
 
     for row in prod_data[1:]:
         row_dict = dict(zip(headers, row))
         row_company = str(row_dict.get("Company", "")).strip().lower()
         stage = str(row_dict.get("Stage", "")).strip().lower()
+
+        if row_company == company:
+            debug_rows.append({
+                "Order #": row_dict.get("Order #"),
+                "Product": row_dict.get("Product"),
+                "Stage": stage,
+            })
+
         if row_company == company and stage != "complete":
             jobs.append({
                 "orderId": str(row_dict.get("Order #", "")).strip(),
                 "product": str(row_dict.get("Product", "")).strip(),
                 "company": row_dict.get("Company", "").strip()
             })
+
+    if not jobs:
+        return jsonify({
+            "error": "No active jobs found for this company",
+            "debug": debug_rows
+        }), 404
 
     return jsonify({"jobs": jobs})
 
