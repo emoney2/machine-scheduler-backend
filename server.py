@@ -369,26 +369,27 @@ def prepare_shipment():
         if str(row_dict.get("Order #")) in order_ids:
             prod_rows.append(row_dict)
 
-    # Step 2: Create product→volume lookup
+    # Step 2: Create product→volume map
     table_map = {}
     for r in table_data[1:]:
         if len(r) >= 2:
             product = r[0]
-            volume_str = r[1]
+            volume_str = r[13] if len(r) >= 14 else r[1]  # use column N if available
             try:
                 volume = float(volume_str)
-                table_map[product] = volume
+                table_map[product.strip().lower()] = volume
             except:
                 continue
 
-    # Step 3: Check for missing volume data
+    # Step 3: Check for missing volumes and build job list
     missing_products = []
     jobs = []
 
     for row in prod_rows:
         order_id = str(row["Order #"])
-        product = row.get("Product")
-        volume = table_map.get(product)
+        product = row.get("Product", "").strip()
+        key = product.lower()
+        volume = table_map.get(key)
 
         if volume is None:
             missing_products.append(product)
