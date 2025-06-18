@@ -43,10 +43,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SHEET_ID = os.environ.get("SPREADSHEET_ID")
-if not SHEET_ID:
-    raise RuntimeError("Environment variable SHEET_ID is not set")
-
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
 raw_frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
 FRONTEND_URL = raw_frontend.strip()
@@ -538,7 +534,7 @@ def set_volume():
 
     update_range = f"Table!N{row_index}"
     sheets.values().update(
-        spreadsheetId=SHEET_ID,
+        spreadsheetId=SPREADSHEET_ID,
         range=update_range,
         valueInputOption="RAW",
         body={"values": [[volume]]}
@@ -1479,7 +1475,7 @@ def process_shipment():
     if not order_ids:
         return jsonify({"error": "Missing order_ids"}), 400
 
-    sheet_id = os.environ["SHEET_ID"]
+    sheet_id = os.environ["SPREADSHEET_ID"]
     sheet_name = "Production Orders"
     try:
         # Fetch current sheet data
