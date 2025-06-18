@@ -285,13 +285,13 @@ def fetch_sheet(spreadsheet_id, sheet_range):
     return res.get("values", [])
 
 def write_sheet(spreadsheet_id, range_, values):
-    sheets_service = get_sheets_service()
+    service = get_sheets_service()
     body = {
         "range": range_,
         "majorDimension": "ROWS",
         "values": values,
     }
-    return sheets_service.spreadsheets().values().update(
+    return service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=range_,
         valueInputOption="USER_ENTERED",
