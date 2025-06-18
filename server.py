@@ -1460,6 +1460,8 @@ def process_shipment():
     if not order_ids or not boxes:
         return jsonify({"error": "Missing order IDs or boxes"}), 400
 
+    sheets_service = get_sheets_service()  # ✅ ← ADD THIS LINE
+
     # Step 1: Fetch Production Orders tab
     prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
     headers = prod_data[0]
