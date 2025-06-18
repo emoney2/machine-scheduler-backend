@@ -1458,30 +1458,45 @@ def process_shipment():
     boxes = data.get("boxes", [])
 
     if not order_ids or not boxes:
-        return jsonify({"error": "Missing order_ids or boxes"}), 400
+        return jsonify({"error": "Missing order IDs or boxes"}), 400
 
-    # Simulate label generation
-    label_urls = []
-    for i, box in enumerate(boxes):
-        label_url = f"https://fake-ups-labels.com/label_{i+1}.png"
-        label_urls.append(label_url)
+    # Step 1: Fetch Production Orders tab
+    prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
+    headers = prod_data[0]
+    rows = prod_data[1:]
 
-    # Simulate invoice URL
-    invoice_url = "https://jr-company-invoices.netlify.app/invoice-preview?orders=" + ",".join(order_ids)
+    order_col = headers.index("Order #")
+    quantity_col = headers.index("Quantity")
+    shipped_col = headers.index("Shipped")
 
-    # Simulate PDF packing slip links
-    packing_slips = [
-        f"https://jr-company-invoices.netlify.app/packing-slip?box={i+1}&orders={','.join(box['jobs'])}"
-        for i, box in enumerate(boxes)
-    ]
+    # Step 2: Prepare updates
+    updates = []
+    for i, row in enumerate(rows):
+        if len(row) <= order_col:
+            continue
+        order_id = str(row[order_col])
+        if order_id in order_ids:
+            # Match original quantity
+            quantity = row[quantity_col] if len(row) > quantity_col else "0"
+            updates.append({
+                "range": f"Production Orders!AD{i+2}",  # Column AD = Shipped, i+2 for 1-based row with header
+                "values": [[quantity]]
+            })
 
+    if updates:
+        body = {"valueInputOption": "USER_ENTERED", "data": updates}
+        sheets_service.spreadsheets().values().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body=body
+        ).execute()
+
+    # Step 3: Simulate return assets (labels, invoice, slips)
     return jsonify({
         "status": "ok",
-        "labels": label_urls,
-        "invoice": invoice_url,
-        "slips": packing_slips
+        "labels": [f"https://fake-ups-labels.com/label_{i+1}.png" for i in range(len(boxes))],
+        "invoice": "https://fake-invoice.com/invoice123.pdf",
+        "slips": [f"https://fake-slip.com/slip_{i+1}.pdf" for i in range(len(boxes))]
     })
-
 
 @app.errorhandler(Exception)
 def handle_exception(e):
