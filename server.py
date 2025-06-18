@@ -1469,9 +1469,9 @@ def company_list():
 @app.route("/api/process-shipment", methods=["POST"])
 def process_shipment():
     data = request.get_json()
-    order_ids = data.get("order_ids", [])
+    order_ids = list(map(str, data.get("order_ids", [])))  # Ensure strings
     boxes = data.get("boxes", [])
-    shipped_quantities = data.get("shipped_quantities", {})  # New
+    shipped_quantities = {str(k): v for k, v in data.get("shipped_quantities", {}).items()}
 
     if not order_ids:
         return jsonify({"error": "Missing order_ids"}), 400
@@ -1492,8 +1492,8 @@ def process_shipment():
         shipped_col = headers.index("Shipped")
 
         updates = []
-        for i, row in enumerate(rows[1:], start=2):  # start=2 accounts for header
-            order_id = row[id_col] if id_col < len(row) else ""
+        for i, row in enumerate(rows[1:], start=2):  # 2 = 1-index + header
+            order_id = row[id_col].strip() if id_col < len(row) else ""
             if order_id in order_ids:
                 shipped_qty = shipped_quantities.get(order_id)
                 if shipped_qty is not None:
@@ -1517,6 +1517,7 @@ def process_shipment():
     except Exception as e:
         print("Shipment error:", str(e))
         return jsonify({"error": str(e)}), 500
+
 
 @app.errorhandler(Exception)
 def handle_exception(e):
