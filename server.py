@@ -299,6 +299,7 @@ def write_sheet(spreadsheet_id, range_, values):
     ).execute()
 
 
+
 def get_sheet_password():
     try:
         vals = fetch_sheet(SPREADSHEET_ID, "Manual State!J2:J2")
