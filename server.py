@@ -1489,7 +1489,7 @@ def process_shipment():
         rows = result.get("values", [])
 
         headers = rows[0]
-        id_col = headers.index("Order ID")
+        id_col = headers.index("Order #")
         shipped_col = headers.index("Shipped")
         stage_col = headers.index("Stage")
 
