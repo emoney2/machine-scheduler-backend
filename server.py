@@ -1462,54 +1462,63 @@ def company_list():
     return jsonify({"companies": companies})
 
 @app.route("/api/process-shipment", methods=["POST"])
-@login_required_session
 def process_shipment():
     data = request.get_json()
     order_ids = data.get("order_ids", [])
     boxes = data.get("boxes", [])
+    shipped_quantities = data.get("shipped_quantities", {})  # New
 
-    if not order_ids or not boxes:
-        return jsonify({"error": "Missing order IDs or boxes"}), 400
+    if not order_ids:
+        return jsonify({"error": "Missing order_ids"}), 400
 
-    sheets_service = get_sheets_service()  # ✅ ← ADD THIS LINE
-
-    # Step 1: Fetch Production Orders tab
-    prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
-    headers = prod_data[0]
-    rows = prod_data[1:]
-
-    order_col = headers.index("Order #")
-    quantity_col = headers.index("Quantity")
-    shipped_col = headers.index("Shipped")
-
-    # Step 2: Prepare updates
-    updates = []
-    for i, row in enumerate(rows):
-        if len(row) <= order_col:
-            continue
-        order_id = str(row[order_col])
-        if order_id in order_ids:
-            # Match original quantity
-            quantity = row[quantity_col] if len(row) > quantity_col else "0"
-            updates.append({
-                "range": f"Production Orders!G{i+2}",
-                "values": [[quantity]]
-            })
-
-    if updates:
-        body = {"valueInputOption": "USER_ENTERED", "data": updates}
-        sheets_service.spreadsheets().values().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body=body
+    sheet_id = os.environ["SHEET_ID"]
+    sheet_name = "Production Orders"
+    try:
+        # Fetch current sheet data
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{sheet_name}!A1:Z",
         ).execute()
+        rows = result.get("values", [])
 
-    # Step 3: Simulate return assets (labels, invoice, slips)
-    return jsonify({
-        "status": "ok",
-        "labels": [f"https://fake-ups-labels.com/label_{i+1}.png" for i in range(len(boxes))],
-        "invoice": "https://fake-invoice.com/invoice123.pdf",
-        "slips": [f"https://fake-slip.com/slip_{i+1}.pdf" for i in range(len(boxes))]
-    })
+        headers = rows[0]
+        id_col = headers.index("Order ID")
+        shipped_col = headers.index("Shipped")
+        stage_col = headers.index("Stage")
+
+        # Prepare updates
+        updates = []
+        for i, row in enumerate(rows[1:], start=2):  # start=2 for 1-based + header row
+            order_id = row[id_col] if id_col < len(row) else ""
+            if order_id in order_ids:
+                shipped_qty = shipped_quantities.get(order_id)
+                if shipped_qty is not None:
+                    updates.append({
+                        "range": f"{sheet_name}!{chr(71)}{i}",  # Column G = 71 = 'G'
+                        "values": [[str(shipped_qty)]]
+                    })
+                updates.append({
+                    "range": f"{sheet_name}!{chr(stage_col + 65)}{i}",
+                    "values": [["Complete"]]
+                })
+
+        # Apply updates
+        if updates:
+            sheets_service.spreadsheets().values().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"valueInputOption": "USER_ENTERED", "data": updates}
+            ).execute()
+
+        # Simulate label, invoice, and slip creation
+        return jsonify({
+            "labels": ["https://example.com/label1.pdf"],
+            "invoice": "https://example.com/invoice.pdf",
+            "slips": ["https://example.com/slip1.pdf"]
+        })
+
+    except Exception as e:
+        print("Shipment error:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 @app.errorhandler(Exception)
 def handle_exception(e):
