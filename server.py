@@ -43,7 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SHEET_ID = os.environ.get("SHEET_ID")
+SHEET_ID = os.environ.get("SPREADSHEET_ID")
 if not SHEET_ID:
     raise RuntimeError("Environment variable SHEET_ID is not set")
 
