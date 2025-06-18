@@ -1472,6 +1472,9 @@ def process_shipment():
     order_ids = [str(oid).strip() for oid in data.get("order_ids", [])]
     shipped_quantities = {str(k).strip(): v for k, v in data.get("shipped_quantities", {}).items()}
 
+    print("→ order_ids received:", order_ids)
+    print("→ shipped_quantities received:", shipped_quantities)
+
     if not order_ids:
         return jsonify({"error": "Missing order_ids"}), 400
 
@@ -1493,19 +1496,26 @@ def process_shipment():
         updates = []
         for i, row in enumerate(rows[1:], start=2):  # start=2 for 1-based index
             row_order_id = str(row[id_col]).strip() if id_col < len(row) else ""
+            print(f"→ Row {i}: Order ID in sheet = '{row_order_id}'")
+
             if row_order_id in order_ids:
                 qty = shipped_quantities.get(row_order_id)
+                print(f"✅ Match! Writing {qty} to row {i}")
                 if qty is not None:
                     updates.append({
                         "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
                         "values": [[str(qty)]]
                     })
 
+        if not updates:
+            print("⚠️ No updates prepared — check for ID mismatches.")
+
         if updates:
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=sheet_id,
                 body={"valueInputOption": "USER_ENTERED", "data": updates}
             ).execute()
+            print("✅ Successfully wrote quantities to sheet.")
 
         return jsonify({
             "labels": ["https://example.com/label1.pdf"],
@@ -1514,7 +1524,7 @@ def process_shipment():
         })
 
     except Exception as e:
-        print("Shipment error:", str(e))
+        print("❌ Shipment error:", str(e))
         return jsonify({"error": str(e)}), 500
 
 
