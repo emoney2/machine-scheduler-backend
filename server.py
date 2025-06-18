@@ -1469,9 +1469,8 @@ def company_list():
 @app.route("/api/process-shipment", methods=["POST"])
 def process_shipment():
     data = request.get_json()
-    order_ids = list(map(str, data.get("order_ids", [])))  # Ensure strings
-    boxes = data.get("boxes", [])
-    shipped_quantities = {str(k): v for k, v in data.get("shipped_quantities", {}).items()}
+    order_ids = [str(oid).strip() for oid in data.get("order_ids", [])]
+    shipped_quantities = {str(k).strip(): v for k, v in data.get("shipped_quantities", {}).items()}
 
     if not order_ids:
         return jsonify({"error": "Missing order_ids"}), 400
@@ -1492,14 +1491,14 @@ def process_shipment():
         shipped_col = headers.index("Shipped")
 
         updates = []
-        for i, row in enumerate(rows[1:], start=2):  # 2 = 1-index + header
-            order_id = row[id_col].strip() if id_col < len(row) else ""
-            if order_id in order_ids:
-                shipped_qty = shipped_quantities.get(order_id)
-                if shipped_qty is not None:
+        for i, row in enumerate(rows[1:], start=2):  # start=2 for 1-based index
+            row_order_id = str(row[id_col]).strip() if id_col < len(row) else ""
+            if row_order_id in order_ids:
+                qty = shipped_quantities.get(row_order_id)
+                if qty is not None:
                     updates.append({
                         "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
-                        "values": [[str(shipped_qty)]]
+                        "values": [[str(qty)]]
                     })
 
         if updates:
