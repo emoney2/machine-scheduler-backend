@@ -1428,6 +1428,29 @@ def mark_inventory_received():
 
     return jsonify({"status":"ok"}), 200
 
+@app.route("/api/company-list")
+@login_required_session
+def company_list():
+    directory_data = fetch_sheet(SPREADSHEET_ID, "Directory!A1:Z")
+    headers = directory_data[0]
+
+    # Try to find the column with company names
+    col_index = None
+    for idx, col in enumerate(headers):
+        if str(col).strip().lower() in ["company name", "company"]:
+            col_index = idx
+            break
+
+    if col_index is None:
+        return jsonify({"error": "Company name column not found in Directory tab"}), 500
+
+    # Get all non-empty company names and deduplicate
+    companies = list({row[col_index].strip() for row in directory_data[1:] if len(row) > col_index and row[col_index].strip()})
+    companies.sort()
+
+    return jsonify({"companies": companies})
+
+
 @app.errorhandler(Exception)
 def handle_exception(e):
     # Log the full stack for debugging
