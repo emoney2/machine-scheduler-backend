@@ -1471,31 +1471,28 @@ def process_shipment():
     data = request.get_json()
     order_ids = data.get("order_ids", [])
     boxes = data.get("boxes", [])
-    shipped_quantities = data.get("shipped_quantities", {})
+    shipped_quantities = data.get("shipped_quantities", {})  # New
 
     if not order_ids:
         return jsonify({"error": "Missing order_ids"}), 400
 
     sheet_id = os.environ["SPREADSHEET_ID"]
     sheet_name = "Production Orders"
-    sheets_service = get_sheets_service()  # ✅ define the service here
 
     try:
-        # Fetch current sheet data
-        result = sheets_service.spreadsheets().values().get(
+        service = get_sheets_service()
+        result = service.spreadsheets().values().get(
             spreadsheetId=sheet_id,
             range=f"{sheet_name}!A1:Z",
         ).execute()
         rows = result.get("values", [])
-
         headers = rows[0]
+
         id_col = headers.index("Order #")
         shipped_col = headers.index("Shipped")
-        stage_col = headers.index("Stage")
 
-        # Prepare updates
         updates = []
-        for i, row in enumerate(rows[1:], start=2):  # start=2 for 1-based row numbers
+        for i, row in enumerate(rows[1:], start=2):  # start=2 accounts for header
             order_id = row[id_col] if id_col < len(row) else ""
             if order_id in order_ids:
                 shipped_qty = shipped_quantities.get(order_id)
@@ -1504,19 +1501,13 @@ def process_shipment():
                         "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
                         "values": [[str(shipped_qty)]]
                     })
-                updates.append({
-                    "range": f"{sheet_name}!{chr(stage_col + 65)}{i}",
-                    "values": [["Complete"]]
-                })
 
-        # Apply updates to Google Sheet
         if updates:
-            sheets_service.spreadsheets().values().batchUpdate(
+            service.spreadsheets().values().batchUpdate(
                 spreadsheetId=sheet_id,
                 body={"valueInputOption": "USER_ENTERED", "data": updates}
             ).execute()
 
-        # Simulate label, invoice, and slip creation
         return jsonify({
             "labels": ["https://example.com/label1.pdf"],
             "invoice": "https://example.com/invoice.pdf",
@@ -1526,7 +1517,6 @@ def process_shipment():
     except Exception as e:
         print("Shipment error:", str(e))
         return jsonify({"error": str(e)}), 500
-
 
 @app.errorhandler(Exception)
 def handle_exception(e):
