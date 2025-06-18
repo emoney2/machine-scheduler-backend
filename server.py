@@ -285,6 +285,21 @@ def fetch_sheet(spreadsheet_id, sheet_range):
         ).execute()
     return res.get("values", [])
 
+def write_sheet(spreadsheet_id, range_, values):
+    sheets_service = get_sheets_service()
+    body = {
+        "range": range_,
+        "majorDimension": "ROWS",
+        "values": values,
+    }
+    return sheets_service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=range_,
+        valueInputOption="USER_ENTERED",
+        body=body
+    ).execute()
+
+
 def get_sheet_password():
     try:
         vals = fetch_sheet(SPREADSHEET_ID, "Manual State!J2:J2")
