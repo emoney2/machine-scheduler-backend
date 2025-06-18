@@ -1479,7 +1479,7 @@ def process_shipment():
             # Match original quantity
             quantity = row[quantity_col] if len(row) > quantity_col else "0"
             updates.append({
-                "range": f"Production Orders!AD{i+2}",  # Column AD = Shipped, i+2 for 1-based row with header
+                "range": f"Production Orders!G{i+2}",
                 "values": [[quantity]]
             })
 
