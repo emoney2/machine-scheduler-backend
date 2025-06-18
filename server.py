@@ -448,34 +448,40 @@ def jobs_for_company():
     prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
     headers = prod_data[0]
     jobs = []
-    debug_rows = []
 
     for row in prod_data[1:]:
         row_dict = dict(zip(headers, row))
         row_company = str(row_dict.get("Company Name", "")).strip().lower()
         stage = str(row_dict.get("Stage", "")).strip().lower()
 
-        if row_company == company:
-            debug_rows.append({
-                "Order #": row_dict.get("Order #"),
-                "Product": row_dict.get("Product"),
-                "Stage": stage,
-            })
-
         if row_company == company and stage != "complete":
+            # Parse Google Drive file ID from image link
+            image_link = str(row_dict.get("Image", "")).strip()
+            file_id = ""
+            if "id=" in image_link:
+                file_id = image_link.split("id=")[-1].split("&")[0]
+            elif "file/d/" in image_link:
+                file_id = image_link.split("file/d/")[-1].split("/")[0]
+
+            preview_url = (
+                f"https://drive.google.com/thumbnail?id={file_id}"
+                if file_id else ""
+            )
+
             jobs.append({
                 "orderId": str(row_dict.get("Order #", "")).strip(),
-                "product": str(row_dict.get("Product", "")).strip(),
-                "company": row_dict.get("Company", "").strip()
+                "date": row_dict.get("Date", "").strip(),
+                "company": row_dict.get("Company Name", "").strip(),
+                "design": row_dict.get("Design", "").strip(),
+                "quantity": row_dict.get("Quantity", "").strip(),
+                "product": row_dict.get("Product", "").strip(),
+                "stage": row_dict.get("Stage", "").strip(),
+                "price": row_dict.get("Price", "").strip(),
+                "due": row_dict.get("Due Date", "").strip(),
+                "image": preview_url
             })
 
-    if not jobs:
-        return jsonify({
-            "error": "No active jobs found for this company",
-            "debug": debug_rows
-        }), 404
-
-    return jsonify({"jobs": jobs})
+    return jsonify({ "jobs": jobs })
 
 
 @app.route("/api/set-volume", methods=["POST"])
