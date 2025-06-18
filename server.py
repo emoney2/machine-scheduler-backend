@@ -314,11 +314,11 @@ _login_page = """
 <!doctype html>
 <title>Login</title>
 <h2>Please log in</h2>
-<form method="post">
+<form method=post>
+  <input name=username placeholder="Username" required>
+  <input name=password type=password placeholder="Password" required>
   <input type="hidden" name="next" value="{{ next }}">
-  <input name="username" placeholder="Username" required>
-  <input name="password" type="password" placeholder="Password" required>
-  <button type="submit">Log In</button>
+  <button type=submit>Log In</button>
 </form>
 {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
 """
@@ -327,27 +327,24 @@ _login_page = """
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
-    next_url = request.args.get("next") or "/"  # Add this line
+    next_url = request.args.get("next") or "/"
 
     if request.method == "POST":
         u = request.form["username"]
         p = request.form["password"]
-        ADMIN_PW    = os.environ.get("ADMIN_PASSWORD", "")
+        ADMIN_PW = os.environ.get("ADMIN_PASSWORD", "")
         ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
         if u == "admin" and p == ADMIN_PW:
             session.clear()
-            session["user"]           = u
+            session["user"] = u
             session["token_at_login"] = ADMIN_TOKEN
-            session["last_activity"]  = datetime.utcnow().isoformat()
-            return redirect(next_url)
+            session["last_activity"] = datetime.utcnow().isoformat()
+            return redirect(request.form.get("next") or "/")
         else:
             error = "Invalid credentials"
 
     return render_template_string(_login_page, error=error, next=next_url)
-
-
-
 
 @app.route("/logout")
 def logout():
