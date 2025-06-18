@@ -314,17 +314,21 @@ _login_page = """
 <!doctype html>
 <title>Login</title>
 <h2>Please log in</h2>
-<form method=post>
-  <input name=username placeholder="Username" required>
-  <input name=password type=password placeholder="Password" required>
-  <button type=submit>Log In</button>
+<form method="post">
+  <input type="hidden" name="next" value="{{ next }}">
+  <input name="username" placeholder="Username" required>
+  <input name="password" type="password" placeholder="Password" required>
+  <button type="submit">Log In</button>
 </form>
 {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
 """
 
-@app.route("/login", methods=["GET","POST"])
+
+@app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
+    next_url = request.args.get("next") or "/"  # Add this line
+
     if request.method == "POST":
         u = request.form["username"]
         p = request.form["password"]
@@ -334,13 +338,14 @@ def login():
         if u == "admin" and p == ADMIN_PW:
             session.clear()
             session["user"]           = u
-            # Instead of pwd_at_login, store token_at_login:
             session["token_at_login"] = ADMIN_TOKEN
             session["last_activity"]  = datetime.utcnow().isoformat()
-            return redirect(FRONTEND_URL)
+            return redirect(next_url)
         else:
             error = "Invalid credentials"
-    return render_template_string(_login_page, error=error)
+
+    return render_template_string(_login_page, error=error, next=next_url)
+
 
 
 
