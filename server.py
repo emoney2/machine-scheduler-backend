@@ -488,44 +488,44 @@ def jobs_for_company():
 @login_required_session
 def set_volume():
     data = request.get_json()
-    product = data.get("product", "").strip()
-    volume = data.get("volume")
+    product = data.get("product")
+    length = data.get("length")
+    width = data.get("width")
+    height = data.get("height")
 
-    if not product or not volume:
-        return jsonify({"error": "Missing product or volume"}), 400
+    if not all([product, length, width, height]):
+        return jsonify({"error": "Missing product or dimensions"}), 400
 
     try:
-        volume = float(volume)
+        volume = float(length) * float(width) * float(height)
     except:
-        return jsonify({"error": "Volume must be a number"}), 400
+        return jsonify({"error": "Invalid dimensions"}), 400
 
-    # Fetch the full Table tab A:Z
     table_data = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
     headers = table_data[0]
+    rows = table_data[1:]
 
-    # Find the row where product name matches column A
-    for idx, row in enumerate(table_data[1:], start=2):  # Row 2 = sheet row 2
-        if len(row) >= 1 and row[0].strip().lower() == product.lower():
-            target_range = f"Table!N{idx}"  # Column N = Volume
-            sheets.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=target_range,
-                valueInputOption="RAW",
-                body={"values": [[volume]]}
-            ).execute()
-            return jsonify({"status": "ok", "updated_row": idx}), 200
+    product_col = headers.index("Product")
+    volume_col = headers.index("Volume")
 
-    # If product not found, append it to A and N
-    sheets.values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Table!A2:N",
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body={"values": [[product] + [""] * 12 + [volume]]}
-    ).execute()
+    updated = False
+    for i, row in enumerate(rows):
+        if len(row) > product_col and row[product_col] == product:
+            while len(row) <= volume_col:
+                row.append("")
+            row[volume_col] = str(volume)
+            update_sheet_range(SPREADSHEET_ID, f"Table!A{i+2}:Z{i+2}", [row])
+            updated = True
+            break
 
-    return jsonify({"status": "added"}), 200
+    if not updated:
+        # Append new row if product not found
+        new_row = [""] * max(product_col + 1, volume_col + 1)
+        new_row[product_col] = product
+        new_row[volume_col] = str(volume)
+        append_sheet(SPREADSHEET_ID, "Table!A:Z", [new_row])
 
+    return jsonify({"status": "ok", "volume": volume})
 
 @app.route("/api/embroideryList", methods=["GET"])
 @login_required_session
