@@ -500,7 +500,6 @@ def jobs_for_company():
 
 
 @app.route("/api/set-volume", methods=["POST"])
-@login_required_session
 def set_volume():
     data = request.get_json()
     product = data.get("product")
@@ -509,34 +508,39 @@ def set_volume():
     height = data.get("height")
 
     if not all([product, length, width, height]):
-        return jsonify({"error": "Missing product or dimensions"}), 400
+        return jsonify({"error": "Missing fields"}), 400
 
     try:
-        volume = float(length) * float(width) * float(height)
-    except:
+        volume = int(length) * int(width) * int(height)
+    except ValueError:
         return jsonify({"error": "Invalid dimensions"}), 400
 
-    # Fetch current Table tab
-    table_data = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
-    headers = table_data[0]
-    rows = table_data[1:]
+    sheets = get_sheets_service().spreadsheets()
+    table_range = "Table!A2:A"
+    result = sheets.values().get(spreadsheetId=SHEET_ID, range=table_range).execute()
+    rows = result.get("values", [])
+    products = [row[0] for row in rows if row]
 
-    product_names = [r[0] for r in rows if r and len(r) >= 1]
+    if product in products:
+        row_index = products.index(product) + 2
+    else:
+        row_index = len(products) + 2
+        sheets.values().append(
+            spreadsheetId=SHEET_ID,
+            range="Table!A2",
+            valueInputOption="RAW",
+            body={"values": [[product]]}
+        ).execute()
 
-    if product not in product_names:
-        return jsonify({"error": f"Product '{product}' is not in list"}), 400
+    update_range = f"Table!N{row_index}"
+    sheets.values().update(
+        spreadsheetId=SHEET_ID,
+        range=update_range,
+        valueInputOption="RAW",
+        body={"values": [[volume]]}
+    ).execute()
 
-    idx = product_names.index(product) + 2  # Account for header + 1-indexing
-    col_letter = "N"  # Column N = Volume
-
-    # Write volume to sheet
-    write_sheet(
-        SPREADSHEET_ID,
-        f"Table!{col_letter}{idx}",
-        [[volume]]
-    )
-
-    return jsonify({"status": "ok", "product": product, "volume": volume})
+    return jsonify({"message": "Volume saved", "volume": volume})
 
 @app.route("/api/embroideryList", methods=["GET"])
 @login_required_session
