@@ -43,7 +43,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SHEET_ID = os.getenv("SHEET_ID")
+SHEET_ID = os.environ.get("SHEET_ID")
+if not SHEET_ID:
+    raise RuntimeError("Environment variable SHEET_ID is not set")
 
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
 raw_frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
