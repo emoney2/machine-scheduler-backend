@@ -1450,6 +1450,38 @@ def company_list():
 
     return jsonify({"companies": companies})
 
+@app.route("/api/process-shipment", methods=["POST"])
+@login_required_session
+def process_shipment():
+    data = request.get_json()
+    order_ids = data.get("order_ids", [])
+    boxes = data.get("boxes", [])
+
+    if not order_ids or not boxes:
+        return jsonify({"error": "Missing order_ids or boxes"}), 400
+
+    # Simulate label generation
+    label_urls = []
+    for i, box in enumerate(boxes):
+        label_url = f"https://fake-ups-labels.com/label_{i+1}.png"
+        label_urls.append(label_url)
+
+    # Simulate invoice URL
+    invoice_url = "https://jr-company-invoices.netlify.app/invoice-preview?orders=" + ",".join(order_ids)
+
+    # Simulate PDF packing slip links
+    packing_slips = [
+        f"https://jr-company-invoices.netlify.app/packing-slip?box={i+1}&orders={','.join(box['jobs'])}"
+        for i, box in enumerate(boxes)
+    ]
+
+    return jsonify({
+        "status": "ok",
+        "labels": label_urls,
+        "invoice": invoice_url,
+        "slips": packing_slips
+    })
+
 
 @app.errorhandler(Exception)
 def handle_exception(e):
