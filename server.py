@@ -24,7 +24,6 @@ from google_auth_httplib2 import AuthorizedHttp
 
 from googleapiclient.http         import MediaIoBaseUpload
 from datetime                      import datetime
-from sheets import write_sheet
 
 START_TIME_COL_INDEX = 27
 
