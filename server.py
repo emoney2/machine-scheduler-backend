@@ -1471,13 +1471,15 @@ def process_shipment():
     data = request.get_json()
     order_ids = data.get("order_ids", [])
     boxes = data.get("boxes", [])
-    shipped_quantities = data.get("shipped_quantities", {})  # New
+    shipped_quantities = data.get("shipped_quantities", {})
 
     if not order_ids:
         return jsonify({"error": "Missing order_ids"}), 400
 
     sheet_id = os.environ["SPREADSHEET_ID"]
     sheet_name = "Production Orders"
+    sheets_service = get_sheets_service()  # ✅ define the service here
+
     try:
         # Fetch current sheet data
         result = sheets_service.spreadsheets().values().get(
@@ -1493,13 +1495,13 @@ def process_shipment():
 
         # Prepare updates
         updates = []
-        for i, row in enumerate(rows[1:], start=2):  # start=2 for 1-based + header row
+        for i, row in enumerate(rows[1:], start=2):  # start=2 for 1-based row numbers
             order_id = row[id_col] if id_col < len(row) else ""
             if order_id in order_ids:
                 shipped_qty = shipped_quantities.get(order_id)
                 if shipped_qty is not None:
                     updates.append({
-                        "range": f"{sheet_name}!{chr(71)}{i}",  # Column G = 71 = 'G'
+                        "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
                         "values": [[str(shipped_qty)]]
                     })
                 updates.append({
@@ -1507,7 +1509,7 @@ def process_shipment():
                     "values": [["Complete"]]
                 })
 
-        # Apply updates
+        # Apply updates to Google Sheet
         if updates:
             sheets_service.spreadsheets().values().batchUpdate(
                 spreadsheetId=sheet_id,
@@ -1524,6 +1526,7 @@ def process_shipment():
     except Exception as e:
         print("Shipment error:", str(e))
         return jsonify({"error": str(e)}), 500
+
 
 @app.errorhandler(Exception)
 def handle_exception(e):
