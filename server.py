@@ -43,6 +43,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+SHEET_ID = os.getenv("SHEET_ID")
+
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
 raw_frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
 FRONTEND_URL = raw_frontend.strip()
