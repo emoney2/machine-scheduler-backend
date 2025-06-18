@@ -324,23 +324,23 @@ _login_page = """
 """
 
 
-@app.route("/login", methods=["GET", "POST"])
+@app.route("/login", methods=["GET","POST"])
 def login():
     error = None
-    next_url = request.args.get("next") or "/"
+    next_url = request.args.get("next") or "/"  # <-- Add this line
 
     if request.method == "POST":
         u = request.form["username"]
         p = request.form["password"]
-        ADMIN_PW = os.environ.get("ADMIN_PASSWORD", "")
+        ADMIN_PW    = os.environ.get("ADMIN_PASSWORD", "")
         ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
         if u == "admin" and p == ADMIN_PW:
             session.clear()
-            session["user"] = u
+            session["user"]           = u
             session["token_at_login"] = ADMIN_TOKEN
-            session["last_activity"] = datetime.utcnow().isoformat()
-            return redirect(request.form.get("next") or "/")
+            session["last_activity"]  = datetime.utcnow().isoformat()
+            return redirect(next_url)
         else:
             error = "Invalid credentials"
 
