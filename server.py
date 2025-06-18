@@ -501,31 +501,27 @@ def set_volume():
     except:
         return jsonify({"error": "Invalid dimensions"}), 400
 
+    # Fetch current Table tab
     table_data = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
     headers = table_data[0]
     rows = table_data[1:]
 
-    product_col = headers.index("Product")
-    volume_col = headers.index("Volume")
+    product_names = [r[0] for r in rows if r and len(r) >= 1]
 
-    updated = False
-    for i, row in enumerate(rows):
-        if len(row) > product_col and row[product_col] == product:
-            while len(row) <= volume_col:
-                row.append("")
-            row[volume_col] = str(volume)
-            update_sheet_range(SPREADSHEET_ID, f"Table!A{i+2}:Z{i+2}", [row])
-            updated = True
-            break
+    if product not in product_names:
+        return jsonify({"error": f"Product '{product}' is not in list"}), 400
 
-    if not updated:
-        # Append new row if product not found
-        new_row = [""] * max(product_col + 1, volume_col + 1)
-        new_row[product_col] = product
-        new_row[volume_col] = str(volume)
-        append_sheet(SPREADSHEET_ID, "Table!A:Z", [new_row])
+    idx = product_names.index(product) + 2  # Account for header + 1-indexing
+    col_letter = "N"  # Column N = Volume
 
-    return jsonify({"status": "ok", "volume": volume})
+    # Write volume to sheet
+    write_sheet(
+        SPREADSHEET_ID,
+        f"Table!{col_letter}{idx}",
+        [[volume]]
+    )
+
+    return jsonify({"status": "ok", "product": product, "volume": volume})
 
 @app.route("/api/embroideryList", methods=["GET"])
 @login_required_session
