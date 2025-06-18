@@ -1519,6 +1519,7 @@ def process_shipment():
         return jsonify({"error": str(e)}), 500
 
 
+
 @app.errorhandler(Exception)
 def handle_exception(e):
     # Log the full stack for debugging
