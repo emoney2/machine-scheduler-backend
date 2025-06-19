@@ -1561,6 +1561,76 @@ def handle_exception(e):
     resp.headers["Access-Control-Allow-Credentials"] = "true"
     return resp
 
+@app.route("/api/product-specs", methods=["POST"])
+@login_required_session
+def set_product_specs():
+    """
+    Accepts JSON:
+      {
+        "product": "My Product Name",
+        "printTime": 12,
+        "perYard": 3,
+        "foamHalf": 10,
+        "foam38": 8,
+        "foam14": 6,
+        "foam18": 4,
+        "magnetN": 5,
+        "magnetS": 5,
+        "elasticHalf": 100,
+        "volume": 2000
+      }
+    Finds the matching row in the Table sheet by column A, then writes
+    each value into its lettered column.
+    """
+    data = request.get_json() or {}
+    product = data.get("product", "").strip()
+    if not product:
+        return jsonify({"error": "Missing product"}), 400
+
+    # 1) Fetch column A (Products) to find the row
+    sheet = get_sheets_service().spreadsheets()
+    result = sheet.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Table!A2:Z"
+    ).execute()
+    values = result.get("values", [])
+
+    row_index = None
+    for i, row in enumerate(values, start=2):
+        if str(row[0]).strip().lower() == product.lower():
+            row_index = i
+            break
+
+    if row_index is None:
+        return jsonify({"error": f"Product '{product}' not found"}), 404
+
+    # 2) Map each incoming field to its sheet column
+    updates = {
+        "D": data.get("printTime", ""),       # Print Times (1 Machine)
+        "F": data.get("perYard", ""),         # How Many Products Per Yard
+        "G": data.get("foamHalf", ""),        # 1/2" Foam
+        "H": data.get("foam38", ""),          # 3/8" Foam
+        "I": data.get("foam14", ""),          # 1/4" Foam
+        "J": data.get("foam18", ""),          # 1/8" Foam
+        "K": data.get("magnetN", ""),         # N Magnets
+        "L": data.get("magnetS", ""),         # S Magnets
+        "M": data.get("elasticHalf", ""),     # 1/2" Elastic
+        "N": data.get("volume", ""),          # Volume
+    }
+
+    # 3) Write each one cell
+    for col, val in updates.items():
+        target = f"Table!{col}{row_index}"
+        sheet.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=target,
+            valueInputOption="RAW",
+            body={"values": [[ val ]]}
+        ).execute()
+
+    return jsonify({"status": "ok"}), 200
+
+
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
