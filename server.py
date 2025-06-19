@@ -1106,6 +1106,18 @@ def add_thread():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+@app.route("/api/table", methods=["GET"])
+@login_required_session
+def get_table():
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
+        headers = rows[0]
+        data = [dict(zip(headers, r)) for r in rows[1:]]
+        return jsonify(data), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ─── MATERIALS ENDPOINTS ────────────────────────────────────────────────
 
 from flask import make_response  # if not already imported
