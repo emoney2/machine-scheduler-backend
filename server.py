@@ -510,6 +510,7 @@ def jobs_for_company():
 
 @app.route("/api/set-volume", methods=["POST"])
 def set_volume():
+    global SPREADSHEET_ID
     data = request.get_json()
     product = data.get("product")
     length = data.get("length")
