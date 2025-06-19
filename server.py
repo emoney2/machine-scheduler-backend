@@ -311,16 +311,22 @@ def get_sheet_password():
 
 # ─── Minimal Login Page (HTML) ───────────────────────────────────────────────
 _login_page = """
-<!doctype html>
-<title>Login</title>
-<h2>Please log in</h2>
-<form method=post>
-  <input type="hidden" name="next" value="{{ next }}">
-  <input name=username placeholder="Username" required>
-  <input name=password type=password placeholder="Password" required>
-  <button type=submit>Log In</button>
-</form>
-{% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+<!DOCTYPE html>
+<html>
+<head><title>Login</title></head>
+<body>
+  <h2>Login</h2>
+  {% if error %}
+    <p style="color: red;">{{ error }}</p>
+  {% endif %}
+  <form method="POST">
+    <input type="text" name="username" placeholder="Username" required><br><br>
+    <input type="password" name="password" placeholder="Password" required><br><br>
+    <input type="hidden" name="next" value="{{ next }}">
+    <button type="submit">Login</button>
+  </form>
+</body>
+</html>
 """
 
 
