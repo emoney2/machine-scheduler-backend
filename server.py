@@ -1106,6 +1106,31 @@ def add_thread():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+@app.route("/api/table", methods=["POST"])
+@login_required_session
+def add_table_entry():
+    """
+    Appends a new product to the Table sheet (column A).
+    Expects JSON body: { "Product": "<product name>" }
+    """
+    data = request.get_json(silent=True) or {}
+    product = data.get("Product", "").strip()
+    if not product:
+        return jsonify({"error": "Missing Product"}), 400
+
+    try:
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Table!A2:Z",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[product]]}
+        ).execute()
+        return jsonify({"status": "ok", "product": product}), 200
+    except Exception as e:
+        logger.exception("Failed to append to Table")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/table", methods=["GET"])
 @login_required_session
 def get_table():
