@@ -799,7 +799,7 @@ def submit_order():
             ).execute()
             raw = resp.get("values", [[""]])[0][0] or ""
             # only replace exact “<col_letter>2” (word-boundaried)
-            return re.sub(rf"\\b{col_letter}2\\b", f\"{col_letter}{next_row}\", raw)
+            return re.sub(rf"\\b{col_letter}2\\b", f"{col_letter}{next_row}", raw)
 
         # timestamp + template cells from row 2
         ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
