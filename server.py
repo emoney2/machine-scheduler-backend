@@ -1109,26 +1109,55 @@ def add_thread():
 @app.route("/api/table", methods=["POST"])
 @login_required_session
 def add_table_entry():
-    """
-    Appends a new product to the Table sheet (column A).
-    Expects JSON body: { "Product": "<product name>" }
-    """
     data = request.get_json(silent=True) or {}
-    product = data.get("Product", "").strip()
-    if not product:
-        return jsonify({"error": "Missing Product"}), 400
+
+    # 1) Extract your 11 fields
+    product_name        = data.get("product", "").strip()        # → A
+    print_time          = data.get("printTime", "")             # → D
+    per_yard            = data.get("perYard", "")               # → F
+    foam_half           = data.get("foamHalf", "")              # → G
+    foam_38             = data.get("foam38", "")                # → H
+    foam_14             = data.get("foam14", "")                # → I
+    foam_18             = data.get("foam18", "")                # → J
+    n_magnets           = data.get("magnetN", "")               # → K
+    s_magnets           = data.get("magnetS", "")               # → L
+    elastic_half_length = data.get("elasticHalf", "")           # → M
+    volume              = data.get("volume", "")                # → N
+
+    if not product_name:
+        return jsonify({"error": "Missing product name"}), 400
 
     try:
+        # 2) Append into Table!A2:N2 with blanks at B, C, E
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Table!A2:Z",
+            range="Table!A2:N2",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": [[product]]}
+            body={
+                "values": [[
+                    product_name,   # A: Products
+                    "",             # B: (blank)
+                    "",             # C: (blank)
+                    print_time,     # D: Print Times (1 Machine)
+                    "",             # E: (blank)
+                    per_yard,       # F: How Many Products Per Yard
+                    foam_half,      # G: 1/2" Foam
+                    foam_38,        # H: 3/8" Foam
+                    foam_14,        # I: 1/4" Foam
+                    foam_18,        # J: 1/8" Foam
+                    n_magnets,      # K: N Magnets
+                    s_magnets,      # L: S Magnets
+                    elastic_half_length,  # M: 1/2" Elastic
+                    volume          # N: Volume
+                ]]
+            }
         ).execute()
-        return jsonify({"status": "ok", "product": product}), 200
+
+        return jsonify({"status": "ok", "product": product_name}), 200
+
     except Exception as e:
-        logger.exception("Failed to append to Table")
+        logger.exception("Failed to append new product to Table")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/table", methods=["GET"])
