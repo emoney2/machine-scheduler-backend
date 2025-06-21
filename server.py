@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import traceback
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -790,14 +791,15 @@ def submit_order():
         new_order  = prev_order + 1
 
         # helper: copy the formula from row 2 of <cell> and rewrite “2” → new row
-        def tpl_formula(cell):
+        def tpl_formula(col_letter, next_row):
             resp = sheets.values().get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"Production Orders!{cell}2",
+                range=f"Production Orders!{col_letter}2",
                 valueRenderOption="FORMULA"
             ).execute()
             raw = resp.get("values", [[""]])[0][0] or ""
-            return raw.replace("2", str(next_row))
+            # only replace exact “<col_letter>2” (word-boundaried)
+            return re.sub(rf"\\b{col_letter}2\\b", f\"{col_letter}{next_row}\", raw)
 
         # timestamp + template cells from row 2
         ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
@@ -807,30 +809,37 @@ def submit_order():
                 range=f"Production Orders!{cell}2"
             ).execute().get("values",[[""]])[0][0]
 
-        preview      = tpl_formula("C")
-        stage        = tpl_formula("I")
-        ship_date    = tpl_formula("V")
-        stitch_count = tpl_formula("W")
-        reenter      = "FALSE"
-        schedule_str = tpl_formula("AC")
+        preview      = tpl_formula("C",  next_row)
+        stage        = tpl_formula("I",  next_row)
+        ship_date    = tpl_formula("V",  next_row)
+        stitch_count = tpl_formula("W", next_row)
+        schedule_str = tpl_formula("AC", next_row)
+
+        # helper: make a Drive folder (optionally under a parent) and return its ID
+        def create_folder(name, parent_id=None):
+            meta = {
+                "name": str(name),
+                "mimeType": "application/vnd.google-apps.folder",
+            }
+            if parent_id:
+                meta["parents"] = [parent_id]
+            folder = drive.files().create(body=meta, fields="id").execute()
+            return folder["id"]
 
         # create Drive folder for this order
         drive = build("drive","v3",credentials=creds)
-        # helper: grant “anyone with link” reader access
         def make_public(file_id):
             drive.permissions().create(
                 fileId=file_id,
                 body={"type":"anyone","role":"reader"}
             ).execute()
-        folder_meta = {
-            "name": str(new_order),
-            "mimeType": "application/vnd.google-apps.folder"
-        }
-        folder = drive.files().create(
-            body=folder_meta,
-            fields="id"
-        ).execute().get("id")
-        make_public(folder)
+
+        # 1) Make the root folder for this order
+        order_folder_id   = create_folder(new_order)
+        make_public(order_folder_id)
+
+        # (we’ll link to it later as order_folder_link)
+        order_folder_link = f"https://drive.google.com/drive/folders/{order_folder_id}"
 
 
         # helper: grant “anyone with link” reader access
@@ -845,7 +854,7 @@ def submit_order():
         for f in prod_files:
             m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
             up = drive.files().create(
-                body={"name": f.filename, "parents": [folder]},
+                body={"name": f.filename, "parents": [order_folder_id]},
                 media_body=m,
                 fields="id, webViewLink"
             ).execute()
@@ -856,23 +865,15 @@ def submit_order():
         print_links = ""
         if print_files:
             # 1) create the “Print Files” folder under the job folder, and get its link
-            pf_res = drive.files().create(
-                body={
-                  "name": "Print Files",
-                  "mimeType": "application/vnd.google-apps.folder",
-                  "parents": [folder]
-                },
-                fields="id, webViewLink"
-            ).execute()
-            pf_id = pf_res["id"]
-            pf_link = pf_res["webViewLink"]
-            make_public(pf_id)
+            print_folder_id = create_folder("Print Files", parent_id=order_folder_id)
+            make_public(print_folder_id)
+            pf_link = f"https://drive.google.com/drive/folders/{print_folder_id}"
 
             # 2) upload each print file into that folder (we don't need their individual links)
             for f in print_files:
                 m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
                 drive.files().create(
-                    body={"name": f.filename, "parents": [pf_id]},
+                    body={"name": f.filename, "parents": [print_folder_id]},
                     media_body=m,
                     fields="id"
                 ).execute()
