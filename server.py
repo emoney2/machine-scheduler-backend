@@ -1172,15 +1172,10 @@ def get_materials():
 @app.route("/api/materials", methods=["POST"])
 @login_required_session
 def add_materials():
-    """
-    Adds new materials to Material Inventory, then logs to Material Log.
-    Expects JSON array of objects with:
-      materialName, unit, minInv, reorder, cost, action, quantity, notes?
-    """
     raw   = request.get_json(silent=True) or []
     items = raw if isinstance(raw, list) else [raw]
 
-    # 1) Fetch the formulas from row 2, columns B, C, H
+    # fetch the raw formulas from row 2
     def get_formula(col):
         resp = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
@@ -1189,14 +1184,20 @@ def add_materials():
         ).execute()
         return resp.get("values", [[""]])[0][0] or ""
 
-    fmtB = get_formula("B")
-    fmtC = get_formula("C")
-    fmtH = get_formula("H")
+    rawB = get_formula("B")
+    rawC = get_formula("C")
+    rawH = get_formula("H")
 
     now      = datetime.now(ZoneInfo("America/New_York"))\
                     .strftime("%-m/%-d/%Y %H:%M:%S")
     inv_rows = []
-    log_rows = []
+    
+    # find where row 2 starts, so we can compute new rows dynamically
+    existing = sheets.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Material Inventory!A2:A"
+    ).execute().get("values", [])
+    next_row = len(existing) + 2  # because A2 is first data row
 
     for it in items:
         name    = it.get("materialName","").strip()
@@ -1204,40 +1205,30 @@ def add_materials():
         mininv  = it.get("minInv","").strip()
         reorder = it.get("reorder","").strip()
         cost    = it.get("cost","").strip()
-        action  = it.get("action","").strip()
-        qty     = it.get("quantity","").strip()
-        notes   = it.get("notes","").strip()
 
-        # skip incomplete entries
-        if not (name and action and qty):
+        if not name:
             continue
 
-        # 2) Build the inventory row A–H
+        # rewrite the row references in each formula
+        formulaB = rawB.replace("2", str(next_row))
+        formulaC = rawC.replace("2", str(next_row))
+        formulaH = rawH.replace("2", str(next_row))
+
         inv_rows.append([
-            name,   # A
-            fmtB,   # B (formula from B2)
-            fmtC,   # C (formula from C2)
-            unit,   # D
-            mininv, # E
-            reorder,# F
-            cost,   # G
-            fmtH    # H (formula from H2)
+            name,       # A
+            formulaB,   # B: uses rawB but with "2"→next_row
+            formulaC,   # C: same
+            unit,       # D: user entry
+            mininv,     # E
+            reorder,    # F
+            cost,       # G
+            formulaH    # H: uses rawH but with "2"→next_row
         ])
 
-        # 3) Build the log row A–I
-        log_rows.append([
-            now,    # A: timestamp
-            "",     # B
-            "",     # C
-            "",     # D
-            "",     # E
-            name,   # F: material
-            qty,    # G: quantity
-            "IN",   # H
-            action  # I: O/R
-        ])
+        next_row += 1
+    # end for
 
-    # 4) Append to Material Inventory
+    # append the rows you’ve built
     if inv_rows:
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
@@ -1247,17 +1238,8 @@ def add_materials():
             body={"values": inv_rows}
         ).execute()
 
-    # 5) Append to Material Log
-    if log_rows:
-        sheets.values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Material Log!A2:I",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": log_rows}
-        ).execute()
-
     return jsonify({"status":"submitted"}), 200
+
 # ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
 @app.route("/api/materialInventory", methods=["OPTIONS"])
 def material_inventory_preflight():
