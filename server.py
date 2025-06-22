@@ -792,14 +792,17 @@ def submit_order():
 
         # helper: copy the formula from row 2 of <cell> and rewrite “2” → new row
         def tpl_formula(col_letter, next_row):
+            # grab the raw formula from row 2
             resp = sheets.values().get(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Production Orders!{col_letter}2",
                 valueRenderOption="FORMULA"
             ).execute()
             raw = resp.get("values", [[""]])[0][0] or ""
-            # only replace exact “<col_letter>2” (word-boundaried)
-            return re.sub(rf"\\b{col_letter}2\\b", f"{col_letter}{next_row}", raw)
+            # rewrite *any* reference ending in “2” to the new row
+            # e.g. C2→C3, Y2→Y3, AC2→AC3, etc.
+            formula = re.sub(r"(\b[A-Z]+)2\b", lambda m: f"{m.group(1)}{next_row}", raw)
+            return formula
 
         # timestamp + template cells from row 2
         ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
@@ -922,36 +925,6 @@ def submit_order():
             valueInputOption="USER_ENTERED",
             body={"values": [[new_formula]]}
         ).execute()
-
-        # now turn that one cell into a checkbox
-        meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-        orders_sheet = next(
-            s for s in meta["sheets"]
-            if s["properties"]["title"] == "Production Orders"
-        )
-        sheet_id = orders_sheet["properties"]["sheetId"]
-        service.spreadsheets().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body={
-                "requests": [{
-                    "setDataValidation": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": next_row - 1,
-                            "endRowIndex": next_row,
-                            "startColumnIndex": 28,
-                            "endColumnIndex": 29
-                        },
-                        "rule": {
-                            "condition": {"type": "BOOLEAN"},
-                            "showCustomUi": True,
-                            "strict": False
-                        }
-                    }
-                }]
-            }
-        ).execute()
-
         return jsonify({"status":"ok","order":new_order}), 200
 
     except Exception as e:
