@@ -5,6 +5,8 @@ import logging
 import time
 import traceback
 import re
+# ─── Global “logout everyone” timestamp ─────────────────────────────────
+logout_all_ts = 0.0
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -108,7 +110,19 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 def login_required_session(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # 1) OPTIONS are always allowed (CORS preflight)
+        # 0) Kill-switch: invalidate any session logged in before logout_all_ts
+        login_time = session.get("login_time", 0)
+        if login_time < logout_all_ts:
+            session.clear()
+            # if it’s an API route, return JSON 401
+            if request.path.startswith("/api/"):
+                response = jsonify({"error": "session invalidated"})
+                response.status_code = 401
+                return response
+            # otherwise redirect to login (which will bounce to your FRONTEND_URL)
+            return redirect(url_for("login", next=request.path))
+
+        # 1) Always ALLOW preflight OPTIONS for CORS
         if request.method == "OPTIONS":
             response = make_response("", 204)
             response.headers["Access-Control-Allow-Origin"]      = FRONTEND_URL
@@ -120,46 +134,56 @@ def login_required_session(f):
         # 2) Must be logged in at all
         if not session.get("user"):
             if request.path.startswith("/api/"):
-                return jsonify({"error": "authentication required"}), 401
+                response = jsonify({"error": "authentication required"})
+                response.status_code = 401
+                return response
             return redirect(url_for("login", next=request.path))
 
-        # 3) Token‐match check: 
-        #    “token_at_login” must equal the current ADMIN_TOKEN, 
-        #    otherwise we immediately log out.
-        ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+        # 3) Token-match check: user’s token_at_login must equal ADMIN_TOKEN
+        ADMIN_TOKEN    = os.environ.get("ADMIN_TOKEN", "")
         token_at_login = session.get("token_at_login", "")
         if token_at_login != ADMIN_TOKEN:
             session.clear()
             if request.path.startswith("/api/"):
-                return jsonify({"error": "session invalidated"}), 401
+                response = jsonify({"error": "session invalidated"})
+                response.status_code = 401
+                return response
             return redirect(url_for("login", next=request.path))
 
-        # 4) Idle timeout: 3 hours of inactivity
+        # 4) Idle timeout: 3 hours
         last = session.get("last_activity")
         if last:
             try:
                 last_dt = datetime.fromisoformat(last)
-            except:
+            except Exception:
+                # malformed timestamp → force login
                 session.clear()
                 if request.path.startswith("/api/"):
-                    return jsonify({"error": "authentication required"}), 401
+                    response = jsonify({"error": "authentication required"})
+                    response.status_code = 401
+                    return response
                 return redirect(url_for("login", next=request.path))
-
+            # check age
             if datetime.utcnow() - last_dt > timedelta(hours=3):
                 session.clear()
                 if request.path.startswith("/api/"):
-                    return jsonify({"error": "session expired"}), 401
+                    response = jsonify({"error": "session expired"})
+                    response.status_code = 401
+                    return response
                 return redirect(url_for("login", next=request.path))
         else:
-            # if no "last_activity" for whatever reason, force login
+            # missing last_activity → force login
             session.clear()
             if request.path.startswith("/api/"):
-                return jsonify({"error": "authentication required"}), 401
+                response = jsonify({"error": "authentication required"})
+                response.status_code = 401
+                return response
             return redirect(url_for("login", next=request.path))
 
         # 5) All good—update last_activity and proceed
         session["last_activity"] = datetime.utcnow().isoformat()
         return f(*args, **kwargs)
+
     return decorated
 
 # Socket.IO (same origin)
@@ -334,15 +358,24 @@ _login_page = """
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
-    # always fall back to your front-end URL
+    # always default back to your front-end
     next_url = request.args.get("next") or request.form.get("next") or FRONTEND_URL
 
     if request.method == "POST":
-        # … auth checks …
+        u = request.form["username"]
+        p = request.form["password"]
+        ADMIN_PW    = os.environ.get("ADMIN_PASSWORD", "")
+        ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
         if u == "admin" and p == ADMIN_PW:
             session.clear()
-            # …
-            # if they tried to go to a backend path, force the redirect home
+            session["user"] = u
+            session["token_at_login"] = ADMIN_TOKEN
+            session["last_activity"] = datetime.utcnow().isoformat()
+            # **new**: stamp when they logged in
+            session["login_time"] = time.time()
+
+            # if they wanted a backend URL, just send them home
             if next_url.startswith("/"):
                 return redirect(FRONTEND_URL)
             return redirect(next_url)
@@ -350,6 +383,7 @@ def login():
             error = "Invalid credentials"
     
     return render_template_string(_login_page, error=error, next=next_url)
+
 
 @app.route("/logout")
 def logout():
@@ -1637,6 +1671,17 @@ def set_product_specs():
         ).execute()
 
     return jsonify({"status": "ok"}), 200
+
+@app.route("/api/logout-all", methods=["POST"])
+@login_required_session
+def logout_all():
+    """
+    Flip the kill-switch: any session logged in *before* 
+    this moment will be invalidated on its next request.
+    """
+    global logout_all_ts
+    logout_all_ts = time.time()
+    return jsonify({"status": "everyone-logged-out"}), 200
 
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
