@@ -334,19 +334,17 @@ _login_page = """
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
-    next_url = request.args.get("next") or request.form.get("next") or "/"
+    # always fall back to your front-end URL
+    next_url = request.args.get("next") or request.form.get("next") or FRONTEND_URL
 
     if request.method == "POST":
-        u = request.form["username"]
-        p = request.form["password"]
-        ADMIN_PW    = os.environ.get("ADMIN_PASSWORD", "")
-        ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
-
+        # … auth checks …
         if u == "admin" and p == ADMIN_PW:
             session.clear()
-            session["user"] = u
-            session["token_at_login"] = ADMIN_TOKEN
-            session["last_activity"] = datetime.utcnow().isoformat()
+            # …
+            # if they tried to go to a backend path, force the redirect home
+            if next_url.startswith("/"):
+                return redirect(FRONTEND_URL)
             return redirect(next_url)
         else:
             error = "Invalid credentials"
