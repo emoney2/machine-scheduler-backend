@@ -5,10 +5,12 @@ import logging
 import time
 import traceback
 import re
+
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from ups_service import get_rate
 
 from functools import wraps
 from dotenv import load_dotenv
@@ -1682,6 +1684,34 @@ def logout_all():
     global logout_all_ts
     logout_all_ts = time.time()
     return jsonify({"status": "everyone-logged-out"}), 200
+
+@app.route("/api/rate", methods=["POST"])
+@login_required_session
+def rate_shipment():
+    """
+    Expects JSON like:
+    {
+      "shipper": { … },
+      "recipient": { … },
+      "packages": [ {Weight, Dimensions?}, … ]
+    }
+    """
+    payload = request.get_json()
+    if not payload:
+        return jsonify({"error": "Missing payload"}), 400
+
+    try:
+        rates = get_rate(
+          shipper    = payload["shipper"],
+          recipient  = payload["recipient"],
+          packages   = payload["packages"]
+        )
+        return jsonify({ "rates": rates }), 200
+    except KeyError as ke:
+        return jsonify({ "error": f"Missing field: {ke}" }), 400
+    except Exception as e:
+        logger.exception("UPS rating error")
+        return jsonify({ "error": str(e) }), 500
 
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
