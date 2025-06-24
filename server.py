@@ -112,19 +112,7 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 def login_required_session(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # 0) Kill-switch: invalidate any session logged in before logout_all_ts
-        login_time = session.get("login_time", 0)
-        if login_time < logout_all_ts:
-            session.clear()
-            # if it’s an API route, return JSON 401
-            if request.path.startswith("/api/"):
-                response = jsonify({"error": "session invalidated"})
-                response.status_code = 401
-                return response
-            # otherwise redirect to login (which will bounce to your FRONTEND_URL)
-            return redirect(url_for("login", next=request.path))
-
-        # 1) Always ALLOW preflight OPTIONS for CORS
+        # 1) Allow OPTIONS (CORS preflight)
         if request.method == "OPTIONS":
             response = make_response("", 204)
             response.headers["Access-Control-Allow-Origin"]      = FRONTEND_URL
@@ -133,59 +121,55 @@ def login_required_session(f):
             response.headers["Access-Control-Allow-Methods"]     = "GET,POST,PUT,OPTIONS"
             return response
 
-        # 2) Must be logged in at all
+        # 2) Must be logged in
         if not session.get("user"):
             if request.path.startswith("/api/"):
-                response = jsonify({"error": "authentication required"})
-                response.status_code = 401
-                return response
+                return jsonify({"error": "authentication required"}), 401
             return redirect(url_for("login", next=request.path))
 
-        # 3) Token-match check: user’s token_at_login must equal ADMIN_TOKEN
-        ADMIN_TOKEN    = os.environ.get("ADMIN_TOKEN", "")
+        # 3) Token at login must match current ADMIN_TOKEN
+        ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "")
         token_at_login = session.get("token_at_login", "")
         if token_at_login != ADMIN_TOKEN:
             session.clear()
             if request.path.startswith("/api/"):
-                response = jsonify({"error": "session invalidated"})
-                response.status_code = 401
-                return response
+                return jsonify({"error": "session invalidated"}), 401
             return redirect(url_for("login", next=request.path))
 
-        # 4) Idle timeout: 3 hours
+        # 4) Idle timeout: 3h
         last = session.get("last_activity")
         if last:
             try:
                 last_dt = datetime.fromisoformat(last)
-            except Exception:
-                # malformed timestamp → force login
+            except:
                 session.clear()
                 if request.path.startswith("/api/"):
-                    response = jsonify({"error": "authentication required"})
-                    response.status_code = 401
-                    return response
+                    return jsonify({"error": "authentication required"}), 401
                 return redirect(url_for("login", next=request.path))
-            # check age
+
             if datetime.utcnow() - last_dt > timedelta(hours=3):
                 session.clear()
                 if request.path.startswith("/api/"):
-                    response = jsonify({"error": "session expired"})
-                    response.status_code = 401
-                    return response
+                    return jsonify({"error": "session expired"}), 401
                 return redirect(url_for("login", next=request.path))
         else:
-            # missing last_activity → force login
             session.clear()
             if request.path.startswith("/api/"):
-                response = jsonify({"error": "authentication required"})
-                response.status_code = 401
-                return response
+                return jsonify({"error": "authentication required"}), 401
+            return redirect(url_for("login", next=request.path))
+
+        # ─── Global “log everyone out” check ───────────────────────
+        global logout_all_ts
+        logged_in_at = session.get("login_ts", 0)
+        if logged_in_at < logout_all_ts:
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "all sessions invalidated"}), 401
             return redirect(url_for("login", next=request.path))
 
         # 5) All good—update last_activity and proceed
         session["last_activity"] = datetime.utcnow().isoformat()
         return f(*args, **kwargs)
-
     return decorated
 
 # Socket.IO (same origin)
@@ -386,6 +370,7 @@ def login():
             session["user"] = u
             session["token_at_login"] = ADMIN_TOKEN
             session["last_activity"] = datetime.utcnow().isoformat()
+            session["login_ts"]      = datetime.utcnow().timestamp()
             # **new**: stamp when they logged in
             session["login_time"] = time.time()
 
@@ -1694,13 +1679,14 @@ def set_product_specs():
 @app.route("/api/logout-all", methods=["POST"])
 @login_required_session
 def logout_all():
-    """
-    Flip the kill-switch: any session logged in *before* 
-    this moment will be invalidated on its next request.
-    """
     global logout_all_ts
-    logout_all_ts = time.time()
-    return jsonify({"status": "everyone-logged-out"}), 200
+    # only allow if they’re using the current ADMIN_TOKEN
+    ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+    if session.get("token_at_login") != ADMIN_TOKEN:
+        return jsonify({"error":"not allowed"}), 403
+
+    logout_all_ts = datetime.utcnow().timestamp()
+    return jsonify({"status":"everyone logged out"}), 200
 
 @app.route("/api/rate", methods=["POST"])
 @login_required_session
