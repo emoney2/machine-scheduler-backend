@@ -271,7 +271,13 @@ def update_embroidery_start_time_in_sheet(job_id, start_time):
 
     # 2) Find & write
     for idx, row in enumerate(values, start=2):
-        if str(row[0]).strip() == str(job_id).strip():
+        # ← Skip empty rows to avoid IndexError
+        if not row or len(row) == 0:
+            continue
+
+        # Safe to access row[0] now
+        cell = str(row[0]).strip()
+        if cell == str(job_id).strip():
             target = f"Embroidery List!AA{idx}"
             try:
                 sheet.values().update(
