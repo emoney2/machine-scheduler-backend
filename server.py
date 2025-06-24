@@ -251,27 +251,37 @@ def update_start_time():
 import traceback
 
 def update_embroidery_start_time_in_sheet(job_id, start_time):
-    # pull existing IDs from column A
+    """
+    Finds the row in 'Embroidery List' where column A matches job_id,
+    then overwrites column AA with start_time.
+    Returns True on success, False if job_id wasn’t found.
+    """
+    service = get_sheets_service()
+    sheet = service.spreadsheets()
+
+    # 1) Read all the IDs in column A (starting at row 2)
     result = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
         range="Embroidery List!A2:A"
     ).execute()
     values = result.get("values", [])
 
-    # scan for matching job_id
+    # 2) Scan for the matching job_id
     for idx, row in enumerate(values, start=2):
         if str(row[0]) == str(job_id):
-            # overwrite the timestamp in column AA
+            target = f"Embroidery List!AA{idx}"   # column AA + that row
+            # 3) Overwrite the timestamp
             sheet.values().update(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"Embroidery List!AA{idx}",
+                range=target,
                 valueInputOption="RAW",
-                body={ "values": [[start_time]] }
+                body={"values": [[start_time]]}
             ).execute()
             return True
 
-    # no match → signal failure
+    # 4) If we dropped out of the loop, we never found that ID
     return False
+
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
 CACHE_TTL           = 10
