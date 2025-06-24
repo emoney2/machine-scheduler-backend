@@ -7,5 +7,6 @@ eventlet
 python-dotenv
 flask-httpauth
 xmltodict==0.14.2
+eventlet>=0.33.0
 
 

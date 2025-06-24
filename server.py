@@ -251,37 +251,27 @@ def update_start_time():
 import traceback
 
 def update_embroidery_start_time_in_sheet(job_id, start_time):
-    """
-    Finds the row in 'Embroidery List' where column A matches job_id,
-    then writes start_time to column AA (27th column).
-    """
-    service = get_sheets_service()
-    sheet = service.spreadsheets()
-
-    # Fetch column A (Job IDs) from Embroidery List
+    # pull existing IDs from column A
     result = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
         range="Embroidery List!A2:A"
     ).execute()
-
     values = result.get("values", [])
 
-    # Find the matching row
-    for i, row in enumerate(values, start=2):  # A2 = row 2
+    # scan for matching job_id
+    for idx, row in enumerate(values, start=2):
         if str(row[0]) == str(job_id):
-            target_range = f"Embroidery List!AA{i}"
+            # overwrite the timestamp in column AA
             sheet.values().update(
                 spreadsheetId=SPREADSHEET_ID,
-                range=target_range,
+                range=f"Embroidery List!AA{idx}",
                 valueInputOption="RAW",
-                body={"values": [[start_time]]}
+                body={ "values": [[start_time]] }
             ).execute()
-            print(f"✅ Updated embroidery_start for job {job_id} at {target_range}")
             return True
 
-    print(f"❌ Job ID {job_id} not found in Embroidery List column A")
+    # no match → signal failure
     return False
-
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
 CACHE_TTL           = 10
