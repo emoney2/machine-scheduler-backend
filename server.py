@@ -260,6 +260,7 @@ def update_embroidery_start_time_in_sheet(job_id, start_time):
         range="Embroidery List!A2:A"
     ).execute()
     values = result.get("values", [])
+    print("🧐 Sheet IDs (A2:A):", [r[0] for r in values][:20], "…")
 
     # 2) Find & write
     for idx, row in enumerate(values, start=2):
