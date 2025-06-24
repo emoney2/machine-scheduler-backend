@@ -557,9 +557,9 @@ def set_volume():
     global SPREADSHEET_ID
     data = request.get_json()
     product = data.get("product")
-    length = data.get("length")
-    width = data.get("width")
-    height = data.get("height")
+    length  = data.get("length")
+    width   = data.get("width")
+    height  = data.get("height")
 
     if not all([product, length, width, height]):
         return jsonify({"error": "Missing fields"}), 400
@@ -571,7 +571,12 @@ def set_volume():
 
     sheets = get_sheets_service().spreadsheets()
     table_range = "Table!A2:A"
-    result = sheets.values().get(spreadsheetId=SHEET_ID, range=table_range).execute()
+
+    # ← now correctly using SPREADSHEET_ID
+    result = sheets.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=table_range
+    ).execute()
     rows = result.get("values", [])
     products = [row[0] for row in rows if row]
 
@@ -580,7 +585,7 @@ def set_volume():
     else:
         row_index = len(products) + 2
         sheets.values().append(
-            spreadsheetId=SHEET_ID,
+            spreadsheetId=SPREADSHEET_ID,
             range="Table!A2",
             valueInputOption="RAW",
             body={"values": [[product]]}
