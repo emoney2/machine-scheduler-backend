@@ -251,36 +251,37 @@ def update_start_time():
 import traceback
 
 def update_embroidery_start_time_in_sheet(job_id, start_time):
-    """
-    Finds the row in 'Embroidery List' where column A matches job_id,
-    then overwrites column AA with start_time.
-    Returns True on success, False if job_id wasn’t found.
-    """
     service = get_sheets_service()
-    sheet = service.spreadsheets()
+    sheet   = service.spreadsheets()
 
-    # 1) Read all the IDs in column A (starting at row 2)
+    # 1) Read the IDs
     result = sheet.values().get(
         spreadsheetId=SPREADSHEET_ID,
         range="Embroidery List!A2:A"
     ).execute()
     values = result.get("values", [])
 
-    # 2) Scan for the matching job_id
+    # 2) Find & write
     for idx, row in enumerate(values, start=2):
-        if str(row[0]) == str(job_id):
-            target = f"Embroidery List!AA{idx}"   # column AA + that row
-            # 3) Overwrite the timestamp
-            sheet.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=target,
-                valueInputOption="RAW",
-                body={"values": [[start_time]]}
-            ).execute()
-            return True
+        if str(row[0]).strip() == str(job_id).strip():
+            target = f"Embroidery List!AA{idx}"
+            try:
+                sheet.values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=target,
+                    valueInputOption="RAW",
+                    body={"values": [[start_time]]}
+                ).execute()
+                print(f"✅ Updated embroidery_start for job {job_id} at {target}")
+                return True
+            except Exception as e:
+                print("⚠️ Error writing startTime to sheet:", e)
+                return False
 
-    # 4) If we dropped out of the loop, we never found that ID
+    # 3) No match → explicit False
+    print(f"❌ Job ID {job_id} not found in Embroidery List column A")
     return False
+
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
