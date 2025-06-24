@@ -112,7 +112,17 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 def login_required_session(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # 1) Allow OPTIONS (CORS preflight)
+        global logout_all_ts
+
+        # 0) If they've logged in before the global logout, invalidate
+        user_login_ts = session.get("login_ts", 0)
+        if user_login_ts < logout_all_ts:
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "logged out"}), 401
+            return redirect(url_for("login", next=request.path))
+
+        # 1) OPTIONS are always allowed (CORS preflight)
         if request.method == "OPTIONS":
             response = make_response("", 204)
             response.headers["Access-Control-Allow-Origin"]      = FRONTEND_URL
@@ -121,22 +131,21 @@ def login_required_session(f):
             response.headers["Access-Control-Allow-Methods"]     = "GET,POST,PUT,OPTIONS"
             return response
 
-        # 2) Must be logged in
+        # 2) Must be logged in at all
         if not session.get("user"):
             if request.path.startswith("/api/"):
                 return jsonify({"error": "authentication required"}), 401
             return redirect(url_for("login", next=request.path))
 
-        # 3) Token at login must match current ADMIN_TOKEN
-        ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "")
-        token_at_login = session.get("token_at_login", "")
-        if token_at_login != ADMIN_TOKEN:
+        # 3) Token‐match check
+        ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+        if session.get("token_at_login") != ADMIN_TOKEN:
             session.clear()
             if request.path.startswith("/api/"):
                 return jsonify({"error": "session invalidated"}), 401
             return redirect(url_for("login", next=request.path))
 
-        # 4) Idle timeout: 3h
+        # 4) Idle timeout: 3 hours
         last = session.get("last_activity")
         if last:
             try:
@@ -156,15 +165,6 @@ def login_required_session(f):
             session.clear()
             if request.path.startswith("/api/"):
                 return jsonify({"error": "authentication required"}), 401
-            return redirect(url_for("login", next=request.path))
-
-        # ─── Global “log everyone out” check ───────────────────────
-        global logout_all_ts
-        logged_in_at = session.get("login_ts", 0)
-        if logged_in_at < logout_all_ts:
-            session.clear()
-            if request.path.startswith("/api/"):
-                return jsonify({"error": "all sessions invalidated"}), 401
             return redirect(url_for("login", next=request.path))
 
         # 5) All good—update last_activity and proceed
@@ -1678,16 +1678,10 @@ def set_product_specs():
 
 @app.route("/api/logout-all", methods=["POST"])
 @login_required_session
-def logout_all():
+def logout_all_users():
     global logout_all_ts
-    # only allow if they’re using the current ADMIN_TOKEN
-    ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
-    if session.get("token_at_login") != ADMIN_TOKEN:
-        return jsonify({"error":"not allowed"}), 403
-
-    logout_all_ts = datetime.utcnow().timestamp()
-    return jsonify({"status":"everyone logged out"}), 200
-
+    logout_all_ts = time.time()
+    return jsonify({"status": "all sessions invalidated"}), 200
 @app.route("/api/rate", methods=["POST"])
 @login_required_session
 def rate_shipment():
