@@ -227,23 +227,26 @@ sheets  = service.spreadsheets()
 
 @app.route('/api/updateStartTime', methods=["POST"])
 def update_start_time():
+    print("🔧 Received /updateStartTime endpoint hit")      # <<== marker #1
     data = request.get_json()
-    print("🔧 Received /updateStartTime payload:", data)
+    print("🔧 Payload:", data)                                # <<== marker #2
 
-    row_id = data.get("id")
+    row_id     = data.get("id")
     start_time = data.get("startTime")
-
     if not row_id or not start_time:
+        print("⚠️ Missing id or startTime in payload")       # <<== marker #3
         return jsonify({"error": "Missing ID or start time"}), 400
 
     try:
         success = update_embroidery_start_time_in_sheet(row_id, start_time)
+        print("🔧 Helper returned:", success)                # <<== marker #4
         if success:
             return jsonify({"status": "ok"}), 200
         else:
             return jsonify({"error": "Update failed"}), 500
     except Exception as e:
-        print("❌ Server error:", e)
+        print("❌ Server exception:", e)                      # <<== marker #5
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
