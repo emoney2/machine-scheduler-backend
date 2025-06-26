@@ -112,16 +112,6 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 def login_required_session(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        global logout_all_ts
-
-        # 0) If they've logged in before the global logout, invalidate
-        user_login_ts = session.get("login_ts", 0)
-        if user_login_ts < logout_all_ts:
-            session.clear()
-            if request.path.startswith("/api/"):
-                return jsonify({"error": "logged out"}), 401
-            return redirect(url_for("login", next=request.path))
-
         # 1) OPTIONS are always allowed (CORS preflight)
         if request.method == "OPTIONS":
             response = make_response("", 204)
@@ -138,8 +128,9 @@ def login_required_session(f):
             return redirect(url_for("login", next=request.path))
 
         # 3) Token‐match check
-        ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
-        if session.get("token_at_login") != ADMIN_TOKEN:
+        ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "")
+        token_at_login = session.get("token_at_login", "")
+        if token_at_login != ADMIN_TOKEN:
             session.clear()
             if request.path.startswith("/api/"):
                 return jsonify({"error": "session invalidated"}), 401
@@ -167,9 +158,18 @@ def login_required_session(f):
                 return jsonify({"error": "authentication required"}), 401
             return redirect(url_for("login", next=request.path))
 
-        # 5) All good—update last_activity and proceed
+        # 5) Forced‐logout check
+        #    any session logged in before logout_all_ts is invalidated
+        if session.get("login_time", 0) < logout_all_ts:
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "forced logout"}), 401
+            return redirect(url_for("login", next=request.path))
+
+        # 6) All good—update last_activity and proceed
         session["last_activity"] = datetime.utcnow().isoformat()
         return f(*args, **kwargs)
+
     return decorated
 
 # Socket.IO (same origin)
@@ -370,6 +370,7 @@ def login():
             session["user"] = u
             session["token_at_login"] = ADMIN_TOKEN
             session["last_activity"] = datetime.utcnow().isoformat()
+            session["login_time"]     = time.time()
             session["login_ts"]      = datetime.utcnow().timestamp()
             # **new**: stamp when they logged in
             session["login_time"] = time.time()
@@ -1121,7 +1122,7 @@ def add_thread():
 def add_table_entry():
     data = request.get_json(silent=True) or {}
 
-    # 1) Extract your 11 fields
+    # 1) Extract your original 11 fields + 3 new ones
     product_name        = data.get("product", "").strip()        # → A
     print_time          = data.get("printTime", "")             # → D
     per_yard            = data.get("perYard", "")               # → F
@@ -1134,32 +1135,40 @@ def add_table_entry():
     elastic_half_length = data.get("elasticHalf", "")           # → M
     volume              = data.get("volume", "")                # → N
 
+    # ← New pouch-specific fields:
+    black_grommets      = data.get("blackGrommets", "")         # → O
+    paracord_ft         = data.get("paracordFt", "")            # → P
+    cord_stoppers       = data.get("cordStoppers", "")          # → Q
+
     if not product_name:
         return jsonify({"error": "Missing product name"}), 400
 
     try:
-        # 2) Append into Table!A2:N2 with blanks at B, C, E
+        # 2) Append into Table!A2:Q2 (now 17 cols A–Q)
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Table!A2:N2",
+            range="Table!A2:Q2",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={
                 "values": [[
-                    product_name,   # A: Products
-                    "",             # B: (blank)
-                    "",             # C: (blank)
-                    print_time,     # D: Print Times (1 Machine)
-                    "",             # E: (blank)
-                    per_yard,       # F: How Many Products Per Yard
-                    foam_half,      # G: 1/2" Foam
-                    foam_38,        # H: 3/8" Foam
-                    foam_14,        # I: 1/4" Foam
-                    foam_18,        # J: 1/8" Foam
-                    n_magnets,      # K: N Magnets
-                    s_magnets,      # L: S Magnets
-                    elastic_half_length,  # M: 1/2" Elastic
-                    volume          # N: Volume
+                    product_name,        # A
+                    "",                  # B
+                    "",                  # C
+                    print_time,          # D
+                    "",                  # E
+                    per_yard,            # F
+                    foam_half,           # G
+                    foam_38,             # H
+                    foam_14,             # I
+                    foam_18,             # J
+                    n_magnets,           # K
+                    s_magnets,           # L
+                    elastic_half_length, # M
+                    volume,              # N
+                    black_grommets,      # O
+                    paracord_ft,         # P
+                    cord_stoppers        # Q
                 ]]
             }
         ).execute()
@@ -1169,6 +1178,7 @@ def add_table_entry():
     except Exception as e:
         logger.exception("Failed to append new product to Table")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/table", methods=["GET"])
 @login_required_session
@@ -1678,10 +1688,14 @@ def set_product_specs():
 
 @app.route("/api/logout-all", methods=["POST"])
 @login_required_session
-def logout_all_users():
+def logout_all():
     global logout_all_ts
+    # bump the timestamp so that any calls to login_required_session will now fail
     logout_all_ts = time.time()
-    return jsonify({"status": "all sessions invalidated"}), 200
+    # push a socket event to all connected clients
+    socketio.emit("forceLogout")
+    return jsonify({"status": "ok"}), 200
+
 @app.route("/api/rate", methods=["POST"])
 @login_required_session
 def rate_shipment():
