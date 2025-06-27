@@ -1099,34 +1099,43 @@ def reorder():
         # 4) Build the new row for the sheet
         ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
         row = [
-            new_id,
-            ts,
-            match.get("preview", ""),
-            match.get("Company Name", ""),
-            match.get("Design", ""),
-            match.get("Quantity", ""),
-            "",
-            match.get("Product", ""),
-            match.get("Stage", ""),
-            match.get("Price", ""),
-            new_due,
-            "PRINT" if print_files else "NO",
-            *match.get("materials", "").split(","),
-            match.get("backMaterial", ""),
-            match.get("furColor", ""),
-            match.get("embBacking", ""),
-            "",
-            match.get("ship_date", ""),
-            match.get("stitch_count", ""),
-            new_notes,
-            prod_files,
-            print_files,
-            "",
-            new_type,
-            match.get("schedule_str", "")
+            new_id,                         # A - Order #
+            ts,                             # B - Date
+            match.get("Preview", ""),       # C - Preview
+            match.get("Company Name", ""),  # D
+            match.get("Design", ""),        # E
+            match.get("Quantity", ""),      # F
+            "",                             # G - Shipped (leave blank for reorder)
+            match.get("Product", ""),       # H
+            match.get("Stage", ""),         # I
+            match.get("Price", ""),         # J
+            new_due,                        # K - Due Date (override)
+            "PRINT" if print_files else "NO",  # L - Print
+            match.get("Material1", ""),     # M
+            match.get("Material2", ""),     # N
+            match.get("Material3", ""),     # O
+            match.get("Material4", ""),     # P
+            match.get("Material5", ""),     # Q
+            match.get("Back Material", ""), # R
+            match.get("Fur Color", ""),     # S
+            match.get("EMB Backing", ""),   # T
+            match.get("Top Stitch Color", ""),  # U
+            match.get("Ship Date", ""),     # V
+            match.get("Stitch Count", ""),  # W
+            new_notes,                      # X - Notes (override)
+            match.get("Image", ""),         # Y
+            print_files,                    # Z - Print Files
+            "",                             # AA - Empty/Unused
+            new_type,                       # AB - Hard Date/Soft Date (override)
+            match.get("Schedule String", ""),  # AC
+            "",                             # AD - Start Date
+            "",                             # AE - End Date
+            match.get("Threads", ""),       # AF
+            ""                              # AG - Tracking #
         ]
 
-        while len(row) < 29:
+
+        while len(row) < 33:
             row.append("")
 
         print("📤 Writing new row to sheet:", row)
