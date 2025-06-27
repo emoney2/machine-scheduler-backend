@@ -1707,6 +1707,7 @@ def company_list():
 @app.route("/api/process-shipment", methods=["POST"])
 def process_shipment():
     data = request.get_json()
+    print("📥 Reorder API received:", data)
     order_ids = [str(oid).strip() for oid in data.get("order_ids", [])]
     shipped_quantities = {str(k).strip(): v for k, v in data.get("shipped_quantities", {}).items()}
 
