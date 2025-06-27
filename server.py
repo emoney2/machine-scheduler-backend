@@ -1017,8 +1017,10 @@ def reorder():
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
         headers = rows[0]
         match = None
+        print("🔍 Looking for Order ID:", prev_id)  # 👈 Add this log line
         for r in rows[1:]:
-            if str(r[0]) == str(prev_id):
+            print("   → row[0]:", r[0])  # 👈 See what it's comparing
+            if str(r[0]).strip().lstrip("#") == str(prev_id).strip().lstrip("#"):
                 match = dict(zip(headers, r))
                 break
         if not match:
