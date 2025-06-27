@@ -1177,7 +1177,13 @@ def add_directory_entry():
       zipCode,
       phoneNumber
     """
-    data = request.get_json(silent=True) or {}
+    try:
+        data = request.get_json(force=True)
+    except Exception as e:
+        print("❌ Failed to parse JSON:", e)
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    print("📥 Incoming /api/reorder payload:", data)
     try:
         # build the row in the same order as your sheet columns A→J
         row = [
