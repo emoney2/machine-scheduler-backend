@@ -1123,7 +1123,7 @@ def reorder():
             match.get("Ship Date", ""),     # V
             match.get("Stitch Count", ""),  # W
             new_notes,                      # X - Notes (override)
-            match.get("Image", ""),         # Y
+            f"https://drive.google.com/drive/folders/{new_folder}",  # Y - Image (new folder link)
             print_files,                    # Z - Print Files
             "",                             # AA - Empty/Unused
             new_type,                       # AB - Hard Date/Soft Date (override)
@@ -1143,7 +1143,7 @@ def reorder():
         next_row = len(colA) + 1
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"Production Orders!A{next_row}:AC{next_row}",
+            range=f"Production Orders!A{next_row}:{chr(64 + len(row))}{next_row}",
             valueInputOption="USER_ENTERED",
             body={"values": [row]}
         ).execute()
