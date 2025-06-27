@@ -1060,7 +1060,7 @@ def reorder():
                 body["name"] = new_name
             return drive.files().copy(fileId=file_id, body=body, fields="id").execute()
 
-        prev_link = match.get("order_folder_link", "")
+        prev_link = match.get("Image", "")
         if not prev_link:
             print("❌ Missing order_folder_link in match.")
             return jsonify({"error": "Missing previous folder link"}), 400
