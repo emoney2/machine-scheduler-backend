@@ -1065,8 +1065,13 @@ def reorder():
             print("❌ Missing order_folder_link in match.")
             return jsonify({"error": "Missing previous folder link"}), 400
 
-        prev_folder = prev_link.rsplit("/", 1)[-1]
+        import re
+        match_drive_id = re.search(r"/d/([a-zA-Z0-9_-]+)", prev_link)
+        prev_folder = match_drive_id.group(1) if match_drive_id else ""
         new_folder = create_folder(new_id)
+
+        if not prev_folder:
+            return jsonify({"error": "Could not extract folder ID from link"}), 400
 
         def make_public(fid):
             drive.permissions().create(
