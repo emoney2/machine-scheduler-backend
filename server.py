@@ -1140,12 +1140,19 @@ def reorder():
 
         print("📤 Writing new row to sheet:", row)
 
-        next_row = len(colA) + 1
-        sheets.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Production Orders!A{next_row}:{chr(64 + len(row))}{next_row}",
+        def colnum_to_letter(n):
+            result = ''
+            while n > 0:
+                n, rem = divmod(n - 1, 26)
+                result = chr(65 + rem) + result
+            return result
+
+        last_col_letter = colnum_to_letter(len(row))
+        sheet.values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"Production Orders!A{next_row}:{last_col_letter}{next_row}",
             valueInputOption="USER_ENTERED",
-            body={"values": [row]}
+            body={"values": [row]},
         ).execute()
 
         print(f"✅ Reorder #{new_id} submitted successfully.")
