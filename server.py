@@ -1148,6 +1148,7 @@ def reorder():
             return result
 
         last_col_letter = colnum_to_letter(len(row))
+        sheet = sheets_service.spreadsheets()
         sheet.values().update(
             spreadsheetId=SHEET_ID,
             range=f"Production Orders!A{next_row}:{last_col_letter}{next_row}",
