@@ -1010,6 +1010,11 @@ def reorder():
     new_notes  = data.get("notes", "")
 
     if not all([prev_id, new_due, new_type]):
+        print("🚨 Missing required field(s):", {
+            "previousOrder": prev_id,
+            "newDueDate": new_due,
+            "newDateType": new_type
+        })
         return jsonify({"error": "Missing fields"}), 400
 
     try:
@@ -1019,7 +1024,7 @@ def reorder():
         match = None
         print("🔍 Looking for Order ID:", prev_id)  # 👈 Add this log line
         for r in rows[1:]:
-            print("   → row[0]:", r[0])  # 👈 See what it's comparing
+            print("🔍 Comparing sheet ID", r[0], "to previousOrder", prev_id)
             if str(r[0]).strip().lstrip("#") == str(prev_id).strip().lstrip("#"):
                 match = dict(zip(headers, r))
                 break
