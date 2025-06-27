@@ -998,12 +998,11 @@ def reorder():
         "newDateType": "Hard Date"|"Soft Date",
         "notes": "<overrideable notes>"
       }
-
-    Copies everything from the previous order row except dueDate, dateType, notes,
-    and increments the Order #. Also clones the production + print folders
-    (and .emb file) into the new Drive folder.
     """
     data = request.get_json(silent=True) or {}
+
+    print("📥 Incoming /api/reorder payload:", data)
+
     prev_id    = data.get("previousOrder")
     new_due    = data.get("newDueDate")
     new_type   = data.get("newDateType")
@@ -1022,14 +1021,18 @@ def reorder():
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
         headers = rows[0]
         match = None
-        print("🔍 Looking for Order ID:", prev_id)  # 👈 Add this log line
+        print(f"🔍 Searching for order #{prev_id} in spreadsheet...")
         for r in rows[1:]:
-            print("🔍 Comparing sheet ID", r[0], "to previousOrder", prev_id)
+            print(f"🔍 Comparing: sheet value {r[0]} vs requested {prev_id}")
             if str(r[0]).strip().lstrip("#") == str(prev_id).strip().lstrip("#"):
                 match = dict(zip(headers, r))
                 break
+
         if not match:
+            print(f"❌ Order #{prev_id} not found.")
             return jsonify({"error": f"Order {prev_id} not found"}), 404
+
+        print("✅ Found matching order row:", match)
 
         # 2) Determine new Order #
         colA = sheets.values().get(
@@ -1039,7 +1042,7 @@ def reorder():
         last = int(colA[-1][0] or 0)
         new_id = last + 1
 
-        # 3) Create Drive folder & copy prod+print files + .emb
+        # 3) Create new Drive folder and copy prod/print files + .emb
         drive = build("drive", "v3", credentials=creds)
 
         def create_folder(name, parent=None):
@@ -1055,20 +1058,22 @@ def reorder():
             body = {"parents": [folder_id]}
             if new_name:
                 body["name"] = new_name
-            return drive.files().copy(
-                fileId=file_id, body=body, fields="id"
-            ).execute()
+            return drive.files().copy(fileId=file_id, body=body, fields="id").execute()
 
         prev_link = match.get("order_folder_link", "")
         if not prev_link:
+            print("❌ Missing order_folder_link in match.")
             return jsonify({"error": "Missing previous folder link"}), 400
 
         prev_folder = prev_link.rsplit("/", 1)[-1]
         new_folder = create_folder(new_id)
-        make_public = lambda fid: drive.permissions().create(
-            fileId=fid,
-            body={"type": "anyone", "role": "reader"}
-        ).execute()
+
+        def make_public(fid):
+            drive.permissions().create(
+                fileId=fid,
+                body={"type": "anyone", "role": "reader"}
+            ).execute()
+
         make_public(new_folder)
 
         query = f"'{prev_folder}' in parents"
@@ -1086,7 +1091,7 @@ def reorder():
                 copied = copy_item(fid, new_folder, new_name)
                 make_public(copied["id"])
 
-        # 4) Assemble the new row just like /submit does, but reuse match[*]
+        # 4) Build the new row for the sheet
         ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
         row = [
             new_id,
@@ -1116,9 +1121,10 @@ def reorder():
             match.get("schedule_str", "")
         ]
 
-        # pad row to exactly 29 cells (A to AC)
         while len(row) < 29:
             row.append("")
+
+        print("📤 Writing new row to sheet:", row)
 
         next_row = len(colA) + 1
         sheets.values().update(
@@ -1128,13 +1134,15 @@ def reorder():
             body={"values": [row]}
         ).execute()
 
+        print(f"✅ Reorder #{new_id} submitted successfully.")
         return jsonify({"status": "ok", "order": new_id}), 200
 
     except Exception as e:
-        # log full error for server console
         import traceback
         traceback.print_exc()
+        print("❌ Exception during reorder:", str(e))
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+
 
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
