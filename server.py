@@ -1054,35 +1054,47 @@ def reorder():
                 body={"type": "anyone", "role": "reader"}
             ).execute()
 
-        prev_link = match.get("Image", "")
-        if not prev_link:
-            return jsonify({"error": "Missing previous folder link"}), 400
-
         import re
-        match_drive_id = re.search(r"/d/([a-zA-Z0-9_-]+)", prev_link)
-        prev_folder = match_drive_id.group(1) if match_drive_id else ""
-        new_folder = create_folder(new_id)
+        prev_image_link = match.get("Image", "")
+        match_file_id = re.search(r"/d/([a-zA-Z0-9_-]+)", prev_image_link)
+        prev_image_file_id = match_file_id.group(1) if match_file_id else ""
 
-        if not prev_folder:
-            return jsonify({"error": "Could not extract folder ID from link"}), 400
+        prev_folder_link = match.get("Image", "")
+        match_folder_id = re.search(r"/folders/([a-zA-Z0-9_-]+)", prev_folder_link)
+        prev_folder_id = match_folder_id.group(1) if match_folder_id else ""
 
-        make_public(new_folder)
-        query = f"'{prev_folder}' in parents"
+        new_folder_id = create_folder(new_id)
+        make_public(new_folder_id)
 
-        copied_files = drive.files().list(q=query, fields="files(id,name,mimeType)").execute()["files"]
-        new_file_link = ""
-        print_files_folder = ""
-        for f in copied_files:
-            name, fid = f["name"], f["id"]
-            if name.endswith(".emb"):
-                copied = copy_item(fid, new_folder, f"{new_id}.emb")
-                make_public(copied["id"])
-                new_file_link = f"https://drive.google.com/file/d/{copied['id']}/view"
-            elif "print" in name.lower():
-                copied = copy_item(fid, new_folder)
-                make_public(copied["id"])
-                print_files_folder = f"https://drive.google.com/drive/folders/{new_folder}"
+        # Copy original image file into new folder
+        new_image_file_link = ""
+        if prev_image_file_id:
+            copied_image = copy_item(prev_image_file_id, new_folder_id)
+            make_public(copied_image["id"])
+            new_image_file_link = f"https://drive.google.com/file/d/{copied_image['id']}/view"
 
+        # Copy .emb file and rename
+        if prev_folder_id:
+            query = f"'{prev_folder_id}' in parents"
+            files = drive.files().list(q=query, fields="files(id,name,mimeType)").execute()["files"]
+            for f in files:
+                if f["name"].lower().endswith(".emb"):
+                    copied_emb = copy_item(f["id"], new_folder_id, f"{new_id}.emb")
+                    make_public(copied_emb["id"])
+                    break
+
+        # Copy Print Files folder if it exists
+        print_files_link = ""
+        if prev_folder_id:
+            subfolders = drive.files().list(q=f"'{prev_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder'", fields="files(id,name)").execute()["files"]
+            for folder in subfolders:
+                if folder["name"].lower() == "print files":
+                    copied_folder = copy_item(folder["id"], new_folder_id)
+                    make_public(copied_folder["id"])
+                    print_files_link = f"https://drive.google.com/drive/folders/{copied_folder['id']}"
+                    break
+
+        # Get formula row to extract formulas for specific columns
         sheet = get_sheets_service().spreadsheets()
         formula_row = sheet.values().get(
             spreadsheetId=SPREADSHEET_ID,
@@ -1124,8 +1136,8 @@ def reorder():
             adjust_formula(formula_row[21]),
             adjust_formula(formula_row[22]),
             new_notes,
-            new_file_link,
-            print_files_folder,
+            new_image_file_link,
+            print_files_link,
             "",
             new_type,
             adjust_formula(formula_row[28]),
@@ -1161,6 +1173,7 @@ def reorder():
         traceback.print_exc()
         print("❌ Exception during reorder:", str(e))
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+
 
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
