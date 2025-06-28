@@ -1073,13 +1073,32 @@ def reorder():
             new_image_file_link = f"https://drive.google.com/file/d/{copied_image['id']}/view"
 
         if prev_folder_id:
-            query = f"'{prev_folder_id}' in parents"
-            files = drive.files().list(q=query, fields="files(id,name,mimeType)").execute()["files"]
-            for f in files:
-                if f["name"].lower().endswith(".emb"):
-                    copied_emb = copy_item(f["id"], new_folder_id, f"{new_id}.emb")
-                    make_public(copied_emb["id"])
-                    break
+            subfolders = drive.files().list(
+                q=f"'{prev_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder'",
+                fields="files(id,name)"
+            ).execute()["files"]
+
+            for folder in subfolders:
+                if folder["name"].strip().lower() == "print files":
+                    print("📁 Found 'Print Files' folder, copying contents...")
+                    # 1. Create new folder inside new job folder
+                    new_print_folder_id = create_folder("Print Files", parent=new_folder_id)
+
+                    # 2. Copy each file into it
+                    files_in_print = drive.files().list(
+                        q=f"'{folder['id']}' in parents",
+                        fields="files(id,name)"
+                    ).execute()["files"]
+
+                    for f in files_in_print:
+                        copied = copy_item(f["id"], new_print_folder_id)
+                        make_public(copied["id"])
+
+                    # 3. Make folder public and store the link
+                    make_public(new_print_folder_id)
+                    print_files_link = f"https://drive.google.com/drive/folders/{new_print_folder_id}"
+                    break  # stop after first match
+
 
         print_files_link = ""
         if prev_folder_id:
