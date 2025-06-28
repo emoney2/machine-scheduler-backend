@@ -1093,46 +1093,46 @@ def reorder():
         def adjust_formula(formula):
             if not formula or not isinstance(formula, str):
                 return ""
-            return formula.replace("A2", f"A{next_row}").replace("K2", f"K{next_row}")
+            return re.sub(r"([A-Z])2", lambda m: f"{m.group(1)}{next_row}", formula)
 
         from datetime import datetime
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
 
         row = [
-            new_id,                                    # A Order #
-            now,                                       # B Date
-            formula_row[2],                            # C Preview (copied formula)
-            match.get("Company Name", ""),             # D
-            match.get("Design", ""),                   # E
-            match.get("Quantity", ""),                # F
-            "",                                        # G Shipped
-            match.get("Product", ""),                 # H
-            adjust_formula(formula_row[8]),            # I Stage
-            match.get("Price", ""),                   # J
-            new_due,                                   # K Due Date
-            match.get("Print", ""),                   # L
-            match.get("Material1", ""),               # M
-            match.get("Material2", ""),               # N
-            match.get("Material3", ""),               # O
-            match.get("Material4", ""),               # P
-            match.get("Material5", ""),               # Q
-            match.get("Back Material", ""),           # R
-            match.get("Fur Color", ""),               # S
-            match.get("EMB Backing", ""),             # T
-            match.get("Top Stitch Color", ""),        # U
-            adjust_formula(formula_row[21]),           # V Ship Date
-            adjust_formula(formula_row[22]),           # W Stitch Count
-            new_notes,                                 # X Notes
-            new_file_link,                             # Y Image
-            print_files_folder,                        # Z Print Files
-            "",                                        # AA
-            new_type,                                  # AB Hard/Soft Date
-            adjust_formula(formula_row[28]),           # AC Schedule String
-            "",                                        # AD Start Date
-            "",                                        # AE End Date
-            adjust_formula(formula_row[31]),           # AF Threads
-            ""                                         # AG Tracking #
+            new_id,
+            now,
+            adjust_formula(formula_row[2]),
+            match.get("Company Name", ""),
+            match.get("Design", ""),
+            match.get("Quantity", ""),
+            "",
+            match.get("Product", ""),
+            adjust_formula(formula_row[8]),
+            match.get("Price", ""),
+            new_due,
+            match.get("Print", ""),
+            match.get("Material1", ""),
+            match.get("Material2", ""),
+            match.get("Material3", ""),
+            match.get("Material4", ""),
+            match.get("Material5", ""),
+            match.get("Back Material", ""),
+            match.get("Fur Color", ""),
+            match.get("EMB Backing", ""),
+            match.get("Top Stitch Color", ""),
+            adjust_formula(formula_row[21]),
+            adjust_formula(formula_row[22]),
+            new_notes,
+            new_file_link,
+            print_files_folder,
+            "",
+            new_type,
+            adjust_formula(formula_row[28]),
+            "",
+            "",
+            adjust_formula(formula_row[31]),
+            ""
         ]
 
         while len(row) < 34:
@@ -1161,7 +1161,6 @@ def reorder():
         traceback.print_exc()
         print("❌ Exception during reorder:", str(e))
         return jsonify({"error": f"Server error: {str(e)}"}), 500
-
 
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
