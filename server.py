@@ -1176,6 +1176,7 @@ def reorder():
                 result = chr(65 + rem) + result
             return result
 
+        print("🧾 Final row to write:", row)
         last_col_letter = colnum_to_letter(len(row))
         sheet.values().update(
             spreadsheetId=SPREADSHEET_ID,
