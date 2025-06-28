@@ -1185,6 +1185,9 @@ def reorder():
         ).execute()
 
         print(f"✅ Reorder #{new_id} submitted successfully.")
+        for idx, val in enumerate(row, start=1):
+            col_letter = chr(64 + idx) if idx <= 26 else f"{chr(64 + (idx - 1) // 26)}{chr(64 + (idx - 1) % 26 + 1)}"
+            print(f"  Column {col_letter} ({idx}): {val}")
         return jsonify({"status": "ok", "order": new_id}), 200
 
     except Exception as e:
