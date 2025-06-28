@@ -1072,11 +1072,29 @@ def reorder():
             make_public(copied_image["id"])
             new_image_file_link = f"https://drive.google.com/file/d/{copied_image['id']}/view"
 
+        print_files_link = ""
         if prev_folder_id:
             subfolders = drive.files().list(
                 q=f"'{prev_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder'",
                 fields="files(id,name)"
             ).execute()["files"]
+
+            for folder in subfolders:
+                if folder["name"].strip().lower() == "print files":
+                    print("📁 Found 'Print Files' folder, copying contents...")
+                    new_print_folder_id = create_folder("Print Files", parent=new_folder_id)
+                    files_in_print = drive.files().list(
+                        q=f"'{folder['id']}' in parents",
+                        fields="files(id,name)"
+                    ).execute()["files"]
+
+                    for f in files_in_print:
+                        copied = copy_item(f["id"], new_print_folder_id)
+                        make_public(copied["id"])
+
+                    make_public(new_print_folder_id)
+                    print_files_link = f"https://drive.google.com/drive/folders/{new_print_folder_id}"
+                    break
 
             for folder in subfolders:
                 if folder["name"].strip().lower() == "print files":
@@ -1098,21 +1116,6 @@ def reorder():
                     make_public(new_print_folder_id)
                     print_files_link = f"https://drive.google.com/drive/folders/{new_print_folder_id}"
                     break  # stop after first match
-
-
-        print_files_link = ""
-        if prev_folder_id:
-            subfolders = drive.files().list(q=f"'{prev_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder'", fields="files(id,name)").execute()["files"]
-            for folder in subfolders:
-                if folder["name"].lower() == "print files":
-                    new_print_folder_id = create_folder("Print Files", parent=new_folder_id)
-                    files_in_print = drive.files().list(q=f"'{folder['id']}' in parents", fields="files(id,name)").execute()["files"]
-                    for f in files_in_print:
-                        copied = copy_item(f["id"], new_print_folder_id)
-                        make_public(copied["id"])
-                    make_public(new_print_folder_id)
-                    print_files_link = f"https://drive.google.com/drive/folders/{new_print_folder_id}"
-                    break
 
         sheet = get_sheets_service().spreadsheets()
         formula_row = sheet.values().get(
