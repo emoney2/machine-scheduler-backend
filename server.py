@@ -1148,6 +1148,9 @@ def reorder():
             return result
 
         last_col_letter = colnum_to_letter(len(row))
+
+        next_row = len(rows) + 1  # ✅ Added this line to define next_row
+
         sheet = get_sheets_service().spreadsheets()
         sheet.values().update(
             spreadsheetId=SPREADSHEET_ID,
