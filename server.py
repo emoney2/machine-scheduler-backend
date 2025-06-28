@@ -990,23 +990,14 @@ def submit_order():
 @app.route("/api/reorder", methods=["POST"])
 @login_required_session
 def reorder():
-    """
-    Expects JSON:
-      {
-        "previousOrder": <number>,
-        "newDueDate": "YYYY-MM-DD",
-        "newDateType": "Hard Date"|"Soft Date",
-        "notes": "<overrideable notes>"
-      }
-    """
     data = request.get_json(silent=True) or {}
 
     print("📥 Incoming /api/reorder payload:", data)
 
-    prev_id    = data.get("previousOrder")
-    new_due    = data.get("newDueDate")
-    new_type   = data.get("newDateType")
-    new_notes  = data.get("notes", "")
+    prev_id = data.get("previousOrder")
+    new_due = data.get("newDueDate")
+    new_type = data.get("newDateType")
+    new_notes = data.get("notes", "")
 
     if not all([prev_id, new_due, new_type]):
         print("🚨 Missing required field(s):", {
@@ -1035,12 +1026,14 @@ def reorder():
         print("✅ Found matching order row:", match)
 
         # 2) Determine new Order #
+        sheets = get_sheets_service().spreadsheets()
         colA = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
             range="Production Orders!A:A"
         ).execute().get("values", [])
         last = int(colA[-1][0] or 0)
         new_id = last + 1
+        next_row = len(colA) + 1  # assumes 1-indexed and header is row 1
 
         # 3) Create new Drive folder and copy prod/print files + .emb
         drive = build("drive", "v3", credentials=creds)
@@ -1058,7 +1051,7 @@ def reorder():
             body = {"parents": [folder_id]}
             if new_name:
                 body["name"] = new_name
-            return drive.files().copy(fileId=file_id, body=body, fields="id").execute()
+            return drive.files().copy(fileId=file_id, body=body, fields="id,name").execute()
 
         prev_link = match.get("Image", "")
         if not prev_link:
@@ -1085,6 +1078,7 @@ def reorder():
         prod_files = match.get("production_files", "")
         print_files = match.get("print_files", "")
 
+        new_emb_link = ""
         for f in drive.files().list(q=query, fields="files(id,name,mimeType)").execute()["files"]:
             name, fid = f["name"], f["id"]
             if (
@@ -1095,51 +1089,39 @@ def reorder():
                 new_name = f"{new_id}.emb" if name.endswith(".emb") else None
                 copied = copy_item(fid, new_folder, new_name)
                 make_public(copied["id"])
+                if name.endswith(".emb"):
+                    new_emb_link = f"https://drive.google.com/file/d/{copied['id']}/view?usp=sharing"
 
-        # 4) Build the new row for the sheet
-        ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
-        row = [
-            new_id,                         # A - Order #
-            ts,                             # B - Date
-            match.get("Preview", ""),       # C - Preview
-            match.get("Company Name", ""),  # D
-            match.get("Design", ""),        # E
-            match.get("Quantity", ""),      # F
-            "",                             # G - Shipped (leave blank for reorder)
-            match.get("Product", ""),       # H
-            match.get("Stage", ""),         # I
-            match.get("Price", ""),         # J
-            new_due,                        # K - Due Date (override)
-            "PRINT" if print_files else "NO",  # L - Print
-            match.get("Material1", ""),     # M
-            match.get("Material2", ""),     # N
-            match.get("Material3", ""),     # O
-            match.get("Material4", ""),     # P
-            match.get("Material5", ""),     # Q
-            match.get("Back Material", ""), # R
-            match.get("Fur Color", ""),     # S
-            match.get("EMB Backing", ""),   # T
-            match.get("Top Stitch Color", ""),  # U
-            match.get("Ship Date", ""),     # V
-            match.get("Stitch Count", ""),  # W
-            new_notes,                      # X - Notes (override)
-            f"https://drive.google.com/drive/folders/{new_folder}",  # Y - Image (new folder link)
-            print_files,                    # Z - Print Files
-            "",                             # AA - Empty/Unused
-            new_type,                       # AB - Hard Date/Soft Date (override)
-            match.get("Schedule String", ""),  # AC
-            "",                             # AD - Start Date
-            "",                             # AE - End Date
-            match.get("Threads", ""),       # AF
-            ""                              # AG - Tracking #
-        ]
+        if not new_emb_link:
+            new_emb_link = f"https://drive.google.com/drive/folders/{new_folder}"
 
+        # 4) Pull formulas from row 2
+        sheet = get_sheets_service().spreadsheets()
+        formula_range = "Production Orders!A2:AG2"
+        formulas = sheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=formula_range,
+            valueRenderOption="FORMULA"
+        ).execute().get("values", [[]])[0]
 
-        while len(row) < 33:
-            row.append("")
+        # Adjust formulas to target the new row
+        adjusted = []
+        for cell in formulas:
+            if isinstance(cell, str) and cell.startswith("="):
+                adjusted.append(re.sub(r"\d+", str(next_row), cell, count=10))
+            else:
+                adjusted.append(cell)
 
-        print("📤 Writing new row to sheet:", row)
+        # 5) Update fixed fields
+        adjusted[0] = new_id                             # A - Order #
+        adjusted[1] = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")  # B - Date
+        adjusted[10] = new_due                           # K - Due Date
+        adjusted[23] = new_notes                         # X - Notes
+        adjusted[24] = new_emb_link                      # Y - Image
+        adjusted[26] = ""                                # AA - Empty
+        adjusted[27] = new_type                          # AB - Hard/Soft Date
 
+        # 6) Submit to sheet
         def colnum_to_letter(n):
             result = ''
             while n > 0:
@@ -1147,16 +1129,12 @@ def reorder():
                 result = chr(65 + rem) + result
             return result
 
-        last_col_letter = colnum_to_letter(len(row))
-
-        next_row = len(rows) + 1  # ✅ Added this line to define next_row
-
-        sheet = get_sheets_service().spreadsheets()
+        last_col_letter = colnum_to_letter(len(adjusted))
         sheet.values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"Production Orders!A{next_row}:{last_col_letter}{next_row}",
             valueInputOption="USER_ENTERED",
-            body={"values": [row]},
+            body={"values": [adjusted]},
         ).execute()
 
         print(f"✅ Reorder #{new_id} submitted successfully.")
@@ -1167,7 +1145,6 @@ def reorder():
         traceback.print_exc()
         print("❌ Exception during reorder:", str(e))
         return jsonify({"error": f"Server error: {str(e)}"}), 500
-
 
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
