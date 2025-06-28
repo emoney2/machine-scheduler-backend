@@ -991,30 +991,41 @@ def submit_order():
 @login_required_session
 def reorder():
     data = request.get_json(silent=True) or {}
-    print("\U0001F4E5 Incoming /api/reorder payload:", data)
 
-    prev_id = data.get("previousOrder")
-    new_due = data.get("newDueDate")
-    new_type = data.get("newDateType")
-    new_notes = data.get("notes", "")
+    print("📥 Incoming /api/reorder payload:", data)
+
+    prev_id    = data.get("previousOrder")
+    new_due    = data.get("newDueDate")
+    new_type   = data.get("newDateType")
+    new_notes  = data.get("notes", "")
 
     if not all([prev_id, new_due, new_type]):
+        print("🚨 Missing required field(s):", {
+            "previousOrder": prev_id,
+            "newDueDate": new_due,
+            "newDateType": new_type
+        })
         return jsonify({"error": "Missing fields"}), 400
 
     try:
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
         headers = rows[0]
         match = None
+        print(f"🔍 Searching for order #{prev_id} in spreadsheet...")
         for r in rows[1:]:
             if str(r[0]).strip().lstrip("#") == str(prev_id).strip().lstrip("#"):
                 match = dict(zip(headers, r))
                 break
 
         if not match:
+            print(f"❌ Order #{prev_id} not found.")
             return jsonify({"error": f"Order {prev_id} not found"}), 404
 
-        colA = get_sheets_service().spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID, range="Production Orders!A:A"
+        print("✅ Found matching order row:", match)
+
+        colA = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Production Orders!A:A"
         ).execute().get("values", [])
         last = int(colA[-1][0] or 0)
         new_id = last + 1
@@ -1023,7 +1034,10 @@ def reorder():
         drive = build("drive", "v3", credentials=creds)
 
         def create_folder(name, parent=None):
-            meta = {"name": str(name), "mimeType": "application/vnd.google-apps.folder"}
+            meta = {
+                "name": str(name),
+                "mimeType": "application/vnd.google-apps.folder"
+            }
             if parent:
                 meta["parents"] = [parent]
             return drive.files().create(body=meta, fields="id").execute()["id"]
@@ -1036,81 +1050,118 @@ def reorder():
 
         def make_public(fid):
             drive.permissions().create(
-                fileId=fid, body={"type": "anyone", "role": "reader"}
+                fileId=fid,
+                body={"type": "anyone", "role": "reader"}
             ).execute()
 
         prev_link = match.get("Image", "")
+        if not prev_link:
+            return jsonify({"error": "Missing previous folder link"}), 400
+
+        import re
         match_drive_id = re.search(r"/d/([a-zA-Z0-9_-]+)", prev_link)
         prev_folder = match_drive_id.group(1) if match_drive_id else ""
+        new_folder = create_folder(new_id)
+
         if not prev_folder:
             return jsonify({"error": "Could not extract folder ID from link"}), 400
 
-        new_folder = create_folder(new_id)
         make_public(new_folder)
-
         query = f"'{prev_folder}' in parents"
-        files_to_copy = drive.files().list(q=query, fields="files(id,name)").execute()["files"]
 
-        prod_file_link = ""
-        print_file_link = ""
-
-        for f in files_to_copy:
+        copied_files = drive.files().list(q=query, fields="files(id,name,mimeType)").execute()["files"]
+        new_file_link = ""
+        print_files_folder = ""
+        for f in copied_files:
             name, fid = f["name"], f["id"]
-            is_prod = name.endswith(".emb")
-            copied = copy_item(fid, new_folder, f"{new_id}.emb" if is_prod else None)
-            make_public(copied["id"])
-            link = f"https://drive.google.com/file/d/{copied['id']}/view?usp=drivesdk"
-            if is_prod:
-                prod_file_link = link
-            else:
-                print_file_link = link
+            if name.endswith(".emb"):
+                copied = copy_item(fid, new_folder, f"{new_id}.emb")
+                make_public(copied["id"])
+                new_file_link = f"https://drive.google.com/file/d/{copied['id']}/view"
+            elif "print" in name.lower():
+                copied = copy_item(fid, new_folder)
+                make_public(copied["id"])
+                print_files_folder = f"https://drive.google.com/drive/folders/{new_folder}"
 
-        sheets = get_sheets_service().spreadsheets()
-        formula_cols = {
-            2: "=NOW()",
-            8: f"=IF(G{next_row}=\"\",IF(VLOOKUP(A{next_row},'Embroidery List'!A:U,20,FALSE)=\"COMPLETE\",\"SEWING\",\"EMBROIDERY\"),\"COMPLETE\")",
-            22: f"=IF(K{next_row}=\"\",\"\",WORKDAY(K{next_row},-3,Holidays!A:A))",
-            23: f"=IF(A{next_row}=\"\",\"\",VLOOKUP(A{next_row},'Embroidery List'!A:U,19,FALSE))",
-            28: f"=IF(A{next_row}=\"\",\"\",VLOOKUP(A{next_row},'Table'!A:Z,26,FALSE))",
-            29: f"=IF(A{next_row}=\"\",\"\",VLOOKUP(A{next_row},'Embroidery List'!A:U,21,FALSE))",
-        }
-
-        row = []
-        for i in range(33):
-            if i == 0:
-                row.append(new_id)
-            elif i in formula_cols:
-                row.append(formula_cols[i])
-            elif i == 10:
-                row.append(new_due)
-            elif i == 11:
-                row.append("PRINT" if print_file_link else "NO")
-            elif i == 24:
-                row.append(new_notes)
-            elif i == 25:
-                row.append(prod_file_link)
-            elif i == 26:
-                row.append(print_file_link)
-            elif i == 27:
-                row.append("")  # unused
-            elif i == 28:
-                row.append(new_type)
-            else:
-                row.append(match.get(headers[i], ""))
-
-        sheets.values().update(
+        sheet = get_sheets_service().spreadsheets()
+        formula_row = sheet.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"Production Orders!A{next_row}",
+            range="Production Orders!A2:AH2",
+            valueRenderOption="FORMULA"
+        ).execute().get("values", [[]])[0]
+
+        def adjust_formula(formula):
+            if not formula or not isinstance(formula, str):
+                return ""
+            return formula.replace("A2", f"A{next_row}").replace("K2", f"K{next_row}")
+
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+
+        row = [
+            new_id,                                    # A Order #
+            now,                                       # B Date
+            formula_row[2],                            # C Preview (copied formula)
+            match.get("Company Name", ""),             # D
+            match.get("Design", ""),                   # E
+            match.get("Quantity", ""),                # F
+            "",                                        # G Shipped
+            match.get("Product", ""),                 # H
+            adjust_formula(formula_row[8]),            # I Stage
+            match.get("Price", ""),                   # J
+            new_due,                                   # K Due Date
+            match.get("Print", ""),                   # L
+            match.get("Material1", ""),               # M
+            match.get("Material2", ""),               # N
+            match.get("Material3", ""),               # O
+            match.get("Material4", ""),               # P
+            match.get("Material5", ""),               # Q
+            match.get("Back Material", ""),           # R
+            match.get("Fur Color", ""),               # S
+            match.get("EMB Backing", ""),             # T
+            match.get("Top Stitch Color", ""),        # U
+            adjust_formula(formula_row[21]),           # V Ship Date
+            adjust_formula(formula_row[22]),           # W Stitch Count
+            new_notes,                                 # X Notes
+            new_file_link,                             # Y Image
+            print_files_folder,                        # Z Print Files
+            "",                                        # AA
+            new_type,                                  # AB Hard/Soft Date
+            adjust_formula(formula_row[28]),           # AC Schedule String
+            "",                                        # AD Start Date
+            "",                                        # AE End Date
+            adjust_formula(formula_row[31]),           # AF Threads
+            ""                                         # AG Tracking #
+        ]
+
+        while len(row) < 34:
+            row.append("")
+
+        def colnum_to_letter(n):
+            result = ''
+            while n > 0:
+                n, rem = divmod(n - 1, 26)
+                result = chr(65 + rem) + result
+            return result
+
+        last_col_letter = colnum_to_letter(len(row))
+        sheet.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!A{next_row}:{last_col_letter}{next_row}",
             valueInputOption="USER_ENTERED",
             body={"values": [row]},
         ).execute()
 
-        print(f"\u2705 Reorder #{new_id} submitted successfully.")
+        print(f"✅ Reorder #{new_id} submitted successfully.")
         return jsonify({"status": "ok", "order": new_id}), 200
 
     except Exception as e:
+        import traceback
         traceback.print_exc()
+        print("❌ Exception during reorder:", str(e))
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+
 
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
