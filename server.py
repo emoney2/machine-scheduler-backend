@@ -863,14 +863,31 @@ def submit_order():
 
         # helper: make a Drive folder (optionally under a parent) and return its ID
         def create_folder(name, parent_id=None):
+            print(f"🔍 Looking for existing folders named '{name}' under parent: {parent_id or 'root'}")
+            query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            if parent_id:
+                query += f" and '{parent_id}' in parents"
+
+            try:
+                matches = drive.files().list(q=query, fields="files(id, name)").execute().get("files", [])
+                for match in matches:
+                    print(f"🗑️ Deleting existing folder: {match['name']} (ID: {match['id']})")
+                    drive.files().delete(fileId=match["id"]).execute()
+            except Exception as e:
+                print(f"❌ Failed to check/delete existing folders: {e}")
+
             meta = {
                 "name": str(name),
                 "mimeType": "application/vnd.google-apps.folder",
             }
             if parent_id:
                 meta["parents"] = [parent_id]
+
+            print(f"📁 Creating new folder: {name}")
             folder = drive.files().create(body=meta, fields="id").execute()
+            print(f"✅ Folder created with ID: {folder['id']}")
             return folder["id"]
+
 
         # create Drive folder for this order
         drive = build("drive","v3",credentials=creds)
