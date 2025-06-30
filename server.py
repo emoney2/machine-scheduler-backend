@@ -527,20 +527,13 @@ def jobs_for_company():
                 if file_id else ""
             )
 
-            jobs.append({
-                "orderId": str(row_dict.get("Order #", "")).strip(),
-                "date": row_dict.get("Date", "").strip(),
-                "company": row_dict.get("Company Name", "").strip(),
-                "design": row_dict.get("Design", "").strip(),
-                "quantity": row_dict.get("Quantity", "").strip(),
-                "product": row_dict.get("Product", "").strip(),
-                "stage": row_dict.get("Stage", "").strip(),
-                "price": row_dict.get("Price", "").strip(),
-                "due": row_dict.get("Due Date", "").strip(),
-                "image": preview_url
-            })
+            # Include full row data
+            row_dict["image"] = preview_url
+            row_dict["orderId"] = str(row_dict.get("Order #", "")).strip()
+            jobs.append(row_dict)
 
     return jsonify({ "jobs": jobs })
+
 
 
 @app.route("/api/set-volume", methods=["POST"])
