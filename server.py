@@ -1768,6 +1768,25 @@ def rate_shipment():
         logger.exception("UPS rating error")
         return jsonify({ "error": str(e) }), 500
 
+@app.route("/api/list-folder-files")
+def list_folder_files():
+    folder_id = request.args.get("folderId")
+    if not folder_id:
+        return jsonify({"error": "Missing folderId"}), 400
+
+    try:
+        drive = build("drive", "v3", credentials=creds)
+        results = drive.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields="files(id, name, mimeType)"
+        ).execute()
+        return jsonify({"files": results.get("files", [])})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
