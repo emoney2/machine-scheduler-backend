@@ -881,7 +881,7 @@ def submit_order():
             ).execute()
 
         # 1) Make the root folder for this order
-        order_folder_id   = create_folder(new_order)
+        order_folder_id = create_folder(new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
         make_public(order_folder_id)
 
         # (we’ll link to it later as order_folder_link)
