@@ -1027,29 +1027,46 @@ def reorder():
         drive = build("drive", "v3", credentials=creds)
 
         def create_folder(name, parent_id=None):
-            # 1. Search for any existing folders with the same name
-            query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-            results = drive.files().list(q=query, fields="files(id, name, parents)").execute()
-            matches = results.get("files", [])
+            print(f"🔍 Checking for existing folders named: {name}")
 
+            # 1. Search for existing folders with the same name
+            query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            try:
+                results = drive.files().list(q=query, fields="files(id, name, parents)").execute()
+                matches = results.get("files", [])
+                print(f"📦 Found {len(matches)} existing folders with name '{name}'")
+            except Exception as e:
+                print(f"❌ Error searching folders: {e}")
+                matches = []
+
+            # 2. Try deleting each match
             for match in matches:
+                print(f"🗑️ Attempting to delete: {match['name']} (ID: {match['id']})")
                 try:
                     drive.files().delete(fileId=match["id"]).execute()
-                    print(f"🗑️ Deleted existing folder: {match['name']} (ID: {match['id']})")
+                    print(f"✅ Deleted folder ID: {match['id']}")
                 except Exception as e:
-                    print(f"⚠️ Error deleting folder: {match['id']} — {e}")
+                    print(f"❌ Failed to delete folder ID {match['id']}: {e}")
 
-            # 2. Create the new folder
+            # 3. Create new folder
+            print(f"🆕 Creating new folder: {name}")
             meta = {
                 "name": str(name),
                 "mimeType": "application/vnd.google-apps.folder",
             }
             if parent_id:
                 meta["parents"] = [parent_id]
+                print(f"📁 Setting parent ID: {parent_id}")
+            else:
+                print("📁 No parent ID set")
 
-            folder = drive.files().create(body=meta, fields="id").execute()
-            print(f"📁 Created new folder: {name} (ID: {folder['id']})")
-            return folder["id"]
+            try:
+                folder = drive.files().create(body=meta, fields="id").execute()
+                print(f"✅ Created new folder ID: {folder['id']}")
+                return folder["id"]
+            except Exception as e:
+                print(f"❌ Failed to create folder: {e}")
+                return None
 
         def copy_item(file_id, folder_id, new_name=None):
             body = {"parents": [folder_id]}
