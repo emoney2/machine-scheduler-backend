@@ -1027,20 +1027,21 @@ def reorder():
         drive = build("drive", "v3", credentials=creds)
 
         def create_folder(name, parent_id=None):
-            # 1. Search for an existing folder with this name in the parent
-            query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            # 1. Search for existing folder with this name under the correct parent
+            query_parts = [f"name = '{name}'", "mimeType = 'application/vnd.google-apps.folder'", "trashed = false"]
             if parent_id:
-                query += f" and '{parent_id}' in parents"
+                query_parts.append(f"'{parent_id}' in parents")
+            query = " and ".join(query_parts)
 
-            results = drive.files().list(q=query, fields="files(id, name)").execute()
-            existing_folders = results.get("files", [])
+            response = drive.files().list(q=query, fields="files(id, name)").execute()
+            existing_folders = response.get("files", [])
 
-            # 2. If one or more matching folders exist, delete them
+            # 2. Delete all existing matching folders
             for folder in existing_folders:
-                print(f"🗑️ Deleting existing folder: {folder['name']} ({folder['id']})")
+                print(f"🗑️ Deleting existing folder named '{name}' with ID {folder['id']}")
                 drive.files().delete(fileId=folder["id"]).execute()
 
-            # 3. Create the new folder
+            # 3. Create new folder
             meta = {
                 "name": str(name),
                 "mimeType": "application/vnd.google-apps.folder",
@@ -1050,7 +1051,6 @@ def reorder():
 
             folder = drive.files().create(body=meta, fields="id").execute()
             return folder["id"]
-
 
         def copy_item(file_id, folder_id, new_name=None):
             body = {"parents": [folder_id]}
