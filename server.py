@@ -7,6 +7,7 @@ import traceback
 import re
 import requests
 import traceback
+import gspread
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
