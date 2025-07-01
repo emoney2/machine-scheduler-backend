@@ -1790,17 +1790,22 @@ def list_folder_files():
 def proxy_drive_file():
     file_id = request.args.get("fileId")
     if not file_id:
+        print("❌ Missing fileId in request")
         return "Missing fileId", 400
 
     try:
-        print(f"📦 Fetching file from Drive: {file_id}")
-        file = drive_service.files().get_media(fileId=file_id).execute()
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        print(f"🔄 Fetching file from: {url}")
+        r = requests.get(url, stream=True)
+        r.raise_for_status()
 
-        response = Response(file)
-        response.headers["Content-Type"] = "application/octet-stream"
-        return response
+        content_type = r.headers.get("Content-Type", "application/octet-stream")
+        print(f"✅ File fetched. Content-Type: {content_type}")
+        return Response(r.iter_content(chunk_size=4096), content_type=content_type)
     except Exception as e:
-        print(f"❌ Error fetching file from Drive: {e}")
+        print("❌ Error during proxying file:")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
