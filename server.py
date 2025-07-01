@@ -1834,6 +1834,26 @@ def drive_file_metadata():
     except Exception as e:
         app.logger.error(f"❌ Error fetching metadata for file {file_id}: {e}")
         return jsonify({"error": str(e)}), 500
+@app.route("/api/clearStartTime", methods=["POST"])
+@cross_origin(origins=["https://machineschedule.netlify.app"], supports_credentials=True)
+def clear_start_time():
+    try:
+        data = request.get_json()
+        order_number = str(data.get("order_number")).strip()
+
+        if not order_number:
+            return jsonify({"error": "Missing order_number"}), 400
+
+        all_rows = orders_ws.get_all_records()
+        for idx, row in enumerate(all_rows, start=2):  # skip header, rows are 1-indexed
+            if str(row.get("Order #")).strip() == order_number:
+                orders_ws.update_acell(f"T{idx}", "")  # Column T = Embroidery Start Time
+                return jsonify({"success": True})
+
+        return jsonify({"error": "Order not found"}), 404
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
