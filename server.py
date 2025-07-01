@@ -1884,11 +1884,9 @@ def clear_start_time():
         return jsonify({"error": "Job not found"}), 404
 
     except Exception as e:
-        print("🔥 Unexpected server error:", str(e))
+        print("🔥 Unexpected server error:")
+        traceback.print_exc()
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
-
-
-
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
