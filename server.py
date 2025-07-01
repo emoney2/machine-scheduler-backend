@@ -6,6 +6,7 @@ import time
 import traceback
 import re
 import requests
+import traceback
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
@@ -1842,13 +1843,18 @@ def get_column_index(sheet, header_name):
     raise ValueError(f"Column '{header_name}' not found.")
 
 @app.route("/api/clearStartTime", methods=["POST"])
-@login_required_session
 def clear_start_time():
     try:
-        data = request.get_json()
-        print("📨 Payload received:", data)
+        print("🧪 Raw data:", request.data)
+        try:
+            data = request.get_json(force=True)
+        except Exception as e:
+            print("❌ Failed to parse JSON:", str(e))
+            return jsonify({"error": "Invalid JSON"}), 400
 
+        print("📨 Payload received:", data)
         job_id = str(data.get("id", "")).strip()
+
         if not job_id:
             print("⚠️ Missing 'id' in payload.")
             return jsonify({"error": "Missing job ID"}), 400
@@ -1864,20 +1870,20 @@ def clear_start_time():
             return jsonify({"error": "Missing column"}), 500
 
         rows = sheet.get_all_records()
-        for i, row in enumerate(rows, start=2):  # start=2 because row 1 is header
+        for i, row in enumerate(rows, start=2):
             if str(row.get("ID", "")).strip() == job_id:
                 sheet.update_cell(i, emb_start_col, "")
-                print(f"✅ Cleared start time for job ID {job_id} at row {i}")
+                print(f"✅ Cleared start time for row {i}")
                 return jsonify({"status": "ok"}), 200
 
-        print(f"❌ Job ID {job_id} not found in sheet.")
+        print("❌ Job ID not found in sheet.")
         return jsonify({"error": "Job not found"}), 404
 
     except Exception as e:
+        import traceback
         print("🔥 Unexpected server error:", str(e))
+        traceback.print_exc()
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
-
-
 
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
