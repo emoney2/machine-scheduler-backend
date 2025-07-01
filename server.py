@@ -1789,6 +1789,7 @@ def list_folder_files():
 
 @app.route("/api/proxy-drive-file")
 def proxy_drive_file():
+    print("🔥 proxy_drive_file hit")
     file_id = request.args.get("fileId")
     if not file_id:
         print("❌ Missing fileId in request")
