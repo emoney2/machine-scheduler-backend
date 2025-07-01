@@ -829,7 +829,9 @@ def submit_order():
 
     try:
         data       = request.form
+        print("📥 Incoming files:", request.files)
         prod_files = request.files.getlist("prodFiles")
+        print("🧾 prod_files length:", len(prod_files))
         print_files= request.files.getlist("printFiles")
 
         # find next empty row in col A
