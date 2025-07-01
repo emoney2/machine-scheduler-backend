@@ -1848,33 +1848,34 @@ def get_column_index(sheet, header_name):
 @app.route("/api/clearStartTime", methods=["POST"])
 def clear_start_time():
     try:
-        print("🧪 Raw data:", request.data)
-        try:
-            data = request.get_json(force=True)
-        except Exception as e:
-            print("❌ Failed to parse JSON:", str(e))
-            return jsonify({"error": "Invalid JSON"}), 400
-
+        data = request.get_json()
         print("📨 Payload received:", data)
-        job_id = str(data.get("id", "")).strip()
 
+        job_id = str(data.get("id", "")).strip()
         if not job_id:
             print("⚠️ Missing 'id' in payload.")
             return jsonify({"error": "Missing job ID"}), 400
 
+        print("🔧 Looking up spreadsheet...")
         sheet = sh.worksheet("Production Orders")
+
         header = sheet.row_values(1)
         print("🧠 Header row:", header)
 
         try:
             emb_start_col = header.index("Embroidery Start Time") + 1
+            print(f"📍 Found 'Embroidery Start Time' at column {emb_start_col}")
         except ValueError:
             print("❌ Could not find 'Embroidery Start Time' in header.")
             return jsonify({"error": "Missing column"}), 500
 
         rows = sheet.get_all_records()
+        print(f"🔎 Scanning {len(rows)} rows for job ID {job_id}...")
+
         for i, row in enumerate(rows, start=2):
-            if str(row.get("ID", "")).strip() == job_id:
+            row_id = str(row.get("ID", "")).strip()
+            if row_id == job_id:
+                print(f"✅ Match at row {i}. Clearing cell...")
                 sheet.update_cell(i, emb_start_col, "")
                 print(f"✅ Cleared start time for row {i}")
                 return jsonify({"status": "ok"}), 200
@@ -1883,10 +1884,9 @@ def clear_start_time():
         return jsonify({"error": "Job not found"}), 404
 
     except Exception as e:
-        import traceback
         print("🔥 Unexpected server error:", str(e))
-        traceback.print_exc()
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
 
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
