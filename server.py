@@ -1785,6 +1785,22 @@ def list_folder_files():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+@app.route("/proxy-drive-file")
+def proxy_drive_file():
+    file_id = request.args.get("fileId")
+    if not file_id:
+        return "Missing fileId", 400
+
+    try:
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        r = requests.get(url, stream=True)
+        r.raise_for_status()
+
+        # detect file type from headers
+        content_type = r.headers.get("Content-Type", "application/octet-stream")
+        return Response(r.iter_content(chunk_size=4096), content_type=content_type)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 
