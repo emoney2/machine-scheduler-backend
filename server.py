@@ -1834,25 +1834,37 @@ def drive_file_metadata():
     except Exception as e:
         app.logger.error(f"❌ Error fetching metadata for file {file_id}: {e}")
         return jsonify({"error": str(e)}), 500
+def get_column_index(sheet, header_name):
+    headers = sheet.row_values(1)
+    for idx, col in enumerate(headers, start=1):
+        if col.strip().lower() == header_name.strip().lower():
+            return idx
+    raise ValueError(f"Column '{header_name}' not found.")
+
 @app.route("/api/clearStartTime", methods=["POST"])
-@cross_origin(origins=["https://machineschedule.netlify.app"], supports_credentials=True)
 def clear_start_time():
     try:
-        data = request.get_json()
-        order_number = str(data.get("order_number")).strip()
+        print("📨 Incoming clearStartTime request")
+        data = request.get_json(force=True)
+        print("📦 Payload:", data)
 
-        if not order_number:
-            return jsonify({"error": "Missing order_number"}), 400
+        job_id = data.get("id")
+        if not job_id:
+            return jsonify({"error": "Missing job ID"}), 400
 
-        all_rows = orders_ws.get_all_records()
-        for idx, row in enumerate(all_rows, start=2):  # skip header, rows are 1-indexed
-            if str(row.get("Order #")).strip() == order_number:
-                orders_ws.update_acell(f"T{idx}", "")  # Column T = Embroidery Start Time
+        sheet = sh.worksheet("Embroidery List")
+        records = sheet.get_all_records()
+        start_col_idx = get_column_index(sheet, "Embroidery Start Time")
+
+        for i, row in enumerate(records, start=2):  # Row 2 = first data row
+            if str(row.get("Order #")).strip() == str(job_id).strip():
+                sheet.update_cell(i, start_col_idx, "")  # Clear the start time
+                print(f"✅ Cleared start time for job {job_id} at row {i}")
                 return jsonify({"success": True})
 
-        return jsonify({"error": "Order not found"}), 404
-
+        return jsonify({"error": "Job ID not found"}), 404
     except Exception as e:
+        print("❌ clearStartTime error:", str(e))
         return jsonify({"error": str(e)}), 500
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
