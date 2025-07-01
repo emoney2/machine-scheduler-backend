@@ -1790,32 +1790,27 @@ def list_folder_files():
 def proxy_drive_file():
     file_id = request.args.get("fileId")
     if not file_id:
-        return jsonify({"error": "Missing fileId"}), 400
+        return "Missing fileId", 400
 
     try:
-        url = f"https://drive.google.com/uc?export=download&id={file_id}"
-        logging.info(f"🔁 Proxying file from Google Drive: {url}")
+        from googleapiclient.http import MediaIoBaseDownload
+        from io import BytesIO
 
-        r = requests.get(url, stream=True)
-        r.raise_for_status()
+        request_file = drive_service.files().get_media(fileId=file_id)
+        fh = BytesIO()
+        downloader = MediaIoBaseDownload(fh, request_file)
 
-        content_type = r.headers.get("Content-Type", "application/octet-stream")
-        content_disp = r.headers.get("Content-Disposition", "")
-        filename = "downloaded_file"
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
 
-        if "filename=" in content_disp:
-            filename = content_disp.split("filename=")[-1].strip('"')
-
-        logging.info(f"✅ Successfully fetched file. Type: {content_type}, Name: {filename}")
-
-        headers = {
-            "Content-Type": content_type,
-            "Content-Disposition": f'attachment; filename="{filename}"'
-        }
-
-        return Response(r.iter_content(chunk_size=4096), headers=headers)
+        fh.seek(0)
+        return send_file(
+            fh,
+            download_name=f"{file_id}.bin",
+            mimetype="application/octet-stream"
+        )
     except Exception as e:
-        logging.exception("❌ Failed to proxy file:")
         return jsonify({"error": str(e)}), 500
 
 
