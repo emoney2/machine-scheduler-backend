@@ -1817,10 +1817,13 @@ def drive_file_metadata():
         return jsonify({"error": "Missing fileId"}), 400
 
     try:
+        print(f"🔍 Fetching metadata for file ID: {file_id}")
         service = get_gdrive_service()
         metadata = service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
+        print(f"✅ Metadata retrieved: {metadata}")
         return jsonify(metadata)
     except Exception as e:
+        print(f"❌ Failed to fetch metadata for {file_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
 
