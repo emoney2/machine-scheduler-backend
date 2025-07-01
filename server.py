@@ -1810,7 +1810,7 @@ def proxy_drive_file():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-@app.route("/drive-file-metadata")
+@app.route("api/drive-file-metadata")
 def drive_file_metadata():
     file_id = request.args.get("fileId")
     if not file_id:
