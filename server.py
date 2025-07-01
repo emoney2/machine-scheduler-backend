@@ -1845,28 +1845,35 @@ def get_column_index(sheet, header_name):
 def clear_start_time():
     try:
         data = request.get_json()
-        print("🔍 Received clearStartTime payload:", data)
+        print("📨 Payload received:", data)
 
         job_id = str(data.get("id", "")).strip()
         if not job_id:
+            print("⚠️ Missing 'id' in payload.")
             return jsonify({"error": "Missing job ID"}), 400
 
-        # Now open the sheet and clear the embroidery_start value
         sheet = sh.worksheet("Production Orders")
-        rows = sheet.get_all_records()
         header = sheet.row_values(1)
-        emb_start_col = header.index("Embroidery Start Time") + 1
+        print("🧠 Header row:", header)
 
+        try:
+            emb_start_col = header.index("Embroidery Start Time") + 1
+        except ValueError:
+            print("❌ Could not find 'Embroidery Start Time' in header.")
+            return jsonify({"error": "Missing column"}), 500
+
+        rows = sheet.get_all_records()
         for i, row in enumerate(rows, start=2):
             if str(row.get("ID", "")).strip() == job_id:
                 sheet.update_cell(i, emb_start_col, "")
-                print(f"✅ Cleared embroidery_start for row {i}")
+                print(f"✅ Cleared start time for row {i}")
                 return jsonify({"status": "ok"}), 200
 
+        print("❌ Job ID not found in sheet.")
         return jsonify({"error": "Job not found"}), 404
 
     except Exception as e:
-        print("❌ Server error in clear_start_time:", str(e))
+        print("🔥 Unexpected server error:", str(e))
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 
