@@ -212,6 +212,8 @@ else:
       "https://www.googleapis.com/auth/drive"
     ]
 )
+sh = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+
 
 _http = Http(timeout=10)
 authed_http = AuthorizedHttp(creds, http=_http)
