@@ -1842,6 +1842,7 @@ def get_column_index(sheet, header_name):
     raise ValueError(f"Column '{header_name}' not found.")
 
 @app.route("/api/clearStartTime", methods=["POST"])
+@login_required_session
 def clear_start_time():
     try:
         data = request.get_json()
@@ -1856,28 +1857,26 @@ def clear_start_time():
         header = sheet.row_values(1)
         print("🧠 Header row:", header)
 
-        # Dynamically get column indexes
         try:
-            id_col = header.index("ID")
-            emb_start_col = header.index("Embroidery Start Time") + 1  # 1-based for gspread
-        except ValueError as e:
-            print("❌ Column missing in header:", str(e))
-            return jsonify({"error": "Missing column in header"}), 500
+            emb_start_col = header.index("Embroidery Start Time") + 1
+        except ValueError:
+            print("❌ Could not find 'Embroidery Start Time' in header.")
+            return jsonify({"error": "Missing column"}), 500
 
         rows = sheet.get_all_records()
-        for i, row in enumerate(rows, start=2):  # start=2 because row 1 is the header
-            sheet_id = str(row.get("ID", "")).strip()
-            if sheet_id == job_id:
+        for i, row in enumerate(rows, start=2):  # start=2 because row 1 is header
+            if str(row.get("ID", "")).strip() == job_id:
                 sheet.update_cell(i, emb_start_col, "")
-                print(f"✅ Cleared 'Embroidery Start Time' for row {i}, ID: {job_id}")
+                print(f"✅ Cleared start time for job ID {job_id} at row {i}")
                 return jsonify({"status": "ok"}), 200
 
-        print(f"❌ Job ID '{job_id}' not found in sheet.")
+        print(f"❌ Job ID {job_id} not found in sheet.")
         return jsonify({"error": "Job not found"}), 404
 
     except Exception as e:
         print("🔥 Unexpected server error:", str(e))
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
 
 
 
