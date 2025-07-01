@@ -12,8 +12,6 @@ logout_all_ts = 0.0
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from ups_service import get_rate
-from your_module_name import get_gdrive_service
-
 from functools import wraps
 from dotenv import load_dotenv
 
