@@ -1786,7 +1786,7 @@ def list_folder_files():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-@app.route("/proxy-drive-file")
+@app.route("/api/proxy-drive-file")
 def proxy_drive_file():
     file_id = request.args.get("fileId")
     if not file_id:
