@@ -1845,48 +1845,38 @@ def get_column_index(sheet, header_name):
             return idx
     raise ValueError(f"Column '{header_name}' not found.")
 
-@app.route("/api/clearStartTime", methods=["POST"])
-def clear_start_time():
+@app.route("/api/resetStartTime", methods=["POST"])
+@login_required_session
+def reset_start_time():
     try:
         data = request.get_json()
-        print("📨 Payload received:", data)
-
         job_id = str(data.get("id", "")).strip()
-        if not job_id:
-            print("⚠️ Missing 'id' in payload.")
-            return jsonify({"error": "Missing job ID"}), 400
+        timestamp = data.get("timestamp", "")
 
-        print("🔧 Looking up spreadsheet...")
+        if not job_id or not timestamp:
+            return jsonify({"error": "Missing job ID or timestamp"}), 400
+
         sheet = sh.worksheet("Production Orders")
-
-        header = sheet.row_values(1)
-        print("🧠 Header row:", header)
+        header = [h.strip() for h in sheet.row_values(1)]
 
         try:
             emb_start_col = header.index("Embroidery Start Time") + 1
-            print(f"📍 Found 'Embroidery Start Time' at column {emb_start_col}")
         except ValueError:
-            print("❌ Could not find 'Embroidery Start Time' in header.")
-            return jsonify({"error": "Missing column"}), 500
+            return jsonify({"error": "Missing 'Embroidery Start Time' column"}), 500
 
         rows = sheet.get_all_records()
-        print(f"🔎 Scanning {len(rows)} rows for job ID {job_id}...")
-
         for i, row in enumerate(rows, start=2):
-            row_id = str(row.get("ID", "")).strip()
-            if row_id == job_id:
-                print(f"✅ Match at row {i}. Clearing cell...")
-                sheet.update_cell(i, emb_start_col, "")
-                print(f"✅ Cleared start time for row {i}")
+            if str(row.get("ID", "")).strip() == job_id:
+                sheet.update_cell(i, emb_start_col, timestamp)
+                print(f"✅ Reset start time for row {i} (Job ID {job_id}) → {timestamp}")
                 return jsonify({"status": "ok"}), 200
 
-        print("❌ Job ID not found in sheet.")
         return jsonify({"error": "Job not found"}), 404
 
     except Exception as e:
-        print("🔥 Unexpected server error:")
-        traceback.print_exc()
+        print("🔥 Server error:", str(e))
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
