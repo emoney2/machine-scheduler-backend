@@ -12,6 +12,7 @@ logout_all_ts = 0.0
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from ups_service import get_rate
+from your_module_name import get_gdrive_service
 
 from functools import wraps
 from dotenv import load_dotenv
@@ -40,6 +41,14 @@ def get_sheets_service():
         scopes=scopes
     )
     return build("sheets", "v4", credentials=credentials)
+
+def get_drive_service():
+    scopes = ['https://www.googleapis.com/auth/drive']
+    credentials = service_account.Credentials.from_service_account_file(
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
+        scopes=scopes
+    )
+    return build("drive", "v3", credentials=credentials)
 
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
@@ -1818,7 +1827,7 @@ def drive_file_metadata():
 
     try:
         print(f"🔍 Fetching metadata for file ID: {file_id}")
-        service = get_gdrive_service()
+        service = get_drive_service()
         metadata = service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
         print(f"✅ Metadata retrieved: {metadata}")
         return jsonify(metadata)
