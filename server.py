@@ -1809,6 +1809,20 @@ def proxy_drive_file():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+@app.route("/drive-file-metadata")
+def drive_file_metadata():
+    file_id = request.args.get("fileId")
+    if not file_id:
+        return jsonify({"error": "Missing fileId"}), 400
+
+    try:
+        service = get_gdrive_service()
+        metadata = service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
+        return jsonify(metadata)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
