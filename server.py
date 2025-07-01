@@ -1823,9 +1823,8 @@ def drive_file_metadata():
         print(f"✅ Metadata retrieved: {metadata}")
         return jsonify(metadata)
     except Exception as e:
-        print(f"❌ Failed to fetch metadata for {file_id}: {e}")
+        app.logger.error(f"❌ Error fetching metadata for file {file_id}: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
