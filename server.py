@@ -1844,28 +1844,31 @@ def get_column_index(sheet, header_name):
 @app.route("/api/clearStartTime", methods=["POST"])
 def clear_start_time():
     try:
-        print("📨 Incoming clearStartTime request")
-        data = request.get_json(force=True)
-        print("📦 Payload:", data)
+        data = request.get_json()
+        print("🔍 Received clearStartTime payload:", data)
 
-        job_id = data.get("id")
+        job_id = str(data.get("id", "")).strip()
         if not job_id:
             return jsonify({"error": "Missing job ID"}), 400
 
-        sheet = sh.worksheet("Embroidery List")
-        records = sheet.get_all_records()
-        start_col_idx = get_column_index(sheet, "Embroidery Start Time")
+        # Now open the sheet and clear the embroidery_start value
+        sheet = sh.worksheet("Production Orders")
+        rows = sheet.get_all_records()
+        header = sheet.row_values(1)
+        emb_start_col = header.index("Embroidery Start Time") + 1
 
-        for i, row in enumerate(records, start=2):  # Row 2 = first data row
-            if str(row.get("Order #")).strip() == str(job_id).strip():
-                sheet.update_cell(i, start_col_idx, "")  # Clear the start time
-                print(f"✅ Cleared start time for job {job_id} at row {i}")
-                return jsonify({"success": True})
+        for i, row in enumerate(rows, start=2):
+            if str(row.get("ID", "")).strip() == job_id:
+                sheet.update_cell(i, emb_start_col, "")
+                print(f"✅ Cleared embroidery_start for row {i}")
+                return jsonify({"status": "ok"}), 200
 
-        return jsonify({"error": "Job ID not found"}), 404
+        return jsonify({"error": "Job not found"}), 404
+
     except Exception as e:
-        print("❌ clearStartTime error:", str(e))
-        return jsonify({"error": str(e)}), 500
+        print("❌ Server error in clear_start_time:", str(e))
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
