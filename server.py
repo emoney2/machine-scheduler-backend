@@ -1793,26 +1793,15 @@ def proxy_drive_file():
         return "Missing fileId", 400
 
     try:
-        from googleapiclient.http import MediaIoBaseDownload
-        from io import BytesIO
+        print(f"📦 Fetching file from Drive: {file_id}")
+        file = drive_service.files().get_media(fileId=file_id).execute()
 
-        request_file = drive_service.files().get_media(fileId=file_id)
-        fh = BytesIO()
-        downloader = MediaIoBaseDownload(fh, request_file)
-
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-
-        fh.seek(0)
-        return send_file(
-            fh,
-            download_name=f"{file_id}.bin",
-            mimetype="application/octet-stream"
-        )
+        response = Response(file)
+        response.headers["Content-Type"] = "application/octet-stream"
+        return response
     except Exception as e:
+        print(f"❌ Error fetching file from Drive: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
