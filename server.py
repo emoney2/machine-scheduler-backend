@@ -5,6 +5,7 @@ import logging
 import time
 import traceback
 import re
+import requests
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
