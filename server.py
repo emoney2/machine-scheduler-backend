@@ -246,20 +246,21 @@ import traceback
 
 def update_embroidery_start_time_in_sheet(order_id, new_start_time):
     try:
-        sheet = SHEETS.get_worksheet("Embroidery List")
-        data = sheet_cache.get_sheet_data(SPREADSHEET_ID, "Embroidery List")
+        sheet = sh.worksheet("Embroidery List")
+        data = sheet.get_all_records()
+        col_names = sheet.row_values(1)
+        id_col = col_names.index("Order #") + 1
+        start_col = col_names.index("Embroidery Start Time") + 1
 
-        # Find the row with matching Order #
-        for i, row in enumerate(data[1:], start=2):  # skip header, rows are 1-indexed
-            if str(row[0]).strip() == str(order_id).strip():
-                sheet.update_acell(f'AA{i}', new_start_time)
-                logger.info(f"✅ Updated embroidery start time for Order #{order_id} → {new_start_time}")
+        for i, row in enumerate(data, start=2):
+            if str(row.get("Order #")).strip() == str(order_id).strip():
+                sheet.update_cell(i, start_col, new_start_time)
+                print(f"✅ Embroidery Start Time updated for Order #{order_id}")
                 return
 
-        logger.warning(f"⚠️ Could not find order #{order_id} in Embroidery List")
+        print(f"⚠️ Order ID {order_id} not found in Embroidery List")
     except Exception as e:
-        logger.error(f"❌ Error updating start time for Order #{order_id}: {e}")
-
+        print(f"❌ Error updating start time for Order #{order_id}: {e}")
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
 CACHE_TTL           = 10
