@@ -907,12 +907,6 @@ def submit_order():
 
         # create Drive folder for this order
         drive = get_drive_service()
-        def make_public(file_id, drive_service):
-            drive_service.permissions().create(
-                fileId=file_id,
-                body={"type": "anyone", "role": "reader"},
-                fields="id"
-            ).execute()
 
         # 1) Make the root folder for this order
         order_folder_id = create_folder(new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
