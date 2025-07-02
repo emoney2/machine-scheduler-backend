@@ -223,71 +223,42 @@ sheets  = service.spreadsheets()
 
 @app.route('/api/updateStartTime', methods=["POST"])
 def update_start_time():
-    data = request.get_json()
-    row_id     = data.get("id")
+    data = request.json
+    job_id = data.get("id")
     start_time = data.get("startTime")
-
-    if not row_id or not start_time:
-        return jsonify({"error": "Missing ID or start time"}), 400
-
-    try:
-        success = update_embroidery_start_time_in_sheet(row_id, start_time)
-        if not success:
-            print(f"⚠️ No matching row for job_id={row_id} — skipping update")
-        # Always respond 200 so the client won’t see an error
-        return jsonify({"status": "ok"}), 200
-
-    except Exception as e:
-        print("❌ Server exception in /updateStartTime:", e)
-        # Still return 200 so the UI won’t break; check logs for details
-        return jsonify({"status": "ok"}), 200
+    
+    print(f"🛬 Incoming request to update start time: {job_id} → {start_time}")
+    
+    update_embroidery_start_time_in_sheet(job_id, start_time)
+    
+    return jsonify({"success": True})
 
 
 # ✅ You must define or update this function to match your actual Google Sheet logic
 import traceback
 
 def update_embroidery_start_time_in_sheet(job_id, start_time):
-    service = get_sheets_service()
-    sheet   = service.spreadsheets()
+    sheet = SHEET.worksheet("Embroidery List")
+    rows = sheet.get_all_values()
+    header = rows[0]
 
-    # 1) Read the IDs
-    result = sheet.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Embroidery List!A2:A"
-    ).execute()
-    values = result.get("values", [])
-    print(
-        "🧐 Sheet IDs (A2:A):",
-        [ (r[0] if len(r) > 0 else None) for r in values ][:20],
-        "…"
-    )
+    try:
+        order_col_index = header.index("Order #")
+        start_time_col_index = header.index("Embroidery Start Time")
+    except ValueError as e:
+        print("❌ Header missing expected column:", e)
+        return
 
-    # 2) Find & write
-    for idx, row in enumerate(values, start=2):
-        # ← Skip empty rows to avoid IndexError
-        if not row or len(row) == 0:
-            continue
+    print(f"🔍 Searching for job ID: {job_id} in Embroidery List...")
 
-        # Safe to access row[0] now
-        cell = str(row[0]).strip()
-        if cell == str(job_id).strip():
-            target = f"Embroidery List!AA{idx}"
-            try:
-                sheet.values().update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=target,
-                    valueInputOption="RAW",
-                    body={"values": [[start_time]]}
-                ).execute()
-                print(f"✅ Updated embroidery_start for job {job_id} at {target}")
-                return True
-            except Exception as e:
-                print("⚠️ Error writing startTime to sheet:", e)
-                return False
+    for i, row in enumerate(rows[1:], start=2):  # start=2 because rows[1] is row 2 in the sheet
+        order_val = row[order_col_index].strip()
+        if order_val == str(job_id).strip():
+            print(f"✅ Found job ID {job_id} on row {i} — updating start time...")
+            sheet.update_cell(i, start_time_col_index + 1, start_time)
+            return
 
-    # 3) No match → explicit False
-    print(f"❌ Job ID {job_id} not found in Embroidery List column A")
-    return False
+    print(f"❌ Job ID {job_id} not found in Embroidery List")
 
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
