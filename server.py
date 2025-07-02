@@ -244,23 +244,23 @@ def update_embroidery_start_time_in_sheet(job_id, start_time):
         rows = sheet.get_all_values()
         header = rows[0]
 
-        print(f"🔍 Searching for job ID: {job_id}")
+        print(f"🪪 Sheet header: {header}")
+        print(f"🔍 Looking for Order # = {job_id}")
 
         order_col_index = header.index("Order #")
         start_time_col_index = header.index("Embroidery Start Time")
 
         for i, row in enumerate(rows[1:], start=2):
+            print(f"👀 Row {i}: {row[order_col_index]}")
             if row[order_col_index].strip() == str(job_id).strip():
-                print(f"✅ Writing time to row {i}, col {start_time_col_index + 1}")
+                print(f"✅ Found match at row {i}, updating...")
                 sheet.update_cell(i, start_time_col_index + 1, start_time)
                 return
 
-        print(f"❌ Job ID {job_id} not found in Embroidery List")
+        print(f"❌ No match found for Order # {job_id}")
 
     except Exception as e:
         print(f"🔥 ERROR in update_embroidery_start_time_in_sheet: {e}")
-
-
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
