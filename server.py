@@ -244,37 +244,25 @@ def update_start_time():
 import traceback
 
 def update_embroidery_start_time_in_sheet(order_id, new_start_time):
-    print(f"🛠️ Starting to update start time for Order ID: {order_id}")
-
     try:
-        sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
-        sheet = sh.worksheet("Embroidery List")
-        data = sheet.get_all_records()
-
-        # Find the column index for "Embroidery Start Time"
+        sheet = sheet_cache["Embroidery List"]
         headers = sheet.row_values(1)
-        if "Embroidery Start Time" not in headers:
-            print("❌ 'Embroidery Start Time' column not found in headers.")
-            return
+        id_col = headers.index("Order #") + 1
+        start_col = headers.index("Embroidery Start Time") + 1
 
-        start_time_col_index = headers.index("Embroidery Start Time") + 1  # 1-based index
-        print(f"🧭 Found 'Embroidery Start Time' column at index {start_time_col_index}")
-
-        # Iterate over rows to find matching Order #
-        found = False
-        for i, row in enumerate(data, start=2):  # Data starts at row 2
-            print(f"🔍 Checking row {i}, Order #: {row.get('Order #')}")
-            if str(row.get("Order #")).strip() == str(order_id).strip():
-                sheet.update_cell(i, start_time_col_index, new_start_time)
-                print(f"✅ Match found on row {i}, updated start time to {new_start_time}")
-                found = True
-                break
-
-        if not found:
-            print(f"❌ No match found for Order ID {order_id} in Embroidery List")
-
+        all_data = sheet.get_all_values()
+        for idx, row in enumerate(all_data[1:], start=2):  # Start at row 2
+            if str(row[id_col - 1]).strip() == str(order_id).strip():
+                # Write ISO timestamp string
+                sheet.update_cell(idx, start_col, new_start_time)
+                logging.info(f"🟢 Embroidery start time updated for Order #{order_id}: {new_start_time}")
+                return True
+        logging.warning(f"⚠️ Order #{order_id} not found in Embroidery List.")
+        return False
     except Exception as e:
-        print(f"🚨 Exception in update_embroidery_start_time_in_sheet: {e}")
+        logging.error(f"❌ Error updating start time for Order #{order_id}: {e}")
+        return False
+
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
 CACHE_TTL           = 10
