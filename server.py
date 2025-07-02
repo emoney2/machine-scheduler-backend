@@ -916,7 +916,7 @@ def submit_order():
 
         # 1) Make the root folder for this order
         order_folder_id = create_folder(new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
-        make_public(order_folder_id)
+        make_public(order_folder_id, drive)
 
         # 🧵 If this is a reorder, copy any .emb files from the original job folder
         reorder_from = data.get("reorderFrom")
@@ -933,7 +933,7 @@ def submit_order():
 
 
         # helper: grant “anyone with link” reader access
-        def make_public(file_id):
+        def make_public(file_id, drive_service):
             drive.permissions().create(
                 fileId=file_id,
                 body={"type": "anyone", "role": "reader"}
