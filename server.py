@@ -613,13 +613,15 @@ def get_embroidery_list():
             return jsonify([]), 200
 
         headers = rows[0]
-        data    = [dict(zip(headers, r)) for r in rows[1:]]
-        for row in data:
-            row["startTime"] = row.get("Start Time", "")
+        data = []
+        for r in rows[1:]:
+            row = dict(zip(headers, r))
+            row.pop("Embroidery Start Time", None)  # 🛑 REMOVE the start time field
+            data.append(row)
 
         # ─── Spot B: CACHE STORE ───────────────────────────────────
         _emb_cache = data
-        _emb_ts    = now
+        _emb_ts = now
 
         return jsonify(data), 200
 
