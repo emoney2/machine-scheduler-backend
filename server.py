@@ -34,21 +34,25 @@ from datetime                      import datetime
 
 START_TIME_COL_INDEX = 27
 
+from google.oauth2.credentials import Credentials as OAuthCredentials
+
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets"
+]
+
+def get_oauth_credentials():
+    if os.path.exists("token.json"):
+        creds = OAuthCredentials.from_authorized_user_file("token.json", SCOPES)
+        return creds
+    else:
+        raise Exception("🔑 token.json not found. Please authenticate via OAuth2.")
+
 def get_sheets_service():
-    scopes = ['https://www.googleapis.com/auth/spreadsheets']
-    credentials = service_account.Credentials.from_service_account_file(
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
-        scopes=scopes
-    )
-    return build("sheets", "v4", credentials=credentials)
+    return build("sheets", "v4", credentials=get_oauth_credentials())
 
 def get_drive_service():
-    scopes = ['https://www.googleapis.com/auth/drive']
-    credentials = service_account.Credentials.from_service_account_file(
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
-        scopes=scopes
-    )
-    return build("drive", "v3", credentials=credentials)
+    return build("drive", "v3", credentials=get_oauth_credentials())
 
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
@@ -199,20 +203,27 @@ EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 
-creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-if creds_json:
-    info = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-else:
-    creds = service_account.Credentials.from_service_account_file(
-    "credentials.json",
-    scopes=[
-      "https://www.googleapis.com/auth/spreadsheets",
-      "https://www.googleapis.com/auth/drive"
-    ]
-)
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials as UserCredentials
+import pickle
+
+SCOPES = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"]
+
+creds = None
+if os.path.exists("token.pickle"):
+    with open("token.pickle", "rb") as token:
+        creds = pickle.load(token)
+
+if not creds or not creds.valid:
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file("oauth-credentials.json", SCOPES)
+        creds = flow.run_local_server(port=0)
+    with open("token.pickle", "wb") as token:
+        pickle.dump(creds, token)
+
 sh = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
 sheet_cache = sh.worksheet("Embroidery List")
 
@@ -819,11 +830,6 @@ def submit_order():
         prev_order = int(col_a[-1][0]) if len(col_a)>1 else 0
         new_order  = prev_order + 1
 
-        # Check for .emb files from the previous order and copy them
-        copy_emb_files(str(prev_order), str(new_order), build("drive", "v3", credentials=creds), "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
-
-
-
         # helper: copy the formula from row 2 of <cell> and rewrite “2” → new row
         def tpl_formula(col_letter, next_row):
             # grab the raw formula from row 2
@@ -881,7 +887,7 @@ def submit_order():
 
 
         # create Drive folder for this order
-        drive = build("drive","v3",credentials=creds)
+        drive = get_drive_service()
         def make_public(file_id):
             drive.permissions().create(
                 fileId=file_id,
@@ -987,11 +993,6 @@ def submit_order():
             valueInputOption="USER_ENTERED",
             body={"values": [[new_formula]]}
         ).execute()
-
-        # 🧵 Try copying .emb files from old order folder if this is a reorder
-        if data.get("reorderFrom"):
-            old_order_num = data.get("reorderFrom")
-            copy_emb_files(old_order_num, new_order, drive, "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
 
         return jsonify({"status":"ok","order":new_order}), 200
 
@@ -1783,7 +1784,7 @@ def list_folder_files():
         return jsonify({"error": "Missing folderId"}), 400
 
     try:
-        drive = build("drive", "v3", credentials=creds)
+        drive = get_drive_service()
         results = drive.files().list(
             q=f"'{folder_id}' in parents and trashed = false",
             fields="files(id, name, mimeType)"
