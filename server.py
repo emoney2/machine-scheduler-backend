@@ -1885,44 +1885,32 @@ def reset_start_time():
         print("🔥 Server error:", str(e))
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
+
 def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
     try:
-        # ✅ Replace this with your actual parent folder env var
-        parent_folder_id = os.environ.get("ORDERS_ROOT_FOLDER")
-        if not parent_folder_id:
-            print("❌ ORDERS_ROOT_FOLDER not set in environment.")
-            return
-
-        # 1. Search for folder named old_order_num
-        query = f"'{parent_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and name = '{old_order_num}' and trashed = false"
-        response = drive_service.files().list(q=query, fields="files(id, name)").execute()
-        folders = response.get("files", [])
+        # Step 1: Look up the old folder
+        query = f"name = '{old_order_num}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        folders = drive_service.files().list(q=query, fields="files(id)").execute().get("files", [])
         if not folders:
-            print(f"📁 No folder found for order {old_order_num}")
-            print(f"🔍 Query used: {query}")
+            print(f"❌ No folder found for order #{old_order_num}")
             return
 
         old_folder_id = folders[0]["id"]
 
-        # 2. Search for .emb files in old folder
-        query = f"'{old_folder_id}' in parents and name contains '.emb' and trashed = false"
-        emb_files = drive_service.files().list(q=query, fields="files(id, name)").execute().get("files", [])
-        if not emb_files:
-            print(f"🧵 No .emb files found in folder {old_order_num}")
-            print(f"🔍 emb query: {query}")
-            return
+        # Step 2: List files inside old folder
+        query = f"'{old_folder_id}' in parents and trashed = false"
+        files = drive_service.files().list(q=query, fields="files(id, name)").execute().get("files", [])
 
-        # 3. Copy each .emb file into the new folder with new name
-        for file in emb_files:
-            new_name = f"{new_order_num}.emb"
-            copied = drive_service.files().copy(
-                fileId=file["id"],
-                body={"name": new_name, "parents": [new_folder_id]}
-            ).execute()
-            print(f"✅ Copied {file['name']} → {new_name}")
-
+        for file in files:
+            if file["name"].lower().endswith(".emb"):
+                print(f"📤 Copying {file['name']} from order {old_order_num} → {new_order_num}")
+                drive_service.files().copy(
+                    fileId=file["id"],
+                    body={"name": f"{new_order_num}.emb", "parents": [new_folder_id]}
+                ).execute()
     except Exception as e:
-        print(f"❌ Error copying .emb files: {e}")
+        print("❌ Error copying .emb files:", e)
+
 
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
