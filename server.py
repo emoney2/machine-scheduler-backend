@@ -616,7 +616,6 @@ def get_embroidery_list():
         data = []
         for r in rows[1:]:
             row = dict(zip(headers, r))
-            row.pop("Embroidery Start Time", None)  # 🛑 REMOVE the start time field
             data.append(row)
 
         # ─── Spot B: CACHE STORE ───────────────────────────────────
