@@ -237,7 +237,7 @@ if not creds or not creds.valid:
         }
 
         flow = Flow.from_client_config(client_config, SCOPES, redirect_uri=oauth_redirect_uri)
-        creds = flow.run_local_server(port=0)
+        creds = flow.run_console()
     with open("token.pickle", "wb") as token:
         pickle.dump(creds, token)
 
