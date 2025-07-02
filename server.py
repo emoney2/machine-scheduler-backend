@@ -226,11 +226,11 @@ def update_start_time():
     data = request.json
     job_id = data.get("id")
     start_time = data.get("startTime")
-    
+
     print(f"🛬 Incoming request to update start time: {job_id} → {start_time}")
-    
+
     update_embroidery_start_time_in_sheet(job_id, start_time)
-    
+
     return jsonify({"success": True})
 
 
@@ -238,27 +238,28 @@ def update_start_time():
 import traceback
 
 def update_embroidery_start_time_in_sheet(job_id, start_time):
-    sheet = SHEET.worksheet("Embroidery List")
-    rows = sheet.get_all_values()
-    header = rows[0]
-
     try:
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        sheet = sh.worksheet("Embroidery List")
+        rows = sheet.get_all_values()
+        header = rows[0]
+
+        print(f"🔍 Searching for job ID: {job_id}")
+
         order_col_index = header.index("Order #")
         start_time_col_index = header.index("Embroidery Start Time")
-    except ValueError as e:
-        print("❌ Header missing expected column:", e)
-        return
 
-    print(f"🔍 Searching for job ID: {job_id} in Embroidery List...")
+        for i, row in enumerate(rows[1:], start=2):
+            if row[order_col_index].strip() == str(job_id).strip():
+                print(f"✅ Writing time to row {i}, col {start_time_col_index + 1}")
+                sheet.update_cell(i, start_time_col_index + 1, start_time)
+                return
 
-    for i, row in enumerate(rows[1:], start=2):  # start=2 because rows[1] is row 2 in the sheet
-        order_val = row[order_col_index].strip()
-        if order_val == str(job_id).strip():
-            print(f"✅ Found job ID {job_id} on row {i} — updating start time...")
-            sheet.update_cell(i, start_time_col_index + 1, start_time)
-            return
+        print(f"❌ Job ID {job_id} not found in Embroidery List")
 
-    print(f"❌ Job ID {job_id} not found in Embroidery List")
+    except Exception as e:
+        print(f"🔥 ERROR in update_embroidery_start_time_in_sheet: {e}")
+
 
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
