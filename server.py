@@ -908,9 +908,10 @@ def submit_order():
         # create Drive folder for this order
         drive = get_drive_service()
         def make_public(file_id):
-            drive.permissions().create(
+            drive_service.permissions().create(
                 fileId=file_id,
-                body={"type":"anyone","role":"reader"}
+                body={"type": "anyone", "role": "reader"},
+                fields="id"
             ).execute()
 
         # 1) Make the root folder for this order
@@ -1893,29 +1894,32 @@ def reset_start_time():
 
 def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
     try:
+        # ✅ Replace this with your actual parent folder env var
+        parent_folder_id = os.environ.get("ORDERS_ROOT_FOLDER")
+        if not parent_folder_id:
+            print("❌ ORDERS_ROOT_FOLDER not set in environment.")
+            return
+
         # 1. Search for folder named old_order_num
         query = f"'{parent_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and name = '{old_order_num}' and trashed = false"
         response = drive_service.files().list(q=query, fields="files(id, name)").execute()
         folders = response.get("files", [])
         if not folders:
             print(f"📁 No folder found for order {old_order_num}")
-            print(f"🔍 Query used: '{parent_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and name = '{old_order_num}' and trashed = false")
-
+            print(f"🔍 Query used: {query}")
             return
+
         old_folder_id = folders[0]["id"]
 
-        # 2. Search inside that folder for .emb files
+        # 2. Search for .emb files in old folder
         query = f"'{old_folder_id}' in parents and name contains '.emb' and trashed = false"
         emb_files = drive_service.files().list(q=query, fields="files(id, name)").execute().get("files", [])
         if not emb_files:
             print(f"🧵 No .emb files found in folder {old_order_num}")
-            print(f"🔍 emb query: '{old_folder_id}' in parents and name contains '.emb' and trashed = false")
+            print(f"🔍 emb query: {query}")
             return
 
-        # 3. Use the provided order_folder_id directly (do not create a new folder)
-        new_folder_id = order_folder_id
-
-        # 4. Copy each .emb file
+        # 3. Copy each .emb file into the new folder with new name
         for file in emb_files:
             new_name = f"{new_order_num}.emb"
             copied = drive_service.files().copy(
