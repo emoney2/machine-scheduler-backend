@@ -28,7 +28,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from httplib2 import Http
 from google_auth_httplib2 import AuthorizedHttp
-from sheet_cache import sheet_cache
+from server import sheet_cache
 
 from googleapiclient.http         import MediaIoBaseUpload
 from datetime                      import datetime
@@ -215,6 +215,7 @@ else:
     ]
 )
 sh = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+sheet_cache = sh.worksheet("Embroidery List")
 
 
 _http = Http(timeout=10)
