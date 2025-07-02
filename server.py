@@ -28,6 +28,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from httplib2 import Http
 from google_auth_httplib2 import AuthorizedHttp
+from sheet_cache import sheet_cache
 
 from googleapiclient.http         import MediaIoBaseUpload
 from datetime                      import datetime
@@ -245,23 +246,19 @@ import traceback
 
 def update_embroidery_start_time_in_sheet(order_id, new_start_time):
     try:
-        sheet = sheet_cache["Embroidery List"]
-        headers = sheet.row_values(1)
-        id_col = headers.index("Order #") + 1
-        start_col = headers.index("Embroidery Start Time") + 1
+        sheet = SHEETS.get_worksheet("Embroidery List")
+        data = sheet_cache.get_sheet_data(SPREADSHEET_ID, "Embroidery List")
 
-        all_data = sheet.get_all_values()
-        for idx, row in enumerate(all_data[1:], start=2):  # Start at row 2
-            if str(row[id_col - 1]).strip() == str(order_id).strip():
-                # Write ISO timestamp string
-                sheet.update_cell(idx, start_col, new_start_time)
-                logging.info(f"🟢 Embroidery start time updated for Order #{order_id}: {new_start_time}")
-                return True
-        logging.warning(f"⚠️ Order #{order_id} not found in Embroidery List.")
-        return False
+        # Find the row with matching Order #
+        for i, row in enumerate(data[1:], start=2):  # skip header, rows are 1-indexed
+            if str(row[0]).strip() == str(order_id).strip():
+                sheet.update_acell(f'AA{i}', new_start_time)
+                logger.info(f"✅ Updated embroidery start time for Order #{order_id} → {new_start_time}")
+                return
+
+        logger.warning(f"⚠️ Could not find order #{order_id} in Embroidery List")
     except Exception as e:
-        logging.error(f"❌ Error updating start time for Order #{order_id}: {e}")
-        return False
+        logger.error(f"❌ Error updating start time for Order #{order_id}: {e}")
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
