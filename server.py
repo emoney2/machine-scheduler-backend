@@ -222,46 +222,54 @@ service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 sheets  = service.spreadsheets()
 
 @app.route('/api/updateStartTime', methods=["POST"])
+@login_required_session
 def update_start_time():
-    data = request.json
-    job_id = data.get("id")
-    start_time = data.get("startTime")
+    data = request.get_json()
+    if not data:
+        print("❌ No JSON payload received in updateStartTime")
+        return jsonify({"error": "Missing JSON payload"}), 400
+
+    job_id     = str(data.get("id", "")).strip()
+    start_time = str(data.get("startTime", "")).strip()
 
     print(f"🛬 Incoming request to update start time: {job_id} → {start_time}")
-
-    update_embroidery_start_time_in_sheet(job_id, start_time)
-
-    return jsonify({"success": True})
-
+    ...
 
 # ✅ You must define or update this function to match your actual Google Sheet logic
 import traceback
 
-def update_embroidery_start_time_in_sheet(job_id, start_time):
+def update_embroidery_start_time_in_sheet(order_id, new_start_time):
+    print(f"🛠️ Starting to update start time for Order ID: {order_id}")
+
     try:
-        sh = gc.open_by_key(SPREADSHEET_ID)
+        sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
         sheet = sh.worksheet("Embroidery List")
-        rows = sheet.get_all_values()
-        header = rows[0]
+        data = sheet.get_all_records()
 
-        print(f"🪪 Sheet header: {header}")
-        print(f"🔍 Looking for Order # = {job_id}")
+        # Find the column index for "Embroidery Start Time"
+        headers = sheet.row_values(1)
+        if "Embroidery Start Time" not in headers:
+            print("❌ 'Embroidery Start Time' column not found in headers.")
+            return
 
-        order_col_index = header.index("Order #")
-        start_time_col_index = header.index("Embroidery Start Time")
+        start_time_col_index = headers.index("Embroidery Start Time") + 1  # 1-based index
+        print(f"🧭 Found 'Embroidery Start Time' column at index {start_time_col_index}")
 
-        for i, row in enumerate(rows[1:], start=2):
-            print(f"👀 Row {i}: {row[order_col_index]}")
-            if row[order_col_index].strip() == str(job_id).strip():
-                print(f"✅ Found match at row {i}, updating...")
-                sheet.update_cell(i, start_time_col_index + 1, start_time)
-                return
+        # Iterate over rows to find matching Order #
+        found = False
+        for i, row in enumerate(data, start=2):  # Data starts at row 2
+            print(f"🔍 Checking row {i}, Order #: {row.get('Order #')}")
+            if str(row.get("Order #")).strip() == str(order_id).strip():
+                sheet.update_cell(i, start_time_col_index, new_start_time)
+                print(f"✅ Match found on row {i}, updated start time to {new_start_time}")
+                found = True
+                break
 
-        print(f"❌ No match found for Order # {job_id}")
+        if not found:
+            print(f"❌ No match found for Order ID {order_id} in Embroidery List")
 
     except Exception as e:
-        print(f"🔥 ERROR in update_embroidery_start_time_in_sheet: {e}")
-
+        print(f"🚨 Exception in update_embroidery_start_time_in_sheet: {e}")
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
 CACHE_TTL           = 10
