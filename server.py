@@ -220,7 +220,7 @@ if not creds or not creds.valid:
         creds.refresh(Request())
     else:
         import json
-        from google_auth_oauthlib.flow import Flow
+        from google.oauth2.credentials import Credentials
 
         oauth_client_id     = os.environ["OAUTH_CLIENT_ID"]
         oauth_client_secret = os.environ["OAUTH_CLIENT_SECRET"]
@@ -236,8 +236,10 @@ if not creds or not creds.valid:
             }
         }
 
-        flow = Flow.from_client_config(client_config, SCOPES, redirect_uri=oauth_redirect_uri)
-        creds = flow.run_console()
+        token_json_str = os.environ["TOKEN_JSON"]
+        token_data = json.loads(token_json_str)
+
+        creds = Credentials.from_authorized_user_info(token_data, SCOPES)
     with open("token.pickle", "wb") as token:
         pickle.dump(creds, token)
 
@@ -1940,3 +1942,18 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"Starting on port {port}")
     socketio.run(app, host="0.0.0.0", port=port, debug=True, use_reloader=False)
+
+
+if __name__ == "__main__":
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/spreadsheets']
+
+    flow = InstalledAppFlow.from_client_secrets_file("oauth-credentials.json", SCOPES)
+    creds = flow.run_local_server(port=0)
+
+    # Save the credentials to token.json
+    with open("token.json", "w") as token:
+        token.write(creds.to_json())
+
+    print("✅ token.json created successfully.")
