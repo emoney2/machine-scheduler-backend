@@ -892,6 +892,15 @@ def submit_order():
         copy_emb_files(data.get("reorderFrom", ""), new_order, drive, "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
         make_public(order_folder_id)
 
+        # 🧵 If this is a reorder, copy any .emb files from the original job folder
+        reorder_from = data.get("reorderFrom")
+        if reorder_from:
+            copy_emb_files(
+                old_order_num=reorder_from,
+                new_order_num=new_order,
+                drive_service=drive,
+                new_folder_id=order_folder_id  # the ID we just created
+            )
 
         # (we’ll link to it later as order_folder_link)
         order_folder_link = f"https://drive.google.com/drive/folders/{order_folder_id}"
@@ -977,6 +986,12 @@ def submit_order():
             valueInputOption="USER_ENTERED",
             body={"values": [[new_formula]]}
         ).execute()
+
+        # 🧵 Try copying .emb files from old order folder if this is a reorder
+        if data.get("reorderFrom"):
+            old_order_num = data.get("reorderFrom")
+            copy_emb_files(old_order_num, new_order, drive, "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
+
         return jsonify({"status":"ok","order":new_order}), 200
 
     except Exception as e:
@@ -1855,7 +1870,7 @@ def reset_start_time():
         print("🔥 Server error:", str(e))
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
-def copy_emb_files(old_order_num, new_order_num, drive_service, parent_folder_id):
+def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
     try:
         # 1. Search for folder named old_order_num
         query = f"'{parent_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and name = '{old_order_num}' and trashed = false"
@@ -1873,19 +1888,8 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, parent_folder_id
             print(f"🧵 No .emb files found in folder {old_order_num}")
             return
 
-        # 3. Create new folder if it doesn't exist
-        query = f"'{parent_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and name = '{new_order_num}' and trashed = false"
-        new_folder_search = drive_service.files().list(q=query, fields="files(id, name)").execute().get("files", [])
-        if new_folder_search:
-            new_folder_id = new_folder_search[0]["id"]
-        else:
-            file_metadata = {
-                "name": new_order_num,
-                "mimeType": "application/vnd.google-apps.folder",
-                "parents": [parent_folder_id],
-            }
-            new_folder = drive_service.files().create(body=file_metadata, fields="id").execute()
-            new_folder_id = new_folder["id"]
+        # 3. Use the provided order_folder_id directly (do not create a new folder)
+        new_folder_id = order_folder_id
 
         # 4. Copy each .emb file
         for file in emb_files:
