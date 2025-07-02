@@ -942,7 +942,7 @@ def submit_order():
                 media_body=m,
                 fields="id, webViewLink"
             ).execute()
-            make_public(up["id"])
+            make_public(up["id"], drive)
             prod_links.append(up["webViewLink"])
 
         # upload print files (if present) — link to the “Print Files” folder
@@ -950,7 +950,7 @@ def submit_order():
         if print_files:
             # 1) create the “Print Files” folder under the job folder, and get its link
             print_folder_id = create_folder("Print Files", parent_id=order_folder_id)
-            make_public(print_folder_id)
+            make_public(print_folder_id, drive)
             pf_link = f"https://drive.google.com/drive/folders/{print_folder_id}"
 
             # 2) upload each print file into that folder (we don't need their individual links)
