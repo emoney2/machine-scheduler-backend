@@ -828,6 +828,14 @@ def save_manual_state():
 
 
 # ─────────────────────────────────────────────
+# helper: grant “anyone with link” reader access
+def make_public(file_id, drive_service):
+    drive_service.permissions().create(
+        fileId=file_id,
+        body={"type": "anyone", "role": "reader"},
+        fields="id"
+    ).execute()
+
 @app.route("/submit", methods=["OPTIONS","POST"])
 def submit_order():
     if request.method == "OPTIONS":
