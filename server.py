@@ -1879,6 +1879,8 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
         folders = response.get("files", [])
         if not folders:
             print(f"📁 No folder found for order {old_order_num}")
+            print(f"🔍 Query used: '{parent_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and name = '{old_order_num}' and trashed = false")
+
             return
         old_folder_id = folders[0]["id"]
 
@@ -1887,6 +1889,7 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
         emb_files = drive_service.files().list(q=query, fields="files(id, name)").execute().get("files", [])
         if not emb_files:
             print(f"🧵 No .emb files found in folder {old_order_num}")
+            print(f"🔍 emb query: '{old_folder_id}' in parents and name contains '.emb' and trashed = false")
             return
 
         # 3. Use the provided order_folder_id directly (do not create a new folder)
