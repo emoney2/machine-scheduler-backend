@@ -219,7 +219,24 @@ if not creds or not creds.valid:
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
     else:
-        flow = InstalledAppFlow.from_client_secrets_file("oauth-credentials.json", SCOPES)
+        import json
+        from google_auth_oauthlib.flow import Flow
+
+        oauth_client_id     = os.environ["OAUTH_CLIENT_ID"]
+        oauth_client_secret = os.environ["OAUTH_CLIENT_SECRET"]
+        oauth_redirect_uri  = os.environ["OAUTH_REDIRECT_URI"]
+
+        client_config = {
+            "installed": {
+                "client_id":     oauth_client_id,
+                "client_secret": oauth_client_secret,
+                "redirect_uris": [oauth_redirect_uri],
+                "auth_uri":      "https://accounts.google.com/o/oauth2/auth",
+                "token_uri":     "https://oauth2.googleapis.com/token"
+            }
+        }
+
+        flow = Flow.from_client_config(client_config, SCOPES, redirect_uri=oauth_redirect_uri)
         creds = flow.run_local_server(port=0)
     with open("token.pickle", "wb") as token:
         pickle.dump(creds, token)
