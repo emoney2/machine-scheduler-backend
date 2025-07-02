@@ -931,14 +931,6 @@ def submit_order():
         # (we’ll link to it later as order_folder_link)
         order_folder_link = f"https://drive.google.com/drive/folders/{order_folder_id}"
 
-
-        # helper: grant “anyone with link” reader access
-        def make_public(file_id, drive_service):
-            drive.permissions().create(
-                fileId=file_id,
-                body={"type": "anyone", "role": "reader"}
-            ).execute()
-
         # upload production files
         prod_links = []
         for f in prod_files:
