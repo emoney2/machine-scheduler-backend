@@ -28,7 +28,6 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from httplib2 import Http
 from google_auth_httplib2 import AuthorizedHttp
-from server import sheet_cache
 
 from googleapiclient.http         import MediaIoBaseUpload
 from datetime                      import datetime
