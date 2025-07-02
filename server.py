@@ -819,6 +819,10 @@ def submit_order():
         prev_order = int(col_a[-1][0]) if len(col_a)>1 else 0
         new_order  = prev_order + 1
 
+        # Check for .emb files from the previous order and copy them
+        copy_emb_files(str(prev_order), str(new_order), build("drive", "v3", credentials=creds), parent_folder_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
+
+
         # helper: copy the formula from row 2 of <cell> and rewrite “2” → new row
         def tpl_formula(col_letter, next_row):
             # grab the raw formula from row 2
@@ -885,7 +889,9 @@ def submit_order():
 
         # 1) Make the root folder for this order
         order_folder_id = create_folder(new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
+        copy_emb_files(data.get("reorderFrom", ""), new_order, drive, "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
         make_public(order_folder_id)
+
 
         # (we’ll link to it later as order_folder_link)
         order_folder_link = f"https://drive.google.com/drive/folders/{order_folder_id}"
@@ -1848,6 +1854,51 @@ def reset_start_time():
     except Exception as e:
         print("🔥 Server error:", str(e))
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
+def copy_emb_files(old_order_num, new_order_num, drive_service, parent_folder_id):
+    try:
+        # 1. Search for folder named old_order_num
+        query = f"'{parent_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and name = '{old_order_num}' and trashed = false"
+        response = drive_service.files().list(q=query, fields="files(id, name)").execute()
+        folders = response.get("files", [])
+        if not folders:
+            print(f"📁 No folder found for order {old_order_num}")
+            return
+        old_folder_id = folders[0]["id"]
+
+        # 2. Search inside that folder for .emb files
+        query = f"'{old_folder_id}' in parents and name contains '.emb' and trashed = false"
+        emb_files = drive_service.files().list(q=query, fields="files(id, name)").execute().get("files", [])
+        if not emb_files:
+            print(f"🧵 No .emb files found in folder {old_order_num}")
+            return
+
+        # 3. Create new folder if it doesn't exist
+        query = f"'{parent_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and name = '{new_order_num}' and trashed = false"
+        new_folder_search = drive_service.files().list(q=query, fields="files(id, name)").execute().get("files", [])
+        if new_folder_search:
+            new_folder_id = new_folder_search[0]["id"]
+        else:
+            file_metadata = {
+                "name": new_order_num,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [parent_folder_id],
+            }
+            new_folder = drive_service.files().create(body=file_metadata, fields="id").execute()
+            new_folder_id = new_folder["id"]
+
+        # 4. Copy each .emb file
+        for file in emb_files:
+            new_name = f"{new_order_num}.emb"
+            copied = drive_service.files().copy(
+                fileId=file["id"],
+                body={"name": new_name, "parents": [new_folder_id]}
+            ).execute()
+            print(f"✅ Copied {file['name']} → {new_name}")
+
+    except Exception as e:
+        print(f"❌ Error copying .emb files: {e}")
+
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
