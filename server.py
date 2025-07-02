@@ -907,7 +907,7 @@ def submit_order():
 
         # create Drive folder for this order
         drive = get_drive_service()
-        def make_public(file_id):
+        def make_public(file_id, drive_service):
             drive_service.permissions().create(
                 fileId=file_id,
                 body={"type": "anyone", "role": "reader"},
