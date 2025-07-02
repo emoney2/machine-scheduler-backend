@@ -224,16 +224,21 @@ sheets  = service.spreadsheets()
 @app.route('/api/updateStartTime', methods=["POST"])
 @login_required_session
 def update_start_time():
-    data = request.get_json()
-    if not data:
-        print("❌ No JSON payload received in updateStartTime")
-        return jsonify({"error": "Missing JSON payload"}), 400
+    try:
+        data = request.get_json()
+        job_id = data.get("id")
+        start_time = data.get("startTime")
 
-    job_id     = str(data.get("id", "")).strip()
-    start_time = str(data.get("startTime", "")).strip()
+        if not job_id or not start_time:
+            return jsonify({"error": "Missing job ID or start time"}), 400
 
-    print(f"🛬 Incoming request to update start time: {job_id} → {start_time}")
-    ...
+        print(f"🧵 Updating embroidery start time for job {job_id} → {start_time}")
+        update_embroidery_start_time_in_sheet(job_id, start_time)
+        return jsonify({"status": "success"})  # ✅ This line was missing
+
+    except Exception as e:
+        print("🔥 Error in update_start_time:", e)
+        return jsonify({"error": str(e)}), 500
 
 # ✅ You must define or update this function to match your actual Google Sheet logic
 import traceback
