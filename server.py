@@ -1931,15 +1931,13 @@ def qbo_login():
 
     qbo = OAuth2Session(
         client_id=QBO_CLIENT_ID,
-        redirect_uri=QBO_REDIRECT_URI,  # ✅ This should be HTTPS
+        redirect_uri=QBO_REDIRECT_URI,
+        scope=QBO_SCOPES,  # ✅ Keep it here
         state=session.get("qbo_oauth_state")
     )
 
-    # ✅ DO NOT pass redirect_uri again here
-    auth_url, state = qbo.authorization_url(
-        QBO_AUTH_URL,
-        scope=QBO_SCOPES
-    )
+    # ✅ Do not include `scope` again here
+    auth_url, state = qbo.authorization_url(QBO_AUTH_URL)
 
     session["qbo_oauth_state"] = state
     print("🔗 QuickBooks redirect URL:", auth_url)
