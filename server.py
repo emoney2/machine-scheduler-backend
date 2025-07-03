@@ -550,7 +550,11 @@ def jobs_for_company():
                 if file_id else ""
             )
 
-            # Include full row data
+            # ✅ Fix: ensure all expected fields exist
+            for key in headers:
+                if key not in row_dict:
+                    row_dict[key] = ""
+
             row_dict["image"] = preview_url
             row_dict["orderId"] = str(row_dict.get("Order #", "")).strip()
             jobs.append(row_dict)
@@ -1958,7 +1962,6 @@ def qbo_callback():
             QBO_TOKEN_URL,
             client_secret=QBO_CLIENT_SECRET,
             authorization_response=request.url,
-            redirect_uri=QBO_REDIRECT_URI
         )
 
         session["qbo_token"] = token
