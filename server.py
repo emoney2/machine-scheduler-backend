@@ -1945,13 +1945,15 @@ def qbo_login():
 def qbo_callback():
     from requests_oauthlib import OAuth2Session
 
-    qbo = OAuth2Session(
-        client_id=QBO_CLIENT_ID,
-        redirect_uri=QBO_REDIRECT_URI,
-        state=session.get("qbo_oauth_state")
-    )
-
     try:
+        print("🔁 Received QBO callback with URL:", request.url)
+
+        qbo = OAuth2Session(
+            client_id=QBO_CLIENT_ID,
+            redirect_uri=QBO_REDIRECT_URI,
+            state=session.get("qbo_oauth_state")
+        )
+
         token = qbo.fetch_token(
             QBO_TOKEN_URL,
             client_secret=QBO_CLIENT_SECRET,
@@ -1964,8 +1966,11 @@ def qbo_callback():
 
         return "✅ QuickBooks authorized successfully!"
     except Exception as e:
-        print("❌ Error in /qbo/callback:", e)
+        print("❌ Error in /qbo/callback:")
+        import traceback
+        traceback.print_exc()
         return f"❌ Callback error: {str(e)}", 500
+
 
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
