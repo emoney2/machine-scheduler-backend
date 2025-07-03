@@ -31,6 +31,8 @@ from google_auth_httplib2 import AuthorizedHttp
 
 from googleapiclient.http         import MediaIoBaseUpload
 from datetime                      import datetime
+from requests_oauthlib import OAuth2Session
+from urllib.parse import urlencode
 
 START_TIME_COL_INDEX = 27
 
@@ -202,6 +204,14 @@ ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
+
+QBO_CLIENT_ID     = os.environ.get("QBO_CLIENT_ID")
+QBO_CLIENT_SECRET = os.environ.get("QBO_CLIENT_SECRET")
+QBO_REDIRECT_URI  = os.environ.get("QBO_REDIRECT_URI")
+QBO_BASE_URL      = os.environ.get("QBO_BASE_URL")
+QBO_AUTH_URL      = "https://appcenter.intuit.com/connect/oauth2"
+QBO_TOKEN_URL     = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+QBO_SCOPES        = ["com.intuit.quickbooks.accounting"]
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -1911,7 +1921,31 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
     except Exception as e:
         print("❌ Error copying .emb files:", e)
 
+@app.route("/qbo/login")
+def qbo_login():
+    qbo = OAuth2Session(QBO_CLIENT_ID, redirect_uri=QBO_REDIRECT_URI, scope=QBO_SCOPES)
+    auth_url, state = qbo.authorization_url(QBO_AUTH_URL)
 
+    session["qbo_oauth_state"] = state
+    return redirect(auth_url)
+
+@app.route("/qbo/callback")
+def qbo_callback():
+    qbo = OAuth2Session(QBO_CLIENT_ID, redirect_uri=QBO_REDIRECT_URI, state=session.get("qbo_oauth_state"))
+    token = qbo.fetch_token(
+        QBO_TOKEN_URL,
+        client_secret=QBO_CLIENT_SECRET,
+        authorization_response=request.url,
+    )
+
+    # Store token + company realm ID in session
+    session["qbo_token"] = token
+    realm_id = request.args.get("realmId")
+    if not realm_id:
+        return "Missing realm ID", 400
+    session["qbo_realm_id"] = realm_id
+
+    return redirect(FRONTEND_URL)
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
