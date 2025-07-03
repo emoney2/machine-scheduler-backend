@@ -72,6 +72,9 @@ FRONTEND_URL = raw_frontend.strip()
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
 
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({"status": "ok", "message": "Backend is running"}), 200
