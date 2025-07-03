@@ -1941,8 +1941,6 @@ def qbo_login():
     print("🔗 QuickBooks redirect URL:", auth_url)
     return redirect(auth_url)
 
-
-
 @app.route("/qbo/callback")
 def qbo_callback():
     qbo = OAuth2Session(QBO_CLIENT_ID, redirect_uri=QBO_REDIRECT_URI, state=session.get("qbo_oauth_state"))
@@ -1971,6 +1969,10 @@ def on_disconnect():
     logger.info(f"Client disconnected: {request.sid}")
 
 # ─── Run ────────────────────────────────────────────────────────────────────────
+print("📡 Available Flask Routes:")
+for rule in app.url_map.iter_rules():
+    print("✅", rule)
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"Starting on port {port}")
