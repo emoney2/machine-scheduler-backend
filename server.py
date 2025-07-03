@@ -1943,21 +1943,33 @@ def qbo_login():
 
 @app.route("/qbo/callback")
 def qbo_callback():
-    qbo = OAuth2Session(QBO_CLIENT_ID, redirect_uri=QBO_REDIRECT_URI, state=session.get("qbo_oauth_state"))
-    token = qbo.fetch_token(
-        QBO_TOKEN_URL,
-        client_secret=QBO_CLIENT_SECRET,
-        authorization_response=request.url,
+    from requests_oauthlib import OAuth2Session
+
+    print("🎯 Entered /qbo/callback")
+
+    qbo = OAuth2Session(
+        client_id=QBO_CLIENT_ID,
+        redirect_uri=QBO_REDIRECT_URI,
+        state=session.get("qbo_oauth_state")
     )
 
-    # Store token + company realm ID in session
-    session["qbo_token"] = token
-    realm_id = request.args.get("realmId")
-    if not realm_id:
-        return "Missing realm ID", 400
-    session["qbo_realm_id"] = realm_id
+    try:
+        token = qbo.fetch_token(
+            QBO_TOKEN_URL,
+            client_secret=QBO_CLIENT_SECRET,
+            authorization_response=request.url
+        )
 
-    return redirect(FRONTEND_URL)
+        # Save token to session or DB (for now, just print it)
+        session["qbo_token"] = token
+        print("✅ QuickBooks token received:", token)
+
+        return "✅ QuickBooks authorized successfully! You can now create invoices."
+
+    except Exception as e:
+        print("❌ Error in /qbo/callback:", e)
+        return f"❌ Callback error: {str(e)}", 500
+
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
