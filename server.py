@@ -1929,15 +1929,9 @@ def qbo_login():
         redirect_uri=QBO_REDIRECT_URI
     )
 
-    # ❌ Don't pass redirect_uri again — it's already set in the session
-    auth_url, state = qbo.authorization_url(
-        QBO_AUTH_URL,
-        response_type="code"
-    )
-
+    auth_url, state = qbo.authorization_url(QBO_AUTH_URL)
     session["qbo_oauth_state"] = state
     return redirect(auth_url)
-
 
 @app.route("/qbo/callback")
 def qbo_callback():
