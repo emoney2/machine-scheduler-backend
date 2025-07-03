@@ -1936,7 +1936,10 @@ def qbo_login():
     )
 
     # ✅ DO NOT pass redirect_uri again here
-    auth_url, state = qbo.authorization_url(QBO_AUTH_URL)
+    auth_url, state = qbo.authorization_url(
+        QBO_AUTH_URL,
+        scope=QBO_SCOPES
+    )
 
     session["qbo_oauth_state"] = state
     print("🔗 QuickBooks redirect URL:", auth_url)
