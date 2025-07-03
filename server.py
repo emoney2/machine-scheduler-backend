@@ -1923,19 +1923,22 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
 
 @app.route("/qbo/login")
 def qbo_login():
-    # ✅ Do NOT pass redirect_uri here
+    from requests_oauthlib import OAuth2Session
+
+    # ⛔ redirect_uri is NOT passed here
     qbo = OAuth2Session(
-        QBO_CLIENT_ID,
+        client_id=QBO_CLIENT_ID,
         scope=QBO_SCOPES
     )
 
-    # ✅ ONLY pass redirect_uri here
+    # ✅ redirect_uri ONLY passed here
     auth_url, state = qbo.authorization_url(
         QBO_AUTH_URL,
         redirect_uri=QBO_REDIRECT_URI
     )
 
     session["qbo_oauth_state"] = state
+    print("🔗 Redirecting to QuickBooks:", auth_url)
     return redirect(auth_url)
 
 @app.route("/qbo/callback")
