@@ -1924,12 +1924,17 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
 @app.route("/qbo/login")
 def qbo_login():
     qbo = OAuth2Session(
-        QBO_CLIENT_ID,
+        client_id=QBO_CLIENT_ID,
         scope=QBO_SCOPES,
         redirect_uri=QBO_REDIRECT_URI
     )
 
-    auth_url, state = qbo.authorization_url(QBO_AUTH_URL)
+    # 💡 Explicitly add redirect_uri here to fix QuickBooks bug
+    auth_url, state = qbo.authorization_url(
+        QBO_AUTH_URL,
+        redirect_uri=QBO_REDIRECT_URI
+    )
+
     session["qbo_oauth_state"] = state
     return redirect(auth_url)
 
