@@ -1926,15 +1926,10 @@ def qbo_login():
     qbo = OAuth2Session(
         client_id=QBO_CLIENT_ID,
         scope=QBO_SCOPES,
-        redirect_uri=QBO_REDIRECT_URI
+        redirect_uri=QBO_REDIRECT_URI  # ✅ Only set here
     )
 
-    # 💡 Explicitly add redirect_uri here to fix QuickBooks bug
-    auth_url, state = qbo.authorization_url(
-        QBO_AUTH_URL,
-        redirect_uri=QBO_REDIRECT_URI
-    )
-
+    auth_url, state = qbo.authorization_url(QBO_AUTH_URL)  # ❌ Don't pass redirect_uri again
     session["qbo_oauth_state"] = state
     return redirect(auth_url)
 
