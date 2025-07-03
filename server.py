@@ -532,6 +532,10 @@ def jobs_for_company():
     jobs = []
 
     for row in prod_data[1:]:
+        # ✅ Pad the row so it matches the length of headers
+        while len(row) < len(headers):
+            row.append("")
+
         row_dict = dict(zip(headers, row))
         row_company = str(row_dict.get("Company Name", "")).strip().lower()
         stage = str(row_dict.get("Stage", "")).strip().lower()
@@ -550,18 +554,12 @@ def jobs_for_company():
                 if file_id else ""
             )
 
-            # ✅ Fix: ensure all expected fields exist
-            for key in headers:
-                if key not in row_dict:
-                    row_dict[key] = ""
-
+            # Add required fields to job dict
             row_dict["image"] = preview_url
             row_dict["orderId"] = str(row_dict.get("Order #", "")).strip()
             jobs.append(row_dict)
 
     return jsonify({ "jobs": jobs })
-
-
 
 @app.route("/api/set-volume", methods=["POST"])
 def set_volume():
