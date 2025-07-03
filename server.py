@@ -1945,8 +1945,6 @@ def qbo_login():
 def qbo_callback():
     from requests_oauthlib import OAuth2Session
 
-    print("🎯 Entered /qbo/callback")
-
     qbo = OAuth2Session(
         client_id=QBO_CLIENT_ID,
         redirect_uri=QBO_REDIRECT_URI,
@@ -1958,14 +1956,13 @@ def qbo_callback():
             QBO_TOKEN_URL,
             client_secret=QBO_CLIENT_SECRET,
             authorization_response=request.url,
-            redirect_uri=QBO_REDIRECT_URI  # ✅ MUST be included here
+            redirect_uri=QBO_REDIRECT_URI
         )
 
         session["qbo_token"] = token
-        print("✅ QuickBooks token received:", token)
+        print("✅ QBO token received:", token)
 
-        return "✅ QuickBooks authorized successfully! You can now create invoices."
-
+        return "✅ QuickBooks authorized successfully!"
     except Exception as e:
         print("❌ Error in /qbo/callback:", e)
         return f"❌ Callback error: {str(e)}", 500
