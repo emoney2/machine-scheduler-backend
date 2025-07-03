@@ -1957,10 +1957,10 @@ def qbo_callback():
         token = qbo.fetch_token(
             QBO_TOKEN_URL,
             client_secret=QBO_CLIENT_SECRET,
-            authorization_response=request.url
+            authorization_response=request.url,
+            redirect_uri=QBO_REDIRECT_URI  # ✅ MUST be included here
         )
 
-        # Save token to session or DB (for now, just print it)
         session["qbo_token"] = token
         print("✅ QuickBooks token received:", token)
 
