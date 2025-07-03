@@ -1660,18 +1660,13 @@ def process_shipment():
         shipped_col = headers.index("Shipped")
 
         updates = []
+        invoices = []
+
         for i, row in enumerate(rows[1:], start=2):  # start=2 for 1-based index
             row_order_id = str(row[id_col]).strip() if id_col < len(row) else ""
             print(f"→ Row {i}: Order ID in sheet = '{row_order_id}'")
 
             if row_order_id in order_ids:
-                # Build order data dict from row
-                order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
-    
-                # Simulate invoice creation
-                invoice_url = create_invoice_in_quickbooks(order_data)
-                invoices.append(invoice_url)
-
                 qty = shipped_quantities.get(row_order_id)
                 print(f"✅ Match! Writing {qty} to row {i}")
                 if qty is not None:
@@ -1680,6 +1675,10 @@ def process_shipment():
                         "values": [[str(qty)]]
                     })
 
+                # Build order data dict and create invoice
+                order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
+                invoice_url = create_invoice_in_quickbooks(order_data)
+                invoices.append(invoice_url)
 
         if not updates:
             print("⚠️ No updates prepared — check for ID mismatches.")
@@ -1691,22 +1690,16 @@ def process_shipment():
             ).execute()
             print("✅ Successfully wrote quantities to sheet.")
 
-        # Simulate creating invoice for the first matching order
-        first_order_row = next((row for row in rows[1:] if str(row[id_col]).strip() in order_ids), None)
-        invoice_url = ""
-        if first_order_row:
-            order_data = dict(zip(headers, first_order_row))
-            invoice_url = create_invoice_in_quickbooks(order_data)
-
         return jsonify({
             "labels": ["https://example.com/label1.pdf"],
-            "invoice": invoice_url,
+            "invoice": invoices[0] if invoices else "",
             "slips": ["https://example.com/slip1.pdf"]
         })
 
     except Exception as e:
         print("❌ Shipment error:", str(e))
         return jsonify({"error": str(e)}), 500
+
 
 
 
