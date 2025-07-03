@@ -75,6 +75,12 @@ CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
+# ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
+def create_invoice_in_quickbooks(order_data):
+    print(f"🧾 Simulating QuickBooks invoice creation for order {order_data['Order #']}")
+    invoice_url = f"https://example.com/invoice_{order_data['Order #']}.pdf"
+    return invoice_url
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({"status": "ok", "message": "Backend is running"}), 200
@@ -438,7 +444,9 @@ def prepare_shipment():
     data = request.get_json()
     order_ids = data.get("order_ids", [])
     if not order_ids:
-        return jsonify({"error": "No order IDs provided"}), 400
+        return jsonify({"error": "Missing order_ids"}), 400
+
+    invoices = []
 
     # Fetch both Production Orders and Table tabs
     prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
@@ -1657,6 +1665,13 @@ def process_shipment():
             print(f"→ Row {i}: Order ID in sheet = '{row_order_id}'")
 
             if row_order_id in order_ids:
+                # Build order data dict from row
+                order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
+    
+                # Simulate invoice creation
+                invoice_url = create_invoice_in_quickbooks(order_data)
+                invoices.append(invoice_url)
+
                 qty = shipped_quantities.get(row_order_id)
                 print(f"✅ Match! Writing {qty} to row {i}")
                 if qty is not None:
@@ -1664,6 +1679,7 @@ def process_shipment():
                         "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
                         "values": [[str(qty)]]
                     })
+
 
         if not updates:
             print("⚠️ No updates prepared — check for ID mismatches.")
@@ -1675,9 +1691,16 @@ def process_shipment():
             ).execute()
             print("✅ Successfully wrote quantities to sheet.")
 
+        # Simulate creating invoice for the first matching order
+        first_order_row = next((row for row in rows[1:] if str(row[id_col]).strip() in order_ids), None)
+        invoice_url = ""
+        if first_order_row:
+            order_data = dict(zip(headers, first_order_row))
+            invoice_url = create_invoice_in_quickbooks(order_data)
+
         return jsonify({
             "labels": ["https://example.com/label1.pdf"],
-            "invoice": "https://example.com/invoice.pdf",
+            "invoice": invoice_url,
             "slips": ["https://example.com/slip1.pdf"]
         })
 
