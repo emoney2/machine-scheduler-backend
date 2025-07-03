@@ -1927,26 +1927,17 @@ def qbo_login():
 
     print("🚀 Entered /qbo/login route")
 
-    print("🧪 ENV VARS:")
-    print("QBO_CLIENT_ID:", QBO_CLIENT_ID)
-    print("QBO_REDIRECT_URI:", QBO_REDIRECT_URI)
-    print("QBO_AUTH_URL:", QBO_AUTH_URL)
-
     qbo = OAuth2Session(
         client_id=QBO_CLIENT_ID,
-        scope=QBO_SCOPES
+        scope=QBO_SCOPES,
+        redirect_uri=QBO_REDIRECT_URI  # ✅ ONLY HERE
     )
 
-    print("🌀 OAuth2Session created")
-
-    auth_url, state = qbo.authorization_url(
-        QBO_AUTH_URL,
-        redirect_uri=QBO_REDIRECT_URI
-    )
-
-    print("🔗 Auth URL generated:", auth_url)
+    # ✅ DO NOT pass redirect_uri again here
+    auth_url, state = qbo.authorization_url(QBO_AUTH_URL)
 
     session["qbo_oauth_state"] = state
+    print("🔗 QuickBooks redirect URL:", auth_url)
     return redirect(auth_url)
 
 
