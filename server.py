@@ -77,59 +77,50 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
 def create_invoice_in_quickbooks(order_data):
-    from requests_oauthlib import OAuth2Session
-    import os
+    print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
 
-    QBO_CLIENT_ID = os.environ["QBO_CLIENT_ID"]
-    QBO_CLIENT_SECRET = os.environ["QBO_CLIENT_SECRET"]
-    QBO_REDIRECT_URI = os.environ["QBO_REDIRECT_URI"]
-    QBO_TOKEN = session.get("qbo_token")  # Make sure user is logged in to QBO
-    REALM_ID = session.get("qbo_realm_id")  # Store realmId from callback
+    access_token = session.get("qbo_token", {}).get("access_token")
+    realm_id = session.get("qbo_token", {}).get("realmId")
 
-    if not QBO_TOKEN or not REALM_ID:
-        print("❌ Missing QBO token or realm ID.")
-        return None
+    if not access_token or not realm_id:
+        raise Exception("Missing QuickBooks access token or realm ID in session")
 
-    qbo = OAuth2Session(QBO_CLIENT_ID, token=QBO_TOKEN)
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
 
-    # Build the invoice payload
-    invoice_payload = {
+    # Convert order data into QBO invoice format
+    invoice_data = {
         "CustomerRef": {
-            "value": "1"  # 🔁 Use actual customer ID later
+            "value": "1"  # 👈 Replace with actual customer ID or lookup logic
         },
         "Line": [
             {
-                "Amount": float(order_data.get("Price", 0)) * float(order_data.get("Quantity", 1)),
                 "DetailType": "SalesItemLineDetail",
+                "Amount": float(order_data.get("Price", 0)) * int(order_data.get("Quantity", 1)),
                 "SalesItemLineDetail": {
                     "ItemRef": {
-                        "value": "1",  # 🔁 Use actual item ID later
-                        "name": order_data.get("Product", "Embroidery")
+                        "value": "1",  # 👈 Replace with real item ID
+                        "name": order_data.get("Product", "Unknown Product")
                     }
                 }
             }
         ]
     }
 
-    # Send it to QBO
-    invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{REALM_ID}/invoice"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
+    qbo_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
+    response = requests.post(qbo_url, headers=headers, json=invoice_data)
 
-    try:
-        resp = qbo.post(invoice_url, json=invoice_payload, headers=headers)
-        resp.raise_for_status()
-        invoice_data = resp.json()
-        print("🧾 Invoice created in sandbox:", invoice_data)
+    if response.status_code != 200:
+        print("❌ QuickBooks API error:", response.text)
+        raise Exception("Failed to create invoice in QuickBooks")
 
-        # You can extract the invoice PDF URL here (in production, you'd query the PDF endpoint)
-        return "https://example.com/invoice_sandbox.pdf"
+    invoice_json = response.json()
+    print("✅ Invoice created:", invoice_json)
+    return invoice_json.get("Invoice", {}).get("DocNumber", "Invoice Created")
 
-    except Exception as e:
-        print("❌ Failed to create invoice in QuickBooks:", str(e))
-        return None
 
 @app.route("/", methods=["GET"])
 def index():
