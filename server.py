@@ -77,9 +77,59 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
 def create_invoice_in_quickbooks(order_data):
-    print(f"🧾 Simulating QuickBooks invoice creation for order {order_data['Order #']}")
-    invoice_url = f"https://example.com/invoice_{order_data['Order #']}.pdf"
-    return invoice_url
+    from requests_oauthlib import OAuth2Session
+    import os
+
+    QBO_CLIENT_ID = os.environ["QBO_CLIENT_ID"]
+    QBO_CLIENT_SECRET = os.environ["QBO_CLIENT_SECRET"]
+    QBO_REDIRECT_URI = os.environ["QBO_REDIRECT_URI"]
+    QBO_TOKEN = session.get("qbo_token")  # Make sure user is logged in to QBO
+    REALM_ID = session.get("qbo_realm_id")  # Store realmId from callback
+
+    if not QBO_TOKEN or not REALM_ID:
+        print("❌ Missing QBO token or realm ID.")
+        return None
+
+    qbo = OAuth2Session(QBO_CLIENT_ID, token=QBO_TOKEN)
+
+    # Build the invoice payload
+    invoice_payload = {
+        "CustomerRef": {
+            "value": "1"  # 🔁 Use actual customer ID later
+        },
+        "Line": [
+            {
+                "Amount": float(order_data.get("Price", 0)) * float(order_data.get("Quantity", 1)),
+                "DetailType": "SalesItemLineDetail",
+                "SalesItemLineDetail": {
+                    "ItemRef": {
+                        "value": "1",  # 🔁 Use actual item ID later
+                        "name": order_data.get("Product", "Embroidery")
+                    }
+                }
+            }
+        ]
+    }
+
+    # Send it to QBO
+    invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{REALM_ID}/invoice"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        resp = qbo.post(invoice_url, json=invoice_payload, headers=headers)
+        resp.raise_for_status()
+        invoice_data = resp.json()
+        print("🧾 Invoice created in sandbox:", invoice_data)
+
+        # You can extract the invoice PDF URL here (in production, you'd query the PDF endpoint)
+        return "https://example.com/invoice_sandbox.pdf"
+
+    except Exception as e:
+        print("❌ Failed to create invoice in QuickBooks:", str(e))
+        return None
 
 @app.route("/", methods=["GET"])
 def index():
