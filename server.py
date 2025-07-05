@@ -166,6 +166,7 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     # Step 3: Build QuickBooks customer payload
     payload = {
         "DisplayName": company_name,
+        "CompanyName": name,
         "PrimaryEmailAddr": {"Address": match.get("Contact Email Address", "")},
         "PrimaryPhone": {"FreeFormNumber": match.get("Phone Number", "")},
         "BillAddr": {
@@ -310,6 +311,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
             {
                 "DetailType": "SalesItemLineDetail",
                 "Amount": float(round(amount, 2)),
+                "Description": order_data.get("Design", ""),
                 "SalesItemLineDetail": {
                     "ItemRef": { "value": item_ref["value"] },
                     "Qty": float(qty),
