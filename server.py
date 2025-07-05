@@ -83,6 +83,20 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
+def get_quickbooks_credentials():
+    access_token = session.get("access_token")
+    realm_id = session.get("realm_id")
+    if not access_token or not realm_id:
+        raise RedirectException("/quickbooks-auth")
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    return headers, realm_id
+
 def get_quickbooks_auth_url(redirect_uri, state=""):
     base_url = "https://appcenter.intuit.com/connect/oauth2"
     client_id = os.environ["QBO_CLIENT_ID"]
