@@ -242,7 +242,7 @@ def get_or_create_item_ref(product_name, headers, realm_id):
         }
     elif res.status_code == 400 and "Duplicate Name Exists Error" in res.text:
         print(f"🔁 Item '{product_name}' already exists, retrieving existing item...")
-        escaped_name = product_name.replace("'", "\\'")
+        escaped_name = product_name.replace("'", "''")
         query = f"SELECT * FROM Item WHERE Name = '{escaped_name}'"
         print(f"🔍 Fallback item lookup query: {query}")
         lookup_res = requests.get(query_url, headers=headers, params={"query": query})
