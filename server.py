@@ -1856,6 +1856,9 @@ def process_shipment():
                 # Build order data dict and create invoice
                 order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
                 invoice_url = create_invoice_in_quickbooks(order_data)
+                print(f"📦 Invoice URL returned: {invoice_url} ({type(invoice_url)})")
+                if not isinstance(invoice_url, str):
+                    invoice_url = str(invoice_url)
                 invoices.append(invoice_url)
 
         if not updates:
@@ -1878,9 +1881,6 @@ def process_shipment():
         print("❌ Shipment error:", str(e))
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
-
-
 
 @app.errorhandler(Exception)
 def handle_exception(e):
