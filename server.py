@@ -207,6 +207,40 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     # Final failure
     raise Exception(f"❌ Failed to create customer in QuickBooks: {res.text}")
 
+def get_or_create_item_ref(product_name, headers, realm_id):
+    query_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/query"
+    query = f"SELECT * FROM Item WHERE Name = '{product_name}'"
+    response = requests.get(query_url, headers=headers, params={"query": query})
+
+    items = response.json().get("QueryResponse", {}).get("Item", [])
+
+    if items:
+        return {
+            "value": items[0]["Id"],
+            "name": items[0]["Name"]
+        }
+
+    print(f"⚠️ Item '{product_name}' not found. Attempting to create...")
+
+    create_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/item"
+    payload = {
+        "Name": product_name,
+        "Type": "NonInventory",
+        "IncomeAccountRef": {
+            "name": "Sales of Product Income",
+            "value": "79"  # Use 79 for sandbox
+        }
+    }
+
+    res = requests.post(create_url, headers=headers, json=payload)
+    if res.status_code in [200, 201]:
+        item = res.json().get("Item", {})
+        return {
+            "value": item["Id"],
+            "name": item["Name"]
+        }
+    else:
+        raise Exception(f"❌ Failed to create item '{product_name}' in QBO: {res.text}")
 
 def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=None, base_shipping_cost=0.0):
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
@@ -239,39 +273,9 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     sheet = sh
     customer_ref = get_or_create_customer_ref(order_data.get("Company Name", ""), sheet, headers, realm_id)
 
-    # Step 2: Look up item in QuickBooks by product name
-    query = f"SELECT * FROM Item WHERE Name = '{product_name}'"
-    response = requests.get(query_url, headers=headers, params={"query": query})
-    items = response.json().get("QueryResponse", {}).get("Item", [])
-
-    if not items:
-        print(f"⚠️ Item '{product_name}' not found. Attempting to create...")
-
-        # Try to create the item in QBO
-        create_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/item"
-        payload = {
-            "Name": product_name,
-            "Type": "NonInventory",
-            "IncomeAccountRef": {
-                "name": "Sales of Product Income",
-                "value": "79"  # Use 79 for sandbox; replace with actual ID for production
-            }
-        }
-
-        res = requests.post(create_url, headers=headers, json=payload)
-        if res.status_code in [200, 201]:
-            item = res.json().get("Item", {})
-            item_ref = {
-                "value": item["Id"],
-                "name": item["Name"]
-            }
-        else:
-            raise Exception(f"❌ Failed to create item '{product_name}' in QBO: {res.text}")
-    else:
-        item_ref = {
-            "value": items[0]["Id"],
-            "name": items[0]["Name"]
-        }
+    # Step 2: Get item reference from QBO (look up or create if missing)
+    product_name = order_data.get("Product", "").strip()
+    item_ref = get_or_create_item_ref(product_name, headers, realm_id)
 
     # Step 3: Build and send invoice
     amount = float(order_data.get("Price", 0)) * int(order_data.get("Quantity", 1))
