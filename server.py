@@ -293,7 +293,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
                 "DetailType": "SalesItemLineDetail",
                 "Amount": float(round(amount, 2)),
                 "SalesItemLineDetail": {
-                    "ItemRef": { "value": item_id },
+                    "ItemRef": { "value": item_ref["value"] },
                     "Qty": float(qty),
                     "UnitPrice": float(round(unit_price, 2))
                 }
