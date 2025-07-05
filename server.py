@@ -179,21 +179,25 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     num_labels = len(tracking_list or [])
     shipping_total = round(float(base_shipping_cost) * 1.1 + num_labels * 5, 2)
 
+    qty = int(order_data.get("Quantity", 1))
+    unit_price = float(order_data.get("Price", 0))
+    amount = round(qty * unit_price, 2)
+
     invoice_payload = {
         "CustomerRef": { "value": customer_id },
         "Line": [
             {
                 "DetailType": "SalesItemLineDetail",
-                "Amount": amount,  # total
+                "Amount": f"{amount:.2f}",  # 👈 formatted as string
                 "SalesItemLineDetail": {
                     "ItemRef": { "value": item_id },
-                    "Qty": int(order_data.get("Quantity", 1)),
-                    "UnitPrice": round(float(order_data.get("Price", 0)), 2)
+                    "Qty": qty,
+                    "UnitPrice": f"{unit_price:.2f}"  # 👈 formatted as string
                 }
             }
         ],
         "TxnDate": datetime.now().strftime("%Y-%m-%d"),
-        "ShippingAmt": shipping_total,
+        "ShippingAmt": f"{shipping_total:.2f}",  # 👈 format this too
         "PrivateNote": "\n".join(tracking_list or [])
     }
 
