@@ -44,6 +44,7 @@ SCOPES = [
 ]
 
 QBO_SCOPE = ["com.intuit.quickbooks.accounting"]
+QBO_AUTH_BASE_URL = "https://appcenter.intuit.com/connect/oauth2"
 
 def get_oauth_credentials():
     if os.path.exists("token.json"):
