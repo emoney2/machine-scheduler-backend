@@ -1856,14 +1856,20 @@ def process_shipment():
                         "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
                         "values": [[str(qty)]]
                     })
+            # Build order data dict and create invoice
+            order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
 
-                # Build order data dict and create invoice
-                order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
-                invoice_url = create_invoice_in_quickbooks(order_data)
-                print(f"📦 Invoice URL returned: {invoice_url} ({type(invoice_url)})")
-                if not isinstance(invoice_url, str):
-                    invoice_url = str(invoice_url)
-                invoices.append(invoice_url)
+            try:
+                invoice = invoice_resp.json().get("Invoice")
+                invoice_url = f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={invoice['Id']}"
+            except Exception as e:
+                traceback.print_exc()
+                invoice_url = ""
+
+            if not isinstance(invoice_url, str):
+                invoice_url = str(invoice_url)
+
+            invoices.append(invoice_url)
 
         if not updates:
             print("⚠️ No updates prepared — check for ID mismatches.")
