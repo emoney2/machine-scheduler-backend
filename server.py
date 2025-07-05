@@ -2035,6 +2035,25 @@ def qbo_callback():
         traceback.print_exc()
         return f"❌ Callback error: {str(e)}", 500
 
+@app.route("/authorize-quickbooks")
+def authorize_quickbooks():
+    from requests_oauthlib import OAuth2Session
+
+    qbo = OAuth2Session(
+        client_id=QBO_CLIENT_ID,
+        redirect_uri=QBO_REDIRECT_URI,
+        scope=QBO_SCOPE
+    )
+
+    authorization_url, state = qbo.authorization_url(QBO_AUTH_BASE_URL)
+
+    # Save the state in session to protect against CSRF
+    session["qbo_oauth_state"] = state
+
+    print("🔗 Redirecting to QuickBooks auth URL:", authorization_url)
+    return redirect(authorization_url)
+
+
 
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
