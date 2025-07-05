@@ -1857,15 +1857,16 @@ def process_shipment():
                         "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
                         "values": [[str(qty)]]
                     })
-            # Build order data dict and create invoice
-            order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
+           # Build order data dict and create invoice
+           order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
 
-            try:
-                invoice = invoice_resp.json().get("Invoice")
-                invoice_url = f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={invoice['Id']}"
-            except Exception as e:
-                traceback.print_exc()
-                invoice_url = ""
+           try:
+               invoice_resp = make_quickbooks_api_call("POST", "/v3/company/{realmId}/invoice", payload=invoice_payload)
+               invoice = invoice_resp.json().get("Invoice")
+               return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={invoice['Id']}"
+           except Exception as e:
+               traceback.print_exc()
+               return ""
 
             if not isinstance(invoice_url, str):
                 invoice_url = str(invoice_url)
