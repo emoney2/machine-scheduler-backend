@@ -139,6 +139,7 @@ def refresh_quickbooks_token():
 
 def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id):
     import requests
+    import time
 
     # Step 1: Try to fetch from QuickBooks
     query_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/query"
@@ -188,7 +189,7 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
             "name": data["DisplayName"]
         }
 
-    # ⛔ If 403, fallback to dummy DisplayName in sandbox
+    # ⛔ If 403 from sandbox, retry with fallback name
     if res.status_code == 403 and "ApplicationAuthorizationFailed" in res.text:
         print("⚠️ Sandbox blocked customer creation. Retrying with fallback DisplayName.")
         payload["DisplayName"] = f"{company_name} Test {int(time.time())}"
@@ -199,15 +200,12 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
                 "value": data["Id"],
                 "name": data["DisplayName"]
             }
+        else:
+            raise Exception(f"❌ Retry also failed: {res2.text}")
 
-    # Otherwise, raise the original error
+    # Final failure
     raise Exception(f"❌ Failed to create customer in QuickBooks: {res.text}")
 
-    data = res.json().get("Customer", {})
-    return {
-        "value": data["Id"],
-        "name": data["DisplayName"]
-    }
 
 def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=None, base_shipping_cost=0.0):
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
