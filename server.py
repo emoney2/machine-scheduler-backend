@@ -184,28 +184,23 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     amount = round(qty * unit_price, 2)
 
     invoice_payload = {
-        "CustomerRef": {
-            "value": customer_id
-        },
+        "CustomerRef": { "value": customer_id },
         "Line": [
             {
-                "Amount": float(round(amount, 2)),
                 "DetailType": "SalesItemLineDetail",
+                "Amount": float(round(amount, 2)),
                 "SalesItemLineDetail": {
-                    "ItemRef": {
-                        "value": item_id
-                    },
+                    "ItemRef": { "value": item_id },
                     "Qty": float(qty),
                     "UnitPrice": float(round(unit_price, 2))
                 }
             }
         ],
         "TxnDate": datetime.now().strftime("%Y-%m-%d"),
-        "ShippingAmt": float(round(shipping_total, 2)),
-        "PrivateNote": "\n".join(tracking_list or []),
-        "SalesTermRef": {
-            "value": "3"  # Net 30
-        }
+        "TotalAmt": float(round(amount, 2)),
+        "SalesTermRef": { "value": "3" },  # Net 30
+        "BillEmail": { "Address": "sandbox@sample.com" },  # Required in sandbox
+        "ShipAddr": { "Country": "USA" }  # Dummy shipping address
     }
 
     invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
