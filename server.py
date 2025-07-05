@@ -101,7 +101,11 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     customer_data = customer_resp.json()
 
     if not customer_data.get("QueryResponse", {}).get("Customer"):
+        print("🔍 Available customers in QBO sandbox:")
+        for c in customer_data.get("QueryResponse", {}).get("Customer", []):
+            print("-", c.get("DisplayName"))
         raise Exception(f"❌ Customer '{customer_name}' not found in QBO sandbox.")
+
     customer_id = customer_data["QueryResponse"]["Customer"][0]["Id"]
     print(f"✅ Found customer '{customer_name}' with ID {customer_id}")
 
