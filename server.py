@@ -181,8 +181,27 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     create_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/customer"
     res = requests.post(create_url, headers=quickbooks_headers, json=payload)
 
-    if res.status_code not in [200, 201]:
-        raise Exception(f"❌ Failed to create customer in QuickBooks: {res.text}")
+    if res.status_code in [200, 201]:
+        data = res.json().get("Customer", {})
+        return {
+            "value": data["Id"],
+            "name": data["DisplayName"]
+        }
+
+    # ⛔ If 403, fallback to dummy DisplayName in sandbox
+    if res.status_code == 403 and "ApplicationAuthorizationFailed" in res.text:
+        print("⚠️ Sandbox blocked customer creation. Retrying with fallback DisplayName.")
+        payload["DisplayName"] = f"{company_name} Test {int(time.time())}"
+        res2 = requests.post(create_url, headers=quickbooks_headers, json=payload)
+        if res2.status_code in [200, 201]:
+            data = res2.json().get("Customer", {})
+            return {
+                "value": data["Id"],
+                "name": data["DisplayName"]
+            }
+
+    # Otherwise, raise the original error
+    raise Exception(f"❌ Failed to create customer in QuickBooks: {res.text}")
 
     data = res.json().get("Customer", {})
     return {
