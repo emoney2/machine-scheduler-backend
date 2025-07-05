@@ -209,7 +209,8 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
 
 def get_or_create_item_ref(product_name, headers, realm_id):
     query_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/query"
-    query = f"SELECT * FROM Item WHERE Name = '{product_name}'"
+    escaped_name = json.dumps(product_name)  # ensures correct quoting
+    query = f"SELECT * FROM Item WHERE Name = {escaped_name}"
     response = requests.get(query_url, headers=headers, params={"query": query})
 
     items = response.json().get("QueryResponse", {}).get("Item", [])
