@@ -1872,9 +1872,9 @@ def process_shipment():
             print("✅ Successfully wrote quantities to sheet.")
 
         return jsonify({
-            "labels": ["https://example.com/label1.pdf"],
-            "invoice": invoices[0] if invoices else "",
-            "slips": ["https://example.com/slip1.pdf"]
+            "labels": [],  # We'll add real label URLs here soon
+            "invoice": invoices[0] if invoices else "",  # should now contain the WebLink
+            "slips": []
         })
 
     except Exception as e:
