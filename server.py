@@ -172,7 +172,9 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
 
     token = session.get("qbo_token")
     if not token or "access_token" not in token or "expires_at" not in token:
-        raise Exception("❌ No QuickBooks token in session")
+        from flask import redirect, request, jsonify
+        next_url = request.args.get("next") or "/ship"
+        return jsonify({ "redirect": f"/quickbooks/login?next={next_url}" })
 
     # Refresh if token is expired
     if time.time() >= token["expires_at"]:
