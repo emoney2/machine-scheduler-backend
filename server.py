@@ -10,6 +10,7 @@ import traceback
 import gspread
 import logging 
 
+
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
 from datetime import datetime, timedelta
@@ -17,6 +18,7 @@ from zoneinfo import ZoneInfo
 from ups_service import get_rate
 from functools import wraps
 from dotenv import load_dotenv
+from urllib.parse import urlencode
 
 from eventlet.semaphore import Semaphore
 from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string
@@ -80,6 +82,21 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
+def get_quickbooks_auth_url(next_path="/"):
+    base_url = "https://app.sandbox.intuit.com/authorize"
+    client_id = os.environ["QB_CLIENT_ID"]
+    redirect_uri = os.environ["QB_REDIRECT_URI"]
+    scope = "com.intuit.quickbooks.accounting"
+    state = urlencode({"next": next_path})
+
+    return (
+        f"{base_url}"
+        f"?client_id={client_id}"
+        f"&redirect_uri={redirect_uri}"
+        f"&response_type=code"
+        f"&scope={scope}"
+        f"&state={state}"
+    )
 
 class RedirectException(Exception):
     def __init__(self, redirect_url):
