@@ -121,8 +121,19 @@ def create_invoice_in_quickbooks(order_data):
     # --- Step 3: Build and send invoice ---
     amount = float(order_data.get("Price", 0)) * int(order_data.get("Quantity", 1))
 
+    base_shipping_cost = float(order_data.get("Shipping Cost", 0))  # mocked UPS rate
+    num_labels = len(tracking_list)
+    shipping_total = round(base_shipping_cost * 1.1 + num_labels * 5, 2)
+
     invoice_payload = {
         "CustomerRef": { "value": customer_id },
+        "ShipMethodRef": {
+            "name": order_data.get("Shipping Method", "UPS Ground")
+        },
+        "SalesTermRef": {
+            "value": "3",  # Assuming "Net 30" has ID 3 in your sandbox
+            "name": "Net 30"
+        },
         "Line": [
             {
                 "DetailType": "SalesItemLineDetail",
@@ -131,7 +142,9 @@ def create_invoice_in_quickbooks(order_data):
                     "ItemRef": { "value": item_id }
                 }
             }
-        ]
+        ],
+        "TrackingNum": tracking_list[0] if tracking_list else "",
+        "PrivateNote": "\n".join(tracking_list)
     }
 
     invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
