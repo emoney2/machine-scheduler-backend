@@ -186,10 +186,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
                 "DetailType": "SalesItemLineDetail",
                 "Amount": amount,
                 "SalesItemLineDetail": {
-                    "ItemRef": {
-                        "value": item_id,
-                        "name": item_name  # <-- NEW
-                    },
+                    "ItemRef": { "value": item_id },
                     "Qty": int(order_data.get("Quantity", 1))  # <-- NEW
                 }
             }
