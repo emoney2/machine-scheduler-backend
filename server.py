@@ -142,7 +142,8 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     import time
 
     # Step 1: Try to fetch from QuickBooks
-    query_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/query"
+    base_qbo_url = "https://sandbox-quickbooks.api.intuit.com/v3/company"
+    query_url = f"{base_qbo_url}/{realm_id}/query"
     query = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
     response = requests.get(query_url, headers=quickbooks_headers, params={"query": query})
 
@@ -179,7 +180,7 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     }
 
     # Step 4: Create customer in QuickBooks
-    create_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/customer"
+    create_url = f"{base_qbo_url}/{realm_id}/customer"
     res = requests.post(create_url, headers=quickbooks_headers, json=payload)
 
     if res.status_code in [200, 201]:
