@@ -192,7 +192,6 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
         ],
         "SalesTermRef": {
             "value": "3",  # Replace with real "Net 30" ID if different
-            "name": "Net 30"
         },
         "ShippingAmt": shipping_total,
         "PrivateNote": "\n".join(tracking_list or [])
