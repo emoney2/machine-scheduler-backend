@@ -222,7 +222,7 @@ def get_or_create_item_ref(product_name, headers, realm_id):
 
     print(f"⚠️ Item '{product_name}' not found. Attempting to create...")
 
-    create_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/item"
+    create_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/item"
     payload = {
         "Name": product_name,
         "Type": "NonInventory",
