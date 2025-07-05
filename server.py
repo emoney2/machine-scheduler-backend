@@ -166,7 +166,7 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     # Step 3: Build QuickBooks customer payload
     payload = {
         "DisplayName": company_name,
-        "CompanyName": name,
+        "CompanyName": company_name,
         "PrimaryEmailAddr": {"Address": match.get("Contact Email Address", "")},
         "PrimaryPhone": {"FreeFormNumber": match.get("Phone Number", "")},
         "BillAddr": {
