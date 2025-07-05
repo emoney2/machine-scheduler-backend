@@ -80,6 +80,42 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
+def refresh_quickbooks_token():
+    token = session.get("qbo_token")
+    if not token or "refresh_token" not in token:
+        raise Exception("No refresh token available in session")
+
+    client_id = os.getenv("QBO_CLIENT_ID")
+    client_secret = os.getenv("QBO_CLIENT_SECRET")
+    refresh_token = token["refresh_token"]
+
+    auth = (client_id, client_secret)
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token
+    }
+
+    resp = requests.post(
+        "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+        auth=auth,
+        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+        data=data
+    )
+
+    if resp.status_code != 200:
+        raise Exception(f"❌ Failed to refresh token: {resp.text}")
+
+    new_token_data = resp.json()
+    token.update({
+        "access_token": new_token_data["access_token"],
+        "expires_at": time.time() + int(new_token_data["expires_in"]),
+        "refresh_token": new_token_data.get("refresh_token", refresh_token),  # fallback to old one if not refreshed
+    })
+    session["qbo_token"] = token
+    print("🔁 Refreshed QuickBooks token")
+
+
+
 def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=None, base_shipping_cost=0.0):
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
 
@@ -94,6 +130,13 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json"
     }
+
+    test_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/companyinfo/{realm_id}"
+    test_resp = requests.get(test_url, headers=headers)
+    if test_resp.status_code == 401:
+        print("🔁 Access token expired. Refreshing...")
+        access_token = refresh_quickbooks_token()
+        headers["Authorization"] = f"Bearer {access_token}"
 
     # Step 1: Get Customer by name
     customer_name = order_data.get("Company Name", "").strip().lower()
