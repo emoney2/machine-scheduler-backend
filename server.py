@@ -139,9 +139,8 @@ def create_invoice_in_quickbooks(order_data):
     # --- Step 4: Build and send invoice ---
     invoice_payload = {
         "CustomerRef": { "value": customer_id },
-        "ShipMethodRef": { "name": shipping_method },
         "SalesTermRef": {
-            "value": "3",  # Assuming "Net 30" is ID 3 in your sandbox
+            "value": "3",  # 🧾 Net 30 (assumes ID 3 exists)
             "name": "Net 30"
         },
         "Line": [
@@ -153,12 +152,14 @@ def create_invoice_in_quickbooks(order_data):
                 }
             }
         ],
-        "TrackingNum": first_tracking,
-        "PrivateNote": all_tracking_notes,
-        "ShipAddr": {
-            "Line1": order_data.get("Company Name", "Shipping Address Line 1")
+        "ShipMethodRef": {
+            "value": "1",  # 👈 You must use a valid QBO ID here (not just 'name')
+            "name": order_data.get("Shipping Method", "UPS Ground")  # Optional but okay if value exists
         },
-        "ShippingAmt": shipping_total
+        "TrackingNum": tracking_list[0] if tracking_list else "",
+        "PrivateNote": "\n".join(tracking_list),
+        "ShipAddr": {},  # optional; QBO may require structured address if included
+        "ShippingCost": shipping_total,
     }
 
     invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
