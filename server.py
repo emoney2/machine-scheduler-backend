@@ -2203,8 +2203,11 @@ def authorize_quickbooks():
     print("🔗 Redirecting to QuickBooks auth URL:", authorization_url)
     return redirect(authorization_url)
 
-
-
+@app.route("/quickbooks/login")
+def quickbooks_login_redirect():
+    next_path = request.args.get("next", "/")
+    auth_url = get_quickbooks_auth_url(next_path)
+    return redirect(auth_url)
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
