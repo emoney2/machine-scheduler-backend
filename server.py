@@ -165,8 +165,9 @@ def create_invoice_in_quickbooks(order_data):
     invoice_resp = requests.post(invoice_url, headers=headers, json=invoice_payload)
 
     if invoice_resp.status_code != 200:
-        print("❌ QBO Invoice Error:", invoice_resp.text)
-        raise Exception("Failed to create invoice in QuickBooks")
+        print("❌ QBO Invoice Error:", invoice_resp.status_code)
+        print("❌ Response Text:", invoice_resp.text)
+        raise Exception(f"QuickBooks Invoice Failed: {invoice_resp.text}")
 
     invoice = invoice_resp.json().get("Invoice")
     print("✅ Invoice created:", invoice)
