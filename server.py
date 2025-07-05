@@ -216,7 +216,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     }
 
     # Step 1: Get or create customer
-    sheet = get_authenticated_sheet()  # ⬅️ This must exist; confirm it returns your gspread sheet
+    sheet = sh
     customer_ref = get_or_create_customer_ref(order_data.get("Company Name", ""), sheet, headers, realm_id)
 
     # Step 2: Get Item by name
