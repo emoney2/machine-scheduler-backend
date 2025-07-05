@@ -237,10 +237,11 @@ def get_or_create_item_ref(product_name, headers, realm_id):
     res = requests.post(create_url, headers=headers, json=payload)
     if res.status_code in [200, 201]:
         item = res.json().get("Item", {})
-        item_ref = {
+        return {
             "value": item["Id"],
             "name": item["Name"]
         }
+
     elif res.status_code == 400 and "Duplicate Name Exists Error" in res.text:
         print(f"🔁 Item '{product_name}' already exists, retrieving existing item...")
         escaped_name = product_name.replace("'", "''")
