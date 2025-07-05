@@ -190,6 +190,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
                 }
             }
         ],
+        "TxnDate": datetime.utcnow().strftime("%Y-%m-%d"),
         "ShippingAmt": shipping_total,
         "PrivateNote": "\n".join(tracking_list or [])
     }
