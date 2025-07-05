@@ -84,7 +84,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
 def get_quickbooks_auth_url(redirect_uri, state=""):
-    base_url = "https://oauth.platform.intuit.com/op/v1/authorize"
+    base_url = "https://appcenter.intuit.com/connect/oauth2"
     client_id = os.environ["QBO_CLIENT_ID"]
     scope = "com.intuit.quickbooks.accounting"
     return (
@@ -93,7 +93,7 @@ def get_quickbooks_auth_url(redirect_uri, state=""):
         f"&redirect_uri={urllib.parse.quote(redirect_uri)}"
         f"&response_type=code"
         f"&scope={scope}"
-        f"&state={state}"
+        f"&state={urllib.parse.quote(state)}"
     )
 
     return auth_url
