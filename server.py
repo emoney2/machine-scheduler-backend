@@ -445,10 +445,6 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
     invoice = res.json().get("Invoice", {})
     return invoice.get("DocNumber", "")
 
-    else:
-        print("❌ Invoice creation failed:", res.text)
-        raise Exception("Failed to create consolidated invoice: " + res.text)
-
 
 
 @app.route("/", methods=["GET"])
