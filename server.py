@@ -120,23 +120,25 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
 
     token = session.get("qbo_token")
+    if not token or "access_token" not in token or "expires_at" not in token:
+        raise Exception("❌ No QuickBooks token in session")
+
+    # Refresh if token is expired
+    if time.time() >= token["expires_at"]:
+        print("🔁 Access token expired. Refreshing...")
+        refresh_quickbooks_token()
+        token = session.get("qbo_token")  # re-pull refreshed token
+
     access_token = token.get("access_token")
     realm_id = token.get("realmId")
 
     if not access_token or not realm_id:
-        raise Exception("Missing QuickBooks access token or realm ID in session")
+        raise Exception("❌ Missing QuickBooks access token or realm ID")
 
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json"
     }
-
-    test_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/companyinfo/{realm_id}"
-    test_resp = requests.get(test_url, headers=headers)
-    if test_resp.status_code == 401:
-        print("🔁 Access token expired. Refreshing...")
-        access_token = refresh_quickbooks_token()
-        headers["Authorization"] = f"Bearer {access_token}"
 
     # Step 1: Get Customer by name
     customer_name = order_data.get("Company Name", "").strip().lower()
