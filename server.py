@@ -80,6 +80,11 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
+
+class RedirectException(Exception):
+    def __init__(self, redirect_url):
+        self.redirect_url = redirect_url
+
 def refresh_quickbooks_token():
     token = session.get("qbo_token")
     if not token or "refresh_token" not in token:
@@ -172,9 +177,8 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
 
     token = session.get("qbo_token")
     if not token or "access_token" not in token or "expires_at" not in token:
-        from flask import redirect, request, jsonify
-        next_url = request.args.get("next") or "/ship"
-        return jsonify({ "redirect": f"/quickbooks/login?next={next_url}" })
+        next_url = "/quickbooks/login?next=/ship"
+        raise RedirectException(next_url)
 
     # Refresh if token is expired
     if time.time() >= token["expires_at"]:
@@ -1860,10 +1864,9 @@ def process_shipment():
                 # ✅ Build order data and create invoice per matching row
                 order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
                 try:
-                    invoice_url = create_invoice_in_quickbooks(order_data)
-                except Exception as e:
-                    traceback.print_exc()
-                    invoice_url = ""
+                    invoice_url = create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=[], base_shipping_cost=0.0)
+                except RedirectException as e:
+                    return jsonify({ "redirect": e.redirect_url }), 401
 
                 if not isinstance(invoice_url, str):
                     invoice_url = str(invoice_url)
