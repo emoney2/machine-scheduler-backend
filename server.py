@@ -429,12 +429,22 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
     }
 
     url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
+    print("📦 Invoice payload:")
+    print(json.dumps(invoice_payload, indent=2))
+
     res = requests.post(url, headers=headers, json=invoice_payload)
 
-    if res.status_code in [200, 201]:
-        invoice = res.json()["Invoice"]
-        print("✅ Consolidated invoice created:", invoice.get("DocNumber"))
-        return invoice.get("DocNumber")
+    print("📬 QBO response status:", res.status_code)
+    print("📬 QBO response body:", res.text)
+
+    if res.status_code not in [200, 201]:
+        print("❌ QBO invoice creation failed.")
+        traceback.print_exc()
+        raise Exception(f"QuickBooks invoice creation failed: {res.text}")
+
+    invoice = res.json().get("Invoice", {})
+    return invoice.get("DocNumber", "")
+
     else:
         print("❌ Invoice creation failed:", res.text)
         raise Exception("Failed to create consolidated invoice: " + res.text)
@@ -2041,6 +2051,7 @@ def process_shipment():
                 all_order_data.append(order_data)
 
         # ✅ Create consolidated invoice AFTER loop
+        print(f"🧾 Attempting to create invoice for {len(all_order_data)} order(s)")
         try:
             invoice_url = create_consolidated_invoice_in_quickbooks(
                 all_order_data,
@@ -2053,6 +2064,8 @@ def process_shipment():
             return jsonify({ "redirect": e.redirect_url }), 401
         except Exception as e:
             session.pop("last_shipment", None)
+            print("❌ Error creating invoice:")
+            traceback.print_exc()
             raise
 
         invoices = [str(invoice_url)]
