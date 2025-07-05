@@ -2204,7 +2204,7 @@ def qbo_callback():
         print("✅ QBO token + realmId stored in session:", token)
 
         # Redirect user back to /ship or wherever they started
-        return redirect(state)
+        return redirect(f"{FRONTEND_URL}{state}")
     except Exception as e:
         print("❌ Error in /qbo/callback:")
         import traceback
