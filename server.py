@@ -96,19 +96,27 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     }
 
     # Step 1: Get Customer by name
-    customer_name = order_data.get("Company Name", "").strip()
-    customer_query_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/query?query=select * from Customer where DisplayName = '{customer_name}'"
-    customer_resp = requests.get(customer_query_url, headers=headers)
-    customer_data = customer_resp.json()
+    customer_name = order_data.get("Company Name", "").strip().lower()
+    query_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/query?query=select * from Customer"
+    resp = requests.get(query_url, headers=headers)
+    if resp.status_code != 200:
+        raise Exception(f"❌ Failed to query customers: {resp.text}")
 
-    if not customer_data.get("QueryResponse", {}).get("Customer"):
-        print("🔍 Available customers in QBO sandbox:")
-        for c in customer_data.get("QueryResponse", {}).get("Customer", []):
-            print("-", c.get("DisplayName"))
-        raise Exception(f"❌ Customer '{customer_name}' not found in QBO sandbox.")
+    customers = resp.json().get("QueryResponse", {}).get("Customer", [])
+    customer_id = None
 
-    customer_id = customer_data["QueryResponse"]["Customer"][0]["Id"]
-    print(f"✅ Found customer '{customer_name}' with ID {customer_id}")
+    print("🔍 All customers in QBO:")
+    for c in customers:
+        display_name = c.get("DisplayName", "").strip()
+        print(f"   - '{display_name}' (ID: {c.get('Id')})")
+        if display_name.lower() == customer_name:
+            customer_id = c["Id"]
+            break
+
+    if not customer_id:
+        raise Exception(f"❌ Customer '{order_data.get('Company Name')}' not found in QBO sandbox.")
+    print(f"✅ Found customer '{order_data.get('Company Name')}' with ID {customer_id}")
+
 
     # Step 2: Get Item by name
     item_name = order_data.get("Product", "").strip()
