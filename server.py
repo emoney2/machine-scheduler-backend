@@ -1787,6 +1787,7 @@ def process_shipment():
 
     except Exception as e:
         print("❌ Shipment error:", str(e))
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
