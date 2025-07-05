@@ -190,9 +190,6 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
                 }
             }
         ],
-        "ShipMethodRef": {
-            "name": shipping_method  # Can also use "value" if ShipMethod ID is known
-        },
         "SalesTermRef": {
             "value": "3",  # Replace with real "Net 30" ID if different
             "name": "Net 30"
