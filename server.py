@@ -79,7 +79,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
-def create_invoice_in_quickbooks(order_data):
+def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=None, base_shipping_cost=0.0):
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
 
     token = session.get("qbo_token")
@@ -91,11 +91,10 @@ def create_invoice_in_quickbooks(order_data):
 
     headers = {
         "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
+        "Accept": "application/json"
     }
 
-    # --- Step 1: Get real customer by name ---
+    # Step 1: Get Customer by name
     customer_name = order_data.get("Company Name", "").strip()
     customer_query_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/query?query=select * from Customer where DisplayName = '{customer_name}'"
     customer_resp = requests.get(customer_query_url, headers=headers)
@@ -103,11 +102,10 @@ def create_invoice_in_quickbooks(order_data):
 
     if not customer_data.get("QueryResponse", {}).get("Customer"):
         raise Exception(f"❌ Customer '{customer_name}' not found in QBO sandbox.")
-    
     customer_id = customer_data["QueryResponse"]["Customer"][0]["Id"]
     print(f"✅ Found customer '{customer_name}' with ID {customer_id}")
 
-    # --- Step 2: Get real item by name ---
+    # Step 2: Get Item by name
     item_name = order_data.get("Product", "").strip()
     item_query_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/query?query=select * from Item where Name = '{item_name}'"
     item_resp = requests.get(item_query_url, headers=headers)
@@ -115,34 +113,16 @@ def create_invoice_in_quickbooks(order_data):
 
     if not item_data.get("QueryResponse", {}).get("Item"):
         raise Exception(f"❌ Item '{item_name}' not found in QBO sandbox.")
-    
     item_id = item_data["QueryResponse"]["Item"][0]["Id"]
     print(f"✅ Found item '{item_name}' with ID {item_id}")
 
-    # --- Step 3: Prepare values ---
+    # Step 3: Build and send invoice
     amount = float(order_data.get("Price", 0)) * int(order_data.get("Quantity", 1))
+    num_labels = len(tracking_list or [])
+    shipping_total = round(float(base_shipping_cost) * 1.1 + num_labels * 5, 2)
 
-    # Tracking numbers
-    tracking_raw = order_data.get("Tracking #", "")
-    tracking_list = [t.strip() for t in tracking_raw.split(",") if t.strip()]
-    first_tracking = tracking_list[0] if tracking_list else ""
-    all_tracking_notes = "\n".join(tracking_list)
-
-    # Shipping method
-    shipping_method = order_data.get("Shipping Method", "UPS Ground")
-
-    # Shipping cost calculation
-    base_shipping_cost = float(order_data.get("Shipping Cost", 0))  # placeholder UPS base cost
-    num_labels = len(tracking_list)
-    shipping_total = round(base_shipping_cost * 1.1 + num_labels * 5, 2)
-
-    # --- Step 4: Build and send invoice ---
     invoice_payload = {
         "CustomerRef": { "value": customer_id },
-        "SalesTermRef": {
-            "value": "3",  # 🧾 Net 30 (assumes ID 3 exists)
-            "name": "Net 30"
-        },
         "Line": [
             {
                 "DetailType": "SalesItemLineDetail",
@@ -153,22 +133,22 @@ def create_invoice_in_quickbooks(order_data):
             }
         ],
         "ShipMethodRef": {
-            "value": "1",  # 👈 You must use a valid QBO ID here (not just 'name')
-            "name": order_data.get("Shipping Method", "UPS Ground")  # Optional but okay if value exists
+            "name": shipping_method  # Can also use "value" if ShipMethod ID is known
         },
-        "TrackingNum": tracking_list[0] if tracking_list else "",
-        "PrivateNote": "\n".join(tracking_list),
-        "ShipAddr": {},  # optional; QBO may require structured address if included
-        "ShippingCost": shipping_total,
+        "SalesTermRef": {
+            "value": "3",  # Replace with real "Net 30" ID if different
+            "name": "Net 30"
+        },
+        "ShippingAmt": shipping_total,
+        "PrivateNote": "\n".join(tracking_list or [])
     }
 
     invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
-    invoice_resp = requests.post(invoice_url, headers=headers, json=invoice_payload)
+    invoice_resp = requests.post(invoice_url, headers={**headers, "Content-Type": "application/json"}, json=invoice_payload)
 
     if invoice_resp.status_code != 200:
-        print("❌ QBO Invoice Error:", invoice_resp.status_code)
-        print("❌ Response Text:", invoice_resp.text)
-        raise Exception(f"QuickBooks Invoice Failed: {invoice_resp.text}")
+        print("❌ QBO Invoice Error:", invoice_resp.text)
+        raise Exception("Failed to create invoice in QuickBooks")
 
     invoice = invoice_resp.json().get("Invoice")
     print("✅ Invoice created:", invoice)
