@@ -2006,8 +2006,6 @@ def process_shipment():
         shipped_col = headers.index("Shipped")
 
         updates = []
-        invoices = []
-
         all_order_data = []
 
         for i, row in enumerate(rows[1:], start=2):  # start=2 for 1-based index
@@ -2023,27 +2021,12 @@ def process_shipment():
                         "values": [[str(qty)]]
                     })
 
-                # ⬅️ Inside the for-loop
+                # Gather data for consolidated invoice
                 order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
                 order_data["ShippedQty"] = qty
                 all_order_data.append(order_data)
-                except RedirectException as e:
-                    session.pop("last_shipment", None)
-                    return jsonify({ "redirect": e.redirect_url }), 401
-                except Exception as e:
-                    session.pop("last_shipment", None)
-                    raise
-                except RedirectException as e:
-                    session.pop("last_shipment", None)  # 🧹 Clear retry flag on redirect failure
-                    return jsonify({ "redirect": e.redirect_url }), 401
-                except Exception as e:
-                    session.pop("last_shipment", None)  # 🧹 Clear retry flag on any invoice failure
-                    raise  # Let the outer except handle it
 
-                if not isinstance(invoice_url, str):
-                    invoice_url = str(invoice_url)
-                invoices.append(invoice_url)
-
+        # ✅ Create consolidated invoice AFTER loop
         try:
             invoice_url = create_consolidated_invoice_in_quickbooks(
                 all_order_data,
@@ -2058,7 +2041,7 @@ def process_shipment():
             session.pop("last_shipment", None)
             raise
 
-        invoices.append(str(invoice_url))
+        invoices = [str(invoice_url)]
 
         if not updates:
             print("⚠️ No updates prepared — check for ID mismatches.")
@@ -2071,7 +2054,7 @@ def process_shipment():
             print("✅ Successfully wrote quantities to sheet.")
 
         return jsonify({
-            "labels": [],  # We'll add real label URLs here soon
+            "labels": [],
             "invoice": invoices[0] if invoices else "",
             "slips": []
         })
