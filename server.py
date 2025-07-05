@@ -2183,10 +2183,13 @@ def qbo_callback():
     try:
         print("🔁 Received QBO callback with URL:", request.url)
 
+        # Get the state from query string (used for redirecting)
+        state = request.args.get("state", "/")
+
         qbo = OAuth2Session(
             client_id=QBO_CLIENT_ID,
             redirect_uri=QBO_REDIRECT_URI,
-            state=session.get("qbo_oauth_state")
+            state=state  # ← grab state directly from request
         )
 
         token = qbo.fetch_token(
@@ -2196,16 +2199,18 @@ def qbo_callback():
         )
 
         realm_id = request.args.get("realmId")
-        token["realmId"] = realm_id  # 👈 Add this line
+        token["realmId"] = realm_id
         session["qbo_token"] = token
         print("✅ QBO token + realmId stored in session:", token)
 
-        return "✅ QuickBooks authorized successfully!"
+        # Redirect user back to /ship or wherever they started
+        return redirect(state)
     except Exception as e:
         print("❌ Error in /qbo/callback:")
         import traceback
         traceback.print_exc()
         return f"❌ Callback error: {str(e)}", 500
+
 
 @app.route("/authorize-quickbooks")
 def authorize_quickbooks():
@@ -2228,8 +2233,10 @@ def authorize_quickbooks():
 @app.route("/quickbooks/login")
 def quickbooks_login_redirect():
     next_path = request.args.get("next", "/")
-    auth_url = get_quickbooks_auth_url(next_path)
+    redirect_uri = os.environ["QBO_REDIRECT_URI"]  # ✅ Must be the full URL
+    auth_url = get_quickbooks_auth_url(redirect_uri, state=next_path)  # ✅ Put /ship in state instead
     return redirect(auth_url)
+
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
