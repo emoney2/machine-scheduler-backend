@@ -82,47 +82,68 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 def create_invoice_in_quickbooks(order_data):
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
 
-    access_token = session.get("qbo_token", {}).get("access_token")
-    realm_id = session.get("qbo_token", {}).get("realmId")
+    token = session.get("qbo_token")
+    access_token = token.get("access_token")
+    realm_id = token.get("realmId")
 
     if not access_token or not realm_id:
         raise Exception("Missing QuickBooks access token or realm ID in session")
 
     headers = {
         "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
+        "Accept": "application/json"
     }
 
-    # Convert order data into QBO invoice format
-    invoice_data = {
-        "CustomerRef": {
-            "value": "1"  # 👈 Replace with actual customer ID or lookup logic
-        },
+    # --- Step 1: Get real customer by name ---
+    customer_name = order_data.get("Company Name", "").strip()
+    customer_query_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/query?query=select * from Customer where DisplayName = '{customer_name}'"
+    customer_resp = requests.get(customer_query_url, headers=headers)
+    customer_data = customer_resp.json()
+
+    if not customer_data.get("QueryResponse", {}).get("Customer"):
+        raise Exception(f"❌ Customer '{customer_name}' not found in QBO sandbox.")
+    
+    customer_id = customer_data["QueryResponse"]["Customer"][0]["Id"]
+    print(f"✅ Found customer '{customer_name}' with ID {customer_id}")
+
+    # --- Step 2: Get real item by name ---
+    item_name = order_data.get("Product", "").strip()
+    item_query_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/query?query=select * from Item where Name = '{item_name}'"
+    item_resp = requests.get(item_query_url, headers=headers)
+    item_data = item_resp.json()
+
+    if not item_data.get("QueryResponse", {}).get("Item"):
+        raise Exception(f"❌ Item '{item_name}' not found in QBO sandbox.")
+    
+    item_id = item_data["QueryResponse"]["Item"][0]["Id"]
+    print(f"✅ Found item '{item_name}' with ID {item_id}")
+
+    # --- Step 3: Build and send invoice ---
+    amount = float(order_data.get("Price", 0)) * int(order_data.get("Quantity", 1))
+
+    invoice_payload = {
+        "CustomerRef": { "value": customer_id },
         "Line": [
             {
                 "DetailType": "SalesItemLineDetail",
-                "Amount": float(order_data.get("Price", 0)) * int(order_data.get("Quantity", 1)),
+                "Amount": amount,
                 "SalesItemLineDetail": {
-                    "ItemRef": {
-                        "value": "1",  # 👈 Replace with real item ID
-                        "name": order_data.get("Product", "Unknown Product")
-                    }
+                    "ItemRef": { "value": item_id }
                 }
             }
         ]
     }
 
-    qbo_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
-    response = requests.post(qbo_url, headers=headers, json=invoice_data)
+    invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
+    invoice_resp = requests.post(invoice_url, headers={**headers, "Content-Type": "application/json"}, json=invoice_payload)
 
-    if response.status_code != 200:
-        print("❌ QuickBooks API error:", response.text)
+    if invoice_resp.status_code != 200:
+        print("❌ QBO Invoice Error:", invoice_resp.text)
         raise Exception("Failed to create invoice in QuickBooks")
 
-    invoice_json = response.json()
-    print("✅ Invoice created:", invoice_json)
-    return invoice_json.get("Invoice", {}).get("DocNumber", "Invoice Created")
+    invoice = invoice_resp.json().get("Invoice")
+    print("✅ Invoice created:", invoice)
+    return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={invoice['Id']}"
 
 
 @app.route("/", methods=["GET"])
