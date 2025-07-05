@@ -2023,8 +2023,10 @@ def qbo_callback():
             authorization_response=request.url,
         )
 
+        realm_id = request.args.get("realmId")
+        token["realmId"] = realm_id  # 👈 Add this line
         session["qbo_token"] = token
-        print("✅ QBO token received:", token)
+        print("✅ QBO token + realmId stored in session:", token)
 
         return "✅ QuickBooks authorized successfully!"
     except Exception as e:
