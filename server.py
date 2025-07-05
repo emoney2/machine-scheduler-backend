@@ -239,16 +239,39 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     sheet = sh
     customer_ref = get_or_create_customer_ref(order_data.get("Company Name", ""), sheet, headers, realm_id)
 
-    # Step 2: Get Item by name
-    item_name = order_data.get("Product", "").strip()
-    item_query_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/query?query=select * from Item where Name = '{item_name}'"
-    item_resp = requests.get(item_query_url, headers=headers)
-    item_data = item_resp.json()
+    # Step 2: Look up item in QuickBooks by product name
+    query = f"SELECT * FROM Item WHERE Name = '{product_name}'"
+    response = requests.get(query_url, headers=headers, params={"query": query})
+    items = response.json().get("QueryResponse", {}).get("Item", [])
 
-    if not item_data.get("QueryResponse", {}).get("Item"):
-        raise Exception(f"❌ Item '{item_name}' not found in QBO sandbox.")
-    item_id = item_data["QueryResponse"]["Item"][0]["Id"]
-    print(f"✅ Found item '{item_name}' with ID {item_id}")
+    if not items:
+        print(f"⚠️ Item '{product_name}' not found. Attempting to create...")
+
+        # Try to create the item in QBO
+        create_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/item"
+        payload = {
+            "Name": product_name,
+            "Type": "NonInventory",
+            "IncomeAccountRef": {
+                "name": "Sales of Product Income",
+                "value": "79"  # Use 79 for sandbox; replace with actual ID for production
+            }
+        }
+
+        res = requests.post(create_url, headers=headers, json=payload)
+        if res.status_code in [200, 201]:
+            item = res.json().get("Item", {})
+            item_ref = {
+                "value": item["Id"],
+                "name": item["Name"]
+            }
+        else:
+            raise Exception(f"❌ Failed to create item '{product_name}' in QBO: {res.text}")
+    else:
+        item_ref = {
+            "value": items[0]["Id"],
+            "name": items[0]["Name"]
+        }
 
     # Step 3: Build and send invoice
     amount = float(order_data.get("Price", 0)) * int(order_data.get("Quantity", 1))
