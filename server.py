@@ -194,6 +194,8 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
 
     token = session.get("qbo_token")
+    print("🔑 QBO Token in session:", token)
+    print("🏢 Realm ID in session:", token.get("realmId") if token else None)
     if not token or "access_token" not in token or "expires_at" not in token:
         next_url = "/quickbooks/login?next=/ship"
         raise RedirectException(next_url)
