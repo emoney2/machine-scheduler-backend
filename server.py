@@ -245,7 +245,7 @@ def get_or_create_item_ref(product_name, headers, realm_id):
         lookup_res = requests.get(query_url, headers=headers, params={"query": query})
         existing_items = lookup_res.json().get("QueryResponse", {}).get("Item", [])
         if existing_items:
-            item_ref = {
+            return {
                 "value": existing_items[0]["Id"],
                 "name": existing_items[0]["Name"]
             }
