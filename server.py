@@ -149,12 +149,14 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     }
 
     invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
+    logging.info("📦 Invoice payload about to send to QuickBooks:")
+    logging.info(json.dumps(invoice_payload, indent=2))
+
     invoice_resp = requests.post(invoice_url, headers={**headers, "Content-Type": "application/json"}, json=invoice_payload)
 
     if invoice_resp.status_code != 200:
         logging.error("❌ QBO Invoice Error: %s", invoice_resp.status_code)
         logging.error("❌ QBO Response: %s", invoice_resp.text)
-        logging.error("❌ Invoice payload was:\n%s", json.dumps(invoice_payload, indent=2))
         raise Exception("Failed to create invoice in QuickBooks")
 
     invoice = invoice_resp.json().get("Invoice")
