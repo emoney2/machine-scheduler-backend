@@ -235,12 +235,25 @@ def get_or_create_item_ref(product_name, headers, realm_id):
     res = requests.post(create_url, headers=headers, json=payload)
     if res.status_code in [200, 201]:
         item = res.json().get("Item", {})
-        return {
+        item_ref = {
             "value": item["Id"],
             "name": item["Name"]
         }
+    elif res.status_code == 400 and "Duplicate Name Exists Error" in res.text:
+        print(f"🔁 Item '{product_name}' already exists, retrieving existing item...")
+        query = f"SELECT * FROM Item WHERE Name = '{product_name}'"
+        lookup_res = requests.get(query_url, headers=headers, params={"query": query})
+        existing_items = lookup_res.json().get("QueryResponse", {}).get("Item", [])
+        if existing_items:
+            item_ref = {
+                "value": existing_items[0]["Id"],
+                "name": existing_items[0]["Name"]
+            }
+        else:
+            raise Exception(f"❌ Item '{product_name}' exists but could not be retrieved.")
     else:
         raise Exception(f"❌ Failed to create item '{product_name}' in QBO: {res.text}")
+
 
 def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=None, base_shipping_cost=0.0):
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
