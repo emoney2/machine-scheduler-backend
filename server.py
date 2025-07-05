@@ -184,14 +184,15 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
         "Line": [
             {
                 "DetailType": "SalesItemLineDetail",
-                "Amount": amount,
+                "Amount": amount,  # total
                 "SalesItemLineDetail": {
                     "ItemRef": { "value": item_id },
-                    "Qty": int(order_data.get("Quantity", 1))  # <-- NEW
+                    "Qty": int(order_data.get("Quantity", 1)),
+                    "UnitPrice": round(float(order_data.get("Price", 0)), 2)
                 }
             }
         ],
-        "TxnDate": datetime.utcnow().strftime("%Y-%m-%d"),
+        "TxnDate": datetime.now().strftime("%Y-%m-%d"),
         "ShippingAmt": shipping_total,
         "PrivateNote": "\n".join(tracking_list or [])
     }
