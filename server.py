@@ -91,7 +91,8 @@ def create_invoice_in_quickbooks(order_data):
 
     headers = {
         "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "Content-Type": "application/json"
     }
 
     # --- Step 1: Get real customer by name ---
@@ -118,20 +119,29 @@ def create_invoice_in_quickbooks(order_data):
     item_id = item_data["QueryResponse"]["Item"][0]["Id"]
     print(f"✅ Found item '{item_name}' with ID {item_id}")
 
-    # --- Step 3: Build and send invoice ---
+    # --- Step 3: Prepare values ---
     amount = float(order_data.get("Price", 0)) * int(order_data.get("Quantity", 1))
 
-    base_shipping_cost = float(order_data.get("Shipping Cost", 0))  # mocked UPS rate
+    # Tracking numbers
+    tracking_raw = order_data.get("Tracking #", "")
+    tracking_list = [t.strip() for t in tracking_raw.split(",") if t.strip()]
+    first_tracking = tracking_list[0] if tracking_list else ""
+    all_tracking_notes = "\n".join(tracking_list)
+
+    # Shipping method
+    shipping_method = order_data.get("Shipping Method", "UPS Ground")
+
+    # Shipping cost calculation
+    base_shipping_cost = float(order_data.get("Shipping Cost", 0))  # placeholder UPS base cost
     num_labels = len(tracking_list)
     shipping_total = round(base_shipping_cost * 1.1 + num_labels * 5, 2)
 
+    # --- Step 4: Build and send invoice ---
     invoice_payload = {
         "CustomerRef": { "value": customer_id },
-        "ShipMethodRef": {
-            "name": order_data.get("Shipping Method", "UPS Ground")
-        },
+        "ShipMethodRef": { "name": shipping_method },
         "SalesTermRef": {
-            "value": "3",  # Assuming "Net 30" has ID 3 in your sandbox
+            "value": "3",  # Assuming "Net 30" is ID 3 in your sandbox
             "name": "Net 30"
         },
         "Line": [
@@ -143,12 +153,16 @@ def create_invoice_in_quickbooks(order_data):
                 }
             }
         ],
-        "TrackingNum": tracking_list[0] if tracking_list else "",
-        "PrivateNote": "\n".join(tracking_list)
+        "TrackingNum": first_tracking,
+        "PrivateNote": all_tracking_notes,
+        "ShipAddr": {
+            "Line1": order_data.get("Company Name", "Shipping Address Line 1")
+        },
+        "ShippingAmt": shipping_total
     }
 
     invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
-    invoice_resp = requests.post(invoice_url, headers={**headers, "Content-Type": "application/json"}, json=invoice_payload)
+    invoice_resp = requests.post(invoice_url, headers=headers, json=invoice_payload)
 
     if invoice_resp.status_code != 200:
         print("❌ QBO Invoice Error:", invoice_resp.text)
