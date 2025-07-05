@@ -151,7 +151,10 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     invoice_resp = requests.post(invoice_url, headers={**headers, "Content-Type": "application/json"}, json=invoice_payload)
 
     if invoice_resp.status_code != 200:
-        print("❌ QBO Invoice Error:", invoice_resp.text)
+        print("❌ QBO Invoice Error:", invoice_resp.status_code)
+        print(invoice_resp.text)
+        print("❌ Invoice payload was:")
+        print(json.dumps(invoice_payload, indent=2))
         raise Exception("Failed to create invoice in QuickBooks")
 
     invoice = invoice_resp.json().get("Invoice")
