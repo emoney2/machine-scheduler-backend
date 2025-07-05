@@ -9,6 +9,7 @@ import requests
 import traceback
 import gspread
 import logging 
+import urllib.parse
 
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
@@ -1887,7 +1888,11 @@ def process_shipment():
                 try:
                     invoice_url = create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=[], base_shipping_cost=0.0)
                 except RedirectException as e:
+                    session.pop("last_shipment", None)  # 🧹 Clear retry flag on redirect failure
                     return jsonify({ "redirect": e.redirect_url }), 401
+                except Exception as e:
+                    session.pop("last_shipment", None)  # 🧹 Clear retry flag on any invoice failure
+                    raise  # Let the outer except handle it
 
                 if not isinstance(invoice_url, str):
                     invoice_url = str(invoice_url)
