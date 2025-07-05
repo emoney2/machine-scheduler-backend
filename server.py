@@ -352,6 +352,80 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     print("✅ Invoice created:", invoice)
     return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={invoice['Id']}"
 
+def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, tracking_list, base_shipping_cost):
+    creds = get_quickbooks_credentials()
+    if not creds.valid:
+        raise RedirectException(creds.authorization_url)
+
+    headers = {
+        "Authorization": f"Bearer {creds.token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    realm_id = creds.realm_id
+    sheet = get_google_sheet()
+
+    # ✅ Use first order's company name to find/create customer
+    first_order = order_data_list[0]
+    customer_ref = get_or_create_customer_ref(first_order.get("Company Name", ""), sheet, headers, realm_id)
+
+    # 🧾 Build Line items
+    line_items = []
+    for order in order_data_list:
+        product_name = order.get("Product", "").strip()
+        design_name = order.get("Design", "").strip()
+        shipped_qty  = int(order.get("ShippedQty", 0))
+        price        = float(order.get("Price", 0) or 0)
+
+        if shipped_qty <= 0:
+            continue  # skip jobs with no quantity
+
+        item_ref = get_or_create_item_ref(product_name, headers, realm_id)
+
+        line_items.append({
+            "DetailType": "SalesItemLineDetail",
+            "Amount": round(shipped_qty * price, 2),
+            "Description": design_name,
+            "SalesItemLineDetail": {
+                "ItemRef": {
+                    "value": item_ref["value"],
+                    "name": item_ref["name"]
+                },
+                "Qty": shipped_qty,
+                "UnitPrice": price
+            }
+        })
+
+    if not line_items:
+        raise Exception("❌ No valid line items to invoice.")
+
+    # 📦 Shipping line (one-time for full invoice)
+    shipping_total = round((base_shipping_cost * 1.1) + (5 * len(tracking_list or [])), 2)
+
+    invoice_payload = {
+        "CustomerRef": customer_ref,
+        "Line": line_items,
+        "SalesTermRef": { "value": "3", "name": "Net 30" },
+        "ShipMethodRef": { "name": shipping_method },
+        "TrackingNum": tracking_list[0] if tracking_list else "",
+        "PrivateNote": "\n".join(tracking_list) if tracking_list else "",
+        "TxnTaxDetail": {},
+        "ShippingAmt": shipping_total
+    }
+
+    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
+    res = requests.post(url, headers=headers, json=invoice_payload)
+
+    if res.status_code in [200, 201]:
+        invoice = res.json()["Invoice"]
+        print("✅ Consolidated invoice created:", invoice.get("DocNumber"))
+        return invoice.get("DocNumber")
+    else:
+        print("❌ Invoice creation failed:", res.text)
+        raise Exception("Failed to create consolidated invoice: " + res.text)
+
+
 
 @app.route("/", methods=["GET"])
 def index():
@@ -1934,6 +2008,8 @@ def process_shipment():
         updates = []
         invoices = []
 
+        all_order_data = []
+
         for i, row in enumerate(rows[1:], start=2):  # start=2 for 1-based index
             row_order_id = str(row[id_col]).strip() if id_col < len(row) else ""
             print(f"→ Row {i}: Order ID in sheet = '{row_order_id}'")
@@ -1947,10 +2023,16 @@ def process_shipment():
                         "values": [[str(qty)]]
                     })
 
-                # ✅ Build order data and create invoice per matching row
+                # ⬅️ Inside the for-loop
                 order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
-                try:
-                    invoice_url = create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=[], base_shipping_cost=0.0)
+                order_data["ShippedQty"] = qty
+                all_order_data.append(order_data)
+                except RedirectException as e:
+                    session.pop("last_shipment", None)
+                    return jsonify({ "redirect": e.redirect_url }), 401
+                except Exception as e:
+                    session.pop("last_shipment", None)
+                    raise
                 except RedirectException as e:
                     session.pop("last_shipment", None)  # 🧹 Clear retry flag on redirect failure
                     return jsonify({ "redirect": e.redirect_url }), 401
@@ -1961,6 +2043,22 @@ def process_shipment():
                 if not isinstance(invoice_url, str):
                     invoice_url = str(invoice_url)
                 invoices.append(invoice_url)
+
+        try:
+            invoice_url = create_consolidated_invoice_in_quickbooks(
+                all_order_data,
+                shipping_method="UPS Ground",
+                tracking_list=[],
+                base_shipping_cost=0.0
+            )
+        except RedirectException as e:
+            session.pop("last_shipment", None)
+            return jsonify({ "redirect": e.redirect_url }), 401
+        except Exception as e:
+            session.pop("last_shipment", None)
+            raise
+
+        invoices.append(str(invoice_url))
 
         if not updates:
             print("⚠️ No updates prepared — check for ID mismatches.")
