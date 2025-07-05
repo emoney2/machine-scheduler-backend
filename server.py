@@ -254,6 +254,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
         logging.error("📦 Invoice Payload:\n%s", json.dumps(invoice_payload, indent=2))
         raise Exception("Failed to create invoice in QuickBooks")
 
+    invoice_resp = create_invoice(order_data)  # Add this line BEFORE you use invoice_resp
     invoice = invoice_resp.json().get("Invoice")
 
     if not invoice or "Id" not in invoice:
