@@ -43,6 +43,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets"
 ]
 
+QBO_SCOPE = ["com.intuit.quickbooks.accounting"]
+
 def get_oauth_credentials():
     if os.path.exists("token.json"):
         creds = OAuthCredentials.from_authorized_user_file("token.json", SCOPES)
