@@ -114,7 +114,58 @@ def refresh_quickbooks_token():
     session["qbo_token"] = token
     print("🔁 Refreshed QuickBooks token")
 
+def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id):
+    import requests
 
+    # Step 1: Try to fetch from QuickBooks
+    query_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/query"
+    query = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
+    response = requests.get(query_url, headers=quickbooks_headers, params={"query": query})
+
+    if response.status_code == 200:
+        customers = response.json().get("QueryResponse", {}).get("Customer", [])
+        if customers:
+            customer = customers[0]
+            return {
+                "value": customer["Id"],
+                "name": customer["DisplayName"]
+            }
+
+    # Step 2: Fetch from Google Sheets Directory
+    directory = sheet.worksheet("Directory").get_all_records()
+    match = next((row for row in directory if row.get("Company Name", "").strip() == company_name.strip()), None)
+
+    if not match:
+        raise Exception(f"❌ Customer '{company_name}' not found in Google Sheets Directory")
+
+    # Step 3: Build QuickBooks customer payload
+    payload = {
+        "DisplayName": company_name,
+        "PrimaryEmailAddr": {"Address": match.get("Contact Email Address", "")},
+        "PrimaryPhone": {"FreeFormNumber": match.get("Phone Number", "")},
+        "BillAddr": {
+            "Line1": match.get("Street Address 1", ""),
+            "Line2": match.get("Street Address 2", ""),
+            "City": match.get("City", ""),
+            "CountrySubDivisionCode": match.get("State", ""),
+            "PostalCode": match.get("Zip Code", "")
+        },
+        "GivenName": match.get("Contact First Name", ""),
+        "FamilyName": match.get("Contact Last Name", "")
+    }
+
+    # Step 4: Create customer in QuickBooks
+    create_url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/customer"
+    res = requests.post(create_url, headers=quickbooks_headers, json=payload)
+
+    if res.status_code not in [200, 201]:
+        raise Exception(f"❌ Failed to create customer in QuickBooks: {res.text}")
+
+    data = res.json().get("Customer", {})
+    return {
+        "value": data["Id"],
+        "name": data["DisplayName"]
+    }
 
 def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=None, base_shipping_cost=0.0):
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
@@ -140,28 +191,9 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
         "Accept": "application/json"
     }
 
-    # Step 1: Get Customer by name
-    customer_name = order_data.get("Company Name", "").strip().lower()
-    query_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/query?query=select * from Customer"
-    resp = requests.get(query_url, headers=headers)
-    if resp.status_code != 200:
-        raise Exception(f"❌ Failed to query customers: {resp.text}")
-
-    customers = resp.json().get("QueryResponse", {}).get("Customer", [])
-    customer_id = None
-
-    print("🔍 All customers in QBO:")
-    for c in customers:
-        display_name = c.get("DisplayName", "").strip()
-        print(f"   - '{display_name}' (ID: {c.get('Id')})")
-        if display_name.lower() == customer_name:
-            customer_id = c["Id"]
-            break
-
-    if not customer_id:
-        raise Exception(f"❌ Customer '{order_data.get('Company Name')}' not found in QBO sandbox.")
-    print(f"✅ Found customer '{order_data.get('Company Name')}' with ID {customer_id}")
-
+    # Step 1: Get or create customer
+    sheet = get_authenticated_sheet()  # ⬅️ This must exist; confirm it returns your gspread sheet
+    customer_ref = get_or_create_customer_ref(order_data.get("Company Name", ""), sheet, headers, realm_id)
 
     # Step 2: Get Item by name
     item_name = order_data.get("Product", "").strip()
@@ -184,7 +216,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     amount = round(qty * unit_price, 2)
 
     invoice_payload = {
-        "CustomerRef": { "value": customer_id },
+        "CustomerRef": customer_ref,
         "Line": [
             {
                 "DetailType": "SalesItemLineDetail",
