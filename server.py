@@ -627,6 +627,7 @@ def login_required_session(f):
         # 3) Token‐match check
         ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "")
         token_at_login = session.get("token_at_login", "")
+        print("🔐 Comparing tokens — token_at_login =", token_at_login, "vs ADMIN_TOKEN =", ADMIN_TOKEN)
         if token_at_login != ADMIN_TOKEN:
             session.clear()
             if request.path.startswith("/api/"):
