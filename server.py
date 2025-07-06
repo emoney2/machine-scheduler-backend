@@ -547,11 +547,14 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
     shipping_total = round((base_shipping_cost * 1.1) + (5 * len(tracking_list or [])), 2)
 
     invoice_payload = {
+        # 1) Who we’re invoicing
         "CustomerRef": customer_ref,
+
+        # 2) The list of items (qty, price, etc)
         "Line": line_items,
-        # Net 30 Terms (value only is fine)
-        "SalesTermRef": { "value": "3" },
-        "ShippingAmt": shipping_total
+
+        # 3) (very safe) explicitly set the transaction date
+        "TxnDate": datetime.now().strftime("%Y-%m-%d")
     }
 
     url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
