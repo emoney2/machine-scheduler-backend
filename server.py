@@ -2172,11 +2172,14 @@ def process_shipment():
                 order_data = {
                     h: (
                         str(parsed_qty) if h == "Shipped" else
-                        parsed_qty if h == "ShippedQty" else
+                        str(parsed_qty) if h == "ShippedQty" else
                         row[headers.index(h)] if headers.index(h) < len(row) else ""
                     )
                     for h in headers
                 }
+
+                # 🔒 Failsafe: explicitly force ShippedQty in case it's missing from headers
+                order_data["ShippedQty"] = str(parsed_qty)
 
                 all_order_data.append(order_data)
 
