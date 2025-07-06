@@ -2109,15 +2109,16 @@ def process_shipment():
             if row_order_id in order_ids:
                 qty = shipped_quantities.get(row_order_id)
                 print(f"✅ Match! Writing {qty} to row {i}")
-                if qty is not None:
-                    updates.append({
-                        "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
-                        "values": [[str(qty)]]
-                    })
+                parsed_qty = int(qty) if qty not in [None, "", "null"] else 0
+
+                updates.append({
+                    "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
+                    "values": [[str(parsed_qty)]]
+                })
 
                 # Gather data for consolidated invoice
                 order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
-                order_data["ShippedQty"] = qty
+                order_data["ShippedQty"] = parsed_qty
                 all_order_data.append(order_data)
 
         # ✅ Create consolidated invoice AFTER loop
