@@ -96,7 +96,6 @@ def get_quickbooks_credentials():
     }
 
     return headers, realm_id
-
 def get_quickbooks_auth_url(redirect_uri, state=""):
     base_url = "https://appcenter.intuit.com/connect/oauth2"
     client_id = os.environ["QBO_CLIENT_ID"]
@@ -367,17 +366,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={invoice['Id']}"
 
 def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, tracking_list, base_shipping_cost):
-    creds = get_quickbooks_credentials()
-    if not creds.valid:
-        raise RedirectException(f"{os.environ['FRONTEND_URL']}/oauth2callback")
-
-    headers = {
-        "Authorization": f"Bearer {creds.token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
-
-    realm_id = creds.realm_id
+    headers, realm_id = get_quickbooks_credentials()
     sheet = get_google_sheet()
 
     # ✅ Use first order's company name to find/create customer
