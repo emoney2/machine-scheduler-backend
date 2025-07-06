@@ -931,6 +931,8 @@ def prepare_shipment():
         if order_id in order_ids:
             parsed_qty = shipped_quantities.get(order_id, 0)
 
+            headers = list(order_data[0].keys()) if order_data else []
+
             order_data = {
                 h: (
                     str(parsed_qty) if h == "Shipped" else
