@@ -2135,11 +2135,18 @@ def company_list():
 def process_shipment():
     data = request.get_json()
     print("📥 Reorder API received:", data)
+
+    # 1) Parse incoming
     order_ids = [str(oid).strip() for oid in data.get("order_ids", [])]
-    shipped_quantities = {str(k).strip(): v for k, v in data.get("shipped_quantities", {}).items()}
+    shipped_quantities = {
+        str(k).strip(): v
+        for k, v in data.get("shipped_quantities", {}).items()
+    }
+    shipping_method = data.get("shipping_method", "")
 
     print("🔍 Received order_ids:", order_ids)
     print("🔍 Received shipped_quantities:", shipped_quantities)
+    print("🔍 Received shipping_method:", shipping_method)
 
     if not order_ids:
         return jsonify({"error": "Missing order_ids"}), 400
@@ -2149,6 +2156,7 @@ def process_shipment():
 
     try:
         service = get_sheets_service()
+        # 2) Read the full sheet
         result = service.spreadsheets().values().get(
             spreadsheetId=sheet_id,
             range=f"{sheet_name}!A1:Z",
@@ -2156,48 +2164,78 @@ def process_shipment():
         rows = result.get("values", [])
         headers = rows[0]
 
-        print("🔍 Sheet headers:", headers)
-        print("🔍 First 5 sheet rows:", rows[1:6])
-
-        id_col = headers.index("Order #")
+        # locate columns
+        id_col      = headers.index("Order #")
         shipped_col = headers.index("Shipped")
 
         updates = []
+        all_order_data = []
 
+        # 3) Build update requests & collect data for invoice
         for i, row in enumerate(rows[1:], start=2):
-            order_id = str(row[id_col]).strip() if id_col < len(row) else ""
+            order_id = str(row[id_col]).strip()
             if order_id in order_ids:
-                qty = shipped_quantities.get(order_id)
-                print(f"✅ Match! Writing {qty} to row {i}")
-
+                raw = shipped_quantities.get(order_id, 0)
                 try:
-                    parsed_qty = int(float(qty))
+                    parsed_qty = int(float(raw))
                 except:
                     parsed_qty = 0
 
+                # queue sheet update
                 updates.append({
                     "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
                     "values": [[str(parsed_qty)]]
                 })
 
+                # build order_data dict for invoice
+                row_dict = dict(zip(headers, row))
+                order_dict = {
+                    h: (
+                        str(parsed_qty) if h in ("Shipped", "ShippedQty")
+                        else row_dict.get(h, "")
+                    )
+                    for h in headers
+                }
+                order_dict["ShippedQty"] = parsed_qty
+                all_order_data.append(order_dict)
+
+        # 4) Push updates
         if updates:
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=sheet_id,
                 body={"valueInputOption": "USER_ENTERED", "data": updates}
             ).execute()
-            print("✅ Successfully wrote quantities to sheet.")
+            print("✅ Shipped quantities written to sheet.")
         else:
-            print("⚠️ No updates prepared — check for ID mismatches.")
+            print("⚠️ No updates to push—check order_ids match sheet.")
 
-        # 🛠️ Done: stub out full response shape for frontend
+        # 5) Create invoice in QuickBooks
+        try:
+            invoice_url = create_consolidated_invoice_in_quickbooks(
+                all_order_data,
+                shipping_method,
+                tracking_list=[],      # replace if you have actual tracking numbers
+                base_shipping_cost=0.0,
+                sheet=service
+            )
+            print("✅ Invoice created:", invoice_url)
+        except RedirectException as e:
+            # front end will redirect user to authenticate
+            return jsonify({"redirect": e.redirect_url}), 302
+        except Exception as iq_err:
+            print("❌ Invoice creation failed:", iq_err)
+            traceback.print_exc()
+            return jsonify({"error": "Invoice creation failed"}), 500
+
+        # 6) Return full payload
         return jsonify({
-            "labels":   [],     # no shipping labels for now
-            "invoice":  "",     # no invoice URL
-            "slips":    []      # no packing slips
+            "labels": [],          # fill if you later generate shipping labels
+            "invoice": invoice_url,
+            "slips": []            # fill if you have packing slips
         }), 200
 
     except Exception as e:
-        print("❌ Shipment error:", str(e))
+        print("❌ Shipment error:", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
