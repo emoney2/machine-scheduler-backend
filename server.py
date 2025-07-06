@@ -160,6 +160,18 @@ def get_quickbooks_auth_url(redirect_uri, state=""):
 
     return auth_url
 
+@app.route("/quickbooks-auth", methods=["GET"])
+def quickbooks_auth():
+    """
+    Initiates the QuickBooks OAuth2 flow by redirecting
+    the browser to Intuit’s authorization URL.
+    """
+    # QBO_REDIRECT_URI should match what you set in your Intuit app
+    redirect_uri = os.environ.get("QBO_REDIRECT_URI")
+    auth_url = get_quickbooks_auth_url(redirect_uri)
+    print("🔗 Redirecting to QuickBooks OAuth at", auth_url)
+    return redirect(auth_url)
+
 
 class RedirectException(Exception):
     def __init__(self, redirect_url):
