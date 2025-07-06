@@ -927,9 +927,22 @@ def prepare_shipment():
     # Step 1: Find orders that match the given Order #
     prod_rows = []
     for row in prod_data[1:]:
-        row_dict = dict(zip(prod_headers, row))
-        if str(row_dict.get("Order #")) in order_ids:
-            prod_rows.append(row_dict)
+        row_dict = dict(zip(headers, row))
+        order_id = str(row_dict.get("Order #"))
+
+        if order_id in order_ids:
+            parsed_qty = shipped_quantities.get(order_id, 0)
+
+            order_data = {
+                h: (
+                    str(parsed_qty) if h == "Shipped" else
+                    parsed_qty if h == "ShippedQty" else
+                    row[headers.index(h)] if headers.index(h) < len(row) else ""
+                )
+                for h in headers
+            }
+
+            all_order_data.append(order_data)
 
     # Step 2: Create product→volume map
     table_map = {}
