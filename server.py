@@ -431,7 +431,7 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
 
         # Gracefully parse price
         try:
-        raw_price = order.get("Price", 0)
+            raw_price = order.get("Price", 0)
             price = float(raw_price or 0)
         except Exception as e:
             print(f"⚠️ Invalid Price '{raw_price}' for {design_name}: {e}")
@@ -459,6 +459,7 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
 
     if not line_items:
         raise Exception("❌ No valid line items to invoice.")
+
 
     # 📦 Shipping line (one-time for full invoice)
     shipping_total = round((base_shipping_cost * 1.1) + (5 * len(tracking_list or [])), 2)
