@@ -95,61 +95,59 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
 def get_quickbooks_credentials():
     """
-    Always load QBO token from disk if present, else from session.
-    Refresh if expired, and re-save to disk.
+    Load QBO token from disk if present, else from session.
+    Refresh if expired, saving back to disk.
     """
-    # 1) Try disk first
     token_path = "qbo_token.json"
+
+    # 1) Load from disk or from session (first-time)
     if os.path.exists(token_path):
         token_data = json.load(open(token_path))
     else:
         token_data = session.get("qbo_token")
 
-    # 2) If still missing, we need a one-time OAuth grant
+    # 2) If still missing, force one-time OAuth grant
     if not token_data:
         raise RedirectException("/quickbooks-auth")
 
-    # 3) Check expiration
-    expires_at = token_data.get("expires_at")
+    # 3) Refresh if expired
     now = time.time()
-    if not expires_at or now >= expires_at:
-        # use refresh_token to get a new access_token
+    if token_data.get("expires_at", 0) <= now:
         refresh_token = token_data.get("refresh_token")
         client_id     = os.getenv("QBO_CLIENT_ID")
         client_secret = os.getenv("QBO_CLIENT_SECRET")
+        token_url     = os.getenv("QBO_TOKEN_URL")
 
-        token_url = os.getenv("QBO_TOKEN_URL")
         auth = (client_id, client_secret)
         body = {
             "grant_type":    "refresh_token",
             "refresh_token": refresh_token
         }
-        res = requests.post(token_url, headers={
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded"
-        }, data=body, auth=auth)
+        res = requests.post(token_url,
+                            headers={"Accept": "application/json",
+                                     "Content-Type": "application/x-www-form-urlencoded"},
+                            data=body, auth=auth)
         res.raise_for_status()
         new_token = res.json()
-        # update our token_data
+        # build refreshed token_data
         token_data = {
             "access_token":  new_token["access_token"],
             "refresh_token": new_token["refresh_token"],
             "expires_at":    now + int(new_token["expires_in"]),
             "realmId":       token_data.get("realmId")
         }
-        # 4) Save updated token back to disk and session
+        # save back to disk & session
         with open(token_path, "w") as f:
             json.dump(token_data, f)
         session["qbo_token"] = token_data
 
-    # 5) Build headers for QuickBooks API calls
+    # 4) Build headers for QuickBooks API
     headers = {
         "Authorization": f"Bearer {token_data['access_token']}",
         "Accept":        "application/json"
     }
     realm_id = token_data.get("realmId")
     return headers, realm_id
-
 
 def get_quickbooks_auth_url(redirect_uri, state=""):
     base_url = "https://appcenter.intuit.com/connect/oauth2"
