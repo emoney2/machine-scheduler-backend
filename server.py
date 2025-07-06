@@ -10,7 +10,7 @@ import traceback
 import gspread
 import logging 
 import urllib.parse
-
+import secrets
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
@@ -164,13 +164,22 @@ def get_quickbooks_auth_url(redirect_uri, state=""):
 def quickbooks_auth():
     """
     Initiates the QuickBooks OAuth2 flow by redirecting
-    the browser to Intuit’s authorization URL.
+    the browser to Intuit’s authorization URL, with a non-empty state.
     """
-    # QBO_REDIRECT_URI should match what you set in your Intuit app
+    # 1) Your registered callback URI
     redirect_uri = os.environ.get("QBO_REDIRECT_URI")
-    auth_url = get_quickbooks_auth_url(redirect_uri)
+
+    # 2) Generate a random state and store in session
+    state = secrets.token_urlsafe(16)
+    session["qbo_oauth_state"] = state
+
+    # 3) Build the Intuit URL, now including our state
+    auth_url = get_quickbooks_auth_url(redirect_uri, state)
     print("🔗 Redirecting to QuickBooks OAuth at", auth_url)
+
+    # 4) Redirect the browser there
     return redirect(auth_url)
+
 
 
 class RedirectException(Exception):
