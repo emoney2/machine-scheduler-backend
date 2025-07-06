@@ -86,6 +86,8 @@ app.config.update(
     SESSION_COOKIE_SECURE=True       # Required when using SAMESITE=None
 )
 
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_DOMAIN"] = ".onrender.com"
 
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
