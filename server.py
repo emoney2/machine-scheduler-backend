@@ -2206,6 +2206,7 @@ def process_shipment():
         str(k).strip(): v
         for k, v in data.get("shipped_quantities", {}).items()
     }
+    boxes = data.get("boxes", [])
     shipping_method = data.get("shipping_method", "")
 
     print("🔍 Received order_ids:", order_ids)
