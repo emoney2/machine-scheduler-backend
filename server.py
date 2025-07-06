@@ -2169,16 +2169,17 @@ def process_shipment():
             if order_id in order_ids:
                 qty = shipped_quantities.get(order_id)
                 print(f"✅ Match! Writing {qty} to row {i}")
-                parsed_qty = int(float(qty))
-          except:
-              parsed_qty = 0
+
+                try:
+                    parsed_qty = int(float(qty))
+                except:
+                    parsed_qty = 0
 
                 updates.append({
                     "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
                     "values": [[str(parsed_qty)]]
                 })
 
-                # Build order_data dict with correct shipped values
                 order_data = {
                     h: (
                         str(parsed_qty) if h == "Shipped" else
@@ -2188,9 +2189,7 @@ def process_shipment():
                     for h in headers
                 }
 
-                # 🔒 Failsafe: explicitly force ShippedQty again
                 order_data["ShippedQty"] = str(parsed_qty)
-
                 all_order_data.append(order_data)
 
         # ✅ Create consolidated invoice AFTER updating the sheet
