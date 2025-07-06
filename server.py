@@ -924,11 +924,16 @@ def prepare_shipment():
     prod_headers = prod_data[0]
     table_headers = table_data[0]
 
+    # ✅ Moved up so it exists before being used
+    shipped_quantities = data.get("shipped_quantities", {})
+
     # Step 1: Find orders that match the given Order #
     prod_rows = []
+    all_order_data = []  # ✅ declare this before using it
+
     for row in prod_data[1:]:
-        row_dict = dict(zip(headers, row))
-        order_id = str(row_dict.get("Order #"))
+        row_dict = dict(zip(prod_headers, row))
+        order_id = str(row_dict.get("Order #")).strip()
 
         if order_id in order_ids:
             parsed_qty = shipped_quantities.get(order_id, 0)
@@ -937,12 +942,13 @@ def prepare_shipment():
                 h: (
                     str(parsed_qty) if h == "Shipped" else
                     parsed_qty if h == "ShippedQty" else
-                    row[headers.index(h)] if headers.index(h) < len(row) else ""
+                    row[prod_headers.index(h)] if prod_headers.index(h) < len(row) else ""
                 )
-                for h in headers
+                for h in prod_headers
             }
 
             all_order_data.append(order_data)
+            prod_rows.append(row_dict)
 
     # Step 2: Create product→volume map
     table_map = {}
@@ -959,9 +965,6 @@ def prepare_shipment():
     # Step 3: Check for missing volumes and build job list
     missing_products = []
     jobs = []
-
-    # This dict will let us look up shipQty from frontend
-    shipped_quantities = data.get("shipped_quantities", {})
 
     for row in prod_rows:
         order_id = str(row["Order #"])
@@ -985,7 +988,6 @@ def prepare_shipment():
                 "volume": volume,
                 "ship_qty": ship_qty
             })
-
 
     if missing_products:
         return jsonify({
