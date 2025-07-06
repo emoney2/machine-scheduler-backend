@@ -144,6 +144,48 @@ def get_quickbooks_credentials():
     realm_id = token_data["realmId"]
     return headers, realm_id
 
+@app.route("/qbo/callback", methods=["GET"])
+def qbo_callback():
+    """
+    OAuth2 callback for Intuit QuickBooks.
+    """
+    code  = request.args.get("code")
+    state = request.args.get("state")
+    realm = request.args.get("realmId")
+
+    # 1) Verify state
+    if not state or state != session.get("qbo_oauth_state"):
+        return "⚠️ Invalid or missing OAuth2 state", 400
+
+    # 2) Exchange the authorization code for tokens
+    oauth = OAuth2Session(
+        os.getenv("QBO_CLIENT_ID"),
+        redirect_uri=os.getenv("QBO_REDIRECT_URI"),
+        state=state
+    )
+    try:
+        token = oauth.fetch_token(
+            os.getenv("QBO_TOKEN_URL"),
+            client_secret=os.getenv("QBO_CLIENT_SECRET"),
+            code=code
+        )
+    except Exception as e:
+        print("❌ QBO token exchange failed:", e)
+        return "⚠️ Token exchange failed", 400
+
+    # 3) Store tokens + realmId in session
+    session["qbo_token"] = {
+        "access_token":  token.get("access_token"),
+        "refresh_token": token.get("refresh_token"),
+        "expires_at":    time.time() + int(token.get("expires_in", 0)),
+        "realmId":       realm
+    }
+    print("✅ QBO tokens saved in session for realm:", realm)
+
+    # 4) Redirect back to your front-end so it can resume
+    frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+    return redirect(frontend)
+
 
 def get_quickbooks_auth_url(redirect_uri, state=""):
     base_url = "https://appcenter.intuit.com/connect/oauth2"
