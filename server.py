@@ -2172,9 +2172,6 @@ def process_shipment():
                     "values": [[str(parsed_qty)]]
                 })
 
-                # Look up shipped quantity from frontend (with fallback to 0)
-                parsed_qty = shipped_quantities.get(order_id, 0)
-
                 # Build order_data dict and override shipped quantity fields inline
                 order_data = {
                     h: (
@@ -2186,13 +2183,6 @@ def process_shipment():
                 }
 
                 all_order_data.append(order_data)
-
-        # ✅ Write ShippedQty to sheet BEFORE invoice generation
-        for job in all_order_data:
-            order_id = str(job.get("Order #")).strip()
-            shipped_qty = job.get("ShippedQty")
-            if order_id and shipped_qty is not None:
-                update_sheet_cell(SPREADSHEET_ID, "Production Orders", "Order #", order_id, "Shipped", shipped_qty)
 
         # ✅ Create consolidated invoice AFTER updating the sheet
         print(f"🧾 Attempting to create invoice for {len(all_order_data)} order(s)")
