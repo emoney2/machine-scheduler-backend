@@ -78,6 +78,14 @@ FRONTEND_URL = raw_frontend.strip()
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
+app.secret_key = os.environ.get("FLASK_SECRET", "shhhh")
+
+# ✅ Allow session cookies to be sent cross-site (Netlify → Render)
+app.config.update(
+    SESSION_COOKIE_SAMESITE="None",  # Required for cross-domain cookies
+    SESSION_COOKIE_SECURE=True       # Required when using SAMESITE=None
+)
+
 
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
