@@ -177,7 +177,7 @@ def get_quickbooks_credentials():
             "realmId":       token_data.get("realmId")
         }
         # save back to disk & session
-        with open(token_path, "w") as f:
+        with open(TOKEN_PATH, "w") as f:
             json.dump(token_data, f)
         session["qbo_token"] = token_data
 
