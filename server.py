@@ -144,49 +144,6 @@ def get_quickbooks_credentials():
     realm_id = token_data["realmId"]
     return headers, realm_id
 
-@app.route("/qbo/callback", methods=["GET"])
-def qbo_callback():
-    """
-    OAuth2 callback for Intuit QuickBooks.
-    """
-    code  = request.args.get("code")
-    state = request.args.get("state")
-    realm = request.args.get("realmId")
-
-    # 1) Verify state
-    if not state or state != session.get("qbo_oauth_state"):
-        return "⚠️ Invalid or missing OAuth2 state", 400
-
-    # 2) Exchange the authorization code for tokens
-    oauth = OAuth2Session(
-        os.getenv("QBO_CLIENT_ID"),
-        redirect_uri=os.getenv("QBO_REDIRECT_URI"),
-        state=state
-    )
-    try:
-        token = oauth.fetch_token(
-            os.getenv("QBO_TOKEN_URL"),
-            client_secret=os.getenv("QBO_CLIENT_SECRET"),
-            code=code
-        )
-    except Exception as e:
-        print("❌ QBO token exchange failed:", e)
-        return "⚠️ Token exchange failed", 400
-
-    # 3) Store tokens + realmId in session
-    session["qbo_token"] = {
-        "access_token":  token.get("access_token"),
-        "refresh_token": token.get("refresh_token"),
-        "expires_at":    time.time() + int(token.get("expires_in", 0)),
-        "realmId":       realm
-    }
-    print("✅ QBO tokens saved in session for realm:", realm)
-
-    # 4) Redirect back to your front-end so it can resume
-    frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
-    return redirect(frontend)
-
-
 def get_quickbooks_auth_url(redirect_uri, state=""):
     base_url = "https://appcenter.intuit.com/connect/oauth2"
     client_id = os.environ["QBO_CLIENT_ID"]
@@ -2563,40 +2520,33 @@ def qbo_login():
     return redirect(auth_url)
 
 
-@app.route("/qbo/callback")
+@app.route("/qbo/callback", methods=["GET"])
 def qbo_callback():
-    from requests_oauthlib import OAuth2Session
+    code  = request.args.get("code")
+    state = request.args.get("state")
+    realm = request.args.get("realmId")
 
-    try:
-        print("🔁 Received QBO callback with URL:", request.url)
+    if state != session.get("qbo_oauth_state"):
+        return "⚠️ Invalid state", 400
 
-        # Get the state from query string (used for redirecting)
-        state = request.args.get("state", "/")
+    oauth = OAuth2Session(
+        os.getenv("QBO_CLIENT_ID"),
+        redirect_uri=os.getenv("QBO_REDIRECT_URI"),
+        state=state
+    )
+    token = oauth.fetch_token(
+        os.getenv("QBO_TOKEN_URL"),
+        client_secret=os.getenv("QBO_CLIENT_SECRET"),
+        code=code
+    )
 
-        qbo = OAuth2Session(
-            client_id=QBO_CLIENT_ID,
-            redirect_uri=QBO_REDIRECT_URI,
-            state=state  # ← grab state directly from request
-        )
-
-        token = qbo.fetch_token(
-            QBO_TOKEN_URL,
-            client_secret=QBO_CLIENT_SECRET,
-            authorization_response=request.url,
-        )
-
-        realm_id = request.args.get("realmId")
-        token["realmId"] = realm_id
-        session["qbo_token"] = token
-        print("✅ QBO token + realmId stored in session:", token)
-
-        # Redirect user back to /ship or wherever they started
-        return redirect(f"{FRONTEND_URL}{state}")
-    except Exception as e:
-        print("❌ Error in /qbo/callback:")
-        import traceback
-        traceback.print_exc()
-        return f"❌ Callback error: {str(e)}", 500
+    session["qbo_token"] = {
+        "access_token":  token["access_token"],
+        "refresh_token": token["refresh_token"],
+        "expires_at":    time.time() + int(token["expires_in"]),
+        "realmId":       realm
+    }
+    return redirect(os.environ.get("FRONTEND_URL"))
 
 
 @app.route("/authorize-quickbooks")
