@@ -97,17 +97,12 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
 def get_quickbooks_credentials():
-    # 🔍 DEBUG: show where we’re looking for the token file
-    print("🔍 BASE_DIR:", BASE_DIR)
-    print("🔍 TOKEN_PATH:", TOKEN_PATH)
-    print("🔍 TOKEN_PATH exists?", os.path.exists(TOKEN_PATH))
-
-    # 1) Load from disk or from session (first-time)
+    logger.info("🔍 Checking for token file at %s", TOKEN_PATH)
     if os.path.exists(TOKEN_PATH):
         token_data = json.load(open(TOKEN_PATH))
     else:
         token_data = session.get("qbo_token")
-    print("🔍 token_data from disk/session:", token_data)
+    logger.info("🔍 Loaded token_data: %s", token_data)
 
     # 2) If still missing, force one-time OAuth grant
     if not token_data:
@@ -2543,7 +2538,7 @@ def qbo_callback():
     # Persist full token dict to disk for reuse
     with open(TOKEN_PATH, "w") as f:
         json.dump(token, f)
-    print("✅ Wrote token to", TOKEN_PATH)
+    logger.info("✅ Wrote QBO token to disk at %s", TOKEN_PATH)
 
     session["qbo_token"] = {
         "access_token":  token["access_token"],
