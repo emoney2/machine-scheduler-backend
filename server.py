@@ -918,6 +918,9 @@ def prepare_shipment():
     missing_products = []
     jobs = []
 
+    # This dict will let us look up shipQty from frontend
+    shipped_quantities = data.get("shipped_quantities", {})
+
     for row in prod_rows:
         order_id = str(row["Order #"])
         product = row.get("Product", "").strip()
@@ -927,11 +930,20 @@ def prepare_shipment():
         if volume is None:
             missing_products.append(product)
         else:
+            # Use shipQty from frontend if provided, fallback to Quantity column
+            raw_ship_qty = shipped_quantities.get(order_id, row.get("Quantity", 0))
+            try:
+                ship_qty = int(raw_ship_qty)
+            except:
+                ship_qty = 0
+
             jobs.append({
                 "order_id": order_id,
                 "product": product,
-                "volume": volume
+                "volume": volume,
+                "ship_qty": ship_qty
             })
+
 
     if missing_products:
         return jsonify({
