@@ -412,16 +412,34 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
     customer_ref = get_or_create_customer_ref(first_order.get("Company Name", ""), sheet, headers, realm_id)
 
     # 🧾 Build Line items
+    print("🧾 Raw order data list:")
+    for o in order_data_list:
+        print(f"  - Design: {o.get('Design')}, ShippedQty: {o.get('ShippedQty')}, Price: {o.get('Price')}")
+
     line_items = []
     for order in order_data_list:
         product_name = order.get("Product", "").strip()
-        design_name = order.get("Design", "").strip()
-        raw_qty = order.get("ShippedQty")
-        shipped_qty = int(raw_qty) if raw_qty not in [None, ""] else 0
-        price        = float(order.get("Price", 0) or 0)
+        design_name  = order.get("Design", "").strip()
+
+        # Gracefully parse quantity
+        try:
+            raw_qty = order.get("ShippedQty")
+            shipped_qty = int(raw_qty) if raw_qty not in [None, ""] else 0
+        except Exception as e:
+            print(f"⚠️ Invalid ShippedQty '{raw_qty}' for {design_name}: {e}")
+            shipped_qty = 0
+
+        # Gracefully parse price
+        try:
+        raw_price = order.get("Price", 0)
+            price = float(raw_price or 0)
+        except Exception as e:
+            print(f"⚠️ Invalid Price '{raw_price}' for {design_name}: {e}")
+            price = 0.0
 
         if shipped_qty <= 0:
-            continue  # skip jobs with no quantity
+            print(f"⏭️ Skipping job with zero quantity: {design_name}")
+            continue
 
         item_ref = get_or_create_item_ref(product_name, headers, realm_id)
 
