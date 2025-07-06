@@ -412,9 +412,13 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
     customer_ref = get_or_create_customer_ref(first_order.get("Company Name", ""), sheet, headers, realm_id)
 
     # 🧾 Build Line items
+    print("📦 Incoming order_data_list:")
+    print(json.dumps(order_data_list, indent=2))
+
     print("🧾 Raw order data list:")
     for o in order_data_list:
-        print(f"  - DESIGN: {o.get('Design')}, PRODUCT: {o.get('Product')}, SHIPPED QTY: {o.get('ShippedQty')}, PRICE: {o.get('Price')}")
+        print(f"  - Design: {o.get('Design')}, ShippedQty: {o.get('ShippedQty')}, Price: {o.get('Price')}")
+
 
     line_items = []
     for order in order_data_list:
