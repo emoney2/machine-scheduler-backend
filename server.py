@@ -405,6 +405,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={invoice['Id']}"
 
 def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, tracking_list, base_shipping_cost, sheet):
+    print("📦 Incoming order_data_list:", json.dumps(order_data_list, indent=2))
     headers, realm_id = get_quickbooks_credentials()
 
     # ✅ Use first order's company name to find/create customer
