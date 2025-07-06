@@ -2051,7 +2051,8 @@ def process_shipment():
                 all_order_data,
                 shipping_method="UPS Ground",
                 tracking_list=[],
-                base_shipping_cost=0.0
+                base_shipping_cost=0.0,
+                sheet=sh
             )
         except RedirectException as e:
             session.pop("last_shipment", None)
