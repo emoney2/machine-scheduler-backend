@@ -98,7 +98,13 @@ def get_quickbooks_credentials():
     import time
     import requests
 
-    token_data = session.get("qbo_token")
+    # 1) Try to load persisted token from disk
+    import json, os
+    if os.path.exists("qbo_token.json"):
+        token_data = json.load(open("qbo_token.json"))
+    else:
+        # fallback to session (for the very first request)
+        token_data = session.get("qbo_token")
     if not token_data:
         raise RedirectException("/quickbooks-auth")
 
@@ -133,6 +139,9 @@ def get_quickbooks_credentials():
             "expires_at": expires_at,
             "realmId": token_data["realmId"]
         }
+        # 2) Persist the refreshed token back to disk
+        with open("qbo_token.json", "w") as f:
+            json.dump(session["qbo_token"], f)
     else:
         access_token = token_data["access_token"]
 
@@ -2231,22 +2240,13 @@ def process_shipment():
             print("⚠️ No updates to push—check order_ids match sheet.")
 
         # 5) Create invoice in QuickBooks
-        try:
-            invoice_url = create_consolidated_invoice_in_quickbooks(
-                all_order_data,
-                shipping_method,
-                tracking_list=[],      # replace if you have actual tracking numbers
-                base_shipping_cost=0.0,
-                sheet=service
-            )
-            print("✅ Invoice created:", invoice_url)
-        except RedirectException as e:
-            # Tell the front-end to redirect instead of issuing an HTTP 302
-            return jsonify({"redirect": e.redirect_url}), 200
-        except Exception as iq_err:
-            print("❌ Invoice creation failed:", iq_err)
-            traceback.print_exc()
-            return jsonify({"error": "Invoice creation failed"}), 500
+        invoice_url = create_consolidated_invoice_in_quickbooks(
+            all_order_data,
+            shipping_method,
+            tracking_list=[],
+            base_shipping_cost=0.0,
+            sheet=service
+        )
 
         # 6) Return full payload
         return jsonify({
@@ -2540,6 +2540,11 @@ def qbo_callback():
         client_secret=os.getenv("QBO_CLIENT_SECRET"),
         code=code
     )
+
+    # Persist the token to disk so we can reuse it without re-authorizing
+    import json
+    with open("qbo_token.json", "w") as f:
+        json.dump(token, f)
 
     session["qbo_token"] = {
         "access_token":  token["access_token"],
