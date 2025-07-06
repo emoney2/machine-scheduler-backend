@@ -614,7 +614,10 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
         raise Exception(f"QuickBooks invoice creation failed: {res.text}")
 
     invoice = res.json().get("Invoice", {})
-    return invoice.get("DocNumber", "")
+    # Grab the real QBO internal ID, not the DocNumber
+    inv_id = invoice.get("Id")
+    # Return the full URL so clients never need to reconstruct it
+    return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={inv_id}"
 
 
 
