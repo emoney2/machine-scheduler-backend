@@ -405,7 +405,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={invoice['Id']}"
 
 def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, tracking_list, base_shipping_cost, sheet):
-    print("📦 Incoming order_data_list:", json.dumps(order_data_list, indent=2))
+    logging.info("📦 Incoming order_data_list:\n%s", json.dumps(order_data_list, indent=2))
     headers, realm_id = get_quickbooks_credentials()
 
     # ✅ Use first order's company name to find/create customer
@@ -464,10 +464,11 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
         })
 
     print(f"✅ Built {len(line_items)} line items")
-
     if not line_items:
+        logger.warning("🚫 No valid line items created. Job data:")
+        for job in jobs:
+            logger.warning(f"  • Job #{job.get('orderId')} → Product: {job.get('Product')}, Qty: {job.get('shipQty')}")
         raise Exception("❌ No valid line items to invoice.")
-
 
     # 📦 Shipping line (one-time for full invoice)
     shipping_total = round((base_shipping_cost * 1.1) + (5 * len(tracking_list or [])), 2)
