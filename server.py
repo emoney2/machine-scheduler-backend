@@ -429,7 +429,20 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
         # Gracefully parse quantity
         try:
             raw_qty = order.get("ShippedQty")
-            shipped_qty = int(raw_qty) if raw_qty not in [None, ""] else 0
+            if raw_qty in [None, ""]:
+                print(f"⚠️ Missing shipped quantity for {design_name}. Skipping this job.")
+                continue
+
+            try:
+                shipped_qty = int(raw_qty)
+            except Exception as e:
+                print(f"⚠️ Invalid ShippedQty '{raw_qty}' for {design_name}: {e}")
+                continue
+
+            if shipped_qty <= 0:
+                print(f"⏭️ Skipping job with zero or negative quantity: {design_name}")
+                continue
+
         except Exception as e:
             print(f"⚠️ Invalid ShippedQty '{raw_qty}' for {design_name}: {e}")
             shipped_qty = 0
