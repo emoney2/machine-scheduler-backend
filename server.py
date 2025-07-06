@@ -2157,13 +2157,18 @@ def process_shipment():
                     "values": [[str(parsed_qty)]]
                 })
 
-                # Gather data for consolidated invoice
-                order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
+                # Look up shipped quantity from frontend (with fallback to 0)
+                parsed_qty = shipped_quantities.get(order_id, 0)
 
-                # Force override with the quantity from the web app
-                order_data["Shipped"] = str(parsed_qty)
-                order_data["ShippedQty"] = parsed_qty
-                order_data["Quantity"] = str(parsed_qty)  # ✅ This is the key fix
+                # Build order_data dict and override shipped quantity fields inline
+                order_data = {
+                    h: (
+                        str(parsed_qty) if h == "Shipped" else
+                        parsed_qty if h == "ShippedQty" else
+                        row[headers.index(h)] if headers.index(h) < len(row) else ""
+                    )
+                    for h in headers
+                }
 
                 all_order_data.append(order_data)
 
