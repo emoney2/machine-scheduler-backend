@@ -2547,7 +2547,8 @@ def qbo_callback():
         "expires_at":    time.time() + int(token["expires_in"]),
         "realmId":       realm
     }
-    return redirect(os.environ.get("FRONTEND_URL"))
+    # Redirect back to the React app using the global FRONTEND_URL (no trailing newline)
+    return redirect(FRONTEND_URL)
 
 
 @app.route("/authorize-quickbooks")
