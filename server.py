@@ -465,9 +465,14 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
 
     print(f"✅ Built {len(line_items)} line items")
     if not line_items:
-        logger.warning("🚫 No valid line items created. Job data:")
-        for job in jobs:
-            logger.warning(f"  • Job #{job.get('orderId')} → Product: {job.get('Product')}, Qty: {job.get('shipQty')}")
+        logger.warning("🚫 No valid line items created. Here's the raw order_data_list:")
+        for i, job in enumerate(order_data_list):
+            logger.warning(
+                f"  [{i+1}] Design: {job.get('Design')}, "
+                f"Product: {job.get('Product')}, "
+                f"Qty: {job.get('ShippedQty')}, "
+                f"Price: {job.get('Price')}"
+            )
         raise Exception("❌ No valid line items to invoice.")
 
     # 📦 Shipping line (one-time for full invoice)
