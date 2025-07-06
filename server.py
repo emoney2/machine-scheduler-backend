@@ -455,26 +455,21 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
         product_name = order.get("Product", "").strip()
         design_name  = order.get("Design", "").strip()
 
-        # Gracefully parse quantity
+        # ✅ Gracefully parse quantity from ShippedQty → Shipped → Quantity
         try:
-            raw_qty = order.get("ShippedQty")
-            if raw_qty in [None, ""]:
-                print(f"⚠️ Missing shipped quantity for {design_name}. Skipping this job.")
-                continue
-
-            try:
-                shipped_qty = int(raw_qty)
-            except Exception as e:
-                print(f"⚠️ Invalid ShippedQty '{raw_qty}' for {design_name}: {e}")
-                continue
-
+            raw_qty = (
+                order.get("ShippedQty") or
+                order.get("Shipped") or
+                order.get("Quantity") or
+                0
+            )
+            shipped_qty = int(raw_qty)
             if shipped_qty <= 0:
                 print(f"⏭️ Skipping job with zero or negative quantity: {design_name}")
                 continue
-
         except Exception as e:
-            print(f"⚠️ Invalid ShippedQty '{raw_qty}' for {design_name}: {e}")
-            shipped_qty = 0
+            print(f"⚠️ Invalid quantity '{raw_qty}' for {design_name}: {e}")
+            continue
 
         # Gracefully parse price
         try:
@@ -941,11 +936,12 @@ def prepare_shipment():
             order_data = {
                 h: (
                     str(parsed_qty) if h == "Shipped" else
-                    parsed_qty if h == "ShippedQty" else
-                    row[prod_headers.index(h)] if prod_headers.index(h) < len(row) else ""
+                    row[headers.index(h)] if headers.index(h) < len(row) else ""
                 )
-                for h in prod_headers
+                for h in headers
             }
+            order_data["ShippedQty"] = parsed_qty
+
 
             all_order_data.append(order_data)
             prod_rows.append(row_dict)
