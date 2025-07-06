@@ -2176,18 +2176,22 @@ def process_shipment():
                     "values": [[str(parsed_qty)]]
                 })
 
-                # Build order_data dict and override shipped quantity fields inline
+                # Get shipped quantity from request, fallback to original sheet value
+                shipped_qty = shipped_quantities.get(order_id, row[headers.index("Shipped")])
+                shipped_qty = int(shipped_qty) if str(shipped_qty).isdigit() else 0
+
+                # Build order_data dict with correct shipped values
                 order_data = {
                     h: (
-                        str(parsed_qty) if h == "Shipped" else
-                        str(parsed_qty) if h == "ShippedQty" else
+                        str(shipped_qty) if h == "Shipped" else
+                        str(shipped_qty) if h == "ShippedQty" else
                         row[headers.index(h)] if headers.index(h) < len(row) else ""
                     )
                     for h in headers
                 }
 
-                # 🔒 Failsafe: explicitly force ShippedQty in case it's missing from headers
-                order_data["ShippedQty"] = str(parsed_qty)
+                # 🔒 Failsafe: explicitly force ShippedQty again
+                order_data["ShippedQty"] = shipped_qty
 
                 all_order_data.append(order_data)
 
