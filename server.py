@@ -2163,35 +2163,31 @@ def process_shipment():
         all_order_data = []
 
         for i, row in enumerate(rows[1:], start=2):  # start=2 for 1-based index
-            row_order_id = str(row[id_col]).strip() if id_col < len(row) else ""
-            print(f"→ Row {i}: Order ID in sheet = '{row_order_id}'")
+            order_id = str(row[id_col]).strip() if id_col < len(row) else ""
+            print(f"→ Row {i}: Order ID in sheet = '{order_id}'")
 
-            if row_order_id in order_ids:
-                qty = shipped_quantities.get(row_order_id)
+            if order_id in order_ids:
+                qty = shipped_quantities.get(order_id)
                 print(f"✅ Match! Writing {qty} to row {i}")
-                parsed_qty = int(shipped_quantities.get(row_order_id, 0))
+                parsed_qty = int(qty) if str(qty).isdigit() else 0
 
                 updates.append({
                     "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
                     "values": [[str(parsed_qty)]]
                 })
 
-                # Get shipped quantity from request, fallback to original sheet value
-                shipped_qty = shipped_quantities.get(order_id, row[headers.index("Shipped")])
-                shipped_qty = int(shipped_qty) if str(shipped_qty).isdigit() else 0
-
                 # Build order_data dict with correct shipped values
                 order_data = {
                     h: (
-                        str(shipped_qty) if h == "Shipped" else
-                        str(shipped_qty) if h == "ShippedQty" else
+                        str(parsed_qty) if h == "Shipped" else
+                        str(parsed_qty) if h == "ShippedQty" else
                         row[headers.index(h)] if headers.index(h) < len(row) else ""
                     )
                     for h in headers
                 }
 
                 # 🔒 Failsafe: explicitly force ShippedQty again
-                order_data["ShippedQty"] = shipped_qty
+                order_data["ShippedQty"] = str(parsed_qty)
 
                 all_order_data.append(order_data)
 
@@ -2236,7 +2232,6 @@ def process_shipment():
         print("❌ Shipment error:", str(e))
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
 
 @app.errorhandler(Exception)
 def handle_exception(e):
