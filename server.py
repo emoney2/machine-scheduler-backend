@@ -38,6 +38,9 @@ from datetime                      import datetime
 from requests_oauthlib import OAuth2Session
 from urllib.parse import urlencode
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
+
 START_TIME_COL_INDEX = 27
 
 from google.oauth2.credentials import Credentials as OAuthCredentials
@@ -94,22 +97,17 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
 def get_quickbooks_credentials():
-    """
-    Load QBO token from disk if present, else from session.
-    Refresh if expired, saving back to disk.
-    """
-    token_path = "qbo_token.json"
-
-    # 🔍 DEBUG: Check current working directory and existence of token file
-    import os
-    print("🔍 CWD:", os.getcwd())
-    print("🔍 token_path exists?", os.path.exists(token_path))
+    # 🔍 DEBUG: show where we’re looking for the token file
+    print("🔍 BASE_DIR:", BASE_DIR)
+    print("🔍 TOKEN_PATH:", TOKEN_PATH)
+    print("🔍 TOKEN_PATH exists?", os.path.exists(TOKEN_PATH))
 
     # 1) Load from disk or from session (first-time)
-    if os.path.exists(token_path):
-        token_data = json.load(open(token_path))
+    if os.path.exists(TOKEN_PATH):
+        token_data = json.load(open(TOKEN_PATH))
     else:
         token_data = session.get("qbo_token")
+    print("🔍 token_data from disk/session:", token_data)
 
     # 2) If still missing, force one-time OAuth grant
     if not token_data:
@@ -2543,8 +2541,9 @@ def qbo_callback():
     )
 
     # Persist full token dict to disk for reuse
-    with open("qbo_token.json", "w") as f:
+    with open(TOKEN_PATH, "w") as f:
         json.dump(token, f)
+    print("✅ Wrote token to", TOKEN_PATH)
 
     session["qbo_token"] = {
         "access_token":  token["access_token"],
