@@ -189,6 +189,35 @@ def refresh_quickbooks_token():
     session["qbo_token"] = token
     print("🔁 Refreshed QuickBooks token")
 
+def update_sheet_cell(sheet_id, sheet_name, lookup_col, lookup_value, target_col, new_value):
+    service = get_sheets_service()
+    result = service.spreadsheets().values().get(
+        spreadsheetId=sheet_id,
+        range=f"{sheet_name}!A1:Z",
+    ).execute()
+    rows = result.get("values", [])
+    headers = rows[0]
+
+    try:
+        lookup_index = headers.index(lookup_col)
+        target_index = headers.index(target_col)
+    except ValueError:
+        print(f"❌ Column not found: {lookup_col} or {target_col}")
+        return
+
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) > lookup_index and str(row[lookup_index]).strip() == str(lookup_value):
+            range_to_update = f"{sheet_name}!{chr(65 + target_index)}{i}"
+            service.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=range_to_update,
+                valueInputOption="USER_ENTERED",
+                body={"values": [[str(new_value)]]}
+            ).execute()
+            print(f"✅ Updated {target_col} for order {lookup_value} to {new_value}")
+            break
+
+
 def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id):
     import requests
     import time
@@ -2136,7 +2165,14 @@ def process_shipment():
                 order_data["ShippedQty"] = parsed_qty
                 all_order_data.append(order_data)
 
-        # ✅ Create consolidated invoice AFTER loop
+        # ✅ Write ShippedQty to sheet BEFORE invoice generation
+        for job in all_order_data:
+            order_id = str(job.get("Order #")).strip()
+            shipped_qty = job.get("ShippedQty")
+            if order_id and shipped_qty is not None:
+                update_sheet_cell(SPREADSHEET_ID, "Production Orders", "Order #", order_id, "Shipped", shipped_qty)
+
+        # ✅ Create consolidated invoice AFTER updating the sheet
         print(f"🧾 Attempting to create invoice for {len(all_order_data)} order(s)")
         try:
             invoice_url = create_consolidated_invoice_in_quickbooks(
@@ -2144,7 +2180,7 @@ def process_shipment():
                 shipping_method="UPS Ground",
                 tracking_list=[],
                 base_shipping_cost=0.0,
-                sheet=sh
+                sheet=service
             )
         except RedirectException as e:
             session.pop("last_shipment", None)
