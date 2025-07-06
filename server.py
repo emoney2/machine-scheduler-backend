@@ -84,17 +84,56 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
 def get_quickbooks_credentials():
-    qbo = session.get("qbo_token")
-    if not qbo or not qbo.get("access_token") or not qbo.get("realmId"):
+    from google.auth.transport.requests import Request as GoogleRequest
+    import time
+    import requests
+
+    token_data = session.get("qbo_token")
+    if not token_data:
         raise RedirectException("/quickbooks-auth")
 
+    expires_at = token_data.get("expires_at")
+    if not expires_at or time.time() > expires_at:
+        print("🔁 Token expired — attempting refresh")
+        refresh_token = token_data["refresh_token"]
+        client_id     = os.environ["QBO_CLIENT_ID"]
+        client_secret = os.environ["QBO_CLIENT_SECRET"]
+
+        token_url = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+        auth = (client_id, client_secret)
+        headers = { "Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded" }
+        body = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token
+        }
+
+        res = requests.post(token_url, headers=headers, data=body, auth=auth)
+        if res.status_code not in [200, 201]:
+            print("❌ Failed to refresh token:", res.text)
+            raise RedirectException("/quickbooks-auth")
+
+        token_json = res.json()
+        access_token = token_json["access_token"]
+        refresh_token = token_json["refresh_token"]
+
+        expires_at = time.time() + int(token_json["expires_in"])
+        session["qbo_token"] = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expires_at,
+            "realmId": token_data["realmId"]
+        }
+    else:
+        access_token = token_data["access_token"]
+
     headers = {
-        "Authorization": f"Bearer {qbo['access_token']}",
+        "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
         "Content-Type": "application/json"
     }
+    realm_id = token_data["realmId"]
+    return headers, realm_id
 
-    return headers, qbo["realmId"]
 
 def get_quickbooks_auth_url(redirect_uri, state=""):
     base_url = "https://appcenter.intuit.com/connect/oauth2"
