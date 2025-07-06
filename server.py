@@ -434,11 +434,10 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
                 }
             }
         ],
-        "TxnDate": datetime.now().strftime("%Y-%m-%d"),
+        # QBO will infer date/total from the line items if you omit these,
+        # but if you want to be explicit you can keep just TotalAmt:
         "TotalAmt": float(round(amount, 2)),
         "SalesTermRef": { "value": "3" },  # Net 30
-        "BillEmail": { "Address": "sandbox@sample.com" },  # Required in sandbox
-        "ShipAddr": { "Country": "USA" }  # Dummy shipping address
     }
 
     invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
