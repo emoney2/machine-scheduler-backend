@@ -119,12 +119,13 @@ def build_packing_slip_pdf(order_data_list, boxes):
     # For each box
     for box in boxes:
         elements.append(Paragraph(f"Box Size: {box['size']}", styles["Heading2"]))
-        # Table header + rows
         data = [["Order #", "Design", "Qty"]]
         for order_data in order_data_list:
-            if order_data["order_id"] in box["jobs"]:
+            # Pull the sheet's "Order #" field instead
+            order_num = str(order_data.get("Order #", "")).strip()
+            if order_num in box["jobs"]:
                 data.append([
-                    order_data.get("order_id", ""),
+                    order_num,
                     order_data.get("Design", ""),
                     str(order_data.get("ShippedQty", "")),
                 ])
