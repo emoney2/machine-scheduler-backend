@@ -2189,8 +2189,12 @@ def process_shipment():
         else:
             print("⚠️ No updates prepared — check for ID mismatches.")
 
-        # 🛠️ Done: just return success
-        return jsonify({"status": "ok"}), 200
+        # 🛠️ Done: stub out full response shape for frontend
+        return jsonify({
+            "labels":   [],     # no shipping labels for now
+            "invoice":  "",     # no invoice URL
+            "slips":    []      # no packing slips
+        }), 200
 
     except Exception as e:
         print("❌ Shipment error:", str(e))
