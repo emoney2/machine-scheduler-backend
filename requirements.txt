@@ -10,5 +10,7 @@ xmltodict==0.14.2
 eventlet>=0.33.0
 flask-cors>=4.0.0
 gspread
+requests
+reportlab
 
 
