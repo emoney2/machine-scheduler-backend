@@ -11,6 +11,9 @@ import gspread
 import logging 
 import urllib.parse
 import secrets
+import io
+import tempfile
+
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
@@ -22,7 +25,7 @@ from dotenv import load_dotenv
 from urllib.parse import urlencode
 
 from eventlet.semaphore import Semaphore
-from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string
+from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string, url_for, send_from_directory
 from flask import make_response
 from flask_cors import CORS
 from flask_cors import CORS, cross_origin
@@ -37,6 +40,9 @@ from googleapiclient.http         import MediaIoBaseUpload
 from datetime                      import datetime
 from requests_oauthlib import OAuth2Session
 from urllib.parse import urlencode
+from reportlab.platypus import SimpleDocTemplate, Table, Paragraph, Spacer
+from reportlab.lib.pagesizes import LETTER
+from reportlab.lib.styles import getSampleStyleSheet
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
@@ -96,6 +102,42 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
+def build_packing_slip_pdf(order_data_list, boxes):
+    """
+    Generates a single PDF containing one sheet per box.
+    Returns the PDF bytes.
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=LETTER)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    # Title
+    elements.append(Paragraph("Packing Slip", styles["Title"]))
+    elements.append(Spacer(1, 12))
+
+    # For each box
+    for box in boxes:
+        elements.append(Paragraph(f"Box Size: {box['size']}", styles["Heading2"]))
+        # Table header + rows
+        data = [["Order #", "Design", "Qty"]]
+        for order_data in order_data_list:
+            if order_data["order_id"] in box["jobs"]:
+                data.append([
+                    order_data.get("order_id", ""),
+                    order_data.get("Design", ""),
+                    str(order_data.get("ShippedQty", "")),
+                ])
+        t = Table(data, hAlign="LEFT")
+        elements.append(t)
+        elements.append(Spacer(1, 24))
+
+    # Build PDF
+    doc.build(elements)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
 def get_quickbooks_credentials():
     logger.info("🔍 Checking for token file at %s", TOKEN_PATH)
     if os.path.exists(TOKEN_PATH):
@@ -2240,11 +2282,21 @@ def process_shipment():
             sheet=service
         )
 
-        # 6) Return full payload
+        # 6) Generate packing‐slip PDF
+        pdf_bytes = build_packing_slip_pdf(all_order_data, boxes)
+        filename = f"packing_slip_{int(time.time())}.pdf"
+        tmp_path = os.path.join(tempfile.gettempdir(), filename)
+        with open(tmp_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        # 7) Build a public URL for the front-end
+        slip_url = url_for("serve_slip", filename=filename, _external=True)
+
+        # 8) Return everything
         return jsonify({
-            "labels": [],          # fill if you later generate shipping labels
+            "labels": [],
             "invoice": invoice_url,
-            "slips": []            # fill if you have packing slips
+            "slips": [slip_url]
         }), 200
 
     except Exception as e:
@@ -2572,6 +2624,11 @@ def quickbooks_login_redirect():
     redirect_uri = os.environ["QBO_REDIRECT_URI"]  # ✅ Must be the full URL
     auth_url = get_quickbooks_auth_url(redirect_uri, state=next_path)  # ✅ Put /ship in state instead
     return redirect(auth_url)
+
+@app.route("/slips/<filename>", methods=["GET"])
+def serve_slip(filename):
+    # Serve the PDF from the temp directory
+    return send_from_directory(tempfile.gettempdir(), filename, as_attachment=False)
 
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
