@@ -930,19 +930,15 @@ def prepare_shipment():
 
         if order_id in order_ids:
             parsed_qty = shipped_quantities.get(order_id, 0)
-
-            headers = list(order_data[0].keys()) if order_data else []
-
+            headers = list(row_dict.keys())
             order_data = {
                 h: (
                     str(parsed_qty) if h == "Shipped" else
-                    row[headers.index(h)] if headers.index(h) < len(row) else ""
+                    row_dict.get(h, "")
                 )
                 for h in headers
             }
             order_data["ShippedQty"] = parsed_qty
-
-
             all_order_data.append(order_data)
             prod_rows.append(row_dict)
 
