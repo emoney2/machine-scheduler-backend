@@ -2117,10 +2117,10 @@ def process_shipment():
                 })
 
                 # Gather data for consolidated invoice
-                order_data = {
-                    h: (str(parsed_qty) if h == "Shipped" else (row[headers.index(h)] if headers.index(h) < len(row) else ""))
-                    for h in headers
-                }
+                order_data = {h: row[headers.index(h)] if headers.index(h) < len(row) else "" for h in headers}
+
+                # Force override with the quantity from the web app
+                order_data["Shipped"] = str(parsed_qty)
                 order_data["ShippedQty"] = parsed_qty
                 all_order_data.append(order_data)
 
