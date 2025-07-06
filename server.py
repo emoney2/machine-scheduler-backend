@@ -455,20 +455,20 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
         product_name = order.get("Product", "").strip()
         design_name  = order.get("Design", "").strip()
 
-        # ✅ Gracefully parse quantity from ShippedQty → Shipped → Quantity
+        # ✅ Gracefully parse quantity from ShippedQty → Shipped → Quantity (ignore "0" if auto-filled)
         try:
-            raw_qty = (
-                order.get("ShippedQty") or
-                order.get("Shipped") or
-                order.get("Quantity") or
-                0
-            )
-            shipped_qty = int(raw_qty)
+            raw_qty = order.get("ShippedQty")
+            if raw_qty and str(raw_qty).strip() != "0":
+                shipped_qty = int(raw_qty)
+            else:
+                fallback_qty = order.get("Shipped") or order.get("Quantity") or 0
+                shipped_qty = int(fallback_qty)
+
             if shipped_qty <= 0:
                 print(f"⏭️ Skipping job with zero or negative quantity: {design_name}")
                 continue
         except Exception as e:
-            print(f"⚠️ Invalid quantity '{raw_qty}' for {design_name}: {e}")
+            print(f"⚠️ Invalid quantity for {design_name}: {e}")
             continue
 
         # Gracefully parse price
