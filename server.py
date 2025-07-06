@@ -416,7 +416,8 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
     for order in order_data_list:
         product_name = order.get("Product", "").strip()
         design_name = order.get("Design", "").strip()
-        shipped_qty  = int(order.get("ShippedQty", 0))
+        raw_qty = order.get("ShippedQty")
+        shipped_qty = int(raw_qty) if raw_qty not in [None, ""] else 0
         price        = float(order.get("Price", 0) or 0)
 
         if shipped_qty <= 0:
