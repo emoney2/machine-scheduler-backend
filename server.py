@@ -421,6 +421,7 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
         product_name = order.get("Product", "").strip()
         design_name  = order.get("Design", "").strip()
 
+        # Gracefully parse quantity
         try:
             raw_qty = order.get("ShippedQty")
             shipped_qty = int(raw_qty) if raw_qty not in [None, ""] else 0
@@ -428,6 +429,7 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
             print(f"⚠️ Invalid ShippedQty '{raw_qty}' for {design_name}: {e}")
             shipped_qty = 0
 
+        # Gracefully parse price
         try:
             raw_price = order.get("Price", 0)
             price = float(raw_price or 0)
@@ -435,8 +437,7 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
             print(f"⚠️ Invalid Price '{raw_price}' for {design_name}: {e}")
             price = 0.0
 
-        print(f"👉 Processing {design_name} | Qty: {shipped_qty}, Price: {price}")
-
+        print(f"👉 Processing {design_name}: Qty={shipped_qty}, Price={price}")
         if shipped_qty <= 0:
             print(f"⏭️ Skipping job with zero quantity: {design_name}")
             continue
@@ -457,9 +458,11 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
             }
         })
 
+    print(f"✅ Built {len(line_items)} line items")
+
     if not line_items:
-        print("🚨 FINAL LINE ITEMS EMPTY")
         raise Exception("❌ No valid line items to invoice.")
+
 
     # 📦 Shipping line (one-time for full invoice)
     shipping_total = round((base_shipping_cost * 1.1) + (5 * len(tracking_list or [])), 2)
