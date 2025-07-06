@@ -550,11 +550,8 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
     invoice_payload = {
         "CustomerRef": customer_ref,
         "Line": line_items,
-        "SalesTermRef": { "value": "3", "name": "Net 30" },
-        "ShipMethodRef": { "name": shipping_method },
-        "TrackingNum": tracking_list[0] if tracking_list else "",
-        "PrivateNote": "\n".join(tracking_list) if tracking_list else "",
-        "TxnTaxDetail": {},
+        # Net 30 Terms (value only is fine)
+        "SalesTermRef": { "value": "3" },
         "ShippingAmt": shipping_total
     }
 
