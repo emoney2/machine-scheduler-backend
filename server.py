@@ -369,7 +369,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
 def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, tracking_list, base_shipping_cost):
     creds = get_quickbooks_credentials()
     if not creds.valid:
-        raise RedirectException(creds.authorization_url)
+        raise RedirectException(f"{os.environ['FRONTEND_URL']}/oauth2callback")
 
     headers = {
         "Authorization": f"Bearer {creds.token}",
