@@ -100,6 +100,11 @@ def get_quickbooks_credentials():
     """
     token_path = "qbo_token.json"
 
+    # 🔍 DEBUG: Check current working directory and existence of token file
+    import os
+    print("🔍 CWD:", os.getcwd())
+    print("🔍 token_path exists?", os.path.exists(token_path))
+
     # 1) Load from disk or from session (first-time)
     if os.path.exists(token_path):
         token_data = json.load(open(token_path))
