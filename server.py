@@ -434,22 +434,10 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
                 }
             }
         ],
-        # 1) Set the invoice date
-        "TxnDate": datetime.now().strftime("%Y-%m-%d"),
-
-        # 2) Total amount (must match sum of line items)
-        "TotalAmt": float(round(amount, 2)),
-
-        # 3) Payment terms (Net 30)
+        "TxnDate":      datetime.now().strftime("%Y-%m-%d"),
+        "TotalAmt":     float(round(amount, 2)),
         "SalesTermRef": { "value": "3" },
- 
-        # 4) (Sandbox) send invoice by email
-        "BillEmail": { "Address": "sandbox@sample.com" }
-    }
-        # QBO will infer date/total from the line items if you omit these,
-        # but if you want to be explicit you can keep just TotalAmt:
-        "TotalAmt": float(round(amount, 2)),
-        "SalesTermRef": { "value": "3" },  # Net 30
+        "BillEmail":    { "Address": "sandbox@sample.com" }
     }
 
     invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
@@ -559,19 +547,13 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
     shipping_total = round((base_shipping_cost * 1.1) + (5 * len(tracking_list or [])), 2)
 
     invoice_payload = {
-        "CustomerRef": customer_ref,
-        "Line": line_items,
-        # 1) Invoice date
-        "TxnDate": datetime.now().strftime("%Y-%m-%d"),
-
-        # 2) Total amount (sum of line item Amounts)
-        "TotalAmt": round(sum(item["Amount"] for item in line_items), 2),
-
-        # 3) Payment terms (Net 30)
+        "CustomerRef":  customer_ref,
+        "Line":         line_items,
+        "TxnDate":      datetime.now().strftime("%Y-%m-%d"),
+        # TotalAmt is auto-calculated by QBO if omitted, but you can include:
+        "TotalAmt":     round(sum(item["Amount"] for item in line_items), 2),
         "SalesTermRef": { "value": "3" },
-
-        # 4) Email the invoice to the customer’s sandbox email
-        "BillEmail": { "Address": "sandbox@sample.com" }
+        "BillEmail":    { "Address": "sandbox@sample.com" }
     }
 
     url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
