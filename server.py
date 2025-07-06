@@ -2232,8 +2232,8 @@ def process_shipment():
             )
             print("✅ Invoice created:", invoice_url)
         except RedirectException as e:
-            # front end will redirect user to authenticate
-            return jsonify({"redirect": e.redirect_url}), 302
+            # Tell the front-end to redirect instead of issuing an HTTP 302
+            return jsonify({"redirect": e.redirect_url}), 200
         except Exception as iq_err:
             print("❌ Invoice creation failed:", iq_err)
             traceback.print_exc()
