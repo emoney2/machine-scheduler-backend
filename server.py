@@ -2109,7 +2109,7 @@ def process_shipment():
             if row_order_id in order_ids:
                 qty = shipped_quantities.get(row_order_id)
                 print(f"✅ Match! Writing {qty} to row {i}")
-                parsed_qty = int(qty) if qty not in [None, "", "null"] else 0
+                parsed_qty = int(shipped_quantities.get(row_order_id, 0))
 
                 updates.append({
                     "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
