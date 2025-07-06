@@ -2138,10 +2138,6 @@ def process_shipment():
     order_ids = [str(oid).strip() for oid in data.get("order_ids", [])]
     shipped_quantities = {str(k).strip(): v for k, v in data.get("shipped_quantities", {}).items()}
 
-    print("→ order_ids received:", order_ids)
-    print("→ shipped_quantities received:", shipped_quantities)
-
-    # 🐞 DEBUG: confirm what we got from React
     print("🔍 Received order_ids:", order_ids)
     print("🔍 Received shipped_quantities:", shipped_quantities)
 
@@ -2160,7 +2156,6 @@ def process_shipment():
         rows = result.get("values", [])
         headers = rows[0]
 
-        # 🐞 DEBUG: inspect sheet
         print("🔍 Sheet headers:", headers)
         print("🔍 First 5 sheet rows:", rows[1:6])
 
@@ -2168,12 +2163,9 @@ def process_shipment():
         shipped_col = headers.index("Shipped")
 
         updates = []
-        all_order_data = []
 
-        for i, row in enumerate(rows[1:], start=2):  # start=2 for 1-based index
+        for i, row in enumerate(rows[1:], start=2):
             order_id = str(row[id_col]).strip() if id_col < len(row) else ""
-            print(f"→ Row {i}: Order ID in sheet = '{order_id}'")
-
             if order_id in order_ids:
                 qty = shipped_quantities.get(order_id)
                 print(f"✅ Match! Writing {qty} to row {i}")
@@ -2188,59 +2180,23 @@ def process_shipment():
                     "values": [[str(parsed_qty)]]
                 })
 
-                order_data = {
-                    h: (
-                        str(parsed_qty) if h == "Shipped" else
-                        str(parsed_qty) if h == "ShippedQty" else
-                        row[headers.index(h)] if headers.index(h) < len(row) else ""
-                    )
-                    for h in headers
-                }
-
-                order_data["ShippedQty"] = str(parsed_qty)
-                all_order_data.append(order_data)
-
-        # ✅ Create consolidated invoice AFTER updating the sheet
-        print(f"🧾 Attempting to create invoice for {len(all_order_data)} order(s)")
-        try:
-            invoice_url = create_consolidated_invoice_in_quickbooks(
-                all_order_data,
-                shipping_method="UPS Ground",
-                tracking_list=[],
-                base_shipping_cost=0.0,
-                sheet=service
-            )
-        except RedirectException as e:
-            session.pop("last_shipment", None)
-            return jsonify({ "redirect": e.redirect_url }), 401
-        except Exception as e:
-            session.pop("last_shipment", None)
-            print("❌ Error creating invoice:")
-            traceback.print_exc()
-            raise
-
-        invoices = [str(invoice_url)]
-
-        if not updates:
-            print("⚠️ No updates prepared — check for ID mismatches.")
-
         if updates:
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=sheet_id,
                 body={"valueInputOption": "USER_ENTERED", "data": updates}
             ).execute()
             print("✅ Successfully wrote quantities to sheet.")
+        else:
+            print("⚠️ No updates prepared — check for ID mismatches.")
 
-        return jsonify({
-            "labels": [],
-            "invoice": invoices[0] if invoices else "",
-            "slips": []
-        })
+        # 🛠️ Done: just return success
+        return jsonify({"status": "ok"}), 200
 
     except Exception as e:
         print("❌ Shipment error:", str(e))
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 @app.errorhandler(Exception)
 def handle_exception(e):
