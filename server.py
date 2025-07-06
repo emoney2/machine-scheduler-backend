@@ -2163,6 +2163,8 @@ def process_shipment():
                 # Force override with the quantity from the web app
                 order_data["Shipped"] = str(parsed_qty)
                 order_data["ShippedQty"] = parsed_qty
+                order_data["Quantity"] = str(parsed_qty)  # ✅ This is the key fix
+
                 all_order_data.append(order_data)
 
         # ✅ Write ShippedQty to sheet BEFORE invoice generation
