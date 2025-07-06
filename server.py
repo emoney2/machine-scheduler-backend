@@ -2141,6 +2141,10 @@ def process_shipment():
     print("→ order_ids received:", order_ids)
     print("→ shipped_quantities received:", shipped_quantities)
 
+    # 🐞 DEBUG: confirm what we got from React
+    print("🔍 Received order_ids:", order_ids)
+    print("🔍 Received shipped_quantities:", shipped_quantities)
+
     if not order_ids:
         return jsonify({"error": "Missing order_ids"}), 400
 
@@ -2155,6 +2159,10 @@ def process_shipment():
         ).execute()
         rows = result.get("values", [])
         headers = rows[0]
+
+        # 🐞 DEBUG: inspect sheet
+        print("🔍 Sheet headers:", headers)
+        print("🔍 First 5 sheet rows:", rows[1:6])
 
         id_col = headers.index("Order #")
         shipped_col = headers.index("Shipped")
