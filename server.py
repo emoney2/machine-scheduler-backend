@@ -2358,21 +2358,9 @@ def process_shipment():
             sheet=service
         )
 
-        # 6) Fetch the QuickBooks‐generated invoice PDF (includes packing slip)
-        #    Extract the invoice ID from the URL (we returned full URL previously)
-        from urllib.parse import parse_qs, urlparse
-        query = urlparse(invoice_url).query
-        invoice_id = parse_qs(query).get("txnId", [None])[0]
-        if not invoice_id:
-            raise Exception(f"Unable to parse invoice ID from URL: {invoice_url}")
-
-        # Get headers & realm for API call
-        headers, realm_id = get_quickbooks_credentials()
-
-        pdf_bytes = fetch_invoice_pdf_bytes(invoice_id, realm_id, headers)
-
-        # Save it to your temporary file directory
-        filename = f"packing_slip_{invoice_id}.pdf"
+        # 6) Generate our custom packing slip PDF
+        pdf_bytes = build_packing_slip_pdf(all_order_data, boxes)
+        filename = f"packing_slip_{int(time.time())}.pdf"
         tmp_path = os.path.join(tempfile.gettempdir(), filename)
         with open(tmp_path, "wb") as f:
             f.write(pdf_bytes)
