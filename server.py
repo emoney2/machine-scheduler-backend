@@ -2296,7 +2296,13 @@ def process_shipment():
             "slips": [slip_url]
         }), 200
 
+    except RedirectException as e:
+        # No valid QuickBooks token → tell client to start OAuth flow
+        print("🔁 Redirecting to OAuth:", e.redirect_url)
+        return jsonify({"redirect": e.redirect_url}), 200
+
     except Exception as e:
+        # Any other error
         print("❌ Shipment error:", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
