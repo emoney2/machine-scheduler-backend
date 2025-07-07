@@ -40,6 +40,18 @@ from googleapiclient.http         import MediaIoBaseUpload
 from datetime                      import datetime
 from requests_oauthlib import OAuth2Session
 from urllib.parse import urlencode
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import LETTER
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    Image,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
@@ -99,16 +111,100 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
-def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers):
+def build_packing_slip_pdf(order_data_list, boxes):
     """
-    Calls the QBO API to get the invoice PDF (which includes the packing slip).
-    Returns raw PDF bytes.
+    PDF layout:
+      ┌──────────────────────────────────────────────────┐
+      │ Logo+Your Info (top-left) │ Customer Info (top-right) │
+      ├──────────────────────────────────────────────────┤
+      │                     PACKING SLIP                │
+      ├──────────────────────────────────────────────────┤
+      │ Order # │   Design   │ Qty │
+      │   ...   │    ...     │ ... │
+      └──────────────────────────────────────────────────┘
     """
-    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice/{invoice_id}/pdf"
-    res = requests.get(url, headers={**headers, "Accept": "application/pdf"})
-    res.raise_for_status()
-    return res.content
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=LETTER,
+        leftMargin=0.5*inch,
+        rightMargin=0.5*inch,
+        topMargin=0.5*inch,
+        bottomMargin=0.5*inch,
+    )
+    styles = getSampleStyleSheet()
+    normal = styles["Normal"]
+    title_style = ParagraphStyle(
+        "TitleCenter",
+        parent=styles["Title"],
+        alignment=1, # TA_CENTER
+        spaceAfter=12
+    )
 
+    elems = []
+
+    # ─── Header ─────────────────────────────────────────────
+    # Left: your logo + company info
+    logo_path = os.path.join(app.root_path, "static", "logo.png")
+    try:
+        logo = Image(logo_path, width=1.5*inch, height=1*inch)
+    except Exception:
+        logo = Paragraph("Your Company Logo", normal)
+
+    your_info = Paragraph(
+        "Your Company Name<br/>123 Main St.<br/>City, ST 12345<br/>Phone: (555) 123-4567",
+        normal
+    )
+
+    # Right: customer info (from first order_data entry)
+    cust = order_data_list[0]
+    customer_info = Paragraph(
+        f"{cust.get('Company Name','')}<br/>{cust.get('Ship To','')}<br/>{cust.get('Address','')}",
+        normal
+    )
+
+    header_table = Table(
+        [[logo, your_info, customer_info]],
+        colWidths=[1.5*inch, 2.5*inch, 2.5*inch]
+    )
+    header_table.setStyle(TableStyle([
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("ALIGN",  (2,0), (2,0), "RIGHT"),
+        ("LEFTPADDING",  (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (-1,-1), 0),
+    ]))
+    elems.append(header_table)
+    elems.append(Spacer(1, 0.25*inch))
+
+    # ─── Title ──────────────────────────────────────────────
+    elems.append(Paragraph("PACKING SLIP", title_style))
+
+    # ─── Line Items ────────────────────────────────────────
+    data = [["Order #", "Design", "Qty"]]
+    for od in order_data_list:
+        data.append([
+            od.get("Order #", ""),
+            od.get("Design", ""),
+            str(od.get("ShippedQty", ""))
+        ])
+
+    table = Table(data, colWidths=[1.5*inch, 3.5*inch, 1.0*inch])
+    table.setStyle(TableStyle([
+        ("GRID",       (0,0), (-1,-1), 0.5, colors.grey),
+        ("BACKGROUND",(0,0), (-1,0),     colors.lightgrey),
+        ("ALIGN",     (2,1), (2,-1),     "RIGHT"),
+        ("VALIGN",    (0,0), (-1,-1),    "MIDDLE"),
+        ("FONTNAME",  (0,0), (-1,0),     "Helvetica-Bold"),
+        ("BOTTOMPADDING",(0,0),(-1,0),   6),
+        ("TOPPADDING",   (0,0),(-1,0),   6),
+    ]))
+    elems.append(table)
+
+    # ─── Build PDF ──────────────────────────────────────────
+    doc.build(elems)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
 
 def get_quickbooks_credentials():
     """
