@@ -2700,9 +2700,10 @@ def qbo_callback():
     }
     # Redirect back into React with a flag so it can resume the shipment
     # e.g. https://machineschedule.netlify.app/?resumeShipment=true
+    # Redirect back into the Ship UI so retryPendingShipment() can pick up from sessionStorage
     frontend = FRONTEND_URL.rstrip("/")
-    resume_url = f"{frontend}/?resumeShipment=true"
-    logger.info("🔁 Redirecting back to React at %s", resume_url)
+    resume_url = f"{frontend}/ship"
+    logger.info("🔁 OAuth callback complete — redirecting to Ship page: %s", resume_url)
     return redirect(resume_url)
 
 @app.route("/authorize-quickbooks")
