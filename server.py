@@ -2599,9 +2599,12 @@ def qbo_callback():
         "expires_at":    time.time() + int(token["expires_in"]),
         "realmId":       realm
     }
-    # Redirect back to the React app using the global FRONTEND_URL (no trailing newline)
-    return redirect(FRONTEND_URL)
-
+    # Redirect back into React with a flag so it can resume the shipment
+    # e.g. https://machineschedule.netlify.app/?resumeShipment=true
+    frontend = FRONTEND_URL.rstrip("/")
+    resume_url = f"{frontend}/?resumeShipment=true"
+    logger.info("🔁 Redirecting back to React at %s", resume_url)
+    return redirect(resume_url)
 
 @app.route("/authorize-quickbooks")
 def authorize_quickbooks():
