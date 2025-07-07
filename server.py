@@ -140,55 +140,47 @@ def build_packing_slip_pdf(order_data_list, boxes):
     return pdf_bytes
 
 def get_quickbooks_credentials():
-    logger.info("🔍 Checking for token file at %s", TOKEN_PATH)
-    if os.path.exists(TOKEN_PATH):
-        token_data = json.load(open(TOKEN_PATH))
-    else:
-        token_data = session.get("qbo_token")
-    logger.info("🔍 Loaded token_data: %s", token_data)
+    """
+    Returns (headers, realm_id) for QBO API calls.
+    First tries session, then falls back to qbo_token.json on disk.
+    If no token is available, raises RedirectException to start OAuth.
+    """
+    # 1) Try to load from Flask session
+    token_data = session.get("qbo_token")
+    if token_data:
+        # refresh if expired
+        if not token_data.get("expires_at") or time.time() > token_data["expires_at"]:
+            refresh_quickbooks_token()
+            token_data = session.get("qbo_token")
 
-    # 2) If still missing, force one-time OAuth grant
-    if not token_data:
-        raise RedirectException("/quickbooks-auth")
-
-    # 3) Refresh if expired
-    now = time.time()
-    if token_data.get("expires_at", 0) <= now:
-        refresh_token = token_data.get("refresh_token")
-        client_id     = os.getenv("QBO_CLIENT_ID")
-        client_secret = os.getenv("QBO_CLIENT_SECRET")
-        token_url     = os.getenv("QBO_TOKEN_URL")
-
-        auth = (client_id, client_secret)
-        body = {
-            "grant_type":    "refresh_token",
-            "refresh_token": refresh_token
+        headers = {
+            "Authorization": f"Bearer {token_data['access_token']}",
+            "Accept": "application/json"
         }
-        res = requests.post(token_url,
-                            headers={"Accept": "application/json",
-                                     "Content-Type": "application/x-www-form-urlencoded"},
-                            data=body, auth=auth)
-        res.raise_for_status()
-        new_token = res.json()
-        # build refreshed token_data
-        token_data = {
-            "access_token":  new_token["access_token"],
-            "refresh_token": new_token["refresh_token"],
-            "expires_at":    now + int(new_token["expires_in"]),
-            "realmId":       token_data.get("realmId")
-        }
-        # save back to disk & session
-        with open(TOKEN_PATH, "w") as f:
-            json.dump(token_data, f)
-        session["qbo_token"] = token_data
+        return headers, token_data["realmId"]
 
-    # 4) Build headers for QuickBooks API
-    headers = {
-        "Authorization": f"Bearer {token_data['access_token']}",
-        "Accept":        "application/json"
-    }
-    realm_id = token_data.get("realmId")
-    return headers, realm_id
+    # 2) Fallback: try to read from disk
+    token_path = os.path.join(app.root_path, "qbo_token.json")
+    if os.path.exists(token_path):
+        with open(token_path, "r") as f:
+            file_token = json.load(f)
+        # store in session for subsequent requests
+        session["qbo_token"] = file_token
+
+        # refresh if expired
+        if not file_token.get("expires_at") or time.time() > file_token["expires_at"]:
+            refresh_quickbooks_token()
+            file_token = session.get("qbo_token")
+
+        headers = {
+            "Authorization": f"Bearer {file_token['access_token']}",
+            "Accept": "application/json"
+        }
+        return headers, file_token["realmId"]
+
+    # 3) No token found: redirect user to OAuth flow
+    raise RedirectException("/quickbooks-auth")
+
 
 def get_quickbooks_auth_url(redirect_uri, state=""):
     base_url = "https://appcenter.intuit.com/connect/oauth2"
