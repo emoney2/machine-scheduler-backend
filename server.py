@@ -44,14 +44,8 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer,
-    Table,
-    TableStyle,
-    Image,
-)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.utils import ImageReader
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
@@ -160,8 +154,12 @@ def build_packing_slip_pdf(order_data_list, boxes):
     # Left cell: logo (half size) + your company info
     logo_path = os.path.join(app.root_path, "static", "logo.png")
     try:
-        # half the previous width & height: adjust as needed
-        logo = Image(logo_path, width=0.75*inch, height=0.5*inch)
+        # preserve aspect ratio, max width = 1.0"
+        reader = ImageReader(logo_path)
+        orig_w, orig_h = reader.getSize()
+        max_w = 1.0 * inch
+        scale = max_w / orig_w
+        logo = Image(logo_path, width=orig_w*scale, height=orig_h*scale)
     except Exception:
         logo = Paragraph("Your Logo", normal)
 
@@ -179,9 +177,10 @@ def build_packing_slip_pdf(order_data_list, boxes):
         normal
     )
 
+    # shift customer info further right
     header_table = Table(
         [[left_cell, customer_info]],
-        colWidths=[3*inch, 3*inch]
+        colWidths=[2.0*inch, 4.0*inch]
     )
     header_table.setStyle(TableStyle([
         ("VALIGN", (0,0), (-1,-1), "TOP"),
@@ -204,7 +203,8 @@ def build_packing_slip_pdf(order_data_list, boxes):
             str(od.get("ShippedQty", ""))
         ])
 
-    table = Table(data, colWidths=[2.5*inch, 2.0*inch, 1.0*inch])
+    # widen the table columns
+    table = Table(data, colWidths=[3.0*inch, 3.0*inch, 1.0*inch])
     table.setStyle(TableStyle([
         ("GRID",         (0,0), (-1,-1), 0.5, colors.grey),
         ("BACKGROUND",   (0,0), (-1,0),   colors.lightgrey),
