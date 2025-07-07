@@ -110,6 +110,18 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
+def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers):
+    """
+    Calls the QuickBooks Online API to get the invoice PDF (which
+    contains both the invoice and packing-slip section), and
+    returns the raw PDF bytes.
+    """
+    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice/{invoice_id}/pdf"
+    response = requests.get(url, headers={**headers, "Accept": "application/pdf"})
+    response.raise_for_status()
+    return response.content
+
+
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
 def build_packing_slip_pdf(order_data_list, boxes):
     """
