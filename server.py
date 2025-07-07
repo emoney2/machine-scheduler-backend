@@ -243,47 +243,37 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
     pdf_bytes = buffer.getvalue()
     buffer.close()
     return pdf_bytes
-def get_quickbooks_credentials():
-    """
-    Returns (headers, realm_id) for QBO API calls.
-    First tries session, then falls back to qbo_token.json on disk.
-    If no token is available, raises RedirectException to start OAuth.
-    """
-    # 1) Try to load from Flask session
-    token_data = session.get("qbo_token")
-    if token_data:
-        # refresh if expired
-        if not token_data.get("expires_at") or time.time() > token_data["expires_at"]:
-            refresh_quickbooks_token()
-            token_data = session.get("qbo_token")
 
+def get_quickbooks_credentials():
+    # 1) First, try the live session
+    token_data = session.get("qbo_token")
+    if token_data and "access_token" in token_data:
+        realm_id = token_data.get("realmId")
         headers = {
             "Authorization": f"Bearer {token_data['access_token']}",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "Content-Type": "application/json"
         }
-        return headers, token_data["realmId"]
+        if realm_id:
+            return headers, realm_id
 
-    # 2) Fallback: try to read from disk
-    token_path = os.path.join(app.root_path, "qbo_token.json")
-    if os.path.exists(token_path):
-        with open(token_path, "r") as f:
+    # 2) Next, fallback to disk-persisted token (from your callback)
+    if os.path.exists(TOKEN_PATH):
+        with open(TOKEN_PATH) as f:
             file_token = json.load(f)
-        # store in session for subsequent requests
-        session["qbo_token"] = file_token
+        realm_id = file_token.get("realmId")
+        access = file_token.get("access_token")
+        if access and realm_id:
+            headers = {
+                "Authorization": f"Bearer {access}",
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            }
+            return headers, realm_id
 
-        # refresh if expired
-        if not file_token.get("expires_at") or time.time() > file_token["expires_at"]:
-            refresh_quickbooks_token()
-            file_token = session.get("qbo_token")
-
-        headers = {
-            "Authorization": f"Bearer {file_token['access_token']}",
-            "Accept": "application/json"
-        }
-        return headers, file_token["realmId"]
-
-    # 3) No token found: redirect user to OAuth flow
+    # 3) If we still have nothing, re-start the OAuth flow
     raise RedirectException("/quickbooks-auth")
+
 
 
 def get_quickbooks_auth_url(redirect_uri, state=""):
@@ -2687,9 +2677,13 @@ def qbo_callback():
         code=code
     )
 
-    # Persist full token dict to disk for reuse
+    # Persist the token **and** realmId to disk for reuse
+    disk_data = {
+        **token,
+        "realmId": realm
+    }
     with open(TOKEN_PATH, "w") as f:
-        json.dump(token, f)
+        json.dump(disk_data, f, indent=2)
     logger.info("✅ Wrote QBO token to disk at %s", TOKEN_PATH)
 
     session["qbo_token"] = {
