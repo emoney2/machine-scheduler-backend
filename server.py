@@ -209,6 +209,7 @@ def build_packing_slip_pdf(order_data_list, boxes):
     table.setStyle(TableStyle([
         ("GRID",         (0,0), (-1,-1), 0.5, colors.grey),
         ("BACKGROUND",   (0,0), (-1,0),   colors.lightgrey),
+        ("ALIGN",        (2,0), (2,0),    "CENTER"),  # center Qty **header** cell
         ("ALIGN",        (2,1), (2,-1),   "CENTER"),  # center Qty column
         ("VALIGN",       (0,0), (-1,-1),  "MIDDLE"),
         ("FONTNAME",     (0,0), (-1,0),   "Helvetica-Bold"),
