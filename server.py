@@ -104,6 +104,22 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
+def fetch_company_info(headers, realm_id):
+    # QuickBooks CompanyInfo endpoint
+    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/companyinfo/{realm_id}"
+    res = requests.get(url, headers={**headers, "Accept": "application/json"})
+    res.raise_for_status()
+    info = res.json().get("CompanyInfo", {})
+    return {
+        "CompanyName": info.get("CompanyName", ""),
+        "AddrLine1":   info.get("CompanyAddr", {}).get("Line1", ""),
+        "City":        info.get("CompanyAddr", {}).get("City", ""),
+        "CountrySubDivisionCode": info.get("CompanyAddr", {}).get("CountrySubDivisionCode", ""),
+        "PostalCode":  info.get("CompanyAddr", {}).get("PostalCode", ""),
+        "Phone":       info.get("PrimaryPhone", {}).get("FreeFormNumber", ""),
+    }
+
+
 def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers):
     """
     Calls the QuickBooks Online API to get the invoice PDF (which
@@ -117,7 +133,7 @@ def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers):
 
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
-def build_packing_slip_pdf(order_data_list, boxes):
+def build_packing_slip_pdf(order_data_list, boxes, company_info):
     """
     PDF layout:
       ┌──────────────────────────────────────────────────┐
@@ -164,7 +180,10 @@ def build_packing_slip_pdf(order_data_list, boxes):
         logo = Paragraph("Your Logo", normal)
 
     your_info = Paragraph(
-        "Your Company Name<br/>123 Main St.<br/>City, ST 12345<br/>Phone: (555) 123-4567",
+        f"{company_info['CompanyName']}<br/>"
+        f"{company_info['AddrLine1']}<br/>"
+        f"{company_info['City']}, {company_info['CountrySubDivisionCode']} {company_info['PostalCode']}<br/>"
+        f"Phone: {company_info['Phone']}",
         normal
     )
 
@@ -2354,17 +2373,17 @@ def process_shipment():
         else:
             print("⚠️ No updates to push—check order_ids match sheet.")
 
-        # 5) Create invoice in QuickBooks
+        # 5) Create invoice in QBO…
+        headers, realm_id = get_quickbooks_credentials()
         invoice_url = create_consolidated_invoice_in_quickbooks(
-            all_order_data,
-            shipping_method,
-            tracking_list=[],
-            base_shipping_cost=0.0,
-            sheet=service
+            all_order_data, shipping_method, tracking_list=[], base_shipping_cost=0.0, sheet=service
         )
 
-        # 6) Generate our custom packing slip PDF
-        pdf_bytes = build_packing_slip_pdf(all_order_data, boxes)
+        # fetch your company’s info
+        company_info = fetch_company_info(headers, realm_id)
+
+        # 6) Generate packing‐slip PDF with real company_info
+        pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
         filename = f"packing_slip_{int(time.time())}.pdf"
         tmp_path = os.path.join(tempfile.gettempdir(), filename)
         with open(tmp_path, "wb") as f:
