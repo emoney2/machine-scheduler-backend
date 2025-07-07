@@ -127,12 +127,13 @@ def build_packing_slip_pdf(order_data_list, boxes):
     """
     PDF layout:
       ┌──────────────────────────────────────────────────┐
-      │ Logo+Your Info (top-left) │ Customer Info (top-right) │
+      │ [logo]           │ Ship To: Customer Info      │
+      │ Your company     │                              │
       ├──────────────────────────────────────────────────┤
-      │                     PACKING SLIP                │
+      │                 PACKING SLIP                   │
       ├──────────────────────────────────────────────────┤
-      │ Order # │   Design   │ Qty │
-      │   ...   │    ...     │ ... │
+      │ Product │ Design │ Qty │
+      │  ...    │  ...   │ ... │
       └──────────────────────────────────────────────────┘
     """
     buffer = io.BytesIO()
@@ -149,39 +150,42 @@ def build_packing_slip_pdf(order_data_list, boxes):
     title_style = ParagraphStyle(
         "TitleCenter",
         parent=styles["Title"],
-        alignment=1, # TA_CENTER
+        alignment=1,  # center
         spaceAfter=12
     )
 
     elems = []
 
     # ─── Header ─────────────────────────────────────────────
-    # Left: your logo + company info
+    # Left cell: logo (half size) + your company info
     logo_path = os.path.join(app.root_path, "static", "logo.png")
     try:
-        logo = Image(logo_path, width=1.5*inch, height=1*inch)
+        # half the previous width & height: adjust as needed
+        logo = Image(logo_path, width=0.75*inch, height=0.5*inch)
     except Exception:
-        logo = Paragraph("Your Company Logo", normal)
+        logo = Paragraph("Your Logo", normal)
 
     your_info = Paragraph(
         "Your Company Name<br/>123 Main St.<br/>City, ST 12345<br/>Phone: (555) 123-4567",
         normal
     )
 
-    # Right: customer info (from first order_data entry)
+    left_cell = [logo, Spacer(1, 0.1*inch), your_info]
+
+    # Right cell: customer info from the first order
     cust = order_data_list[0]
     customer_info = Paragraph(
-        f"{cust.get('Company Name','')}<br/>{cust.get('Ship To','')}<br/>{cust.get('Address','')}",
+        f"<b>Ship To:</b><br/>{cust.get('Company Name','')}<br/>{cust.get('Address','')}<br/>{cust.get('Phone','')}",
         normal
     )
 
     header_table = Table(
-        [[logo, your_info, customer_info]],
-        colWidths=[1.5*inch, 2.5*inch, 2.5*inch]
+        [[left_cell, customer_info]],
+        colWidths=[3*inch, 3*inch]
     )
     header_table.setStyle(TableStyle([
         ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("ALIGN",  (2,0), (2,0), "RIGHT"),
+        ("ALIGN",  (1,0), (1,0), "RIGHT"),
         ("LEFTPADDING",  (0,0), (-1,-1), 0),
         ("RIGHTPADDING", (0,0), (-1,-1), 0),
     ]))
@@ -192,23 +196,23 @@ def build_packing_slip_pdf(order_data_list, boxes):
     elems.append(Paragraph("PACKING SLIP", title_style))
 
     # ─── Line Items ────────────────────────────────────────
-    data = [["Order #", "Design", "Qty"]]
+    data = [["Product", "Design", "Qty"]]
     for od in order_data_list:
         data.append([
-            od.get("Order #", ""),
+            od.get("Product", ""),
             od.get("Design", ""),
             str(od.get("ShippedQty", ""))
         ])
 
-    table = Table(data, colWidths=[1.5*inch, 3.5*inch, 1.0*inch])
+    table = Table(data, colWidths=[2.5*inch, 2.0*inch, 1.0*inch])
     table.setStyle(TableStyle([
-        ("GRID",       (0,0), (-1,-1), 0.5, colors.grey),
-        ("BACKGROUND",(0,0), (-1,0),     colors.lightgrey),
-        ("ALIGN",     (2,1), (2,-1),     "RIGHT"),
-        ("VALIGN",    (0,0), (-1,-1),    "MIDDLE"),
-        ("FONTNAME",  (0,0), (-1,0),     "Helvetica-Bold"),
-        ("BOTTOMPADDING",(0,0),(-1,0),   6),
-        ("TOPPADDING",   (0,0),(-1,0),   6),
+        ("GRID",         (0,0), (-1,-1), 0.5, colors.grey),
+        ("BACKGROUND",   (0,0), (-1,0),   colors.lightgrey),
+        ("ALIGN",        (2,1), (2,-1),   "RIGHT"),
+        ("VALIGN",       (0,0), (-1,-1),  "MIDDLE"),
+        ("FONTNAME",     (0,0), (-1,0),   "Helvetica-Bold"),
+        ("BOTTOMPADDING",(0,0),  (-1,0),   6),
+        ("TOPPADDING",   (0,0),  (-1,0),   6),
     ]))
     elems.append(table)
 
@@ -217,7 +221,6 @@ def build_packing_slip_pdf(order_data_list, boxes):
     pdf_bytes = buffer.getvalue()
     buffer.close()
     return pdf_bytes
-
 def get_quickbooks_credentials():
     """
     Returns (headers, realm_id) for QBO API calls.
