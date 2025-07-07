@@ -46,6 +46,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib.utils import ImageReader
+from uuid import uuid4
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
@@ -286,11 +287,10 @@ def get_quickbooks_credentials():
 
 
 def get_quickbooks_auth_url(redirect_uri, state=""):
-    base_url = "https://appcenter.intuit.com/connect/oauth2"
     client_id = os.environ["QBO_CLIENT_ID"]
-    scope = "com.intuit.quickbooks.accounting"
+    scope     = "com.intuit.quickbooks.accounting"
     return (
-        f"{base_url}?"
+        f"{QBO_AUTH_BASE_URL}?"
         f"client_id={client_id}"
         f"&redirect_uri={urllib.parse.quote(redirect_uri)}"
         f"&response_type=code"
@@ -298,26 +298,21 @@ def get_quickbooks_auth_url(redirect_uri, state=""):
         f"&state={urllib.parse.quote(state)}"
     )
 
-    return auth_url
-
 @app.route("/quickbooks-auth", methods=["GET"])
 def quickbooks_auth():
     """
     Initiates the QuickBooks OAuth2 flow by redirecting
-    the browser to Intuit’s authorization URL, with a non-empty state.
+    the browser to Intuit’s authorization URL, with a fresh state.
     """
-    # 1) Your registered callback URI
-    redirect_uri = os.environ.get("QBO_REDIRECT_URI")
-
-    # 2) Generate a random state and store in session
-    state = secrets.token_urlsafe(16)
+    # 1) Generate a random state and store it in the session
+    state = str(uuid4())
     session["qbo_oauth_state"] = state
 
-    # 3) Build the Intuit URL, now including our state
-    auth_url = get_quickbooks_auth_url(redirect_uri, state)
-    print("🔗 Redirecting to QuickBooks OAuth at", auth_url)
+    # 2) Build redirect URI & auth URL with that state
+    redirect_uri = os.environ.get("QBO_REDIRECT_URI")
+    auth_url = get_quickbooks_auth_url(redirect_uri, state=state)
 
-    # 4) Redirect the browser there
+    logger.info("🔗 Redirecting to QuickBooks OAuth at %s (state=%s)", auth_url, state)
     return redirect(auth_url)
 
 
