@@ -40,9 +40,6 @@ from googleapiclient.http         import MediaIoBaseUpload
 from datetime                      import datetime
 from requests_oauthlib import OAuth2Session
 from urllib.parse import urlencode
-from reportlab.platypus import SimpleDocTemplate, Table, Paragraph, Spacer
-from reportlab.lib.pagesizes import LETTER
-from reportlab.lib.styles import getSampleStyleSheet
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
@@ -102,42 +99,16 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
-def build_packing_slip_pdf(order_data_list, boxes):
+def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers):
     """
-    Generates a single PDF containing one sheet per box.
-    Returns the PDF bytes.
+    Calls the QBO API to get the invoice PDF (which includes the packing slip).
+    Returns raw PDF bytes.
     """
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=LETTER)
-    styles = getSampleStyleSheet()
-    elements = []
+    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice/{invoice_id}/pdf"
+    res = requests.get(url, headers={**headers, "Accept": "application/pdf"})
+    res.raise_for_status()
+    return res.content
 
-    # Title
-    elements.append(Paragraph("Packing Slip", styles["Title"]))
-    elements.append(Spacer(1, 12))
-
-    # For each box
-    for box in boxes:
-        elements.append(Paragraph(f"Box Size: {box['size']}", styles["Heading2"]))
-        data = [["Order #", "Design", "Qty"]]
-        for order_data in order_data_list:
-            # Pull the sheet's "Order #" field instead
-            order_num = str(order_data.get("Order #", "")).strip()
-            if order_num in box["jobs"]:
-                data.append([
-                    order_num,
-                    order_data.get("Design", ""),
-                    str(order_data.get("ShippedQty", "")),
-                ])
-        t = Table(data, hAlign="LEFT")
-        elements.append(t)
-        elements.append(Spacer(1, 24))
-
-    # Build PDF
-    doc.build(elements)
-    pdf_bytes = buffer.getvalue()
-    buffer.close()
-    return pdf_bytes
 
 def get_quickbooks_credentials():
     """
@@ -2279,9 +2250,21 @@ def process_shipment():
             sheet=service
         )
 
-        # 6) Generate packing‐slip PDF
-        pdf_bytes = build_packing_slip_pdf(all_order_data, boxes)
-        filename = f"packing_slip_{int(time.time())}.pdf"
+        # 6) Fetch the QuickBooks‐generated invoice PDF (includes packing slip)
+        #    Extract the invoice ID from the URL (we returned full URL previously)
+        from urllib.parse import parse_qs, urlparse
+        query = urlparse(invoice_url).query
+        invoice_id = parse_qs(query).get("txnId", [None])[0]
+        if not invoice_id:
+            raise Exception(f"Unable to parse invoice ID from URL: {invoice_url}")
+
+        # Get headers & realm for API call
+        headers, realm_id = get_quickbooks_credentials()
+
+        pdf_bytes = fetch_invoice_pdf_bytes(invoice_id, realm_id, headers)
+
+        # Save it to your temporary file directory
+        filename = f"packing_slip_{invoice_id}.pdf"
         tmp_path = os.path.join(tempfile.gettempdir(), filename)
         with open(tmp_path, "wb") as f:
             f.write(pdf_bytes)
@@ -2291,10 +2274,11 @@ def process_shipment():
 
         # 8) Return everything
         return jsonify({
-            "labels": [],
+            "labels": [],         # still blank unless you add UPS labels
             "invoice": invoice_url,
             "slips": [slip_url]
         }), 200
+
 
     except RedirectException as e:
         # No valid QuickBooks token → tell client to start OAuth flow
