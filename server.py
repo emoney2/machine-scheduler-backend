@@ -2458,7 +2458,7 @@ def process_shipment():
         slip_url = url_for("serve_slip", filename=filename, _external=True)
 
         # 8) Return everything
-        num_slips = len(packed_boxes)  # however you calculate how many copies
+        num_slips = len(boxes)  # however you calculate how many copies
         filename  = f"{order_id}_copies_{num_slips}_packing_slip.pdf"
         media     = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
         drive_service.files().create(
