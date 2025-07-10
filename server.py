@@ -2458,14 +2458,16 @@ def process_shipment():
         # 7) Build a public URL for the front-end
         slip_url = url_for("serve_slip", filename=filename, _external=True)
 
-        # 8) Return everything
-        num_slips = len(boxes)  # however you calculate how many copies
+        # 8) Upload packing slip to Drive for the watcher
+        # Use the first order_id from the request (not the loop variable)
+        primary_order_id = order_ids[0]
+        num_slips        = len(boxes)
+        pdf_filename     = f"{primary_order_id}_copies_{num_slips}_packing_slip.pdf"
+        media            = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
         drive = get_drive_service()
-        filename = f"{order_id}_copies_{len(boxes)}_packing_slip.pdf"
-        media    = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
         drive.files().create(
             body={
-                "name":    filename,
+                "name":    pdf_filename,
                 "parents": [os.environ["PACKING_SLIP_PRINT_FOLDER_ID"]]
             },
             media_body=media
