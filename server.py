@@ -1182,7 +1182,9 @@ def prepare_shipment():
     data = request.get_json()
     order_ids = data.get("order_ids", [])
     if not order_ids:
-        return jsonify({"error": "Missing order_ids"}), 400for row in prod_rows:
+        return jsonify({"error": "Missing order_ids"}), 400
+
+    for row in prod_rows:
 
     invoices = []
 
