@@ -14,9 +14,6 @@ import secrets
 import io
 import tempfile
 
-
-
-
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
 from io import BytesIO
@@ -39,7 +36,9 @@ from googleapiclient.discovery import build
 from httplib2 import Http
 from google_auth_httplib2 import AuthorizedHttp
 
-from googleapiclient.http         import MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseUpload
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 from datetime                      import datetime
 from requests_oauthlib import OAuth2Session
 from urllib.parse import urlencode
@@ -2461,9 +2460,10 @@ def process_shipment():
 
         # 8) Return everything
         num_slips = len(boxes)  # however you calculate how many copies
-        filename  = f"{order_id}_copies_{num_slips}_packing_slip.pdf"
-        media     = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
-        drive_service.files().create(
+        drive = get_drive_service()
+        filename = f"{order_id}_copies_{len(boxes)}_packing_slip.pdf"
+        media    = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
+        drive.files().create(
             body={
                 "name":    filename,
                 "parents": [os.environ["PACKING_SLIP_PRINT_FOLDER_ID"]]
