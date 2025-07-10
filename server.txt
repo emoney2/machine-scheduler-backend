@@ -11,6 +11,9 @@ import gspread
 import logging 
 import urllib.parse
 import secrets
+import io
+import tempfile
+
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
@@ -22,7 +25,7 @@ from dotenv import load_dotenv
 from urllib.parse import urlencode
 
 from eventlet.semaphore import Semaphore
-from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string
+from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string, url_for, send_from_directory
 from flask import make_response
 from flask_cors import CORS
 from flask_cors import CORS, cross_origin
@@ -37,6 +40,13 @@ from googleapiclient.http         import MediaIoBaseUpload
 from datetime                      import datetime
 from requests_oauthlib import OAuth2Session
 from urllib.parse import urlencode
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import LETTER
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.utils import ImageReader
+from uuid import uuid4
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
@@ -95,64 +105,182 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
-# ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
-def get_quickbooks_credentials():
-    logger.info("🔍 Checking for token file at %s", TOKEN_PATH)
-    if os.path.exists(TOKEN_PATH):
-        token_data = json.load(open(TOKEN_PATH))
-    else:
-        token_data = session.get("qbo_token")
-    logger.info("🔍 Loaded token_data: %s", token_data)
-
-    # 2) If still missing, force one-time OAuth grant
-    if not token_data:
-        raise RedirectException("/quickbooks-auth")
-
-    # 3) Refresh if expired
-    now = time.time()
-    if token_data.get("expires_at", 0) <= now:
-        refresh_token = token_data.get("refresh_token")
-        client_id     = os.getenv("QBO_CLIENT_ID")
-        client_secret = os.getenv("QBO_CLIENT_SECRET")
-        token_url     = os.getenv("QBO_TOKEN_URL")
-
-        auth = (client_id, client_secret)
-        body = {
-            "grant_type":    "refresh_token",
-            "refresh_token": refresh_token
-        }
-        res = requests.post(token_url,
-                            headers={"Accept": "application/json",
-                                     "Content-Type": "application/x-www-form-urlencoded"},
-                            data=body, auth=auth)
-        res.raise_for_status()
-        new_token = res.json()
-        # build refreshed token_data
-        token_data = {
-            "access_token":  new_token["access_token"],
-            "refresh_token": new_token["refresh_token"],
-            "expires_at":    now + int(new_token["expires_in"]),
-            "realmId":       token_data.get("realmId")
-        }
-        # save back to disk & session
-        with open(token_path, "w") as f:
-            json.dump(token_data, f)
-        session["qbo_token"] = token_data
-
-    # 4) Build headers for QuickBooks API
-    headers = {
-        "Authorization": f"Bearer {token_data['access_token']}",
-        "Accept":        "application/json"
+def fetch_company_info(headers, realm_id):
+    # QuickBooks CompanyInfo endpoint
+    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/companyinfo/{realm_id}"
+    res = requests.get(url, headers={**headers, "Accept": "application/json"})
+    res.raise_for_status()
+    info = res.json().get("CompanyInfo", {})
+    return {
+        "CompanyName": info.get("CompanyName", ""),
+        "AddrLine1":   info.get("CompanyAddr", {}).get("Line1", ""),
+        "City":        info.get("CompanyAddr", {}).get("City", ""),
+        "CountrySubDivisionCode": info.get("CompanyAddr", {}).get("CountrySubDivisionCode", ""),
+        "PostalCode":  info.get("CompanyAddr", {}).get("PostalCode", ""),
+        "Phone":       info.get("PrimaryPhone", {}).get("FreeFormNumber", ""),
     }
-    realm_id = token_data.get("realmId")
-    return headers, realm_id
+
+
+def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers):
+    """
+    Calls the QuickBooks Online API to get the invoice PDF (which
+    contains both the invoice and packing-slip section), and
+    returns the raw PDF bytes.
+    """
+    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice/{invoice_id}/pdf"
+    response = requests.get(url, headers={**headers, "Accept": "application/pdf"})
+    response.raise_for_status()
+    return response.content
+
+
+# ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
+def build_packing_slip_pdf(order_data_list, boxes, company_info):
+    """
+    PDF layout:
+      ┌──────────────────────────────────────────────────┐
+      │ [logo]           │ Ship To: Customer Info      │
+      │ Your company     │                              │
+      ├──────────────────────────────────────────────────┤
+      │                 PACKING SLIP                   │
+      ├──────────────────────────────────────────────────┤
+      │ Product │ Design │ Qty │
+      │  ...    │  ...   │ ... │
+      └──────────────────────────────────────────────────┘
+    """
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=LETTER,
+        leftMargin=0.5*inch,
+        rightMargin=0.5*inch,
+        topMargin=0.5*inch,
+        bottomMargin=0.5*inch,
+    )
+    styles = getSampleStyleSheet()
+    normal = styles["Normal"]
+    title_style = ParagraphStyle(
+        "TitleCenter",
+        parent=styles["Title"],
+        alignment=1,  # center
+        spaceAfter=12
+    )
+
+    elems = []
+
+    # ─── Header ─────────────────────────────────────────────
+    # Left cell: logo (half size) + your company info
+    logo_path = os.path.join(app.root_path, "static", "logo.png")
+    try:
+        # preserve aspect ratio, max width = 1.0"
+        reader = ImageReader(logo_path)
+        orig_w, orig_h = reader.getSize()
+        max_w = 1.0 * inch
+        scale = max_w / orig_w
+        logo = Image(logo_path, width=orig_w*scale, height=orig_h*scale)
+    except Exception:
+        logo = Paragraph("Your Logo", normal)
+
+    your_info = Paragraph(
+        f"{company_info['CompanyName']}<br/>"
+        f"{company_info['AddrLine1']}<br/>"
+        f"{company_info['City']}, {company_info['CountrySubDivisionCode']} {company_info['PostalCode']}<br/>"
+        f"Phone: {company_info['Phone']}",
+        normal
+    )
+
+    left_cell = [logo, Spacer(1, 0.1*inch), your_info]
+
+    # Right cell: customer info from the first order
+    cust = order_data_list[0]
+    customer_info = Paragraph(
+        f"<b>Ship To:</b><br/>{cust.get('Company Name','')}<br/>{cust.get('Address','')}<br/>{cust.get('Phone','')}",
+        normal
+    )
+
+    # shift customer info further right
+    header_table = Table(
+        [[left_cell, customer_info]],
+        # Swap widths so customer info moves left
+        colWidths=[4.0*inch, 2.0*inch]
+    )
+    header_table.setStyle(TableStyle([
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("ALIGN",  (1,0), (1,0), "RIGHT"),
+        ("LEFTPADDING",  (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (-1,-1), 0),
+    ]))
+    elems.append(header_table)
+    elems.append(Spacer(1, 0.25*inch))
+
+    # ─── Title ──────────────────────────────────────────────
+    elems.append(Paragraph("PACKING SLIP", title_style))
+
+    # ─── Line Items ────────────────────────────────────────
+    data = [["Product", "Design", "Qty"]]
+    for od in order_data_list:
+        data.append([
+            od.get("Product", ""),
+            od.get("Design", ""),
+            str(od.get("ShippedQty", ""))
+        ])
+
+    # widen the table columns
+    table = Table(data, colWidths=[3.0*inch, 3.0*inch, 1.0*inch])
+    table.setStyle(TableStyle([
+        ("GRID",         (0,0), (-1,-1), 0.5, colors.grey),
+        ("BACKGROUND",   (0,0), (-1,0),   colors.lightgrey),
+        ("ALIGN",        (2,0), (2,0),    "CENTER"),  # center Qty **header** cell
+        ("ALIGN",        (2,1), (2,-1),   "CENTER"),  # center Qty column
+        ("VALIGN",       (0,0), (-1,-1),  "MIDDLE"),
+        ("FONTNAME",     (0,0), (-1,0),   "Helvetica-Bold"),
+        ("BOTTOMPADDING",(0,0),  (-1,0),   6),
+        ("TOPPADDING",   (0,0),  (-1,0),   6),
+    ]))
+    elems.append(table)
+
+    # ─── Build PDF ──────────────────────────────────────────
+    doc.build(elems)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+def get_quickbooks_credentials():
+    # 1) First, try the live session
+    token_data = session.get("qbo_token")
+    if token_data and "access_token" in token_data:
+        realm_id = token_data.get("realmId")
+        headers = {
+            "Authorization": f"Bearer {token_data['access_token']}",
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+        if realm_id:
+            return headers, realm_id
+
+    # 2) Next, fallback to disk-persisted token (from your callback)
+    if os.path.exists(TOKEN_PATH):
+        with open(TOKEN_PATH) as f:
+            file_token = json.load(f)
+        realm_id = file_token.get("realmId")
+        access = file_token.get("access_token")
+        if access and realm_id:
+            headers = {
+                "Authorization": f"Bearer {access}",
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            }
+            return headers, realm_id
+
+    # 3) If we still have nothing, re-start the OAuth flow
+    raise RedirectException("/quickbooks-auth")
+
+
 
 def get_quickbooks_auth_url(redirect_uri, state=""):
-    base_url = "https://appcenter.intuit.com/connect/oauth2"
     client_id = os.environ["QBO_CLIENT_ID"]
-    scope = "com.intuit.quickbooks.accounting"
+    scope     = "com.intuit.quickbooks.accounting"
     return (
-        f"{base_url}?"
+        f"{QBO_AUTH_BASE_URL}?"
         f"client_id={client_id}"
         f"&redirect_uri={urllib.parse.quote(redirect_uri)}"
         f"&response_type=code"
@@ -160,26 +288,21 @@ def get_quickbooks_auth_url(redirect_uri, state=""):
         f"&state={urllib.parse.quote(state)}"
     )
 
-    return auth_url
-
 @app.route("/quickbooks-auth", methods=["GET"])
 def quickbooks_auth():
     """
     Initiates the QuickBooks OAuth2 flow by redirecting
-    the browser to Intuit’s authorization URL, with a non-empty state.
+    the browser to Intuit’s authorization URL, with a fresh state.
     """
-    # 1) Your registered callback URI
-    redirect_uri = os.environ.get("QBO_REDIRECT_URI")
-
-    # 2) Generate a random state and store in session
-    state = secrets.token_urlsafe(16)
+    # 1) Generate a random state and store it in the session
+    state = str(uuid4())
     session["qbo_oauth_state"] = state
 
-    # 3) Build the Intuit URL, now including our state
-    auth_url = get_quickbooks_auth_url(redirect_uri, state)
-    print("🔗 Redirecting to QuickBooks OAuth at", auth_url)
+    # 2) Build redirect URI & auth URL with that state
+    redirect_uri = os.environ.get("QBO_REDIRECT_URI")
+    auth_url = get_quickbooks_auth_url(redirect_uri, state=state)
 
-    # 4) Redirect the browser there
+    logger.info("🔗 Redirecting to QuickBooks OAuth at %s (state=%s)", auth_url, state)
     return redirect(auth_url)
 
 
@@ -571,7 +694,10 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
         raise Exception(f"QuickBooks invoice creation failed: {res.text}")
 
     invoice = res.json().get("Invoice", {})
-    return invoice.get("DocNumber", "")
+    # Grab the real QBO internal ID, not the DocNumber
+    inv_id = invoice.get("Id")
+    # Return the full URL so clients never need to reconstruct it
+    return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={inv_id}"
 
 
 
@@ -2164,6 +2290,7 @@ def process_shipment():
         str(k).strip(): v
         for k, v in data.get("shipped_quantities", {}).items()
     }
+    boxes = data.get("boxes", [])
     shipping_method = data.get("shipping_method", "")
 
     print("🔍 Received order_ids:", order_ids)
@@ -2231,23 +2358,40 @@ def process_shipment():
         else:
             print("⚠️ No updates to push—check order_ids match sheet.")
 
-        # 5) Create invoice in QuickBooks
+        # 5) Create invoice in QBO…
+        headers, realm_id = get_quickbooks_credentials()
         invoice_url = create_consolidated_invoice_in_quickbooks(
-            all_order_data,
-            shipping_method,
-            tracking_list=[],
-            base_shipping_cost=0.0,
-            sheet=service
+            all_order_data, shipping_method, tracking_list=[], base_shipping_cost=0.0, sheet=service
         )
 
-        # 6) Return full payload
+        # fetch your company’s info
+        company_info = fetch_company_info(headers, realm_id)
+
+        # 6) Generate packing‐slip PDF with real company_info
+        pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
+        filename = f"packing_slip_{int(time.time())}.pdf"
+        tmp_path = os.path.join(tempfile.gettempdir(), filename)
+        with open(tmp_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        # 7) Build a public URL for the front-end
+        slip_url = url_for("serve_slip", filename=filename, _external=True)
+
+        # 8) Return everything
         return jsonify({
-            "labels": [],          # fill if you later generate shipping labels
+            "labels": [],         # still blank unless you add UPS labels
             "invoice": invoice_url,
-            "slips": []            # fill if you have packing slips
+            "slips": [slip_url]
         }), 200
 
+
+    except RedirectException as e:
+        # No valid QuickBooks token → tell client to start OAuth flow
+        print("🔁 Redirecting to OAuth:", e.redirect_url)
+        return jsonify({"redirect": e.redirect_url}), 200
+
     except Exception as e:
+        # Any other error
         print("❌ Shipment error:", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -2533,9 +2677,13 @@ def qbo_callback():
         code=code
     )
 
-    # Persist full token dict to disk for reuse
+    # Persist the token **and** realmId to disk for reuse
+    disk_data = {
+        **token,
+        "realmId": realm
+    }
     with open(TOKEN_PATH, "w") as f:
-        json.dump(token, f)
+        json.dump(disk_data, f, indent=2)
     logger.info("✅ Wrote QBO token to disk at %s", TOKEN_PATH)
 
     session["qbo_token"] = {
@@ -2544,9 +2692,13 @@ def qbo_callback():
         "expires_at":    time.time() + int(token["expires_in"]),
         "realmId":       realm
     }
-    # Redirect back to the React app using the global FRONTEND_URL (no trailing newline)
-    return redirect(FRONTEND_URL)
-
+    # Redirect back into React with a flag so it can resume the shipment
+    # e.g. https://machineschedule.netlify.app/?resumeShipment=true
+    # Redirect back into the Ship UI so retryPendingShipment() can pick up from sessionStorage
+    frontend = FRONTEND_URL.rstrip("/")
+    resume_url = f"{frontend}/ship"
+    logger.info("🔁 OAuth callback complete — redirecting to Ship page: %s", resume_url)
+    return redirect(resume_url)
 
 @app.route("/authorize-quickbooks")
 def authorize_quickbooks():
@@ -2572,6 +2724,11 @@ def quickbooks_login_redirect():
     redirect_uri = os.environ["QBO_REDIRECT_URI"]  # ✅ Must be the full URL
     auth_url = get_quickbooks_auth_url(redirect_uri, state=next_path)  # ✅ Put /ship in state instead
     return redirect(auth_url)
+
+@app.route("/slips/<filename>", methods=["GET"])
+def serve_slip(filename):
+    # Serve the PDF from the temp directory
+    return send_from_directory(tempfile.gettempdir(), filename, as_attachment=False)
 
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────

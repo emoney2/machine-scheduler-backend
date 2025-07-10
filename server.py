@@ -2696,7 +2696,7 @@ def qbo_callback():
     # e.g. https://machineschedule.netlify.app/?resumeShipment=true
     # Redirect back into the Ship UI so retryPendingShipment() can pick up from sessionStorage
     frontend = FRONTEND_URL.rstrip("/")
-    resume_url = f"{frontend}/ship"
+    resume_url = f"{frontend}/ship?resumeShipment=true"
     logger.info("🔁 OAuth callback complete — redirecting to Ship page: %s", resume_url)
     return redirect(resume_url)
 
