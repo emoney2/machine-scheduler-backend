@@ -50,6 +50,35 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.utils import ImageReader
 from uuid import uuid4
 
+# ── HARD-CODED BOX INVENTORY & FIT-FUNCTION ─────────────────────────────────────
+BOX_TYPES = [
+    {"size": "10x10x10", "dims": (10, 10, 10)},
+    {"size": "15x15x15", "dims": (15, 15, 15)},
+    {"size": "20x20x20", "dims": (20, 20, 20)},
+]
+
+def can_fit(product_dims, box_dims):
+    p = sorted(product_dims)
+    b = sorted(box_dims)
+    return all(pi <= bi for pi, bi in zip(p, b))
+
+def choose_box_for_item(length, width, height, volume):
+    # 1) Filter out boxes that are too small in any orientation
+    eligible = [
+        box for box in BOX_TYPES
+        if can_fit((length, width, height), box["dims"])
+    ]
+    # 2) Sort by smallest volume
+    eligible.sort(key=lambda b: b["dims"][0] * b["dims"][1] * b["dims"][2])
+    # 3) Pick the first whose volume ≥ item volume
+    for box in eligible:
+        box_vol = box["dims"][0] * box["dims"][1] * box["dims"][2]
+        if box_vol >= volume:
+            return box["size"]
+    # Fallback to largest box
+    return BOX_TYPES[-1]["size"]
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
 
@@ -1215,11 +1244,16 @@ def prepare_shipment():
             except:
                 ship_qty = 0
 
+            # parse physical dimensions (in inches) from your sheet
+            length = float(row_dict.get("Length", 0)   or 0)
+            width  = float(row_dict.get("Width",  0)   or 0)
+            height = float(row_dict.get("Height", 0)   or 0)
             jobs.append({
-                "order_id": order_id,
-                "product": product,
-                "volume": volume,
-                "ship_qty": ship_qty
+                "order_id":  order_id,
+                "product":   product,
+                "volume":    volume,
+                "dimensions": (length, width, height),
+                "ship_qty":  ship_qty
             })
 
     if missing_products:
@@ -1228,33 +1262,35 @@ def prepare_shipment():
             "missing_products": list(set(missing_products))
         }), 400
 
-    # Step 4: Pack jobs into boxes using greedy volume fit
-    box_sizes = {
-        "Small": 1000,
-        "Medium": 2197,
-        "Large": 8000,
-    }
+    # Step 4: Choose the smallest box that fits dimension + volume
+    BOX_TYPES = [
+        {"size": "Small",  "dims": (10, 10, 10), "vol": 10*10*10},
+        {"size": "Medium", "dims": (15, 15, 15), "vol": 15*15*15},
+        {"size": "Large",  "dims": (20, 20, 20), "vol": 20*20*20},
+    ]
+
+    def can_fit(prod_dims, box_dims):
+        p = sorted(prod_dims)
+        b = sorted(box_dims)
+        return all(pi <= bi for pi, bi in zip(p, b))
+
+    def choose_box(prod_dims, vol):
+        # filter only boxes that can physically fit
+        eligible = [
+            b for b in BOX_TYPES
+            if can_fit(prod_dims, b["dims"]) and b["vol"] >= vol
+        ]
+        # sort by smallest volume
+        eligible.sort(key=lambda b: b["vol"])
+        # return the best match or fall back to largest
+        return (eligible[0]["size"] if eligible else BOX_TYPES[-1]["size"])
 
     boxes = []
-    remaining = jobs.copy()
-
-    while remaining:
-        used_volume = 0
-        box_jobs = []
-
-        for job in remaining[:]:
-            if used_volume + job["volume"] <= box_sizes["Large"]:
-                used_volume += job["volume"]
-                box_jobs.append(job)
-                remaining.remove(job)
-
-        for size, cap in box_sizes.items():
-            if used_volume <= cap:
-                boxes.append({
-                    "size": size,
-                    "jobs": [j["order_id"] for j in box_jobs]
-                })
-                break
+    for job in jobs:
+        dims = job["dimensions"]
+        for _ in range(job["ship_qty"]):
+            size = choose_box(dims, job["volume"])
+            boxes.append({"size": size, "jobs": [job["order_id"]]})
 
     return jsonify({
         "status": "ok",
@@ -2460,9 +2496,9 @@ def process_shipment():
 
         # 8) Upload packing slip to Drive for the watcher
         # Use the first order_id from the request (not the loop variable)
-        primary_order_id = order_ids[0]
-        num_slips        = len(boxes)
-        pdf_filename     = f"{primary_order_id}_copies_{num_slips}_packing_slip.pdf"
+        order_ids_str = "-".join(order_ids)
+        num_slips     = len(boxes)
+        pdf_filename  = f"{order_ids_str}_copies_{len(boxes)}_packing_slip.pdf"
         media            = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
         drive = get_drive_service()
         drive.files().create(
