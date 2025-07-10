@@ -15,6 +15,7 @@ import io
 import tempfile
 
 
+
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
 from datetime import datetime, timedelta
@@ -2457,11 +2458,23 @@ def process_shipment():
         slip_url = url_for("serve_slip", filename=filename, _external=True)
 
         # 8) Return everything
+        num_slips = len(packed_boxes)  # however you calculate how many copies
+        filename  = f"{order_id}_copies_{num_slips}_packing_slip.pdf"
+        media     = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
+        drive_service.files().create(
+            body={
+                "name":    filename,
+                "parents": [os.environ["PACKING_SLIP_PRINT_FOLDER_ID"]]
+            },
+            media_body=media
+        ).execute()
+
+        # now return just the labels & invoice—no more pop-up slips
         return jsonify({
-            "labels": [],         # still blank unless you add UPS labels
+            "labels":  label_urls,
             "invoice": invoice_url,
-            "slips": [slip_url]
-        }), 200
+            "slips":   []
+        })
 
 
     except RedirectException as e:
