@@ -717,7 +717,13 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
 
     line_items = []
     for order in order_data_list:
-        product_name = order.get("Product", "").strip()
+        raw_name = order.get("Product","").strip()
+        # ── SKIP any Back jobs entirely ──
+        if re.search(r"\s+Back$", raw_name, flags=re.IGNORECASE):
+            continue
+
+        # ── Derive base product name by removing Front/Full suffix ──
+        product_base = re.sub(r"\s+(Front|Full)$","", raw_name, flags=re.IGNORECASE).strip()
         design_name  = order.get("Design", "").strip()
 
         # ✅ Robust parsing of shipped quantity with 0-check
@@ -748,7 +754,7 @@ def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, 
             print(f"⏭️ Skipping job with zero quantity: {design_name}")
             continue
 
-        item_ref = get_or_create_item_ref(product_name, headers, realm_id)
+        item_ref = get_or_create_item_ref(product_base, headers, realm_id)
 
         line_items.append({
             "DetailType": "SalesItemLineDetail",
@@ -1176,7 +1182,7 @@ def prepare_shipment():
     data = request.get_json()
     order_ids = data.get("order_ids", [])
     if not order_ids:
-        return jsonify({"error": "Missing order_ids"}), 400
+        return jsonify({"error": "Missing order_ids"}), 400for row in prod_rows:
 
     invoices = []
 
@@ -1230,7 +1236,10 @@ def prepare_shipment():
 
     for row in prod_rows:
         order_id = str(row["Order #"])
-        product = row.get("Product", "").strip()
+        product  = row.get("Product","").strip()
+        # ── IGNORE Back jobs entirely in prepare-shipment ──
+        if re.search(r"\s+Back$", product, flags=re.IGNORECASE):
+            continue
         key = product.lower()
         volume = table_map.get(key)
 
