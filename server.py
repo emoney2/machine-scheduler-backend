@@ -2720,9 +2720,12 @@ def authorize_quickbooks():
 
 @app.route("/quickbooks/login")
 def quickbooks_login_redirect():
-    next_path = request.args.get("next", "/")
-    redirect_uri = os.environ["QBO_REDIRECT_URI"]  # ✅ Must be the full URL
-    auth_url = get_quickbooks_auth_url(redirect_uri, state=next_path)  # ✅ Put /ship in state instead
+    # grab desired post-OAuth path (e.g. /ship)
+    next_path = request.args.get("next", "/ship")
+    # must match exactly what Intuit expects
+    redirect_uri = os.environ["QBO_REDIRECT_URI"]
+    # pass that as state so we can come back here
+    auth_url = get_quickbooks_auth_url(redirect_uri, state=next_path)
     return redirect(auth_url)
 
 @app.route("/slips/<filename>", methods=["GET"])
