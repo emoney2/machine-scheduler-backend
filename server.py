@@ -2473,7 +2473,7 @@ def process_shipment():
 
         # now return just the labels & invoice—no more pop-up slips
         return jsonify({
-            "labels":  label_urls,
+            "labels":  labels,
             "invoice": invoice_url,
             "slips":   []
         })
