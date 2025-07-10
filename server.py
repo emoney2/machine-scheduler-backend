@@ -245,33 +245,103 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
     return pdf_bytes
 
 def get_quickbooks_credentials():
-    # 1) First, try the live session
+    # 1) First, try the live session token in Flask session
     token_data = session.get("qbo_token")
     if token_data and "access_token" in token_data:
         realm_id = token_data.get("realmId")
-        headers = {
-            "Authorization": f"Bearer {token_data['access_token']}",
-            "Accept": "application/json",
-            "Content-Type": "application/json"
+        token = {
+            "access_token":  token_data["access_token"],
+            "refresh_token": token_data.get("refresh_token"),
+            "expires_at":    token_data.get("expires_at", 0)
         }
-        if realm_id:
-            return headers, realm_id
 
-    # 2) Next, fallback to disk-persisted token (from your callback)
+        # → refresh if expired
+        if token["expires_at"] < time.time():
+            oauth = OAuth2Session(
+                os.getenv("QBO_CLIENT_ID"),
+                token=token,
+                auto_refresh_kwargs={
+                    "client_id":     os.getenv("QBO_CLIENT_ID"),
+                    "client_secret": os.getenv("QBO_CLIENT_SECRET"),
+                },
+                auto_refresh_url=os.getenv("QBO_TOKEN_URL"),
+                token_updater=lambda new_tok: None
+            )
+            new_token = oauth.refresh_token(
+                os.getenv("QBO_TOKEN_URL"),
+                client_id=os.getenv("QBO_CLIENT_ID"),
+                client_secret=os.getenv("QBO_CLIENT_SECRET")
+            )
+            new_token["expires_at"] = time.time() + int(new_token["expires_in"])
+
+            # persist refreshed token to session & disk
+            session["qbo_token"] = {
+                "access_token":  new_token["access_token"],
+                "refresh_token": new_token["refresh_token"],
+                "expires_at":    new_token["expires_at"],
+                "realmId":       realm_id
+            }
+            with open(TOKEN_PATH, "w") as f:
+                json.dump({**new_token, "realmId": realm_id}, f, indent=2)
+            token = new_token
+
+        headers = {
+            "Authorization": f"Bearer {token['access_token']}",
+            "Accept":        "application/json",
+            "Content-Type":  "application/json"
+        }
+        return headers, realm_id
+
+    # 2) Fallback to disk-persisted token
     if os.path.exists(TOKEN_PATH):
         with open(TOKEN_PATH) as f:
             file_token = json.load(f)
         realm_id = file_token.get("realmId")
-        access = file_token.get("access_token")
-        if access and realm_id:
+        token = {
+            "access_token":  file_token.get("access_token"),
+            "refresh_token": file_token.get("refresh_token"),
+            "expires_at":    file_token.get("expires_at", 0)
+        }
+
+        if token["access_token"] and realm_id:
+            # → refresh if expired
+            if token["expires_at"] < time.time():
+                oauth = OAuth2Session(
+                    os.getenv("QBO_CLIENT_ID"),
+                    token=token,
+                    auto_refresh_kwargs={
+                        "client_id":     os.getenv("QBO_CLIENT_ID"),
+                        "client_secret": os.getenv("QBO_CLIENT_SECRET"),
+                    },
+                    auto_refresh_url=os.getenv("QBO_TOKEN_URL"),
+                    token_updater=lambda new_tok: None
+                )
+                new_token = oauth.refresh_token(
+                    os.getenv("QBO_TOKEN_URL"),
+                    client_id=os.getenv("QBO_CLIENT_ID"),
+                    client_secret=os.getenv("QBO_CLIENT_SECRET")
+                )
+                new_token["expires_at"] = time.time() + int(new_token["expires_in"])
+
+                # persist refreshed token to disk & session
+                with open(TOKEN_PATH, "w") as f:
+                    json.dump({**new_token, "realmId": realm_id}, f, indent=2)
+                session["qbo_token"] = {
+                    "access_token":  new_token["access_token"],
+                    "refresh_token": new_token["refresh_token"],
+                    "expires_at":    new_token["expires_at"],
+                    "realmId":       realm_id
+                }
+                token = new_token
+
             headers = {
-                "Authorization": f"Bearer {access}",
-                "Accept": "application/json",
-                "Content-Type": "application/json"
+                "Authorization": f"Bearer {token['access_token']}",
+                "Accept":        "application/json",
+                "Content-Type":  "application/json"
             }
             return headers, realm_id
 
-    # 3) If we still have nothing, re-start the OAuth flow
+    # 3) No valid token → restart OAuth
     raise RedirectException("/quickbooks-auth")
 
 
