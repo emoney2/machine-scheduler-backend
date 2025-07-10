@@ -1262,7 +1262,7 @@ def prepare_shipment():
             "missing_products": list(set(missing_products))
         }), 400
 
-    # Step 4: Choose the smallest box that fits dimension + volume
+    # Step 4: Pack items into as few boxes as possible, respecting both vol & dims
     BOX_TYPES = [
         {"size": "Small",  "dims": (10, 10, 10), "vol": 10*10*10},
         {"size": "Medium", "dims": (15, 15, 15), "vol": 15*15*15},
@@ -1270,27 +1270,60 @@ def prepare_shipment():
     ]
 
     def can_fit(prod_dims, box_dims):
-        p = sorted(prod_dims)
-        b = sorted(box_dims)
-        return all(pi <= bi for pi, bi in zip(p, b))
+        p_sorted = sorted(prod_dims)
+        b_sorted = sorted(box_dims)
+        return all(p <= b for p, b in zip(p_sorted, b_sorted))
 
-    def choose_box(prod_dims, vol):
-        # filter only boxes that can physically fit
+    # 4a) Expand each item by its quantity
+    items = []
+    for job in jobs:
+        for _ in range(job["ship_qty"]):
+            items.append({
+                "order_id": job["order_id"],
+                "dims":      job["dimensions"],
+                "volume":    job["volume"]
+            })
+
+    # 4b) Greedily fill boxes
+    boxes = []
+    while items:
+        # start a new box with the first item
+        group     = [items.pop(0)]
+        total_vol = group[0]["volume"]
+        max_dims  = list(group[0]["dims"])
+
+        # try to pack more items into this same box
+        i = 0
+        while i < len(items):
+            it       = items[i]
+            new_dims = (
+                max(max_dims[0], it["dims"][0]),
+                max(max_dims[1], it["dims"][1]),
+                max(max_dims[2], it["dims"][2]),
+            )
+            # check against the largest box capacity and dims
+            largest = BOX_TYPES[-1]
+            if (total_vol + it["volume"] <= largest["vol"]
+                and can_fit(new_dims, largest["dims"])):
+                total_vol += it["volume"]
+                max_dims  = list(new_dims)
+                group.append(it)
+                items.pop(i)
+                continue
+            i += 1
+
+        # 4c) Choose the smallest box that fits this group
         eligible = [
             b for b in BOX_TYPES
-            if can_fit(prod_dims, b["dims"]) and b["vol"] >= vol
+            if can_fit(max_dims, b["dims"]) and b["vol"] >= total_vol
         ]
-        # sort by smallest volume
         eligible.sort(key=lambda b: b["vol"])
-        # return the best match or fall back to largest
-        return (eligible[0]["size"] if eligible else BOX_TYPES[-1]["size"])
+        chosen = (eligible[0]["size"] if eligible else BOX_TYPES[-1]["size"])
 
-    boxes = []
-    for job in jobs:
-        dims = job["dimensions"]
-        for _ in range(job["ship_qty"]):
-            size = choose_box(dims, job["volume"])
-            boxes.append({"size": size, "jobs": [job["order_id"]]})
+        boxes.append({
+            "size": chosen,
+            "jobs": [g["order_id"] for g in group]
+        })
 
     return jsonify({
         "status": "ok",
