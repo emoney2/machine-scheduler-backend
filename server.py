@@ -377,72 +377,79 @@ def update_sheet_cell(sheet_id, sheet_name, lookup_col, lookup_value, target_col
 def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id):
     import requests
     import time
+    import os
+    import json
 
-    # Step 1: Try to fetch from QuickBooks
+    # ── 1) Try to fetch from QuickBooks ───────────────────────────
     base_qbo_url = "https://sandbox-quickbooks.api.intuit.com/v3/company"
-    query_url = f"{base_qbo_url}/{realm_id}/query"
-    query = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
-    response = requests.get(query_url, headers=quickbooks_headers, params={"query": query})
+    query_url   = f"{base_qbo_url}/{realm_id}/query"
+    query       = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
+    response    = requests.get(query_url, headers=quickbooks_headers, params={"query": query})
 
     if response.status_code == 200:
         customers = response.json().get("QueryResponse", {}).get("Customer", [])
         if customers:
-            customer = customers[0]
-            return {
-                "value": customer["Id"],
-                "name": customer["DisplayName"]
-            }
+            cust = customers[0]
+            return {"value": cust["Id"], "name": cust["DisplayName"]}
 
-    # Step 2: Fetch from Google Sheets Directory
-    directory = sheet.worksheet("Directory").get_all_records()
-    match = next((row for row in directory if row.get("Company Name", "").strip() == company_name.strip()), None)
+    # ── 2) Fetch from Google Sheets “Directory” ────────────────────
+    #    (using the low-level Sheets API)
+    SPREADSHEET_ID = os.environ["SHEET_ID"]
+    resp = sheet.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Directory!A1:Z"
+    ).execute()
+    rows = resp.get("values", [])
+    if not rows or len(rows) < 2:
+        directory = []
+    else:
+        headers = rows[0]
+        directory = [dict(zip(headers, row)) for row in rows[1:]]
 
+    match = next(
+        (row for row in directory
+         if row.get("Company Name", "").strip() == company_name.strip()),
+        None
+    )
     if not match:
         raise Exception(f"❌ Customer '{company_name}' not found in Google Sheets Directory")
 
-    # Step 3: Build QuickBooks customer payload
+    # ── 3) Build QuickBooks customer payload ───────────────────────
     payload = {
-        "DisplayName": company_name,
-        "CompanyName": company_name,
+        "DisplayName":    company_name,
+        "CompanyName":    company_name,
         "PrimaryEmailAddr": {"Address": match.get("Contact Email Address", "")},
-        "PrimaryPhone": {"FreeFormNumber": match.get("Phone Number", "")},
+        "PrimaryPhone":     {"FreeFormNumber": match.get("Phone Number", "")},
         "BillAddr": {
-            "Line1": match.get("Street Address 1", ""),
-            "Line2": match.get("Street Address 2", ""),
-            "City": match.get("City", ""),
-            "CountrySubDivisionCode": match.get("State", ""),
-            "PostalCode": match.get("Zip Code", "")
+            "Line1":                 match.get("Street Address 1", ""),
+            "Line2":                 match.get("Street Address 2", ""),
+            "City":                  match.get("City", ""),
+            "CountrySubDivisionCode":match.get("State", ""),
+            "PostalCode":            match.get("Zip Code", "")
         },
         "GivenName": match.get("Contact First Name", ""),
-        "FamilyName": match.get("Contact Last Name", "")
+        "FamilyName":match.get("Contact Last Name", "")
     }
 
-    # Step 4: Create customer in QuickBooks
+    # ── 4) Create customer in QuickBooks ──────────────────────────
     create_url = f"{base_qbo_url}/{realm_id}/customer"
     res = requests.post(create_url, headers=quickbooks_headers, json=payload)
-
-    if res.status_code in [200, 201]:
+    if res.status_code in (200, 201):
         data = res.json().get("Customer", {})
-        return {
-            "value": data["Id"],
-            "name": data["DisplayName"]
-        }
+        return {"value": data["Id"], "name": data["DisplayName"]}
 
-    # ⛔ If 403 from sandbox, retry with fallback name
+    # ── 5) Sandbox fallback if “ApplicationAuthorizationFailed” ────
     if res.status_code == 403 and "ApplicationAuthorizationFailed" in res.text:
-        print("⚠️ Sandbox blocked customer creation. Retrying with fallback DisplayName.")
+        print("⚠️ Sandbox blocked creation; retrying with fallback name.")
         payload["DisplayName"] = f"{company_name} Test {int(time.time())}"
         res2 = requests.post(create_url, headers=quickbooks_headers, json=payload)
-        if res2.status_code in [200, 201]:
+        if res2.status_code in (200, 201):
             data = res2.json().get("Customer", {})
-            return {
-                "value": data["Id"],
-                "name": data["DisplayName"]
-            }
+            return {"value": data["Id"], "name": data["DisplayName"]}
         else:
             raise Exception(f"❌ Retry also failed: {res2.text}")
 
-    # Final failure
+    # ── Final failure ──────────────────────────────────────────────
     raise Exception(f"❌ Failed to create customer in QuickBooks: {res.text}")
 
 def get_or_create_item_ref(product_name, headers, realm_id):
