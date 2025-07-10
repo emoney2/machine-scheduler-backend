@@ -1184,10 +1184,6 @@ def prepare_shipment():
     if not order_ids:
         return jsonify({"error": "Missing order_ids"}), 400
 
-    for row in prod_rows:
-
-    invoices = []
-
     # Fetch both Production Orders and Table tabs
     prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
     table_data = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
