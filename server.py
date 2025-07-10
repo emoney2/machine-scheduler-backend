@@ -394,7 +394,9 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
 
     # ── 2) Fetch from Google Sheets “Directory” ────────────────────
     #    (using the low-level Sheets API)
-    SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+    SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+    if not SPREADSHEET_ID:
+        raise Exception("🚨 Missing SPREADSHEET_ID environment variable")
     resp = sheet.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
         range="Directory!A1:Z"
