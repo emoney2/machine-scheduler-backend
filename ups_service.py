@@ -9,6 +9,11 @@ UPS_CLIENT_ID     = os.getenv("UPS_CLIENT_ID")
 UPS_CLIENT_SECRET = os.getenv("UPS_CLIENT_SECRET")
 UPS_ACCOUNT       = os.getenv("UPS_ACCOUNT")
 
+if not (UPS_CLIENT_ID and UPS_CLIENT_SECRET and UPS_ACCOUNT):
+    raise RuntimeError(
+        "UPS credentials not set – please check UPS_CLIENT_ID, UPS_CLIENT_SECRET & UPS_ACCOUNT"
+    )
+
 # UPS sandbox OAuth2 & Rate endpoints
 OAUTH_URL = "https://wwwcie.ups.com/security/v1/oauth/token"
 RATE_URL  = "https://wwwcie.ups.com/ship/v1/rating/Rate"
@@ -28,8 +33,10 @@ def _get_access_token():
     )
     resp.raise_for_status()
     token_data = resp.json()
+    # DEBUG: log the raw token response
+    print("UPS OAuth token response:", token_data)
+
     access_token = token_data["access_token"]
-    # ensure expires_in is an int
     expires_in   = int(token_data.get("expires_in", 86400))
     _token_cache.update({
         "access_token": access_token,
@@ -54,7 +61,6 @@ def get_rate(shipper, recipient, packages):
         "Authorization": f"Bearer {token}"
     }
 
-    # Build the Shipment payload
     shipment = {
         "Shipper":  {**shipper,  "ShipperNumber": UPS_ACCOUNT},
         "ShipTo":   recipient,
