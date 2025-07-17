@@ -414,38 +414,46 @@ class RedirectException(Exception):
         self.redirect_url = redirect_url
 
 def refresh_quickbooks_token():
-    token = session.get("qbo_token")
-    if not token or "refresh_token" not in token:
-        raise Exception("No refresh token available in session")
+    """
+    Refresh the QuickBooks OAuth token using sandbox or production credentials.
+    """
+    # ── 0) Determine environment from session ─────────────────────
+    env_override = session.get("qboEnv", QBO_ENV)
 
-    client_id = os.getenv("QBO_CLIENT_ID")
-    client_secret = os.getenv("QBO_CLIENT_SECRET")
-    refresh_token = token["refresh_token"]
+    # ── 1) Pick the correct client ID/secret ─────────────────────
+    client_id, client_secret = get_qbo_oauth_credentials(env_override)
 
-    auth = (client_id, client_secret)
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token
-    }
+    # ── 2) Load existing token from disk ──────────────────────────
+    with open(TOKEN_PATH, "r") as f:
+        disk_data = json.load(f)
 
-    resp = requests.post(
-        "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
-        auth=auth,
-        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
-        data=data
+    # ── 3) Rebuild the OAuth2Session with that token ─────────────
+    oauth = OAuth2Session(
+        client_id=client_id,
+        token=disk_data
     )
 
-    if resp.status_code != 200:
-        raise Exception(f"❌ Failed to refresh token: {resp.text}")
+    # ── 4) Refresh the token using matching client_secret ────────
+    new_token = oauth.refresh_token(
+        QBO_TOKEN_URL,
+        client_secret=client_secret,
+        refresh_token=disk_data["refresh_token"]
+    )
 
-    new_token_data = resp.json()
-    token.update({
-        "access_token": new_token_data["access_token"],
-        "expires_at": time.time() + int(new_token_data["expires_in"]),
-        "refresh_token": new_token_data.get("refresh_token", refresh_token),  # fallback to old one if not refreshed
-    })
-    session["qbo_token"] = token
-    print("🔁 Refreshed QuickBooks token")
+    # ── 5) Persist refreshed token to disk ───────────────────────
+    disk_data.update(new_token)
+    with open(TOKEN_PATH, "w") as f:
+        json.dump(disk_data, f, indent=2)
+
+    # ── 6) Update session so API calls see the new expiry ───────
+    session["qbo_token"] = {
+        "access_token":  new_token["access_token"],
+        "refresh_token": new_token["refresh_token"],
+        "expires_at":    time.time() + int(new_token["expires_in"]),
+        "realmId":       disk_data["realmId"]
+    }
+
+    print(f"🔁 Refreshed QBO token for env '{env_override}'")
 
 def update_sheet_cell(sheet_id, sheet_name, lookup_col, lookup_value, target_col, new_value):
     service = get_sheets_service()
@@ -956,19 +964,19 @@ EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 
+# ── Legacy QuickBooks vars (still available if used elsewhere) ────
 QBO_CLIENT_ID     = os.environ.get("QBO_CLIENT_ID")
 QBO_CLIENT_SECRET = os.environ.get("QBO_CLIENT_SECRET")
 QBO_REDIRECT_URI  = os.environ.get("QBO_REDIRECT_URI")
-QBO_BASE_URL      = os.environ.get("QBO_BASE_URL")
 QBO_AUTH_URL      = "https://appcenter.intuit.com/connect/oauth2"
 QBO_TOKEN_URL     = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
 QBO_SCOPES        = ["com.intuit.quickbooks.accounting"]
 
-## ── QuickBooks environment configuration ────────────────────────
+# ── QuickBooks environment configuration ────────────────────────
 QBO_SANDBOX_BASE_URL = os.environ.get(
     "QBO_SANDBOX_BASE_URL",
     "https://sandbox-quickbooks.api.intuit.com"
-)  # default sandbox URL
+)
 QBO_PROD_BASE_URL = os.environ.get(
     "QBO_PROD_BASE_URL",
     "https://quickbooks.api.intuit.com"
@@ -981,7 +989,22 @@ def get_base_qbo_url(env_override: str = None) -> str:
     """
     env = (env_override or QBO_ENV).lower()
     return QBO_PROD_BASE_URL if env == "production" else QBO_SANDBOX_BASE_URL
-## ───────────────────────────────────────────────────────────────
+
+# ── OAuth client credentials for sandbox vs. production ─────────
+QBO_SANDBOX_CLIENT_ID     = os.environ.get("QBO_SANDBOX_CLIENT_ID")
+QBO_SANDBOX_CLIENT_SECRET = os.environ.get("QBO_SANDBOX_CLIENT_SECRET")
+QBO_PROD_CLIENT_ID        = os.environ.get("QBO_PROD_CLIENT_ID")
+QBO_PROD_CLIENT_SECRET    = os.environ.get("QBO_PROD_CLIENT_SECRET")
+
+def get_qbo_oauth_credentials(env_override: str = None):
+    """
+    Return (client_id, client_secret) for the chosen QuickBooks environment.
+    """
+    env = (env_override or QBO_ENV).lower()
+    if env == "production":
+        return QBO_PROD_CLIENT_ID, QBO_PROD_CLIENT_SECRET
+    return QBO_SANDBOX_CLIENT_ID, QBO_SANDBOX_CLIENT_SECRET
+# ─────────────────────────────────────────────────────────────────
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -2826,26 +2849,38 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
     except Exception as e:
         print("❌ Error copying .emb files:", e)
 
+from flask import request, session, redirect
+from requests_oauthlib import OAuth2Session
+
 @app.route("/qbo/login")
 def qbo_login():
-    from requests_oauthlib import OAuth2Session
-
     print("🚀 Entered /qbo/login route")
 
+    # ── 0) Determine sandbox vs prod from query or session ───────
+    env_override = request.args.get("env") or session.get("qboEnv")
+    session["qboEnv"] = env_override or QBO_ENV
+
+    # ── 1) Pick the correct OAuth client ID/secret ───────────────
+    client_id, client_secret = get_qbo_oauth_credentials(env_override)
+
+    # ── 2) Build the OAuth2Session with the chosen client_id ─────
     qbo = OAuth2Session(
-        client_id=QBO_CLIENT_ID,
+        client_id=client_id,
         redirect_uri=QBO_REDIRECT_URI,
-        scope=QBO_SCOPES,  # ✅ Keep it here
+        scope=QBO_SCOPES,
         state=session.get("qbo_oauth_state")
     )
 
-    # ✅ Do not include `scope` again here
+    # ── 3) Generate the authorization URL ─────────────────────────
     auth_url, state = qbo.authorization_url(QBO_AUTH_URL)
 
+    # ── 4) Persist state and redirect the user ────────────────────
     session["qbo_oauth_state"] = state
     print("🔗 QuickBooks redirect URL:", auth_url)
     return redirect(auth_url)
 
+
+logger = logging.getLogger(__name__)
 
 @app.route("/qbo/callback", methods=["GET"])
 def qbo_callback():
@@ -2856,38 +2891,46 @@ def qbo_callback():
     if state != session.get("qbo_oauth_state"):
         return "⚠️ Invalid state", 400
 
-    oauth = OAuth2Session(
-        os.getenv("QBO_CLIENT_ID"),
-        redirect_uri=os.getenv("QBO_REDIRECT_URI"),
+    # ── 0) Determine sandbox vs production from session ──────────
+    env_override = session.get("qboEnv", QBO_ENV)
+
+    # ── 1) Pick the correct OAuth client credentials ─────────────
+    client_id, client_secret = get_qbo_oauth_credentials(env_override)
+
+    # ── 2) Rebuild OAuth2Session with that client_id & state ─────
+    qbo = OAuth2Session(
+        client_id,
+        redirect_uri=QBO_REDIRECT_URI,
         state=state
     )
-    token = oauth.fetch_token(
-        os.getenv("QBO_TOKEN_URL"),
-        client_secret=os.getenv("QBO_CLIENT_SECRET"),
+
+    # ── 3) Exchange code for token using the matching client_secret ─
+    token = qbo.fetch_token(
+        QBO_TOKEN_URL,
+        client_secret=client_secret,
         code=code
     )
 
-    # Persist the token **and** realmId to disk for reuse
-    disk_data = {
-        **token,
-        "realmId": realm
-    }
+    # ── 4) Persist token & realmId to disk for reuse ─────────────
+    disk_data = { **token, "realmId": realm }
     with open(TOKEN_PATH, "w") as f:
         json.dump(disk_data, f, indent=2)
     logger.info("✅ Wrote QBO token to disk at %s", TOKEN_PATH)
 
+    # ── 5) Store in session for your API calls ────────────────────
     session["qbo_token"] = {
         "access_token":  token["access_token"],
         "refresh_token": token["refresh_token"],
         "expires_at":    time.time() + int(token["expires_in"]),
         "realmId":       realm
     }
-    # Redirect back into React with a flag so it can resume the shipment
-    # e.g. https://machineschedule.netlify.app/?resumeShipment=true
-    # Redirect back into the Ship UI so retryPendingShipment() can pick up from sessionStorage
+    session["qboEnv"] = env_override
+    logger.info("✅ Stored QBO token in session, environment: %s", env_override)
+
+    # ── 6) Redirect back into your Ship UI ────────────────────────
     frontend = FRONTEND_URL.rstrip("/")
     resume_url = f"{frontend}/ship"
-    logger.info("🔁 OAuth callback complete — redirecting to Ship page: %s", resume_url)
+    logger.info("🔁 OAuth callback complete — redirecting to Ship page: %s", resume_url)
     return redirect(resume_url)
 
 @app.route("/authorize-quickbooks")
