@@ -707,122 +707,118 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     )
     return f"{app_url}/app/invoice?txnId={invoice['Id']}"
 
-def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, tracking_list, base_shipping_cost, sheet):
-    logging.info("📦 Incoming order_data_list:\n%s", json.dumps(order_data_list, indent=2))
+def create_consolidated_invoice_in_quickbooks(
+    order_data_list,
+    shipping_method,
+    tracking_list,
+    base_shipping_cost,
+    sheet,
+    env_override=None
+):
+    """
+    Builds a single consolidated invoice in QuickBooks (sandbox or production).
+    """
+
+    # ── 0) Pick sandbox vs. production base URL ─────────────────────
+    base = get_base_qbo_url(env_override)
+
+    # ── 1) Get QBO credentials ──────────────────────────────────────
     headers, realm_id = get_quickbooks_credentials()
 
-    # ✅ Use first order's company name to find/create customer
+    logging.info("📦 Incoming order_data_list:\n%s", json.dumps(order_data_list, indent=2))
+
+    # ── 2) Find or create the customer ──────────────────────────────
     first_order = order_data_list[0]
-    customer_ref = get_or_create_customer_ref(first_order.get("Company Name", ""), sheet, headers, realm_id)
+    customer_ref = get_or_create_customer_ref(
+        first_order.get("Company Name", ""),
+        sheet,
+        headers,
+        realm_id,
+        env_override  # propagate override
+    )
 
-    # 🧾 Build Line items
-    print("📦 Incoming order_data_list:")
-    print(json.dumps(order_data_list, indent=2))
-
-    print("🧾 Raw order data list:")
-    for o in order_data_list:
-        print(f"  - Design: {o.get('Design')}, ShippedQty: {o.get('ShippedQty')}, Price: {o.get('Price')}")
-
-
+    # ── 3) Build line items ─────────────────────────────────────────
     line_items = []
     for order in order_data_list:
-        raw_name = order.get("Product","").strip()
-        # ── SKIP any Back jobs entirely ──
+        raw_name = order.get("Product", "").strip()
+
+        # Skip any “Back” jobs
         if re.search(r"\s+Back$", raw_name, flags=re.IGNORECASE):
             continue
 
-        # ── Derive base product name by removing Front/Full suffix ──
-        product_base = re.sub(r"\s+(Front|Full)$","", raw_name, flags=re.IGNORECASE).strip()
+        product_base = re.sub(r"\s+(Front|Full)$", "", raw_name, flags=re.IGNORECASE).strip()
         design_name  = order.get("Design", "").strip()
 
-        # ✅ Robust parsing of shipped quantity with 0-check
+        # Parse shipped quantity (fallback to other fields)
         try:
-            raw_qty = order.get("ShippedQty")
-            if raw_qty is None or str(raw_qty).strip() in ["", "0"]:
-                raw_qty = order.get("Shipped")
-            if raw_qty is None or str(raw_qty).strip() in ["", "0"]:
-                raw_qty = order.get("Quantity")
-            shipped_qty = int(float(raw_qty))  # At this point, it must be valid
+            raw_qty = order.get("ShippedQty") or order.get("Shipped") or order.get("Quantity")
+            shipped_qty = int(float(raw_qty))
             if shipped_qty <= 0:
-                print(f"⏭️ Skipping job with zero or negative quantity: {design_name}")
                 continue
-        except Exception as e:
-            print(f"⚠️ Invalid quantity value '{raw_qty}' for {design_name}: {e}")
+        except Exception:
             continue
 
-        # Gracefully parse price
+        # Parse price
         try:
-            raw_price = order.get("Price", 0)
-            price = float(raw_price or 0)
-        except Exception as e:
-            print(f"⚠️ Invalid Price '{raw_price}' for {design_name}: {e}")
+            price = float(order.get("Price", 0) or 0)
+        except Exception:
             price = 0.0
 
-        print(f"👉 Processing {design_name}: Qty={shipped_qty}, Price={price}")
-        if shipped_qty <= 0:
-            print(f"⏭️ Skipping job with zero quantity: {design_name}")
-            continue
-
-        item_ref = get_or_create_item_ref(product_base, headers, realm_id)
+        # Lookup or create item, propagating override
+        item_ref = get_or_create_item_ref(
+            product_base,
+            headers,
+            realm_id,
+            env_override
+        )
 
         line_items.append({
             "DetailType": "SalesItemLineDetail",
-            "Amount": round(shipped_qty * price, 2),
+            "Amount":     round(shipped_qty * price, 2),
             "Description": design_name,
             "SalesItemLineDetail": {
-                "ItemRef": {
-                    "value": item_ref["value"],
-                    "name": item_ref["name"]
-                },
-                "Qty": shipped_qty,
-                "UnitPrice": price
+                "ItemRef":   { "value": item_ref["value"], "name": item_ref["name"] },
+                "Qty":        shipped_qty,
+                "UnitPrice":  price
             }
         })
 
-    print(f"✅ Built {len(line_items)} line items")
     if not line_items:
-        logger.warning("🚫 No valid line items created. Here's the raw order_data_list:")
-        for i, job in enumerate(order_data_list):
-            logger.warning(
-                f"  [{i+1}] Design: {job.get('Design')}, "
-                f"Product: {job.get('Product')}, "
-                f"Qty: {job.get('ShippedQty')}, "
-                f"Price: {job.get('Price')}"
-            )
         raise Exception("❌ No valid line items to invoice.")
 
-    # 📦 Shipping line (one-time for full invoice)
-    shipping_total = round((base_shipping_cost * 1.1) + (5 * len(tracking_list or [])), 2)
-
+    # ── 4) Build the invoice payload ────────────────────────────────
     invoice_payload = {
         "CustomerRef":  customer_ref,
         "Line":         line_items,
         "TxnDate":      datetime.now().strftime("%Y-%m-%d"),
-        # TotalAmt is auto-calculated by QBO if omitted, but you can include:
         "TotalAmt":     round(sum(item["Amount"] for item in line_items), 2),
         "SalesTermRef": { "value": "3" },
         "BillEmail":    { "Address": "sandbox@sample.com" }
     }
 
-    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
-    print("📦 Invoice payload:")
-    print(json.dumps(invoice_payload, indent=2))
+    # ── 5) Send to QuickBooks ───────────────────────────────────────
+    url = f"{base}/v3/company/{realm_id}/invoice"
+    logging.info("📦 Invoice payload:\n%s", json.dumps(invoice_payload, indent=2))
 
-    res = requests.post(url, headers=headers, json=invoice_payload)
-
-    print("📬 QBO response status:", res.status_code)
-    print("📬 QBO response body:", res.text)
-
-    if res.status_code not in [200, 201]:
-        print("❌ QBO invoice creation failed.")
-        traceback.print_exc()
+    res = requests.post(
+        url,
+        headers={**headers, "Content-Type": "application/json"},
+        json=invoice_payload
+    )
+    if res.status_code not in (200, 201):
+        logging.error("❌ QBO invoice creation failed: %s", res.text)
         raise Exception(f"QuickBooks invoice creation failed: {res.text}")
 
     invoice = res.json().get("Invoice", {})
-    # Grab the real QBO internal ID, not the DocNumber
     inv_id = invoice.get("Id")
-    # Return the full URL so clients never need to reconstruct it
-    return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={inv_id}"
+
+    # ── 6) Build the UI link for sandbox vs. production ────────────
+    app_url = (
+        "https://app.qbo.intuit.com"
+        if (env_override or QBO_ENV) == "production"
+        else "https://app.sandbox.qbo.intuit.com"
+    )
+    return f"{app_url}/app/invoice?txnId={inv_id}"
 
 
 
