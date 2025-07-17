@@ -16,7 +16,6 @@ _token_cache = {}
 
 def _get_access_token():
     now = time.time()
-    # reuse until ~1min before expiry
     if _token_cache and _token_cache["expires_at"] > now:
         return _token_cache["access_token"]
 
@@ -28,24 +27,17 @@ def _get_access_token():
     resp.raise_for_status()
     token_data = resp.json()
     access_token = token_data["access_token"]
-    # expires_in is in seconds
-    expires_in = token_data.get("expires_in", 86400)
+    expires_in   = token_data.get("expires_in", 86400)
     _token_cache.update({
         "access_token": access_token,
-        "expires_at": now + expires_in - 60
+        "expires_at":    now + expires_in - 60
     })
     return access_token
 
 def get_rate(shipper, recipient, packages):
-    """
-    :param shipper:    {Name,AttentionName,Phone,Address:{…}}
-    :param recipient:  same shape as shipper
-    :param packages:   list of {Weight, Dimensions?} dicts
-    :returns:          list of rates: [{serviceCode, method, rate, currency, deliveryDate}, …]
-    """
     token = _get_access_token()
     headers = {
-        "Content-Type": "application/json",
+        "Content-Type":  "application/json",
         "Authorization": f"Bearer {token}"
     }
 
@@ -69,9 +61,9 @@ def get_rate(shipper, recipient, packages):
         if dims:
             pkg_obj["Dimensions"] = {
                 "UnitOfMeasurement": {"Code": "IN"},
-                "Length": str(dims["Length"]),
-                "Width":  str(dims["Width"]),
-                "Height": str(dims["Height"])
+                "Length":            str(dims["Length"]),
+                "Width":             str(dims["Width"]),
+                "Height":            str(dims["Height"])
             }
         shipment["Package"].append(pkg_obj)
 
@@ -91,10 +83,10 @@ def get_rate(shipper, recipient, packages):
         svc     = rs["Service"]
         charges = rs["TotalCharges"]
         results.append({
-            "serviceCode": svc["Code"],
-            "method":      svc.get("Description", ""),
-            "rate":        charges["MonetaryValue"],
-            "currency":    charges["CurrencyCode"],
+            "serviceCode":  svc["Code"],
+            "method":       svc.get("Description", ""),
+            "rate":         charges["MonetaryValue"],
+            "currency":     charges["CurrencyCode"],
             "deliveryDate": rs.get("GuaranteedDelivery", {}).get("Date", "")
         })
     return results
