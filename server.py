@@ -699,13 +699,13 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
         raise Exception("❌ QuickBooks invoice creation failed or response invalid")
 
     print("✅ Invoice created:", invoice)
-          # ── Build link for sandbox vs. production UI ────────────
-          app_url = (
-              "https://app.qbo.intuit.com"
-              if (env_override or QBO_ENV) == "production"
-              else "https://app.sandbox.qbo.intuit.com"
-          )
-          return f"{app_url}/app/invoice?txnId={invoice['Id']}"
+    # ── Build link for sandbox vs. production UI ────────────
+    app_url = (
+        "https://app.qbo.intuit.com"
+        if (env_override or QBO_ENV) == "production"
+        else "https://app.sandbox.qbo.intuit.com"
+    )
+    return f"{app_url}/app/invoice?txnId={invoice['Id']}"
 
 def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, tracking_list, base_shipping_cost, sheet):
     logging.info("📦 Incoming order_data_list:\n%s", json.dumps(order_data_list, indent=2))
