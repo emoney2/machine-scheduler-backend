@@ -136,23 +136,23 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
- def fetch_company_info(headers, realm_id, env_override=None):
-     """
-     Fetch company info from QuickBooks (sandbox or production).
-     """
-     base = get_base_qbo_url(env_override)
-     url = f"{base}/v3/company/{realm_id}/companyinfo/{realm_id}"
-     res = requests.get(url, headers={**headers, "Accept": "application/json"})
-     res.raise_for_status()
-     info = res.json().get("CompanyInfo", {})
-     return {
-         "CompanyName": info.get("CompanyName", ""),
-         "AddrLine1":   info.get("CompanyAddr", {}).get("Line1", ""),
-         "City":        info.get("CompanyAddr", {}).get("City", ""),
-         "CountrySubDivisionCode": info.get("CompanyAddr", {}).get("CountrySubDivisionCode", ""),
-         "PostalCode":  info.get("CompanyAddr", {}).get("PostalCode", ""),
-         "Phone":       info.get("PrimaryPhone", {}).get("FreeFormNumber", ""),
-     }
+def fetch_company_info(headers, realm_id, env_override=None):
+    """
+    Fetch company info from QuickBooks (sandbox or production).
+    """
+    base = get_base_qbo_url(env_override)
+    url = f"{base}/v3/company/{realm_id}/companyinfo/{realm_id}"
+    res = requests.get(url, headers={**headers, "Accept": "application/json"})
+    res.raise_for_status()
+    info = res.json().get("CompanyInfo", {})
+    return {
+        "CompanyName": info.get("CompanyName", ""),
+        "AddrLine1":   info.get("CompanyAddr", {}).get("Line1", ""),
+        "City":        info.get("CompanyAddr", {}).get("City", ""),
+        "CountrySubDivisionCode": info.get("CompanyAddr", {}).get("CountrySubDivisionCode", ""),
+        "PostalCode":  info.get("CompanyAddr", {}).get("PostalCode", ""),
+        "Phone":       info.get("PrimaryPhone", {}).get("FreeFormNumber", ""),
+    }
 
 
 def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers, env_override=None):
