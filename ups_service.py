@@ -29,7 +29,8 @@ def _get_access_token():
     resp.raise_for_status()
     token_data = resp.json()
     access_token = token_data["access_token"]
-    expires_in   = token_data.get("expires_in", 86400)
+    # ensure expires_in is an int
+    expires_in   = int(token_data.get("expires_in", 86400))
     _token_cache.update({
         "access_token": access_token,
         "expires_at":    now + expires_in - 60
