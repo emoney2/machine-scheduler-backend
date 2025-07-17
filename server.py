@@ -2659,33 +2659,21 @@ def logout_all():
     socketio.emit("forceLogout")
     return jsonify({"status": "ok"}), 200
 
-@app.route("/api/rate", methods=["POST"])
+@app.route('/api/rate', methods=['POST'])
 @login_required_session
 def rate_shipment():
-    """
-    Expects JSON like:
-    {
-      "shipper": { … },
-      "recipient": { … },
-      "packages": [ {Weight, Dimensions?}, … ]
-    }
-    """
-    payload = request.get_json()
-    if not payload:
-        return jsonify({"error": "Missing payload"}), 400
+    data = request.get_json() or {}
+    shipper   = data.get('shipper')
+    recipient = data.get('recipient')
+    packages  = data.get('packages', [])
 
     try:
-        rates = get_rate(
-          shipper    = payload["shipper"],
-          recipient  = payload["recipient"],
-          packages   = payload["packages"]
-        )
-        return jsonify({ "rates": rates }), 200
-    except KeyError as ke:
-        return jsonify({ "error": f"Missing field: {ke}" }), 400
+        rates = get_rate(shipper, recipient, packages)
     except Exception as e:
-        logger.exception("UPS rating error")
-        return jsonify({ "error": str(e) }), 500
+        app.logger.error(f"UPS rating failed, falling back to empty rates: {e}")
+        rates = []
+
+    return jsonify(rates)
 
 @app.route("/api/list-folder-files")
 def list_folder_files():
