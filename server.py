@@ -477,16 +477,18 @@ def update_sheet_cell(sheet_id, sheet_name, lookup_col, lookup_value, target_col
 
 
 def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id, env_override=None):
+    """
+    Look up a customer in QuickBooks; create if missing.
+    """
     import requests
     import time
     import os
-    import json
 
     # ── 1) Try to fetch from QuickBooks ───────────────────────────
-          base = get_base_qbo_url(env_override)
-          query_url = f"{base}/v3/company/{realm_id}/query"
-    query       = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
-    response    = requests.get(query_url, headers=quickbooks_headers, params={"query": query})
+    base = get_base_qbo_url(env_override)
+    query_url = f"{base}/v3/company/{realm_id}/query"
+    query = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
+    response = requests.get(query_url, headers=quickbooks_headers, params={"query": query})
 
     if response.status_code == 200:
         customers = response.json().get("QueryResponse", {}).get("Customer", [])
@@ -495,7 +497,6 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
             return {"value": cust["Id"], "name": cust["DisplayName"]}
 
     # ── 2) Fetch from Google Sheets “Directory” ────────────────────
-    #    (using the low-level Sheets API)
     SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
     if not SPREADSHEET_ID:
         raise Exception("🚨 Missing SPREADSHEET_ID environment variable")
@@ -511,8 +512,7 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
         directory = [dict(zip(headers, row)) for row in rows[1:]]
 
     match = next(
-        (row for row in directory
-         if row.get("Company Name", "").strip() == company_name.strip()),
+        (row for row in directory if row.get("Company Name", "").strip() == company_name.strip()),
         None
     )
     if not match:
@@ -520,19 +520,19 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
 
     # ── 3) Build QuickBooks customer payload ───────────────────────
     payload = {
-        "DisplayName":    company_name,
-        "CompanyName":    company_name,
+        "DisplayName":      company_name,
+        "CompanyName":      company_name,
         "PrimaryEmailAddr": {"Address": match.get("Contact Email Address", "")},
         "PrimaryPhone":     {"FreeFormNumber": match.get("Phone Number", "")},
         "BillAddr": {
-            "Line1":                 match.get("Street Address 1", ""),
-            "Line2":                 match.get("Street Address 2", ""),
-            "City":                  match.get("City", ""),
-            "CountrySubDivisionCode":match.get("State", ""),
-            "PostalCode":            match.get("Zip Code", "")
+            "Line1":                  match.get("Street Address 1", ""),
+            "Line2":                  match.get("Street Address 2", ""),
+            "City":                   match.get("City", ""),
+            "CountrySubDivisionCode": match.get("State", ""),
+            "PostalCode":             match.get("Zip Code", "")
         },
-        "GivenName": match.get("Contact First Name", ""),
-        "FamilyName":match.get("Contact Last Name", "")
+        "GivenName":  match.get("Contact First Name", ""),
+        "FamilyName": match.get("Contact Last Name", "")
     }
 
     # ── 4) Create customer in QuickBooks ──────────────────────────
