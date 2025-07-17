@@ -136,33 +136,34 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
-def fetch_company_info(headers, realm_id):
-    # QuickBooks CompanyInfo endpoint
-    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/companyinfo/{realm_id}"
-    res = requests.get(url, headers={**headers, "Accept": "application/json"})
-    res.raise_for_status()
-    info = res.json().get("CompanyInfo", {})
-    return {
-        "CompanyName": info.get("CompanyName", ""),
-        "AddrLine1":   info.get("CompanyAddr", {}).get("Line1", ""),
-        "City":        info.get("CompanyAddr", {}).get("City", ""),
-        "CountrySubDivisionCode": info.get("CompanyAddr", {}).get("CountrySubDivisionCode", ""),
-        "PostalCode":  info.get("CompanyAddr", {}).get("PostalCode", ""),
-        "Phone":       info.get("PrimaryPhone", {}).get("FreeFormNumber", ""),
-    }
+ def fetch_company_info(headers, realm_id, env_override=None):
+     """
+     Fetch company info from QuickBooks (sandbox or production).
+     """
+     base = get_base_qbo_url(env_override)
+     url = f"{base}/v3/company/{realm_id}/companyinfo/{realm_id}"
+     res = requests.get(url, headers={**headers, "Accept": "application/json"})
+     res.raise_for_status()
+     info = res.json().get("CompanyInfo", {})
+     return {
+         "CompanyName": info.get("CompanyName", ""),
+         "AddrLine1":   info.get("CompanyAddr", {}).get("Line1", ""),
+         "City":        info.get("CompanyAddr", {}).get("City", ""),
+         "CountrySubDivisionCode": info.get("CompanyAddr", {}).get("CountrySubDivisionCode", ""),
+         "PostalCode":  info.get("CompanyAddr", {}).get("PostalCode", ""),
+         "Phone":       info.get("PrimaryPhone", {}).get("FreeFormNumber", ""),
+     }
 
 
-def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers):
+def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers, env_override=None):
     """
-    Calls the QuickBooks Online API to get the invoice PDF (which
-    contains both the invoice and packing-slip section), and
-    returns the raw PDF bytes.
+    Fetch the invoice PDF from QuickBooks (sandbox or production).
     """
-    url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice/{invoice_id}/pdf"
+    base = get_base_qbo_url(env_override)
+    url = f"{base}/v3/company/{realm_id}/invoice/{invoice_id}/pdf"
     response = requests.get(url, headers={**headers, "Accept": "application/pdf"})
     response.raise_for_status()
     return response.content
-
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
 def build_packing_slip_pdf(order_data_list, boxes, company_info):
@@ -475,15 +476,15 @@ def update_sheet_cell(sheet_id, sheet_name, lookup_col, lookup_value, target_col
             break
 
 
-def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id):
+def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id, env_override=None):
     import requests
     import time
     import os
     import json
 
     # ── 1) Try to fetch from QuickBooks ───────────────────────────
-    base_qbo_url = "https://sandbox-quickbooks.api.intuit.com/v3/company"
-    query_url   = f"{base_qbo_url}/{realm_id}/query"
+          base = get_base_qbo_url(env_override)
+          query_url = f"{base}/v3/company/{realm_id}/query"
     query       = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
     response    = requests.get(query_url, headers=quickbooks_headers, params={"query": query})
 
@@ -535,7 +536,7 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     }
 
     # ── 4) Create customer in QuickBooks ──────────────────────────
-    create_url = f"{base_qbo_url}/{realm_id}/customer"
+    create_url = f"{base}/v3/company/{realm_id}/customer"
     res = requests.post(create_url, headers=quickbooks_headers, json=payload)
     if res.status_code in (200, 201):
         data = res.json().get("Customer", {})
@@ -555,8 +556,8 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     # ── Final failure ──────────────────────────────────────────────
     raise Exception(f"❌ Failed to create customer in QuickBooks: {res.text}")
 
-def get_or_create_item_ref(product_name, headers, realm_id):
-    query_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/query"
+def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
+    query_url = f"{base}/v3/company/{realm_id}/query"
     escaped_name = json.dumps(product_name)  # ensures correct quoting
     query = f"SELECT * FROM Item WHERE Name = {escaped_name}"
     response = requests.get(query_url, headers=headers, params={"query": query})
@@ -571,7 +572,7 @@ def get_or_create_item_ref(product_name, headers, realm_id):
 
     print(f"⚠️ Item '{product_name}' not found. Attempting to create...")
 
-    create_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/item"
+    create_url = f"{base}/v3/company/{realm_id}/item"
     payload = {
         "Name": product_name,
         "Type": "NonInventory",
@@ -609,7 +610,7 @@ def get_or_create_item_ref(product_name, headers, realm_id):
         raise Exception(f"❌ Failed to create item '{product_name}' in QBO: {res.text}")
 
 
-def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=None, base_shipping_cost=0.0):
+def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=None, base_shipping_cost=0.0, env_override=None):
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
 
     token = session.get("qbo_token")
@@ -635,6 +636,8 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json"
     }
+    # ── Pick sandbox vs prod for this run ────────────────────
+    base = get_base_qbo_url(env_override)
 
     # Step 1: Get or create customer
     sheet = sh
@@ -673,7 +676,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
         "BillEmail":    { "Address": "sandbox@sample.com" }
     }
 
-    invoice_url = f"https://sandbox-quickbooks.api.intuit.com/v3/company/{realm_id}/invoice"
+    invoice_url = f"{base}/v3/company/{realm_id}/invoice"
     logging.info("📦 Invoice payload about to send to QuickBooks:")
     logging.info(json.dumps(invoice_payload, indent=2))
 
@@ -696,7 +699,13 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
         raise Exception("❌ QuickBooks invoice creation failed or response invalid")
 
     print("✅ Invoice created:", invoice)
-    return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={invoice['Id']}"
+          # ── Build link for sandbox vs. production UI ────────────
+          app_url = (
+              "https://app.qbo.intuit.com"
+              if (env_override or QBO_ENV) == "production"
+              else "https://app.sandbox.qbo.intuit.com"
+          )
+          return f"{app_url}/app/invoice?txnId={invoice['Id']}"
 
 def create_consolidated_invoice_in_quickbooks(order_data_list, shipping_method, tracking_list, base_shipping_cost, sheet):
     logging.info("📦 Incoming order_data_list:\n%s", json.dumps(order_data_list, indent=2))
@@ -958,6 +967,25 @@ QBO_BASE_URL      = os.environ.get("QBO_BASE_URL")
 QBO_AUTH_URL      = "https://appcenter.intuit.com/connect/oauth2"
 QBO_TOKEN_URL     = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
 QBO_SCOPES        = ["com.intuit.quickbooks.accounting"]
+
+## ── QuickBooks environment configuration ────────────────────────
+QBO_SANDBOX_BASE_URL = os.environ.get(
+    "QBO_SANDBOX_BASE_URL",
+    "https://sandbox-quickbooks.api.intuit.com"
+)  # default sandbox URL
+QBO_PROD_BASE_URL = os.environ.get(
+    "QBO_PROD_BASE_URL",
+    "https://quickbooks.api.intuit.com"
+)
+QBO_ENV = os.environ.get("QBO_ENV", "sandbox").lower()  # 'sandbox' or 'production'
+
+def get_base_qbo_url(env_override: str = None) -> str:
+    """
+    Return the correct QuickBooks API base URL based on env_override or QBO_ENV.
+    """
+    env = (env_override or QBO_ENV).lower()
+    return QBO_PROD_BASE_URL if env == "production" else QBO_SANDBOX_BASE_URL
+## ───────────────────────────────────────────────────────────────
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -2439,6 +2467,7 @@ def company_list():
 @app.route("/api/process-shipment", methods=["POST"])
 def process_shipment():
     data = request.get_json()
+    env_override = data.get("qboEnv")  # either "sandbox" or "production"
     print("📥 Reorder API received:", data)
 
     # 1) Parse incoming
@@ -2518,11 +2547,16 @@ def process_shipment():
         # 5) Create invoice in QBO…
         headers, realm_id = get_quickbooks_credentials()
         invoice_url = create_consolidated_invoice_in_quickbooks(
-            all_order_data, shipping_method, tracking_list=[], base_shipping_cost=0.0, sheet=service
+            all_order_data,
+            shipping_method,
+            tracking_list=[],
+            base_shipping_cost=0.0,
+            sheet=service,
+            env_override=env_override
         )
 
         # fetch your company’s info
-        company_info = fetch_company_info(headers, realm_id)
+        company_info = fetch_company_info(headers, realm_id, env_override)
 
         # 6) Generate packing‐slip PDF with real company_info
         pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
