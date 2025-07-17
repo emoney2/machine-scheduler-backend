@@ -733,7 +733,10 @@ def create_consolidated_invoice_in_quickbooks(
     # ── 1) Get QBO credentials ──────────────────────────────────────
     headers, realm_id = get_quickbooks_credentials()
 
-    logging.info("📦 Incoming order_data_list:\n%s", json.dumps(order_data_list, indent=2))
+    logging.info(
+        "📦 Incoming order_data_list:\n%s",
+        json.dumps(order_data_list, indent=2)
+    )
 
     # ── 2) Find or create the customer ──────────────────────────────
     first_order = order_data_list[0]
@@ -742,7 +745,7 @@ def create_consolidated_invoice_in_quickbooks(
         sheet,
         headers,
         realm_id,
-        env_override  # propagate override
+        env_override
     )
 
     # ── 3) Build line items ─────────────────────────────────────────
@@ -754,12 +757,18 @@ def create_consolidated_invoice_in_quickbooks(
         if re.search(r"\s+Back$", raw_name, flags=re.IGNORECASE):
             continue
 
-        product_base = re.sub(r"\s+(Front|Full)$", "", raw_name, flags=re.IGNORECASE).strip()
-        design_name  = order.get("Design", "").strip()
+        product_base = re.sub(
+            r"\s+(Front|Full)$", "", raw_name, flags=re.IGNORECASE
+        ).strip()
+        design_name = order.get("Design", "").strip()
 
         # Parse shipped quantity (fallback to other fields)
         try:
-            raw_qty = order.get("ShippedQty") or order.get("Shipped") or order.get("Quantity")
+            raw_qty = (
+                order.get("ShippedQty")
+                or order.get("Shipped")
+                or order.get("Quantity")
+            )
             shipped_qty = int(float(raw_qty))
             if shipped_qty <= 0:
                 continue
@@ -785,7 +794,10 @@ def create_consolidated_invoice_in_quickbooks(
             "Amount":     round(shipped_qty * price, 2),
             "Description": design_name,
             "SalesItemLineDetail": {
-                "ItemRef":   { "value": item_ref["value"], "name": item_ref["name"] },
+                "ItemRef":  {
+                    "value": item_ref["value"],
+                    "name":  item_ref["name"]
+                },
                 "Qty":        shipped_qty,
                 "UnitPrice":  price
             }
@@ -800,13 +812,16 @@ def create_consolidated_invoice_in_quickbooks(
         "Line":         line_items,
         "TxnDate":      datetime.now().strftime("%Y-%m-%d"),
         "TotalAmt":     round(sum(item["Amount"] for item in line_items), 2),
-        "SalesTermRef": { "value": "3" },
-        "BillEmail":    { "Address": "sandbox@sample.com" }
+        "SalesTermRef": {"value": "3"},
+        "BillEmail":    {"Address": "sandbox@sample.com"}
     }
 
     # ── 5) Send to QuickBooks ───────────────────────────────────────
     url = f"{base}/v3/company/{realm_id}/invoice"
-    logging.info("📦 Invoice payload:\n%s", json.dumps(invoice_payload, indent=2))
+    logging.info(
+        "📦 Invoice payload:\n%s",
+        json.dumps(invoice_payload, indent=2)
+    )
 
     res = requests.post(
         url,
