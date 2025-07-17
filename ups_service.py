@@ -1,132 +1,100 @@
 import os
+import time
 import requests
-import xmltodict
 
-# Load your UPS credentials from environment
-UPS_ACCESS_KEY = os.getenv("UPS_ACCESS_KEY")
-UPS_USERNAME   = os.getenv("UPS_USERNAME")
-UPS_PASSWORD   = os.getenv("UPS_PASSWORD")
+# Pull these from your .env
+UPS_CLIENT_ID     = os.getenv("UPS_CLIENT_ID")
+UPS_CLIENT_SECRET = os.getenv("UPS_CLIENT_SECRET")
+UPS_ACCOUNT       = os.getenv("UPS_ACCOUNT")
 
-# Base URL for UPS rate API (use the sandbox/testing endpoint for now)
-UPS_RATE_URL = "https://wwwcie.ups.com/rest/Rate"  # test endpoint
+# Sandbox endpoints
+OAUTH_URL = "https://wwwcie.ups.com/security/v1/oauth/token"
+RATE_URL  = "https://wwwcie.ups.com/ship/v1/rating/Rate"
+
+# Simple in‑process token cache
+_token_cache = {}
+
+def _get_access_token():
+    now = time.time()
+    # reuse until ~1min before expiry
+    if _token_cache and _token_cache["expires_at"] > now:
+        return _token_cache["access_token"]
+
+    resp = requests.post(
+        OAUTH_URL,
+        auth=(UPS_CLIENT_ID, UPS_CLIENT_SECRET),
+        data={"grant_type": "client_credentials"}
+    )
+    resp.raise_for_status()
+    token_data = resp.json()
+    access_token = token_data["access_token"]
+    # expires_in is in seconds
+    expires_in = token_data.get("expires_in", 86400)
+    _token_cache.update({
+        "access_token": access_token,
+        "expires_at": now + expires_in - 60
+    })
+    return access_token
 
 def get_rate(shipper, recipient, packages):
     """
-    Query UPS Rates API.
-
-    :param shipper: dict with keys: 'Name','AttentionName','Phone','Address':{…}
-    :param recipient: same shape as shipper
-    :param packages: list of dicts, each with 'Weight' and optionally 'Dimensions'
-    :returns: parsed dict of UPS response
+    :param shipper:    {Name,AttentionName,Phone,Address:{…}}
+    :param recipient:  same shape as shipper
+    :param packages:   list of {Weight, Dimensions?} dicts
+    :returns:          list of rates: [{serviceCode, method, rate, currency, deliveryDate}, …]
     """
-    # 1) Build the XML request
-    # TODO: fill in build_rate_request_xml(...)
-    xml_request = build_rate_request_xml(shipper, recipient, packages)
+    token = _get_access_token()
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
 
-    # 2) POST it
-    resp = requests.post(
-        UPS_RATE_URL,
-        data=xml_request,
-        headers={"Content-Type": "application/xml"}
-    )
-    resp.raise_for_status()
+    # Build the core Shipment block
+    shipment = {
+        "Shipper":   {**shipper,   "ShipperNumber": UPS_ACCOUNT},
+        "ShipTo":    recipient,
+        "ShipFrom":  shipper,
+        "Package":   []
+    }
 
-    # 3) Parse XML → Python dict
-    return xmltodict.parse(resp.text)
-
-def build_rate_request_xml(shipper, recipient, packages):
-    # AccessRequest as before…
-    access_request = f"""
-    <?xml version="1.0"?>
-    <AccessRequest>
-      <AccessLicenseNumber>{UPS_ACCESS_KEY}</AccessLicenseNumber>
-      <UserId>{UPS_USERNAME}</UserId>
-      <Password>{UPS_PASSWORD}</Password>
-    </AccessRequest>
-    """
-
-    # Build Shipment element
-    # 1) Shipper
-    shipper_xml = f"""
-    <Shipper>
-      <Name>{shipper['Name']}</Name>
-      <AttentionName>{shipper['AttentionName']}</AttentionName>
-      <PhoneNumber>{shipper['Phone']}</PhoneNumber>
-      <ShipperNumber>{UPS_ACCESS_KEY}</ShipperNumber>
-      <Address>
-        <AddressLine1>{shipper['Address']['AddressLine1']}</AddressLine1>
-        <City>{shipper['Address']['City']}</City>
-        <StateProvinceCode>{shipper['Address']['StateProvinceCode']}</StateProvinceCode>
-        <PostalCode>{shipper['Address']['PostalCode']}</PostalCode>
-        <CountryCode>{shipper['Address']['CountryCode']}</CountryCode>
-      </Address>
-    </Shipper>
-    """
-
-    # 2) ShipTo (recipient)
-    shipto_xml = f"""
-    <ShipTo>
-      <Name>{recipient['Name']}</Name>
-      <AttentionName>{recipient['AttentionName']}</AttentionName>
-      <PhoneNumber>{recipient['Phone']}</PhoneNumber>
-      <Address>
-        <AddressLine1>{recipient['Address']['AddressLine1']}</AddressLine1>
-        <City>{recipient['Address']['City']}</City>
-        <StateProvinceCode>{recipient['Address']['StateProvinceCode']}</StateProvinceCode>
-        <PostalCode>{recipient['Address']['PostalCode']}</PostalCode>
-        <CountryCode>{recipient['Address']['CountryCode']}</CountryCode>
-      </Address>
-    </ShipTo>
-    """
-
-    # 3) Packages
-    packages_xml = ""
     for pkg in packages:
         dims = pkg.get("Dimensions", {})
-        dim_xml = ""
+        pkg_obj = {
+            "PackagingType": {"Code": pkg.get("PackagingType", "02")},
+            "PackageWeight": {
+                "UnitOfMeasurement": {"Code": "LBS"},
+                "Weight": str(pkg["Weight"])
+            }
+        }
         if dims:
-            dim_xml = f"""
-            <Dimensions>
-              <UnitOfMeasurement><Code>IN</Code></UnitOfMeasurement>
-              <Length>{dims['Length']}</Length>
-              <Width>{dims['Width']}</Width>
-              <Height>{dims['Height']}</Height>
-            </Dimensions>
-            """
-        packages_xml += f"""
-        <Package>
-          <PackagingType>
-            <Code>02</Code><!-- Customer Supplied Package -->
-          </PackagingType>
-          {dim_xml}
-          <PackageWeight>
-            <UnitOfMeasurement><Code>LBS</Code></UnitOfMeasurement>
-            <Weight>{pkg['Weight']}</Weight>
-          </PackageWeight>
-        </Package>
-        """
+            pkg_obj["Dimensions"] = {
+                "UnitOfMeasurement": {"Code": "IN"},
+                "Length": str(dims["Length"]),
+                "Width":  str(dims["Width"]),
+                "Height": str(dims["Height"])
+            }
+        shipment["Package"].append(pkg_obj)
 
-    # Wrap Shipment with those parts
-    rate_request = f"""
-    <?xml version="1.0"?>
-    <RatingServiceSelectionRequest>
-      <Request>
-        <TransactionReference>
-          <CustomerContext>Rate Request</CustomerContext>
-        </TransactionReference>
-        <RequestAction>Rate</RequestAction>
-        <RequestOption>Shop</RequestOption>
-      </Request>
-      <Shipment>
-        {shipper_xml}
-        {shipto_xml}
-        {packages_xml}
-      </Shipment>
-    </RatingServiceSelectionRequest>
-    """
+    payload = {
+        "RateRequest": {
+            "Request": {"RequestOption": "Rate"},
+            "Shipment": shipment
+        }
+    }
 
-    # Combine and return
-    return access_request + rate_request
+    resp = requests.post(RATE_URL, json=payload, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
 
-    # Combine the two documents in one POST body:
-    return access_request + rate_request
+    results = []
+    for rs in data.get("RateResponse", {}).get("RatedShipment", []):
+        svc     = rs["Service"]
+        charges = rs["TotalCharges"]
+        results.append({
+            "serviceCode": svc["Code"],
+            "method":      svc.get("Description", ""),
+            "rate":        charges["MonetaryValue"],
+            "currency":    charges["CurrencyCode"],
+            "deliveryDate": rs.get("GuaranteedDelivery", {}).get("Date", "")
+        })
+    return results
