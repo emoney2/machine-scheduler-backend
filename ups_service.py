@@ -15,8 +15,9 @@ if not (UPS_CLIENT_ID and UPS_CLIENT_SECRET and UPS_ACCOUNT):
         "UPS credentials not set – check UPS_CLIENT_ID, UPS_CLIENT_SECRET & UPS_ACCOUNT"
     )
 
-OAUTH_URL = "https://wwwcie.ups.com/security/v1/oauth/token"
-RATE_URL  = "https://wwwcie.ups.com/ship/v1/rating/Rate"
+# ← PRODUCTION OAuth2 & Rate endpoints
+OAUTH_URL = "https://onlinetools.ups.com/security/v1/oauth/token"
+RATE_URL  = "https://onlinetools.ups.com/ship/v1/rating/Rate"
 
 _token_cache = {}
 
@@ -30,13 +31,13 @@ def _get_access_token():
         auth=(UPS_CLIENT_ID, UPS_CLIENT_SECRET),
         data={"grant_type": "client_credentials"}
     )
-    # **Debug**: print status + body of the token response
-    print("🔑 UPS OAuth status:", resp.status_code, "body:", resp.text)
+    # debug
+    print("🔑 OAuth status:", resp.status_code, "body:", resp.text)
     resp.raise_for_status()
 
-    token_data = resp.json()
-    access_token = token_data["access_token"]
-    expires_in   = int(token_data.get("expires_in", 86400))
+    tk = resp.json()
+    access_token = tk["access_token"]
+    expires_in   = int(tk.get("expires_in", 86400))
     _token_cache.update({
         "access_token": access_token,
         "expires_at":    now + expires_in - 60
@@ -56,6 +57,7 @@ def get_rate(shipper, recipient, packages):
         "ShipFrom":  shipper,
         "Package":   []
     }
+
     for pkg in packages:
         dims = pkg.get("Dimensions", {})
         pkg_obj = {
@@ -81,12 +83,12 @@ def get_rate(shipper, recipient, packages):
         }
     }
 
-    # **Debug**: print the JSON we’re sending to UPS
-    print("📦 UPS Rate payload:", json.dumps(payload))
+    # debug
+    print("📦 Rate payload:", json.dumps(payload))
 
     resp = requests.post(RATE_URL, json=payload, headers=headers)
-    # **Debug**: print status + body of the rate response
-    print("🚚 UPS Rate status:", resp.status_code, "body:", resp.text)
+    # debug
+    print("🚚 Rate status:", resp.status_code, "body:", resp.text)
     resp.raise_for_status()
 
     data = resp.json()
