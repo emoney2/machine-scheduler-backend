@@ -2252,7 +2252,7 @@ def material_inventory_preflight():
 def submit_material_inventory():
     """
     1. Appends entries to Material Log!A2:H
-    2. Ensures new materials/threads are added to Material Inventory
+    2. Adds new materials/threads to correct inventory section (Material: A, Thread: J)
     """
     raw = request.get_json(silent=True) or []
     items = raw if isinstance(raw, list) else [raw]
@@ -2260,63 +2260,56 @@ def submit_material_inventory():
     now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
     log_rows = []
 
-    # Load Material Inventory sheet once
     inv_sheet = sh.worksheet("Material Inventory")
-    inv_data = inv_sheet.get_all_values()
 
     for it in items:
-        print("🔍 Item:", it)  # Debug print
+        print("📦 Incoming item:", it)
 
         name = it.get("materialName", "").strip()
         action = it.get("action", "").strip()
         qty = it.get("quantity", "").strip()
         notes = it.get("notes", "").strip()
-        mat_type = it.get("type", "").strip()  # "Material" or "Thread"
-        unit = it.get("unit", "").strip()      # optional
+        mat_type = it.get("type", "").strip()
+        unit = it.get("unit", "").strip()
 
         if not (name and action and qty and mat_type):
-            continue  # skip invalid entries
+            print("⚠️ Skipping item due to missing fields")
+            continue
 
-        # ───── Append to Material Log (A2:H) ─────
+        # ── Log row for Material Log tab
         log_rows.append([
-            now,    # A: Timestamp
-            "",     # B
-            "",     # C
-            "",     # D
-            "",     # E
-            name,   # F: Material Name
-            qty,    # G: Quantity
-            "IN",   # H: fixed “IN”
-            action  # I: Ordered/Received
+            now, "", "", "", "",  # B–E
+            name, qty, "IN", action
         ])
 
-        # ───── Add to Material Inventory if not already there ─────
         is_thread = mat_type.lower() == "thread"
         name_col = 9 if is_thread else 0   # J or A
         qty_col  = 10 if is_thread else 1  # K or B
         unit_col = 11 if is_thread else 2  # L or C
 
-        # 1) See if already exists
-        found = False
-        for i, row in enumerate(inv_data[1:], start=2):
-            cell_val = row[name_col].strip() if len(row) > name_col else ""
-            if cell_val.lower() == name.lower():
-                found = True
+        # 1. Check if already exists
+        existing = inv_sheet.col_values(name_col + 1)
+        exists = any(cell.strip().lower() == name.lower() for cell in existing[1:])  # skip header
+
+        if exists:
+            print(f"🟡 {name} already exists in inventory column {chr(65 + name_col)}")
+            continue
+
+        # 2. Find first empty cell in correct column
+        for i in range(2, len(existing) + 10):  # search a few rows beyond current
+            cell_val = inv_sheet.cell(i, name_col + 1).value
+            if not cell_val:
+                print(f"✅ Inserting {name} into row {i}")
+                inv_sheet.update_cell(i, name_col + 1, name)
+                inv_sheet.update_cell(i, qty_col + 1, qty)
+                inv_sheet.update_cell(i, unit_col + 1, unit)
                 break
+        else:
+            print(f"❌ No empty slot found in column {chr(65 + name_col)}")
 
-        # 2) If not found, insert into the correct column set (Material or Thread)
-        if not found:
-            for i, row in enumerate(inv_data[1:], start=2):
-                cell_val = row[name_col].strip() if len(row) > name_col else ""
-                if not cell_val:
-                    inv_sheet.update_cell(i, name_col + 1, name)
-                    inv_sheet.update_cell(i, qty_col + 1, qty)
-                    inv_sheet.update_cell(i, unit_col + 1, unit)
-                    print(f"✅ Inserted new {mat_type} at row {i}")
-                    break
-
-    # ✅ Append all logs at once
+    # Write to Material Log
     if log_rows:
+        print(f"🧾 Appending {len(log_rows)} rows to Material Log")
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Material Log!A2:H",
@@ -2324,10 +2317,10 @@ def submit_material_inventory():
             insertDataOption="INSERT_ROWS",
             body={"values": log_rows}
         ).execute()
+    else:
+        print("⚠️ No valid log rows to append")
 
     return jsonify({"status": "submitted"}), 200
-
-
 
 
 @app.route("/api/products", methods=["GET"])
