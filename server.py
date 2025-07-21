@@ -2267,7 +2267,7 @@ def submit_material_inventory():
         logging.info("📦 Incoming item: %s", it)
 
         name     = it.get("materialName", "").strip()
-        type_    = it.get("type", "").strip()
+        type_    = it.get("type", "").strip()      # Material or Thread
         unit     = it.get("unit", "").strip()
         min_inv  = it.get("minInv", "").strip()
         reorder  = it.get("reorder", "").strip()
@@ -2284,7 +2284,7 @@ def submit_material_inventory():
         # Fetch current inventory sheet
         resp = sheet.get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A1:O1000").execute()
         values = resp.get("values", [])
-        rows = values[1:]  # Skip header
+        rows = values[1:]  # skip header
 
         target_row = None
         if type_ == "Material":
@@ -2301,15 +2301,16 @@ def submit_material_inventory():
         logging.info("📌 Target row for inventory insert: %s", target_row)
 
         if target_row:
-            A = f"A{target_row}"
-            B = f"B{target_row}"
-            C = f"C{target_row}"
-            G = f"G{target_row}"
-            H = f"H{target_row}"
+            # Fetch formulas from row 2 to replicate
+            row2 = sheet.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Material Inventory!A2:O2",
+                valueRenderOption="FORMULA"
+            ).execute().get("values", [[]])[0]
 
-            inventory_formula = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!G:G))'
-            on_order_formula = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!C:C))'
-            value_formula = f'=IF({A}="","",{G}*({B}+{C}))'
+            inventory_formula = row2[1].replace("A2", f"A{target_row}") if len(row2) > 1 else ""
+            on_order_formula  = row2[2].replace("A2", f"A{target_row}") if len(row2) > 2 else ""
+            value_formula     = row2[7].replace("A2", f"A{target_row}") if len(row2) > 7 else ""
 
             values = [[
                 name,               # A - Material
@@ -2320,7 +2321,7 @@ def submit_material_inventory():
                 reorder,            # F - Reorder
                 cost,               # G - Cost
                 value_formula,      # H - Value
-                "", "", "", "", "", ""  # I–O Thread Columns
+                "", "", "", "", "", ""  # I–O Thread columns
             ]]
 
             write_range = f"Material Inventory!A{target_row}:O{target_row}"
@@ -2331,10 +2332,10 @@ def submit_material_inventory():
                 body={"values": values}
             ).execute()
 
-            # Log to Material Log
-            log_rows.append([
-                timestamp, "", "", "", "", name, qty, "IN", action
-            ])
+        # Log to Material Log
+        log_rows.append([
+            timestamp, "", "", "", "", name, qty, "IN", action
+        ])
 
     logging.info("🧾 Appending material log row: %s", log_rows)
 
@@ -2348,6 +2349,7 @@ def submit_material_inventory():
         ).execute()
 
     return jsonify({"status": "submitted"}), 200
+
 
 @app.route("/api/products", methods=["GET"])
 @login_required_session
