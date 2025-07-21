@@ -2263,7 +2263,7 @@ def submit_material_inventory():
     inv_sheet = sh.worksheet("Material Inventory")
 
     for it in items:
-        print("📦 Incoming item:", it)
+        logging.info("📦 Incoming item: %s", it)
 
         name = it.get("materialName", "").strip()
         action = it.get("action", "").strip()
