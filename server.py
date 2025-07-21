@@ -2300,14 +2300,29 @@ def submit_material_inventory():
 
         logging.info("📌 Target row for inventory insert: %s", target_row)
 
-        if target_row:
-            write_range = f"Material Inventory!A{target_row}:P{target_row}"
-            values = [[
-                name, cost, "", unit, min_inv, reorder, "", "", "",
-                name if type_ == "Thread" else "",  # J
-                cost if type_ == "Thread" else "",  # K
-                "", "", "", "", notes
-            ]]
+   if target_row:
+       A = f"A{target_row}"
+       B = f"B{target_row}"
+       C = f"C{target_row}"
+       G = f"G{target_row}"
+       H = f"H{target_row}"
+
+       inventory_formula = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!G:G))'
+       on_order_formula = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!C:C))'
+       value_formula = f'=IF({A}="","",{G}*({B}+{C}))'
+
+       values = [[
+           name,               # A - Material
+           inventory_formula,  # B - Inventory
+           on_order_formula,   # C - On Order
+           unit,               # D - Unit
+           min_inv,            # E - Min Inv
+           reorder,            # F - Reorder
+           cost,               # G - Cost
+           value_formula,      # H - Value
+           "", "", "", "", "", ""  # I–O Thread Columns
+       ]]
+
             sheet.update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=write_range,
