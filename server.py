@@ -2254,27 +2254,28 @@ def submit_material_inventory():
     1. Appends entries to Material Log!A2:H
     2. Ensures new materials/threads are added to Material Inventory
     """
-    raw   = request.get_json(silent=True) or []
+    raw = request.get_json(silent=True) or []
     items = raw if isinstance(raw, list) else [raw]
 
-    now      = datetime.now(ZoneInfo("America/New_York"))\
-                    .strftime("%-m/%-d/%Y %H:%M:%S")
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
     log_rows = []
 
-    # Load Material Inventory sheet
+    # Load Material Inventory sheet once
     inv_sheet = sh.worksheet("Material Inventory")
-    inv_data  = inv_sheet.get_all_values()
+    inv_data = inv_sheet.get_all_values()
 
     for it in items:
-        name   = it.get("materialName", "").strip()
+        print("🔍 Item:", it)  # Debug print
+
+        name = it.get("materialName", "").strip()
         action = it.get("action", "").strip()
-        qty    = it.get("quantity", "").strip()
-        notes  = it.get("notes", "").strip()
+        qty = it.get("quantity", "").strip()
+        notes = it.get("notes", "").strip()
         mat_type = it.get("type", "").strip()  # "Material" or "Thread"
-        unit   = it.get("unit", "").strip()    # optional
+        unit = it.get("unit", "").strip()      # optional
 
         if not (name and action and qty and mat_type):
-            continue
+            continue  # skip invalid entries
 
         # ───── Append to Material Log (A2:H) ─────
         log_rows.append([
@@ -2289,26 +2290,32 @@ def submit_material_inventory():
             action  # I: Ordered/Received
         ])
 
-        # ───── Add to Inventory if not already there ─────
+        # ───── Add to Material Inventory if not already there ─────
         is_thread = mat_type.lower() == "thread"
-        name_col = 9 if is_thread else 0  # J or A
-        qty_col  = 10 if is_thread else 1
-        unit_col = 11 if is_thread else 2
+        name_col = 9 if is_thread else 0   # J or A
+        qty_col  = 10 if is_thread else 1  # K or B
+        unit_col = 11 if is_thread else 2  # L or C
 
+        # 1) See if already exists
         found = False
         for i, row in enumerate(inv_data[1:], start=2):
-            if len(row) > name_col and row[name_col].strip().lower() == name.lower():
+            cell_val = row[name_col].strip() if len(row) > name_col else ""
+            if cell_val.lower() == name.lower():
                 found = True
                 break
 
+        # 2) If not found, insert into the correct column set (Material or Thread)
         if not found:
             for i, row in enumerate(inv_data[1:], start=2):
-                if len(row) <= name_col or not row[name_col].strip():
+                cell_val = row[name_col].strip() if len(row) > name_col else ""
+                if not cell_val:
                     inv_sheet.update_cell(i, name_col + 1, name)
                     inv_sheet.update_cell(i, qty_col + 1, qty)
                     inv_sheet.update_cell(i, unit_col + 1, unit)
+                    print(f"✅ Inserted new {mat_type} at row {i}")
                     break
 
+    # ✅ Append all logs at once
     if log_rows:
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
@@ -2319,6 +2326,7 @@ def submit_material_inventory():
         ).execute()
 
     return jsonify({"status": "submitted"}), 200
+
 
 
 
