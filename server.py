@@ -2747,9 +2747,9 @@ def set_product_specs():
         target = f"Table!{col}{row_index}"
         sheet.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=target,
-            valueInputOption="RAW",
-            body={"values": [[ val ]]}
+            range=f"Material Inventory!A{target_row}:P{target_row}",  # <- now includes column P
+            valueInputOption="USER_ENTERED",
+            body={"values": [inventory_row]}
         ).execute()
 
     return jsonify({"status": "ok"}), 200
