@@ -2251,9 +2251,8 @@ def material_inventory_preflight():
 @login_required_session
 def submit_material_inventory():
     """
-    Only appends entries to Material Log!A2:H
-    Expects JSON array (or single object) with:
-      materialName, action (Ordered/Received), quantity, notes?
+    1. Appends entries to Material Log!A2:H
+    2. Ensures new materials/threads are added to Material Inventory
     """
     raw   = request.get_json(silent=True) or []
     items = raw if isinstance(raw, list) else [raw]
@@ -2262,27 +2261,53 @@ def submit_material_inventory():
                     .strftime("%-m/%-d/%Y %H:%M:%S")
     log_rows = []
 
-    for it in items:
-        name   = it.get("materialName","").strip()
-        action = it.get("action","").strip()
-        qty    = it.get("quantity","").strip()
-        notes  = it.get("notes","").strip()
+    # Load Material Inventory sheet
+    inv_sheet = sh.worksheet("Material Inventory")
+    inv_data  = inv_sheet.get_all_values()
 
-        if not (name and action and qty):
+    for it in items:
+        name   = it.get("materialName", "").strip()
+        action = it.get("action", "").strip()
+        qty    = it.get("quantity", "").strip()
+        notes  = it.get("notes", "").strip()
+        mat_type = it.get("type", "").strip()  # "Material" or "Thread"
+        unit   = it.get("unit", "").strip()    # optional
+
+        if not (name and action and qty and mat_type):
             continue
 
-        # build the log row: columns A–H of Material Log
+        # ───── Append to Material Log (A2:H) ─────
         log_rows.append([
             now,    # A: Timestamp
             "",     # B
             "",     # C
             "",     # D
             "",     # E
-            name,   # F: Material name
+            name,   # F: Material Name
             qty,    # G: Quantity
             "IN",   # H: fixed “IN”
-            action  # I: O/R (“Ordered” or “Received”)
+            action  # I: Ordered/Received
         ])
+
+        # ───── Add to Inventory if not already there ─────
+        is_thread = mat_type.lower() == "thread"
+        name_col = 9 if is_thread else 0  # J or A
+        qty_col  = 10 if is_thread else 1
+        unit_col = 11 if is_thread else 2
+
+        found = False
+        for i, row in enumerate(inv_data[1:], start=2):
+            if len(row) > name_col and row[name_col].strip().lower() == name.lower():
+                found = True
+                break
+
+        if not found:
+            for i, row in enumerate(inv_data[1:], start=2):
+                if len(row) <= name_col or not row[name_col].strip():
+                    inv_sheet.update_cell(i, name_col + 1, name)
+                    inv_sheet.update_cell(i, qty_col + 1, qty)
+                    inv_sheet.update_cell(i, unit_col + 1, unit)
+                    break
 
     if log_rows:
         sheets.values().append(
@@ -2293,7 +2318,8 @@ def submit_material_inventory():
             body={"values": log_rows}
         ).execute()
 
-    return jsonify({"status":"submitted"}), 200
+    return jsonify({"status": "submitted"}), 200
+
 
 
 @app.route("/api/products", methods=["GET"])
