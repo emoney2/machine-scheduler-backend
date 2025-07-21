@@ -2267,7 +2267,7 @@ def submit_material_inventory():
         logging.info("📦 Incoming item: %s", it)
 
         name     = it.get("materialName", "").strip()
-        type_    = it.get("type", "").strip()      # Material or Thread
+        type_    = it.get("type", "").strip()
         unit     = it.get("unit", "").strip()
         min_inv  = it.get("minInv", "").strip()
         reorder  = it.get("reorder", "").strip()
@@ -2281,46 +2281,48 @@ def submit_material_inventory():
         if not (name and qty and type_):
             continue
 
-        # Fetch current inventory sheet
+        # Fetch sheet data
         resp = sheet.get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A1:O1000").execute()
         values = resp.get("values", [])
-        rows = values[1:]  # skip header
+        rows = values[1:]
 
         target_row = None
-        if type_ == "Material":
-            for i, row in enumerate(rows, start=2):
-                if not row or not row[0].strip():  # Column A empty
-                    target_row = i
-                    break
-        elif type_ == "Thread":
-            for i, row in enumerate(rows, start=2):
-                if len(row) < 10 or not row[9].strip():  # Column J empty
-                    target_row = i
-                    break
+        for i, row in enumerate(rows, start=2):
+            if type_ == "Material" and (not row or not row[0].strip()):
+                target_row = i
+                break
+            elif type_ == "Thread" and (len(row) < 10 or not row[9].strip()):
+                target_row = i
+                break
 
         logging.info("📌 Target row for inventory insert: %s", target_row)
 
-        if target_row:
-            # Fetch formulas from row 2 to replicate
-            row2 = sheet.get(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Material Inventory!A2:O2",
-                valueRenderOption="FORMULA"
-            ).execute().get("values", [[]])[0]
+        if type_ == "Material" and target_row:
+            A = f"A{target_row}"
+            B = f"B{target_row}"
+            C = f"C{target_row}"
+            G = f"G{target_row}"
+            H = f"H{target_row}"
 
-            inventory_formula = row2[1].replace("A2", f"A{target_row}") if len(row2) > 1 else ""
-            on_order_formula  = row2[2].replace("A2", f"A{target_row}") if len(row2) > 2 else ""
-            value_formula     = row2[7].replace("A2", f"A{target_row}") if len(row2) > 7 else ""
+            # Fetch formula from row 2 column H
+            value_formula_row2 = values[1][7] if len(values) > 1 and len(values[1]) > 7 else "=G2*(B2+C2)"
+            value_formula = value_formula_row2 \
+                .replace("G2", G) \
+                .replace("B2", B) \
+                .replace("C2", C)
 
-            values = [[
+            inventory_formula = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!G:G))'
+            on_order_formula  = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!C:C))'
+
+            values_to_write = [[
                 name,               # A - Material
-                inventory_formula,  # B - Inventory
-                on_order_formula,   # C - On Order
-                unit,               # D - Unit
-                min_inv,            # E - Min Inv
-                reorder,            # F - Reorder
-                cost,               # G - Cost
-                value_formula,      # H - Value
+                inventory_formula,  # B
+                on_order_formula,   # C
+                unit,               # D
+                min_inv,            # E
+                reorder,            # F
+                cost,               # G
+                value_formula,      # H
                 "", "", "", "", "", ""  # I–O Thread columns
             ]]
 
@@ -2329,10 +2331,10 @@ def submit_material_inventory():
                 spreadsheetId=SPREADSHEET_ID,
                 range=write_range,
                 valueInputOption="USER_ENTERED",
-                body={"values": values}
+                body={"values": values_to_write}
             ).execute()
 
-        # Log to Material Log
+        # Append to Material Log
         log_rows.append([
             timestamp, "", "", "", "", name, qty, "IN", action
         ])
