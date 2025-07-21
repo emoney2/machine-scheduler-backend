@@ -2301,7 +2301,7 @@ def submit_material_inventory():
         logging.info("📌 Target row for inventory insert: %s", target_row)
 
         if target_row:
-            write_range = f"Material Inventory!A{target_row}:O{target_row}"
+            write_range = f"Material Inventory!A{target_row}:P{target_row}"
             values = [[
                 name, cost, "", unit, min_inv, reorder, "", "", "",
                 name if type_ == "Thread" else "",  # J
