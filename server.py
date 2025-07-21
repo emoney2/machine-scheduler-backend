@@ -2257,7 +2257,7 @@ def submit_material_inventory():
     items = request.get_json(silent=True) or []
     items = items if isinstance(items, list) else [items]
 
-    sheet = SHEETS.spreadsheet().values()
+    sheet = sheets.values()
     timestamp = datetime.now(ZoneInfo("America/New_York"))\
         .strftime("%-m/%-d/%Y %H:%M:%S")
 
@@ -2332,8 +2332,6 @@ def submit_material_inventory():
         ).execute()
 
     return jsonify({"status": "submitted"}), 200
-
-
 
 @app.route("/api/products", methods=["GET"])
 @login_required_session
