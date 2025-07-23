@@ -2294,14 +2294,18 @@ def submit_material_inventory():
            (type_ == "Thread" and name.lower() in thread_names):
             logging.info("⏩ Skipping duplicate: %s", name)
         else:
-            target_row = None
-            for i, row in enumerate(rows, start=2):
-                if type_ == "Material" and (not row or not row[0].strip()):
-                    target_row = i
-                    break
-                elif type_ == "Thread" and (len(row) < 10 or not row[9].strip()):
-                    target_row = i
-                    break
+     target_row = None
+     for i, row in enumerate(rows, start=2):
+         if type_ == "Material" and (not row or not row[0].strip()):
+             target_row = i
+             break
+         elif type_ == "Thread" and (len(row) < 10 or not row[9].strip()):
+             target_row = i
+             break
+
+     # If we didn’t find any blank row in the returned data, append at the bottom
+     if target_row is None:
+         target_row = len(rows) + 2
 
             logging.info("📌 Target row for inventory insert: %s", target_row)
 
