@@ -2251,11 +2251,11 @@ def material_inventory_preflight():
 @login_required_session
 def submit_material_inventory():
     """
-    Handles adding new materials or threads to the Material Inventory tab
-    by copying formulas from row 2 (FORMULA mode) and
-    logs entries to Material Log (for materials) or Thread Data (for threads).
+    Handles adding new materials (cols A–H) or threads (cols J–O) to the
+    Material Inventory sheet by copying row 2 formulas, and logs everything
+    into Material Log or Thread Data.
     """
-    # 1) Parse incoming payload
+    # 1) Pull in the payload (array or single object)
     items = request.get_json(silent=True) or []
     items = items if isinstance(items, list) else [items]
 
@@ -2266,37 +2266,35 @@ def submit_material_inventory():
     material_log_rows = []
     thread_log_rows   = []
 
-    # 2) Fetch row 2 formulas in FORMULA mode
+    # 2) Grab the master formulas from row 2 (FORMULA mode)
     formula_resp = sheet.get(
         spreadsheetId=SPREADSHEET_ID,
         range="Material Inventory!A2:O2",
         valueRenderOption="FORMULA"
     ).execute()
-    formula_values = formula_resp.get("values", [])
-    formula_row = formula_values[0] if formula_values else []
+    formula_row = (formula_resp.get("values") or [[]])[0]
 
-    inv_tpl             = str(formula_row[1])  if len(formula_row) > 1  else ""
-    on_order_tpl        = str(formula_row[2])  if len(formula_row) > 2  else ""
-    val_tpl             = str(formula_row[7])  if len(formula_row) > 7  else ""
-    thread_inv_tpl      = str(formula_row[10]) if len(formula_row) > 10 else ""
-    thread_on_order_tpl = str(formula_row[11]) if len(formula_row) > 11 else ""
-    thread_val_tpl      = str(formula_row[14]) if len(formula_row) > 14 else ""
+    inv_tpl             = str(formula_row[1])  if len(formula_row)>1  else ""
+    on_order_tpl        = str(formula_row[2])  if len(formula_row)>2  else ""
+    val_tpl             = str(formula_row[7])  if len(formula_row)>7  else ""
+    thread_inv_tpl      = str(formula_row[10]) if len(formula_row)>10 else ""
+    thread_on_order_tpl = str(formula_row[11]) if len(formula_row)>11 else ""
+    thread_val_tpl      = str(formula_row[14]) if len(formula_row)>14 else ""
 
-    # 3) Fetch existing inventory rows (to detect duplicates & blanks)
+    # 3) Pull existing rows so we can find blanks / detect duplicates
     data_resp = sheet.get(
         spreadsheetId=SPREADSHEET_ID,
         range="Material Inventory!A1:O1000"
     ).execute()
-    values = data_resp.get("values", [])
-    rows   = values[1:]  # skip header
+    all_values = data_resp.get("values", [])
+    rows = all_values[1:]  # skip header
 
-    # 4) Loop through each submitted item
+    # 4) Process each entry
     for it in items:
-        logging.info("📦 Incoming item: %s", it)
-
-        # ← CHANGED: fallback to "value" if no materialName, default type to Material
-        name    = (it.get("materialName") or it.get("value") or "").strip()
-        type_   = (it.get("type") or "").strip() or "Material"
+        # Pull name from materialName (bulk/new‑item) or value (grid)
+        name  = (it.get("materialName") or it.get("value") or "").strip()
+        # Default to Material if type is missing
+        type_ = (it.get("type") or "").strip() or "Material"
 
         unit    = it.get("unit",    "").strip()
         min_inv = it.get("minInv",  "").strip()
@@ -2305,89 +2303,76 @@ def submit_material_inventory():
         action  = it.get("action",  "").strip()
         qty     = it.get("quantity","").strip()
 
-        # skip incomplete submissions
-        if not (name and type_ and qty):
+        # Must have at least a name and a qty
+        if not (name and qty):
             continue
 
-        # detect duplicates
-        existing_materials = {
-            r[0].strip().lower() for r in rows if r and r[0].strip()
-        }
-        existing_threads = {
-            r[9].strip().lower() for r in rows if len(r) > 9 and r[9].strip()
-        }
-        if (type_ == "Material" and name.lower() in existing_materials) or \
-           (type_ == "Thread"   and name.lower() in existing_threads):
+        # Build sets of existing names to skip duplicates
+        existing_materials = {r[0].strip().lower() for r in rows if r and r[0].strip()}
+        existing_threads   = {r[9].strip().lower() for r in rows if len(r)>9 and r[9].strip()}
+
+        # Skip if already present
+        if (type_=="Material" and name.lower() in existing_materials) or \
+           (type_=="Thread"   and name.lower() in existing_threads):
             logging.info("⏩ Skipping duplicate: %s", name)
             continue
 
-        # find first blank slot
+        # 5) Find the first blank slot
         target_row = None
         for i, row in enumerate(rows, start=2):
-            if type_ == "Material" and (not row or not row[0].strip()):
-                target_row = i
-                break
-            if type_ == "Thread" and (len(row) < 10 or not row[9].strip()):
-                target_row = i
-                break
-        # fallback to append
+            if type_ == "Material":
+                # blank if col A is empty
+                if not row or not row[0].strip():
+                    target_row = i
+                    break
+            else:
+                # blank if col I (index 8) is empty
+                if len(row) < 9 or not row[8].strip():
+                    target_row = i
+                    break
+
+        # fallback to append at bottom
         if target_row is None:
             target_row = len(rows) + 2
 
         logging.info("📌 Writing %s at row %s", type_, target_row)
 
+        # 6a) Build the values_to_write for Materials (A–H)
         if type_ == "Material":
-            A = f"A{target_row}"; B = f"B{target_row}"
-            C = f"C{target_row}"; G = f"G{target_row}"
+            A = f"A{target_row}"
+            B = f"B{target_row}"
+            C = f"C{target_row}"
+            G = f"G{target_row}"
             H = f"H{target_row}"
 
-            inventory_formula = re.sub(r"([A-Za-z]+)2",
-                                       lambda m: f"{m.group(1)}{target_row}",
-                                       inv_tpl)
-            on_order_formula = re.sub(r"([A-Za-z]+)2",
-                                      lambda m: f"{m.group(1)}{target_row}",
-                                      on_order_tpl)
-            value_formula = re.sub(r"([A-Za-z]+)2",
-                                   lambda m: f"{m.group(1)}{target_row}",
-                                   val_tpl)
+            inv_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target_row}", inv_tpl)
+            oo_f   = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target_row}", on_order_tpl)
+            val_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target_row}", val_tpl)
 
             values_to_write = [[
-                name,
-                inventory_formula,
-                on_order_formula,
-                unit,
-                min_inv,
-                reorder,
-                cost,
-                value_formula,
+                name, inv_f, oo_f, unit,
+                min_inv, reorder, cost, val_f,
                 "", "", "", "", "", ""
             ]]
+        # 6b) Build for Threads (J–O)
         else:
-            J = f"J{target_row}"; K = f"K{target_row}"
-            L = f"L{target_row}"; O = f"O{target_row}"
+            J = f"J{target_row}"
+            K = f"K{target_row}"
+            L = f"L{target_row}"
+            O = f"O{target_row}"
 
-            inventory_formula = re.sub(r"([A-Za-z]+)2",
-                                       lambda m: f"{m.group(1)}{target_row}",
-                                       thread_inv_tpl)
-            on_order_formula = re.sub(r"([A-Za-z]+)2",
-                                      lambda m: f"{m.group(1)}{target_row}",
-                                      thread_on_order_tpl)
-            value_formula = re.sub(r"([A-Za-z]+)2",
-                                   lambda m: f"{m.group(1)}{target_row}",
-                                   thread_val_tpl)
+            inv_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target_row}", thread_inv_tpl)
+            oo_f   = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target_row}", thread_on_order_tpl)
+            val_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target_row}", thread_val_tpl)
 
             values_to_write = [[
                 "", "", "", "", "", "", "", "",  # A–H blank
                 "",                               # I blank
-                name,
-                inventory_formula,
-                on_order_formula,
-                min_inv,
-                reorder,
-                value_formula
+                name, inv_f, oo_f,
+                min_inv, reorder, val_f
             ]]
 
-        # 5) Update the sheet
+        # 7) Update the row in Material Inventory
         write_range = f"Material Inventory!A{target_row}:O{target_row}"
         sheet.update(
             spreadsheetId=SPREADSHEET_ID,
@@ -2396,13 +2381,13 @@ def submit_material_inventory():
             body={"values": values_to_write}
         ).execute()
 
-        # 6) Queue log entries
+        # 8) Queue up logs
         if type_ == "Material":
             material_log_rows.append([timestamp, "", "", "", "", name, qty, "IN", action])
         else:
             thread_log_rows.append([timestamp, name, qty, "IN", action, cost, min_inv, reorder])
 
-    # 7) Append to log tabs
+    # 9) Append to the log sheets
     if material_log_rows:
         sheet.append(
             spreadsheetId=SPREADSHEET_ID,
@@ -2411,6 +2396,7 @@ def submit_material_inventory():
             insertDataOption="INSERT_ROWS",
             body={"values": material_log_rows}
         ).execute()
+
     if thread_log_rows:
         sheet.append(
             spreadsheetId=SPREADSHEET_ID,
