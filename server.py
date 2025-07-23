@@ -2294,14 +2294,16 @@ def submit_material_inventory():
     for it in items:
         logging.info("📦 Incoming item: %s", it)
 
-        name    = it.get("materialName", "").strip()
-        type_   = it.get("type",        "").strip()  # "Material" or "Thread"
-        unit    = it.get("unit",        "").strip()
-        min_inv = it.get("minInv",      "").strip()
-        reorder = it.get("reorder",     "").strip()
-        cost    = it.get("cost",        "").strip()
-        action  = it.get("action",      "").strip()
-        qty     = it.get("quantity",    "").strip()
+        # ← CHANGED: fallback to "value" if no materialName, default type to Material
+        name    = (it.get("materialName") or it.get("value") or "").strip()
+        type_   = (it.get("type") or "").strip() or "Material"
+
+        unit    = it.get("unit",    "").strip()
+        min_inv = it.get("minInv",  "").strip()
+        reorder = it.get("reorder", "").strip()
+        cost    = it.get("cost",    "").strip()
+        action  = it.get("action",  "").strip()
+        qty     = it.get("quantity","").strip()
 
         # skip incomplete submissions
         if not (name and type_ and qty):
@@ -2319,7 +2321,7 @@ def submit_material_inventory():
             logging.info("⏩ Skipping duplicate: %s", name)
             continue
 
-        # find the first blank slot in the fetched rows
+        # find first blank slot
         target_row = None
         for i, row in enumerate(rows, start=2):
             if type_ == "Material" and (not row or not row[0].strip()):
@@ -2328,20 +2330,15 @@ def submit_material_inventory():
             if type_ == "Thread" and (len(row) < 10 or not row[9].strip()):
                 target_row = i
                 break
-
-        # fallback to append below last fetched row
+        # fallback to append
         if target_row is None:
             target_row = len(rows) + 2
 
         logging.info("📌 Writing %s at row %s", type_, target_row)
 
-        # prepare the row for Material vs Thread
         if type_ == "Material":
-            # columns A–H
-            A = f"A{target_row}"
-            B = f"B{target_row}"
-            C = f"C{target_row}"
-            G = f"G{target_row}"
+            A = f"A{target_row}"; B = f"B{target_row}"
+            C = f"C{target_row}"; G = f"G{target_row}"
             H = f"H{target_row}"
 
             inventory_formula = re.sub(r"([A-Za-z]+)2",
@@ -2366,11 +2363,8 @@ def submit_material_inventory():
                 "", "", "", "", "", ""
             ]]
         else:
-            # columns J–O
-            J = f"J{target_row}"
-            K = f"K{target_row}"
-            L = f"L{target_row}"
-            O = f"O{target_row}"
+            J = f"J{target_row}"; K = f"K{target_row}"
+            L = f"L{target_row}"; O = f"O{target_row}"
 
             inventory_formula = re.sub(r"([A-Za-z]+)2",
                                        lambda m: f"{m.group(1)}{target_row}",
@@ -2393,7 +2387,7 @@ def submit_material_inventory():
                 value_formula
             ]]
 
-        # 5) Execute the sheet update
+        # 5) Update the sheet
         write_range = f"Material Inventory!A{target_row}:O{target_row}"
         sheet.update(
             spreadsheetId=SPREADSHEET_ID,
@@ -2402,17 +2396,13 @@ def submit_material_inventory():
             body={"values": values_to_write}
         ).execute()
 
-        # 6) Queue up log entries
+        # 6) Queue log entries
         if type_ == "Material":
-            material_log_rows.append([
-                timestamp, "", "", "", "", name, qty, "IN", action
-            ])
+            material_log_rows.append([timestamp, "", "", "", "", name, qty, "IN", action])
         else:
-            thread_log_rows.append([
-                timestamp, name, qty, "IN", action, cost, min_inv, reorder
-            ])
+            thread_log_rows.append([timestamp, name, qty, "IN", action, cost, min_inv, reorder])
 
-    # 7) Append to the log sheets
+    # 7) Append to log tabs
     if material_log_rows:
         sheet.append(
             spreadsheetId=SPREADSHEET_ID,
@@ -2421,7 +2411,6 @@ def submit_material_inventory():
             insertDataOption="INSERT_ROWS",
             body={"values": material_log_rows}
         ).execute()
-
     if thread_log_rows:
         sheet.append(
             spreadsheetId=SPREADSHEET_ID,
