@@ -2263,10 +2263,10 @@ def submit_material_inventory():
 
     log_rows = []
 
-    # Fetch current Material Inventory data
+    # Fetch full Material Inventory tab once
     resp = sheet.get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A1:O1000").execute()
     values = resp.get("values", [])
-    rows = values[1:]
+    rows = values[1:]  # skip header
 
     for it in items:
         logging.info("📦 Incoming item: %s", it)
@@ -2286,53 +2286,55 @@ def submit_material_inventory():
         if not (name and qty and type_):
             continue
 
-        # Only add to Material Inventory if it's a Material and not already present
-        if type_ == "Material":
-            existing_names = [row[0].strip() for row in rows if row and row[0].strip()]
-            if name not in existing_names:
-                target_row = None
-                for i, row in enumerate(rows, start=2):
-                    if not row or not row[0].strip():
-                        target_row = i
-                        break
+        # Check if material already exists
+        existing_materials = [r[0].strip().lower() for r in rows if r and r[0].strip()]
+        if type_ == "Material" and name.lower() in existing_materials:
+            logging.info(f"⚠️ Material '{name}' already exists. Skipping inventory insert.")
+        elif type_ == "Material":
+            # Find first available blank row
+            target_row = None
+            for i, row in enumerate(rows, start=2):
+                if not row or not row[0].strip():
+                    target_row = i
+                    break
+            if not target_row:
+                target_row = len(rows) + 2  # add at end
 
-                if target_row:
-                    A = f"A{target_row}"
-                    B = f"B{target_row}"
-                    C = f"C{target_row}"
-                    G = f"G{target_row}"
-                    H = f"H{target_row}"
+            A = f"A{target_row}"
+            B = f"B{target_row}"
+            C = f"C{target_row}"
+            G = f"G{target_row}"
+            H = f"H{target_row}"
 
-                    value_formula_row2 = values[1][7] if len(values) > 1 and len(values[1]) > 7 else "=G2*(B2+C2)"
-                    value_formula = value_formula_row2 \
-                        .replace("G2", G) \
-                        .replace("B2", B) \
-                        .replace("C2", C)
+            value_formula_row2 = values[1][7] if len(values) > 1 and len(values[1]) > 7 else "=G2*(B2+C2)"
+            value_formula = value_formula_row2 \
+                .replace("G2", G).replace("B2", B).replace("C2", C)
 
-                    inventory_formula = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!G:G))'
-                    on_order_formula  = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!C:C))'
+            inventory_formula = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!G:G))'
+            on_order_formula  = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!C:C))'
 
-                    values_to_write = [[
-                        name,               # A - Material
-                        inventory_formula,  # B
-                        on_order_formula,   # C
-                        unit,               # D
-                        min_inv,            # E
-                        reorder,            # F
-                        cost,               # G
-                        value_formula,      # H
-                        "", "", "", "", "", ""  # I–O Thread columns
-                    ]]
+            values_to_write = [[
+                name,               # A - Material
+                inventory_formula,  # B
+                on_order_formula,   # C
+                unit,               # D
+                min_inv,            # E
+                reorder,            # F
+                cost,               # G
+                value_formula,      # H
+                "", "", "", "", "", ""  # I–O Thread columns
+            ]]
 
-                    write_range = f"Material Inventory!A{target_row}:O{target_row}"
-                    sheet.update(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range=write_range,
-                        valueInputOption="USER_ENTERED",
-                        body={"values": values_to_write}
-                    ).execute()
+            write_range = f"Material Inventory!A{target_row}:O{target_row}"
+            logging.info(f"📌 Writing new material to {write_range}")
+            sheet.update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=write_range,
+                valueInputOption="USER_ENTERED",
+                body={"values": values_to_write}
+            ).execute()
 
-        # Append to Material Log regardless of type
+        # Always append to Material Log
         log_rows.append([
             timestamp, "", "", "", "", name, qty, "IN", action
         ])
