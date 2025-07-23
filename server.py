@@ -2381,7 +2381,7 @@ def get_inventory():
 @login_required_session
 def submit_thread_inventory():
     entries = request.get_json(silent=True) or []
-    now     = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+    now     = datetime.now(ZoneInfo("America/New_York")).strftime("%m/%d/%Y %H:%M:%S")
     to_log  = []
 
     for e in entries:
