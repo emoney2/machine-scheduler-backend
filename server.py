@@ -2320,61 +2320,44 @@ def submit_material_inventory():
 
             logging.info("📌 Writing %s at row %s", type_, target_row)
 
-            if type_ == "Material":
-                # Material goes in columns A–H
-                A = f"A{target_row}"
-                B = f"B{target_row}"
-                C = f"C{target_row}"
-                G = f"G{target_row}"
-                H = f"H{target_row}"
+     if type_ == "Material":
+         # Build cell refs
+         A = f"A{target_row}"
+         B = f"B{target_row}"
+         C = f"C{target_row}"
+         G = f"G{target_row}"
+         H = f"H{target_row}"
 
-                # Dynamic formulas
-                inventory_formula = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!G:G))'
-                on_order_formula  = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!C:C))'
-                value_formula     = f'={G}*({B}+{C})'
+         # 1) Grab the exact formulas from row 2
+         #    values[1][1] is B2, values[1][2] is C2, values[1][7] is H2
+         inv_tpl      = values[1][1]  if len(values) > 1 and len(values[1]) > 1 else ''
+         on_order_tpl = values[1][2]  if len(values) > 1 and len(values[1]) > 2 else ''
+         val_tpl      = values[1][7]  if len(values) > 1 and len(values[1]) > 7 else ''
 
-                values_to_write = [[
-                    name,               # A: Material Name
-                    inventory_formula,  # B: Inventory formula
-                    on_order_formula,   # C: On Order formula
-                    unit,               # D: Unit
-                    min_inv,            # E: Min Inv
-                    reorder,            # F: Reorder
-                    cost,               # G: Cost
-                    value_formula,      # H: Value formula
-                    "", "", "", "", "", ""  # I–O blank
-                ]]
+         # 2) Replace every "…2" with your target row
+         inventory_formula = re.sub(r"([A-Za-z]+)2", rf"\1{target_row}", inv_tpl)
+         on_order_formula  = re.sub(r"([A-Za-z]+)2", rf"\1{target_row}", on_order_tpl)
+         value_formula     = re.sub(r"([A-Za-z]+)2", rf"\1{target_row}", val_tpl)
 
-            else:  # Thread
-                # Thread goes in columns J–O
-                J = f"J{target_row}"
-                K = f"K{target_row}"
-                L = f"L{target_row}"
-                O = f"O{target_row}"
+         values_to_write = [[
+             name,               # A: Material Name
+             inventory_formula,  # B: copied-from-B2→row
+             on_order_formula,   # C: copied-from-C2→row
+             unit,               # D
+             min_inv,            # E
+             reorder,            # F
+             cost,               # G
+             value_formula,      # H: copied-from-H2→row
+             "", "", "", "", "", ""  # I–O blank
+         ]]
 
-                inventory_formula = f'=IF({J}="","",SUMIF(\'Thread Data\'!A:A,{J},\'Thread Data\'!C:C))'
-                on_order_formula  = f'=IF({J}="","",SUMIF(\'Thread Data\'!A:A,{J},\'Thread Data\'!B:B))'
-                value_formula     = f'={O}*({K}+{L})'
-
-                values_to_write = [[
-                    "", "", "", "", "", "", "", "",  # A–H blank
-                    "",                               # I blank
-                    name,             # J: Thread Color
-                    inventory_formula,# K: Inventory formula
-                    on_order_formula, # L: On Order formula
-                    min_inv,          # M: Min Inv
-                    reorder,          # N: Reorder
-                    value_formula     # O: Value formula
-                ]]
-
-            # Write into Material Inventory tab
-            write_range = f"Material Inventory!A{target_row}:O{target_row}"
-            sheet.update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=write_range,
-                valueInputOption="USER_ENTERED",
-                body={"values": values_to_write}
-            ).execute()
+         write_range = f"Material Inventory!A{target_row}:O{target_row}"
+         sheet.update(
+             spreadsheetId=SPREADSHEET_ID,
+             range=write_range,
+             valueInputOption="USER_ENTERED",
+             body={"values": values_to_write}
+         ).execute()
 
         # now log into the appropriate log sheet
         if type_ == "Material":
