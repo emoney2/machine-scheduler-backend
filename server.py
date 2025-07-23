@@ -2252,7 +2252,7 @@ def material_inventory_preflight():
 def submit_material_inventory():
     """
     Handles adding new materials or threads to the correct inventory row
-    and logs an IN action in the Material Log or Thread Data tab.
+    and logs an IN action in the Material Log tab or Thread Data tab accordingly.
     """
     items = request.get_json(silent=True) or []
     items = items if isinstance(items, list) else [items]
@@ -2270,7 +2270,7 @@ def submit_material_inventory():
         range="Material Inventory!A1:O1000"
     ).execute()
     values = resp.get("values", [])
-    rows   = values[1:]  # skip header row
+    rows   = values[1:]  # skip header
 
     for it in items:
         logging.info("📦 Incoming item: %s", it)
@@ -2290,12 +2290,8 @@ def submit_material_inventory():
             continue
 
         # build existing‑names sets
-        existing_materials = {
-            r[0].strip().lower() for r in rows if r and r[0].strip()
-        }
-        existing_threads = {
-            r[9].strip().lower() for r in rows if len(r) > 9 and r[9].strip()
-        }
+        existing_materials = {r[0].strip().lower() for r in rows if r and r[0].strip()}
+        existing_threads   = {r[9].strip().lower() for r in rows if len(r) > 9 and r[9].strip()}
 
         # skip duplicates
         if (type_ == "Material" and name.lower() in existing_materials) or \
@@ -2322,12 +2318,14 @@ def submit_material_inventory():
                 A = f"A{target_row}"; B = f"B{target_row}"; C = f"C{target_row}"
                 G = f"G{target_row}"; H = f"H{target_row}"
 
-                # copy‑and‑adjust the value formula from row 2
-                base_val_formula = values[1][7] if len(values) > 1 and len(values[1]) > 7 else "=G2*(B2+C2)"
-                value_formula = base_val_formula.replace("G2", G).replace("B2", B).replace("C2", C)
+                # 👇 Copy formulas from row 2 (columns B, C, H)
+                inv_tpl      = values[1][1] if len(values) > 1 and len(values[1]) > 1 else f'=IF(A2="","",SUMIF(\'Material Log\'!F:F,A2,\'Material Log\'!G:G))'
+                on_order_tpl = values[1][2] if len(values) > 1 and len(values[1]) > 2 else f'=IF(A2="","",SUMIF(\'Material Log\'!F:F,A2,\'Material Log\'!C:C))'
+                val_tpl      = values[1][7] if len(values) > 1 and len(values[1]) > 7 else '=G2*(B2+C2)'
 
-                inventory_formula = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!G:G))'
-                on_order_formula  = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!C:C))'
+                inventory_formula = inv_tpl.replace("A2", A)
+                on_order_formula  = on_order_tpl.replace("A2", A)
+                value_formula     = val_tpl.replace("G2", G).replace("B2", B).replace("C2", C)
 
                 values_to_write = [[
                     name,
@@ -2344,14 +2342,18 @@ def submit_material_inventory():
             else:  # Thread
                 J = f"J{target_row}"; K = f"K{target_row}"; L = f"L{target_row}"; O = f"O{target_row}"
 
-                inventory_formula = f'=IF({J}="","",SUMIF(\'Thread Data\'!A:A,{J},\'Thread Data\'!C:C))'
-                on_order_formula  = f'=IF({J}="","",SUMIF(\'Thread Data\'!A:A,{J},\'Thread Data\'!B:B))'
-                # assuming column M holds cost and N holds minInv, adjust as needed
-                value_formula     = f'=IF({O}="","",{O}*({K}+{L}))'
+                # 👇 Copy formulas from row 2 (columns K, L, O)
+                thread_inv_tpl      = values[1][10] if len(values[1]) > 10 else f'=IF(J2="","",SUMIF(\'Thread Data\'!A:A,J2,\'Thread Data\'!C:C))'
+                thread_on_order_tpl = values[1][11] if len(values[1]) > 11 else f'=IF(J2="","",SUMIF(\'Thread Data\'!A:A,J2,\'Thread Data\'!B:B))'
+                thread_val_tpl      = values[1][14] if len(values[1]) > 14 else '=O2*(K2+L2)'
+
+                inventory_formula = thread_inv_tpl.replace("J2", J)
+                on_order_formula  = thread_on_order_tpl.replace("J2", J)
+                value_formula     = thread_val_tpl.replace("O2", O).replace("K2", K).replace("L2", L)
 
                 values_to_write = [[
                     "", "", "", "", "", "", "", "",  # A–H blank
-                    "",                              # I
+                    "",                               # I blank
                     name,
                     inventory_formula,
                     on_order_formula,
@@ -2368,7 +2370,7 @@ def submit_material_inventory():
                 body={"values": values_to_write}
             ).execute()
 
-        # now log to the correct log sheet
+        # now log to the correct log tab
         if type_ == "Material":
             material_log_rows.append([
                 timestamp, "", "", "", "", name, qty, "IN", action
@@ -2398,6 +2400,7 @@ def submit_material_inventory():
         ).execute()
 
     return jsonify({"status": "submitted"}), 200
+
 
 @app.route("/api/products", methods=["GET"])
 @login_required_session
