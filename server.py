@@ -2263,6 +2263,11 @@ def submit_material_inventory():
 
     log_rows = []
 
+    # Fetch current Material Inventory data
+    resp = sheet.get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A1:O1000").execute()
+    values = resp.get("values", [])
+    rows = values[1:]
+
     for it in items:
         logging.info("📦 Incoming item: %s", it)
 
@@ -2281,60 +2286,53 @@ def submit_material_inventory():
         if not (name and qty and type_):
             continue
 
-        # Fetch sheet data
-        resp = sheet.get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A1:O1000").execute()
-        values = resp.get("values", [])
-        rows = values[1:]
+        # Only add to Material Inventory if it's a Material and not already present
+        if type_ == "Material":
+            existing_names = [row[0].strip() for row in rows if row and row[0].strip()]
+            if name not in existing_names:
+                target_row = None
+                for i, row in enumerate(rows, start=2):
+                    if not row or not row[0].strip():
+                        target_row = i
+                        break
 
-        target_row = None
-        for i, row in enumerate(rows, start=2):
-            if type_ == "Material" and (not row or not row[0].strip()):
-                target_row = i
-                break
-            elif type_ == "Thread" and (len(row) < 10 or not row[9].strip()):
-                target_row = i
-                break
+                if target_row:
+                    A = f"A{target_row}"
+                    B = f"B{target_row}"
+                    C = f"C{target_row}"
+                    G = f"G{target_row}"
+                    H = f"H{target_row}"
 
-        logging.info("📌 Target row for inventory insert: %s", target_row)
+                    value_formula_row2 = values[1][7] if len(values) > 1 and len(values[1]) > 7 else "=G2*(B2+C2)"
+                    value_formula = value_formula_row2 \
+                        .replace("G2", G) \
+                        .replace("B2", B) \
+                        .replace("C2", C)
 
-        if type_ == "Material" and target_row:
-            A = f"A{target_row}"
-            B = f"B{target_row}"
-            C = f"C{target_row}"
-            G = f"G{target_row}"
-            H = f"H{target_row}"
+                    inventory_formula = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!G:G))'
+                    on_order_formula  = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!C:C))'
 
-            # Fetch formula from row 2 column H
-            value_formula_row2 = values[1][7] if len(values) > 1 and len(values[1]) > 7 else "=G2*(B2+C2)"
-            value_formula = value_formula_row2 \
-                .replace("G2", G) \
-                .replace("B2", B) \
-                .replace("C2", C)
+                    values_to_write = [[
+                        name,               # A - Material
+                        inventory_formula,  # B
+                        on_order_formula,   # C
+                        unit,               # D
+                        min_inv,            # E
+                        reorder,            # F
+                        cost,               # G
+                        value_formula,      # H
+                        "", "", "", "", "", ""  # I–O Thread columns
+                    ]]
 
-            inventory_formula = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!G:G))'
-            on_order_formula  = f'=IF({A}="","",SUMIF(\'Material Log\'!F:F,{A},\'Material Log\'!C:C))'
+                    write_range = f"Material Inventory!A{target_row}:O{target_row}"
+                    sheet.update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=write_range,
+                        valueInputOption="USER_ENTERED",
+                        body={"values": values_to_write}
+                    ).execute()
 
-            values_to_write = [[
-                name,               # A - Material
-                inventory_formula,  # B
-                on_order_formula,   # C
-                unit,               # D
-                min_inv,            # E
-                reorder,            # F
-                cost,               # G
-                value_formula,      # H
-                "", "", "", "", "", ""  # I–O Thread columns
-            ]]
-
-            write_range = f"Material Inventory!A{target_row}:O{target_row}"
-            sheet.update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=write_range,
-                valueInputOption="USER_ENTERED",
-                body={"values": values_to_write}
-            ).execute()
-
-        # Append to Material Log
+        # Append to Material Log regardless of type
         log_rows.append([
             timestamp, "", "", "", "", name, qty, "IN", action
         ])
@@ -2351,7 +2349,6 @@ def submit_material_inventory():
         ).execute()
 
     return jsonify({"status": "submitted"}), 200
-
 
 @app.route("/api/products", methods=["GET"])
 @login_required_session
