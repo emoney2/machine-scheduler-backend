@@ -1733,6 +1733,38 @@ def submit_order():
 
         try:
                 data        = request.form
+                data        = request.form
+
+                # ─── VALIDATE REQUIRED FIELDS ────────────────────────────────────────
+                materials         = data.getlist("materials")
+                material_percents = data.getlist("materialPercents")
+                materials[:]         = (materials + [""] * 5)[:5]
+                material_percents[:] = (material_percents + [""] * 5)[:5]
+
+                # 1) Material1 mandatory
+                if not materials[0].strip():
+                    return jsonify({"error": "Material1 is required."}), 400
+
+                # 2) If product contains “full”, backMaterial is mandatory
+                product = (data.get("product") or "").strip().lower()
+                if "full" in product and not data.get("backMaterial", "").strip():
+                    return jsonify({"error": "Back Material is required for “Full” products."}), 400
+
+                # 3) Every populated material must have its percent
+                for idx, mat in enumerate(materials):
+                    if mat.strip():
+                        pct = material_percents[idx].strip()
+                        if not pct:
+                            return jsonify({
+                                "error": f"Percentage for Material{idx+1} (“{mat}”) is required."
+                            }), 400
+                        try:
+                            float(pct)
+                        except ValueError:
+                            return jsonify({
+                                "error": f"Material{idx+1} percentage (“{pct}”) must be a number."
+                            }), 400
+
                 prod_files  = request.files.getlist("prodFiles")
                 print_files = request.files.getlist("printFiles")
 
