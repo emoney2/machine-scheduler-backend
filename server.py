@@ -1728,214 +1728,155 @@ def make_public(file_id, drive_service):
 
 @app.route("/submit", methods=["OPTIONS","POST"])
 def submit_order():
-    if request.method == "OPTIONS":
-        return make_response("", 204)
+        if request.method == "OPTIONS":
+                return make_response("", 204)
 
-    try:
-        data       = request.form
-        print("📥 Incoming files:", request.files)
-        prod_files = request.files.getlist("prodFiles")
-        print("🧾 prod_files length:", len(prod_files))
-        print_files= request.files.getlist("printFiles")
+        try:
+                data        = request.form
+                prod_files  = request.files.getlist("prodFiles")
+                print_files = request.files.getlist("printFiles")
 
-        # find next empty row in col A
-        col_a = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Production Orders!A:A"
-        ).execute().get("values", [])
-        next_row   = len(col_a) + 1
-        prev_order = int(col_a[-1][0]) if len(col_a)>1 else 0
-        new_order  = prev_order + 1
+                # find next empty row in col A
+                col_a      = sheets.values().get(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range="Production Orders!A:A"
+                ).execute().get("values", [])
+                next_row   = len(col_a) + 1
+                prev_order = int(col_a[-1][0]) if len(col_a) > 1 else 0
+                new_order  = prev_order + 1
 
-        # helper: copy the formula from row 2 of <cell> and rewrite “2” → new row
-        def tpl_formula(col_letter, next_row):
-            # grab the raw formula from row 2
-            resp = sheets.values().get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Production Orders!{col_letter}2",
-                valueRenderOption="FORMULA"
-            ).execute()
-            raw = resp.get("values", [[""]])[0][0] or ""
-            # rewrite *any* reference ending in “2” to the new row
-            # e.g. C2→C3, Y2→Y3, AC2→AC3, etc.
-            formula = re.sub(r"(\b[A-Z]+)2\b", lambda m: f"{m.group(1)}{next_row}", raw)
-            return formula
+                # helper: copy formula from row 2 and bump to next_row
+                def tpl_formula(col_letter, next_row):
+                        resp = sheets.values().get(
+                                spreadsheetId=SPREADSHEET_ID,
+                                range=f"Production Orders!{col_letter}2",
+                                valueRenderOption="FORMULA"
+                        ).execute()
+                        raw = resp.get("values", [[""]])[0][0] or ""
+                        return re.sub(r"(\b[A-Z]+)2\b",
+                                      lambda m: f"{m.group(1)}{next_row}",
+                                      raw)
 
-        # timestamp + template cells from row 2
-        ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
-        def tpl(cell):
-            return sheets.values().get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Production Orders!{cell}2"
-            ).execute().get("values",[[""]])[0][0]
+                # timestamp + template formulas
+                ts           = datetime.now(ZoneInfo("America/New_York")) \
+                                         .strftime("%-m/%-d/%Y %H:%M:%S")
+                preview      = tpl_formula("C", next_row)
+                stage        = tpl_formula("I", next_row)
+                ship_date    = tpl_formula("V", next_row)
+                stitch_count = tpl_formula("W", next_row)
+                schedule_str = tpl_formula("AC", next_row)
 
-        preview      = tpl_formula("C",  next_row)
-        stage        = tpl_formula("I",  next_row)
-        ship_date    = tpl_formula("V",  next_row)
-        stitch_count = tpl_formula("W", next_row)
-        schedule_str = tpl_formula("AC", next_row)
+                # helper: create a Drive folder
+                def create_folder(name, parent_id=None):
+                        query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+                        if parent_id:
+                                query += f" and '{parent_id}' in parents"
+                        try:
+                                matches = drive.files().list(q=query, fields="files(id,name)").execute().get("files", [])
+                                for match in matches:
+                                        drive.files().delete(fileId=match["id"]).execute()
+                        except:
+                                pass
+                        meta = {"name": str(name), "mimeType": "application/vnd.google-apps.folder"}
+                        if parent_id:
+                                meta["parents"] = [parent_id]
+                        folder = drive.files().create(body=meta, fields="id").execute()
+                        return folder["id"]
 
-        # helper: make a Drive folder (optionally under a parent) and return its ID
-        def create_folder(name, parent_id=None):
-            print(f"🔍 Looking for existing folders named '{name}' under parent: {parent_id or 'root'}")
-            query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-            if parent_id:
-                query += f" and '{parent_id}' in parents"
+                drive           = get_drive_service()
+                order_folder_id = create_folder(new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
+                make_public(order_folder_id, drive)
 
-            try:
-                matches = drive.files().list(q=query, fields="files(id, name)").execute().get("files", [])
-                for match in matches:
-                    print(f"🗑️ Deleting existing folder: {match['name']} (ID: {match['id']})")
-                    drive.files().delete(fileId=match["id"]).execute()
-            except Exception as e:
-                print(f"❌ Failed to check/delete existing folders: {e}")
+                # handle reorder
+                reorder_from = data.get("reorderFrom")
+                if reorder_from:
+                        copy_emb_files(
+                                old_order_num=reorder_from,
+                                new_order_num=new_order,
+                                drive_service=drive,
+                                new_folder_id=order_folder_id
+                        )
 
-            meta = {
-                "name": str(name),
-                "mimeType": "application/vnd.google-apps.folder",
-            }
-            if parent_id:
-                meta["parents"] = [parent_id]
+                # upload production files
+                prod_links = []
+                for f in prod_files:
+                        m  = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+                        up = drive.files().create(
+                                body={"name": f.filename, "parents": [order_folder_id]},
+                                media_body=m,
+                                fields="id,webViewLink"
+                        ).execute()
+                        make_public(up["id"], drive)
+                        prod_links.append(up["webViewLink"])
 
-            print(f"📁 Creating new folder: {name}")
-            folder = drive.files().create(body=meta, fields="id").execute()
-            print(f"✅ Folder created with ID: {folder['id']}")
-            return folder["id"]
+                # upload print files
+                print_links = ""
+                if print_files:
+                        pf_id = create_folder("Print Files", parent_id=order_folder_id)
+                        make_public(pf_id, drive)
+                        for f in print_files:
+                                m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+                                drive.files().create(
+                                        body={"name": f.filename, "parents": [pf_id]},
+                                        media_body=m,
+                                        fields="id"
+                                ).execute()
+                        print_links = f"https://drive.google.com/drive/folders/{pf_id}"
 
+                # ─── FETCH + PAD MATERIALS & PERCENTS ─────────────────────────────────
+                materials         = data.getlist("materials")
+                material_percents = data.getlist("materialPercents")
+                materials[:]         = (materials + [""] * 5)[:5]
+                material_percents[:] = (material_percents + [""] * 5)[:5]
 
-        # create Drive folder for this order
-        drive = get_drive_service()
+                # ─── ASSEMBLE ROW A→AC ─────────────────────────────────────────────────
+                row = [
+                        new_order, ts, preview,
+                        data.get("company"), data.get("designName"), data.get("quantity"),
+                        "",  # shipped
+                        data.get("product"), stage, data.get("price"),
+                        data.get("dueDate"), ("PRINT" if print_files else "NO"),
+                        *materials,  # M–Q
+                        data.get("backMaterial"), data.get("furColor"),
+                        data.get("embBacking", ""), "",  # top stitch blank
+                        ship_date, stitch_count,
+                        data.get("notes"),
+                        ",".join(prod_links),
+                        print_links,
+                        "",  # AA blank
+                        data.get("dateType"),
+                        schedule_str
+                ]
 
-        # 1) Make the root folder for this order
-        order_folder_id = create_folder(new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
-        make_public(order_folder_id, drive)
-
-        # 🧵 If this is a reorder, copy any .emb files from the original job folder
-        reorder_from = data.get("reorderFrom")
-        if reorder_from:
-            copy_emb_files(
-                old_order_num=reorder_from,
-                new_order_num=new_order,
-                drive_service=drive,
-                new_folder_id=order_folder_id  # the ID we just created
-            )
-
-        # (we’ll link to it later as order_folder_link)
-        order_folder_link = f"https://drive.google.com/drive/folders/{order_folder_id}"
-
-        # upload production files
-        prod_links = []
-        for f in prod_files:
-            m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
-            up = drive.files().create(
-                body={"name": f.filename, "parents": [order_folder_id]},
-                media_body=m,
-                fields="id, webViewLink"
-            ).execute()
-            make_public(up["id"], drive)
-            prod_links.append(up["webViewLink"])
-
-        # upload print files (if present) — link to the “Print Files” folder
-        print_links = ""
-        if print_files:
-            # 1) create the “Print Files” folder under the job folder, and get its link
-            print_folder_id = create_folder("Print Files", parent_id=order_folder_id)
-            make_public(print_folder_id, drive)
-            pf_link = f"https://drive.google.com/drive/folders/{print_folder_id}"
-
-            # 2) upload each print file into that folder (we don't need their individual links)
-            for f in print_files:
-                m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
-                drive.files().create(
-                    body={"name": f.filename, "parents": [print_folder_id]},
-                    media_body=m,
-                    fields="id"
+                sheets.values().update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"Production Orders!A{next_row}:AC{next_row}",
+                        valueInputOption="USER_ENTERED",
+                        body={"values": [row]}
                 ).execute()
 
-            # 3) write only the folder’s public link into the sheet
-            print_links = pf_link
-
-
-        # assemble row A→AC
-                    # ─── FETCH + PAD MATERIALS & PERCENTS ─────────────────────────
-                    materials         = data.getlist("materials")
-                    material_percents = data.getlist("materialPercents")
-                    materials[:]         = (materials + [""] * 5)[:5]
-                    material_percents[:] = (material_percents + [""] * 5)[:5]
-
-                    # ─── ASSEMBLE ROW A→AK ────────────────────────────────────────
-                    row = [
-                      new_order, ts, preview,
-                      data.get("company"), data.get("designName"), data.get("quantity"),
-                      "",  # shipped
-                      data.get("product"), stage, data.get("price"),
-                      data.get("dueDate"), ("PRINT" if print_files else "NO"),
-
-                      # M–Q: Material1…Material5
-                      materials[0], materials[1], materials[2],
-                      materials[3], materials[4],
-
-                      # R–U: Back Material, Fur Color, EMB Backing, Top Stitch Color
-                      data.get("backMaterial"), data.get("furColor"),
-                      data.get("embBacking",""), "",
-
-                      # V–X: Ship Date, Stitch Count, Notes
-                      ship_date, stitch_count, data.get("notes"),
-
-                      # Y–Z: Image links, Print Files link
-                      ",".join(prod_links), print_links,
-
-                      # AA: blank
-                      "",
-
-                      # AB–AC: Hard Date/Soft Date, Schedule String
-                      data.get("dateType"), schedule_str,
-
-                      # AD–AF: Start Date, End Date, Threads (still blank)
-                      "", "", "",
-
-                      # AG–AK: Material1%…Material5%
-                      material_percents[0],
-                      material_percents[1],
-                      material_percents[2],
-                      material_percents[3],
-                      material_percents[4],
-                    ]
-
-                    # ─── WRITE TO SHEET THROUGH AK ────────────────────────────────
-                    sheets.values().update(
+                # ─── COPY AF2 FORMULA DOWN TO AF<next_row> ──────────────────────────
+                resp = sheets.values().get(
                         spreadsheetId=SPREADSHEET_ID,
-                        range=f"Production Orders!A{next_row}:AK{next_row}",
+                        range="Production Orders!AF2",
+                        valueRenderOption="FORMULA"
+                ).execute()
+                raw_formula = resp.get("values", [[""]])[0][0] or ""
+                new_formula = raw_formula.replace("2", str(next_row))
+                sheets.values().update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"Production Orders!AF{next_row}",
                         valueInputOption="USER_ENTERED",
-                        body={"values":[row]}
-                    ).execute()
- 
-        # ─── COPY AF2 FORMULA DOWN TO AF<next_row> ─────────────────
-        resp = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Production Orders!AF2",
-            valueRenderOption="FORMULA"
-        ).execute()
-        raw_formula = resp.get("values", [[""]])[0][0] or ""
-        new_formula = raw_formula.replace("2", str(next_row))
-        sheets.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Production Orders!AF{next_row}",
-            valueInputOption="USER_ENTERED",
-            body={"values": [[new_formula]]}
-        ).execute()
+                        body={"values": [[new_formula]]}
+                ).execute()
 
-        return jsonify({"status":"ok","order":new_order}), 200
+                return jsonify({"status": "ok", "order": new_order}), 200
 
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        logger.error("Error in /submit:\n%s", tb)
-        # return the exception message and stack to the client (for now)
-        return jsonify({
-            "error": str(e),
-            "trace": tb
-        }), 500
+        except Exception as e:
+                tb = traceback.format_exc()
+                logger.error("Error in /submit:\n%s", tb)
+                return jsonify({"error": str(e), "trace": tb}), 500
+
 
 @app.route("/api/reorder", methods=["POST"])
 @login_required_session
