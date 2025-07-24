@@ -1871,6 +1871,7 @@ def submit_order():
             "",  # AA blank
             data.get("dateType"),
             schedule_str,
+            "", "", "",                 # AD, AE, AF – pad so percents start at AG
             *material_percents           # AG–AK
         ]
 
