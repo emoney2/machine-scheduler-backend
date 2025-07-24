@@ -1857,30 +1857,58 @@ def submit_order():
 
 
         # assemble row A→AC
-        row = [
-          new_order, ts, preview,
-          data.get("company"), data.get("designName"), data.get("quantity"),
-          "",  # shipped
-          data.get("product"), stage, data.get("price"),
-          data.get("dueDate"), ("PRINT" if print_files else "NO"),
-          *data.getlist("materials"),  # M–Q
-          data.get("backMaterial"), data.get("furColor"),
-          data.get("embBacking",""), "",  # top stitch blank
-          ship_date, stitch_count,
-          data.get("notes"),
-          ",".join(prod_links),
-          print_links,
-          "",
-          data.get("dateType"),
-          schedule_str
-        ]
+                    # ─── FETCH + PAD MATERIALS & PERCENTS ─────────────────────────
+                    materials         = data.getlist("materials")
+                    material_percents = data.getlist("materialPercents")
+                    materials[:]         = (materials + [""] * 5)[:5]
+                    material_percents[:] = (material_percents + [""] * 5)[:5]
 
-        sheets.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Production Orders!A{next_row}:AC{next_row}",
-            valueInputOption="USER_ENTERED",
-            body={"values":[row]}
-        ).execute()
+                    # ─── ASSEMBLE ROW A→AK ────────────────────────────────────────
+                    row = [
+                      new_order, ts, preview,
+                      data.get("company"), data.get("designName"), data.get("quantity"),
+                      "",  # shipped
+                      data.get("product"), stage, data.get("price"),
+                      data.get("dueDate"), ("PRINT" if print_files else "NO"),
+
+                      # M–Q: Material1…Material5
+                      materials[0], materials[1], materials[2],
+                      materials[3], materials[4],
+
+                      # R–U: Back Material, Fur Color, EMB Backing, Top Stitch Color
+                      data.get("backMaterial"), data.get("furColor"),
+                      data.get("embBacking",""), "",
+
+                      # V–X: Ship Date, Stitch Count, Notes
+                      ship_date, stitch_count, data.get("notes"),
+
+                      # Y–Z: Image links, Print Files link
+                      ",".join(prod_links), print_links,
+
+                      # AA: blank
+                      "",
+
+                      # AB–AC: Hard Date/Soft Date, Schedule String
+                      data.get("dateType"), schedule_str,
+
+                      # AD–AF: Start Date, End Date, Threads (still blank)
+                      "", "", "",
+
+                      # AG–AK: Material1%…Material5%
+                      material_percents[0],
+                      material_percents[1],
+                      material_percents[2],
+                      material_percents[3],
+                      material_percents[4],
+                    ]
+
+                    # ─── WRITE TO SHEET THROUGH AK ────────────────────────────────
+                    sheets.values().update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"Production Orders!A{next_row}:AK{next_row}",
+                        valueInputOption="USER_ENTERED",
+                        body={"values":[row]}
+                    ).execute()
  
         # ─── COPY AF2 FORMULA DOWN TO AF<next_row> ─────────────────
         resp = sheets.values().get(
