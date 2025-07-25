@@ -3065,6 +3065,18 @@ def serve_slip(filename):
     # Serve the PDF from the temp directory
     return send_from_directory(tempfile.gettempdir(), filename, as_attachment=False)
 
+@app.route("/api/thread-colors", methods=["GET"])
+@login_required_session
+def get_thread_colors():
+    try:
+        sheet = sh.worksheet("Thread Inventory")
+        data = sheet.get_all_records()
+        colors = sorted({row["Thread Colors"] for row in data if "Thread Colors" in row and row["Thread Colors"].strip()})
+        return jsonify(colors), 200
+    except Exception as e:
+        print("❌ Failed to fetch thread colors:", e)
+        return jsonify([]), 500
+
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
