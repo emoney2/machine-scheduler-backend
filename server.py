@@ -3070,9 +3070,30 @@ def serve_slip(filename):
 def get_thread_colors():
     try:
         sheet = sh.worksheet("Thread Inventory")
-        data = sheet.get_all_records()
-        colors = sorted({row["Thread Colors"] for row in data if "Thread Colors" in row and row["Thread Colors"].strip()})
-        return jsonify(colors), 200
+        data = sheet.get_all_values()
+
+        if not data or len(data) < 2:
+            return jsonify([]), 200
+
+        headers = data[0]
+        rows = data[1:]
+
+        # Find the index of the "Thread Colors" column
+        try:
+            col_idx = headers.index("Thread Colors")
+        except ValueError:
+            raise Exception("🧵 'Thread Colors' column not found in header row.")
+
+        # Collect all unique numeric thread codes
+        thread_colors = set()
+        for row in rows:
+            if len(row) > col_idx:
+                val = str(row[col_idx]).strip()
+                if val and val.isdigit():  # Only include values like 1800, 1801, etc.
+                    thread_colors.add(val)
+
+        return jsonify(sorted(thread_colors)), 200
+
     except Exception as e:
         print("❌ Failed to fetch thread colors:", e)
         return jsonify([]), 500
