@@ -390,10 +390,9 @@ def get_quickbooks_credentials():
             return headers, realm_id
 
 
-
-# 3) No valid token → restart OAuth
-env_qbo = session.get("qboEnv", os.environ.get("QBO_ENV", "production"))
-raise RedirectException(f"/qbo/login?env={env_qbo}")
+    # 3) No valid token → restart OAuth
+    env_qbo = os.environ.get("QBO_ENV", "production")
+    raise RedirectException(f"/qbo/login?env={env_qbo}")
 
 
 def get_quickbooks_auth_url(redirect_uri, state=""):
