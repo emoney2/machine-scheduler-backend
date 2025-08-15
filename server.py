@@ -988,7 +988,7 @@ MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 # ── Legacy QuickBooks vars (still available if used elsewhere) ────
 QBO_CLIENT_ID     = os.environ.get("QBO_CLIENT_ID")
 QBO_CLIENT_SECRET = os.environ.get("QBO_CLIENT_SECRET")
-QBO_REDIRECT_URI  = os.environ.get("QBO_REDIRECT_URI")
+QBO_REDIRECT_URI  = (os.environ.get("QBO_REDIRECT_URI") or "").strip()
 QBO_AUTH_URL      = "https://appcenter.intuit.com/connect/oauth2"
 QBO_TOKEN_URL     = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
 QBO_SCOPES        = ["com.intuit.quickbooks.accounting"]
@@ -2618,7 +2618,9 @@ def company_list():
 def process_shipment():
     data = request.get_json()
     env_override = data.get("qboEnv")  # either "sandbox" or "production"
-    session["qboEnv"] = (env_override or "production")
+    session["qboEnv"] = (env_override or "production")  # ← store desired env
+    print("📥 Reorder API received:", data)
+
 
     print("📥 Reorder API received:", data)
 
