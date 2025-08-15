@@ -2996,13 +2996,18 @@ def qbo_login():
     # ── 1) Pick the correct OAuth client ID/secret ───────────────
     client_id, client_secret = get_qbo_oauth_credentials(env_override)
 
+    # Log what we’re sending so you can confirm in Render logs
+    print(f"QBO env: {session.get('qboEnv', QBO_ENV)} | redirect_uri={QBO_REDIRECT_URI!r}")
+    print(f"QBO client id (first 6): {str(client_id)[:6]}…")
+
     # ── 2) Build the OAuth2Session with the chosen client_id ─────
     qbo = OAuth2Session(
-        client_id=client_id,
-        redirect_uri=QBO_REDIRECT_URI,
-        scope=QBO_SCOPES,
-        state=session.get("qbo_oauth_state")
+     client_id=client_id,
+     redirect_uri=QBO_REDIRECT_URI,
+     scope=QBO_SCOPES,
+     state=session.get("qbo_oauth_state")
     )
+
 
     # ── 3) Generate the authorization URL ─────────────────────────
     auth_url, state = qbo.authorization_url(QBO_AUTH_URL)
