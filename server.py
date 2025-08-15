@@ -2248,7 +2248,7 @@ def submit_material_inventory():
     """
     Handles adding new materials to Material Inventory (cols A–H)
     and threads to the new Thread Inventory tab (cols A–F),
-    copying row 2 formulas dynamically, and logging to
+    copying row 2 formulas dynamically, and logging to
     Material Log or Thread Data accordingly.
     """
     try:
@@ -2263,24 +2263,24 @@ def submit_material_inventory():
         material_log_rows = []
         thread_log_rows   = []
 
-        # 2) Fetch row 2 formulas for Material Inventory (A2:H2)
+        # 2) Fetch row 2 formulas for Material Inventory (A2:H2)
         mat_formula = sheet.get(
             spreadsheetId=SPREADSHEET_ID,
             range="Material Inventory!A2:H2",
             valueRenderOption="FORMULA"
         ).execute().get("values", [[]])[0]
-        mat_inv_tpl  = str(mat_formula[1]) if len(mat_formula)>1 else ""
-        mat_oo_tpl   = str(mat_formula[2]) if len(mat_formula)>2 else ""
-        mat_val_tpl  = str(mat_formula[7]) if len(mat_formula)>7 else ""
+        mat_inv_tpl  = str(mat_formula[1]) if len(mat_formula) > 1 else ""
+        mat_oo_tpl   = str(mat_formula[2]) if len(mat_formula) > 2 else ""
+        mat_val_tpl  = str(mat_formula[7]) if len(mat_formula) > 7 else ""
 
-        # 3) Fetch row 2 formulas for Thread Inventory (A2:F2)
+        # 3) Fetch row 2 formulas for Thread Inventory (A2:F2)
         thr_formula = sheet.get(
             spreadsheetId=SPREADSHEET_ID,
             range="Thread Inventory!A2:F2",
             valueRenderOption="FORMULA"
         ).execute().get("values", [[]])[0]
-        thr_inv_tpl = str(thr_formula[1]) if len(thr_formula)>1 else ""
-        thr_oo_tpl  = str(thr_formula[2]) if len(thr_formula)>2 else ""
+        thr_inv_tpl = str(thr_formula[1]) if len(thr_formula) > 1 else ""
+        thr_oo_tpl  = str(thr_formula[2]) if len(thr_formula) > 2 else ""
 
         # 4) Fetch existing rows for each tab
         mat_rows = sheet.get(
@@ -2291,6 +2291,14 @@ def submit_material_inventory():
             spreadsheetId=SPREADSHEET_ID,
             range="Thread Inventory!A1:F1000"
         ).execute().get("values", [])[1:]
+
+        # Build lowercase name sets for quick existence checks
+        existing_mats = {r[0].strip().lower() for r in mat_rows if r and r[0].strip()}
+        existing_thrs = {r[0].strip().lower() for r in thr_rows if r and r[0].strip()}
+
+        # Helper: find first blank row (1-based index + header) in a sheet's col A
+        def first_blank_row(rows):
+            return next((i + 2 for i, r in enumerate(rows) if not r or not (r[0].strip() if len(r) > 0 else "")), len(rows) + 2)
 
         # 5) Process each item
         for it in items:
@@ -2303,57 +2311,75 @@ def submit_material_inventory():
             action  = it.get("action",  "").strip()
             qty     = it.get("quantity","").strip()
 
+            # must have name and quantity to do anything
             if not (name and qty):
                 continue
 
             if type_ == "Material":
-                # skip duplicates
-                existing = {r[0].strip().lower() for r in mat_rows if r and r[0].strip()}
-                if name.lower() in existing:
-                    continue
-                # find first blank in col A
-                target = next((i+2 for i,r in enumerate(mat_rows) if not r or not r[0].strip()), len(mat_rows)+2)
-                # build formulas
-                A = f"A{target}"; B = f"B{target}"; C = f"C{target}"
-                G = f"G{target}"; H = f"H{target}"
-                inv_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_inv_tpl)
-                oo_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_oo_tpl)
-                val_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_val_tpl)
-                row_vals = [[
-                    name, inv_f, oo_f, unit,
-                    min_inv, reorder, cost, val_f
-                ]]
-                # write and log
-                sheet.update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"Material Inventory!A{target}:H{target}",
-                    valueInputOption="USER_ENTERED",
-                    body={"values": row_vals}
-                ).execute()
+                is_new = name.lower() not in existing_mats
+                if is_new:
+                    target = first_blank_row(mat_rows)
+
+                    # build formulas for the new target row
+                    A = f"A{target}"; B = f"B{target}"; C = f"C{target}"
+                    G = f"G{target}"; H = f"H{target}"
+                    inv_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_inv_tpl)
+                    oo_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_oo_tpl)
+                    val_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_val_tpl)
+
+                    row_vals = [[
+                        name, inv_f, oo_f, unit,
+                        min_inv, reorder, cost, val_f
+                    ]]
+
+                    # write the new inventory row
+                    sheet.update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"Material Inventory!A{target}:H{target}",
+                        valueInputOption="USER_ENTERED",
+                        body={"values": row_vals}
+                    ).execute()
+
+                    # keep in-memory sets/rows up to date for subsequent items
+                    existing_mats.add(name.lower())
+                    # pad mat_rows so future first_blank_row() stays correct
+                    while len(mat_rows) < target - 1:
+                        mat_rows.append([])
+                    mat_rows.append([name])
+
+                # ALWAYS log the material movement (even if not new)
                 material_log_rows.append([timestamp, "", "", "", "", name, qty, "IN", action])
 
-            else:  # Thread
-                # skip duplicates
-                existing = {r[0].strip().lower() for r in thr_rows if r and r[0].strip()}
-                if name.lower() in existing:
-                    continue
-                # find first blank in col A of Thread Inventory
-                target = next((i+2 for i,r in enumerate(thr_rows) if not r or not r[0].strip()), len(thr_rows)+2)
-                # build formulas and values
-                A = f"A{target}"; B = f"B{target}"; C = f"C{target}"
-                inv_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", thr_inv_tpl)
-                oo_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", thr_oo_tpl)
-                row_vals = [[
-                    name, inv_f, oo_f,
-                    min_inv, reorder, cost
-                ]]
-                # write and log
-                sheet.update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"Thread Inventory!A{target}:F{target}",
-                    valueInputOption="USER_ENTERED",
-                    body={"values": row_vals}
-                ).execute()
+            else:
+                # Thread
+                is_new = name.lower() not in existing_thrs
+                if is_new:
+                    target = first_blank_row(thr_rows)
+
+                    # build thread formulas for the target row
+                    A = f"A{target}"; B = f"B{target}"; C = f"C{target}"
+                    inv_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", thr_inv_tpl)
+                    oo_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", thr_oo_tpl)
+
+                    row_vals = [[
+                        name, inv_f, oo_f,
+                        min_inv, reorder, cost
+                    ]]
+
+                    # write the new thread inventory row
+                    sheet.update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"Thread Inventory!A{target}:F{target}",
+                        valueInputOption="USER_ENTERED",
+                        body={"values": row_vals}
+                    ).execute()
+
+                    existing_thrs.add(name.lower())
+                    while len(thr_rows) < target - 1:
+                        thr_rows.append([])
+                    thr_rows.append([name])
+
+                # ALWAYS log the thread movement (even if not new)
                 thread_log_rows.append([timestamp, name, qty, "IN", action, cost, min_inv, reorder])
 
         # 6) Append to logs
