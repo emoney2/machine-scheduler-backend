@@ -289,21 +289,25 @@ def get_quickbooks_credentials():
 
         # → refresh if expired
         if token["expires_at"] < time.time():
+            env_for_oauth = session.get("qboEnv", QBO_ENV)
+            client_id, client_secret = get_qbo_oauth_credentials(env_for_oauth)
+
             oauth = OAuth2Session(
-                os.getenv("QBO_CLIENT_ID"),
+                client_id=client_id,
                 token=token,
                 auto_refresh_kwargs={
-                    "client_id":     os.getenv("QBO_CLIENT_ID"),
-                    "client_secret": os.getenv("QBO_CLIENT_SECRET"),
+                    "client_id":     client_id,
+                    "client_secret": client_secret,
                 },
-                auto_refresh_url=os.getenv("QBO_TOKEN_URL"),
+                auto_refresh_url=QBO_TOKEN_URL,
                 token_updater=lambda new_tok: None
             )
             new_token = oauth.refresh_token(
-                os.getenv("QBO_TOKEN_URL"),
-                client_id=os.getenv("QBO_CLIENT_ID"),
-                client_secret=os.getenv("QBO_CLIENT_SECRET")
+                QBO_TOKEN_URL,
+                client_id=client_id,
+                client_secret=client_secret
             )
+
             new_token["expires_at"] = time.time() + int(new_token["expires_in"])
 
             # persist refreshed token to session & disk
@@ -374,7 +378,7 @@ def get_quickbooks_credentials():
             return headers, realm_id
 
     # 3) No valid token → restart OAuth
-    raise RedirectException("/quickbooks-auth")
+    raise RedirectException("/qbo/login")
 
 
 
@@ -625,8 +629,10 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     print("🔑 QBO Token in session:", token)
     print("🏢 Realm ID in session:", token.get("realmId") if token else None)
     if not token or "access_token" not in token or "expires_at" not in token:
-        next_url = "/quickbooks/login?next=/ship"
-        raise RedirectException(next_url)
+      env_qbo = session.get("qboEnv", QBO_ENV)
+      next_url = f"/qbo/login?env={env_qbo}"
+      raise RedirectException(next_url)
+
 
     # Refresh if token is expired
     if time.time() >= token["expires_at"]:
@@ -2612,6 +2618,8 @@ def company_list():
 def process_shipment():
     data = request.get_json()
     env_override = data.get("qboEnv")  # either "sandbox" or "production"
+    session["qboEnv"] = (env_override or "production")
+
     print("📥 Reorder API received:", data)
 
     # 1) Parse incoming
