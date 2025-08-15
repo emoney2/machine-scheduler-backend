@@ -342,30 +342,42 @@ def get_quickbooks_credentials():
         if token["access_token"] and realm_id:
             # → refresh if expired
             if token["expires_at"] < time.time():
+                # Use env-aware credentials (production vs sandbox)
+                env_for_oauth = session.get("qboEnv", os.environ.get("QBO_ENV", "production")).lower()
+                try:
+                    client_id, client_secret = get_qbo_oauth_credentials(env_for_oauth)
+                except NameError:
+                    is_prod = env_for_oauth in ("prod", "production", "live")
+                    client_id     = os.environ.get("QBO_PROD_CLIENT_ID") if is_prod else os.environ.get("QBO_SANDBOX_CLIENT_ID")
+                    client_secret = os.environ.get("QBO_PROD_CLIENT_SECRET") if is_prod else os.environ.get("QBO_SANDBOX_CLIENT_SECRET")
+                    # Fallback to generic names if present
+                    client_id     = client_id or os.environ.get("QBO_CLIENT_ID")
+                    client_secret = client_secret or os.environ.get("QBO_CLIENT_SECRET")
+
                 oauth = OAuth2Session(
-                    os.getenv("QBO_CLIENT_ID"),
+                    client_id=client_id,
                     token=token,
                     auto_refresh_kwargs={
-                        "client_id":     os.getenv("QBO_CLIENT_ID"),
-                        "client_secret": os.getenv("QBO_CLIENT_SECRET"),
+                        "client_id":     client_id,
+                        "client_secret": client_secret,
                     },
-                    auto_refresh_url=os.getenv("QBO_TOKEN_URL"),
+                    auto_refresh_url=QBO_TOKEN_URL,
                     token_updater=lambda new_tok: None
                 )
                 new_token = oauth.refresh_token(
-                    os.getenv("QBO_TOKEN_URL"),
-                    client_id=os.getenv("QBO_CLIENT_ID"),
-                    client_secret=os.getenv("QBO_CLIENT_SECRET")
+                    QBO_TOKEN_URL,
+                    client_id=client_id,
+                    client_secret=client_secret
                 )
-                new_token["expires_at"] = time.time() + int(new_token["expires_in"])
+                new_token["expires_at"] = time.time() + int(new_token.get("expires_in", 3600))
 
                 # persist refreshed token to disk & session
                 with open(TOKEN_PATH, "w") as f:
                     json.dump({**new_token, "realmId": realm_id}, f, indent=2)
                 session["qbo_token"] = {
-                    "access_token":  new_token["access_token"],
-                    "refresh_token": new_token["refresh_token"],
-                    "expires_at":    new_token["expires_at"],
+                    "access_token":  new_token.get("access_token"),
+                    "refresh_token": new_token.get("refresh_token"),
+                    "expires_at":    new_token.get("expires_at"),
                     "realmId":       realm_id
                 }
                 token = new_token
@@ -377,9 +389,11 @@ def get_quickbooks_credentials():
             }
             return headers, realm_id
 
-    # 3) No valid token → restart OAuth
-    raise RedirectException("/qbo/login")
 
+
+# 3) No valid token → restart OAuth
+env_qbo = session.get("qboEnv", os.environ.get("QBO_ENV", "production"))
+raise RedirectException(f"/qbo/login?env={env_qbo}")
 
 
 def get_quickbooks_auth_url(redirect_uri, state=""):
@@ -569,6 +583,7 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     raise Exception(f"❌ Failed to create customer in QuickBooks: {res.text}")
 
 def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
+    base = get_base_qbo_url(env_override)
     query_url = f"{base}/v3/company/{realm_id}/query"
     escaped_name = json.dumps(product_name)  # ensures correct quoting
     query = f"SELECT * FROM Item WHERE Name = {escaped_name}"
@@ -620,6 +635,7 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
             raise Exception(f"❌ Item '{product_name}' exists but could not be retrieved.")
     else:
         raise Exception(f"❌ Failed to create item '{product_name}' in QBO: {res.text}")
+
 
 
 def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=None, base_shipping_cost=0.0, env_override=None):
