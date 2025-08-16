@@ -511,7 +511,7 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
 
     # ── 1) Try to fetch from QuickBooks ───────────────────────────
     base = get_base_qbo_url(env_override)
-    query_url = f"{base}/v3/company/{realm_id}/query"
+    query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
     query = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
     response = requests.get(query_url, headers=quickbooks_headers, params={"query": query})
 
@@ -598,7 +598,7 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
 
     print(f"⚠️ Item '{product_name}' not found. Attempting to create...")
 
-    create_url = f"{base}/v3/company/{realm_id}/item"
+    create_url = f"{base}/v3/company/{realm_id}/item?minorversion=65"
     payload = {
         "Name": product_name,
         "Type": "NonInventory",
