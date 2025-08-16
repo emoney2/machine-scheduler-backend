@@ -702,7 +702,6 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
         "TxnDate":      datetime.now().strftime("%Y-%m-%d"),
         "TotalAmt":     float(round(amount, 2)),
         "SalesTermRef": { "value": "3" },
-        "BillEmail":    { "Address": "sandbox@sample.com" }
     }
 
     invoice_url = f"{base}/v3/company/{realm_id}/invoice"
