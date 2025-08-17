@@ -159,6 +159,42 @@ def fetch_company_info(headers, realm_id, env_override=None):
         "Phone":       info.get("PrimaryPhone", {}).get("FreeFormNumber", ""),
     }
 
+# --- CORS: handle all OPTIONS preflight early ---
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed = {
+            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+        }
+        resp = make_response("", 204)
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+        return resp  # short-circuit OPTIONS
+
+@app.after_request
+def apply_cors(response):
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    allowed = {
+        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+        "https://machineschedule.netlify.app",
+        "http://localhost:3000",
+    }
+    if origin in allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+    return response
+
+@app.route("/api/ping", methods=["GET", "OPTIONS"])
+def api_ping():
+    return jsonify({"ok": True}), 200
 
 @app.route("/labels/<path:filename>")
 def serve_label(filename):
