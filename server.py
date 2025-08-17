@@ -362,29 +362,71 @@ def drive_proxy(file_id):
     try:
         # --- Fast path: Drive thumbnail ---
         if use_thumb:
-            # Get (thumb URL, etag) from 10-min cache or Drive once
-            meta = _get_thumb_meta(file_id, size, headers)
-            if meta:
-                etag = meta["etag"]
+            meta_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
+            meta = requests.get(meta_url, headers=headers, timeout=6)
+            if meta.status_code == 200:
+                info = meta.json()
+                thumb = info.get("thumbnailLink")
+                if thumb:
+                    # Convert wNNN → sNNN and apply robustly to the Drive thumb URL
+                    desired = f"=s{size[1:] if size.startswith('w') else '256'}"
+                    if "=s" in thumb:
+                        import re  # ok to import here; or move to file top
+                        thumb = re.sub(r"=s\d+", desired, thumb)
+                    else:
+                        thumb = thumb + desired
 
-                # If the browser already has this version, 304 without any external calls
-                if request.headers.get("If-None-Match") == etag:
-                    resp = make_response("", 304)
-                    resp.headers["ETag"] = etag
-                    resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
-                    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-                    allowed = {
-                        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-                        "https://machineschedule.netlify.app",
-                        "http://localhost:3000",
-                    }
-                    if origin in allowed:
-                        resp.headers["Access-Control-Allow-Origin"] = origin
-                        resp.headers["Access-Control-Allow-Credentials"] = "true"
-                    return resp
+                    # Build deterministic ETag (file id + size + file version)
+                    etag = f'W/"{file_id}-t-{size}-{info.get("md5Checksum") or info.get("modifiedTime") or ""}"'
+
+                    # If client already has this version cached, return 304
+                    if request.headers.get("If-None-Match") == etag:
+                        resp = make_response("", 304)
+                        resp.headers["ETag"] = etag
+                        resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+                        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+                        allowed = {
+                            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+                            "https://machineschedule.netlify.app",
+                            "http://localhost:3000",
+                        }
+                        if origin in allowed:
+                            resp.headers["Access-Control-Allow-Origin"] = origin
+                            resp.headers["Access-Control-Allow-Credentials"] = "true"
+                        return resp
+
+                    # Download the actual Drive thumbnail
+                    img = requests.get(thumb, headers=headers, timeout=8)
+
+                    # Debug log: see size Google returned
+                    try:
+                        app.logger.info(
+                            f"[thumb] id={file_id} sz={size} status={img.status_code} "
+                            f"bytes={len(img.content) if getattr(img,'content',None) else 0} url={thumb}"
+                        )
+                    except Exception:
+                        pass
+
+                    if img.status_code == 200 and img.content:
+                        resp = Response(img.content, status=200, mimetype="image/jpeg")
+                        # Cache one day; browsers/CDNs can reuse until ETag changes
+                        resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+                        resp.headers["ETag"] = etag
+                        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+                        allowed = {
+                            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+                            "https://machineschedule.netlify.app",
+                            "http://localhost:3000",
+                        }
+                        if origin in allowed:
+                            resp.headers["Access-Control-Allow-Origin"] = origin
+                            resp.headers["Access-Control-Allow-Credentials"] = "true"
+                        return resp
+
 
                 # Download the actual thumbnail (single external request now)
                 img = requests.get(meta["thumb"], headers=headers, timeout=8)
+                app.logger.info(f"[thumb] id={file_id} sz={size} status={img.status_code} bytes={len(img.content) if img.content else 0} url={meta['thumb']}")
                 if img.status_code == 200 and img.content:
                     resp = Response(img.content, status=200, mimetype="image/jpeg")
                     resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
