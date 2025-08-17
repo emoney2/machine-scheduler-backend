@@ -988,6 +988,48 @@ socketio = SocketIO(
     cors_allowed_origins=[FRONTEND_URL],
     async_mode="eventlet"
 )
+# --- Drive: make file public (anyone with link → reader) ---------------------
+@app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
+@login_required_session
+def drive_make_public():
+    if request.method == "OPTIONS":
+        # CORS preflight
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+        return resp
+
+    data = request.get_json(silent=True) or {}
+    file_id = (data.get("fileId") or "").strip()
+    if not file_id:
+        return jsonify({"ok": False, "error": "missing fileId"}), 400
+
+    try:
+        drive = get_drive_service()
+        # Check existing permissions for 'anyone'
+        perms = drive.permissions().list(
+            fileId=file_id,
+            fields="permissions(id,type,role)"
+        ).execute()
+        already_public = any(
+            p.get("type") == "anyone" and p.get("role") in ("reader", "commenter", "writer")
+            for p in (perms.get("permissions") or [])
+        )
+
+        if not already_public:
+            # Make it public (view-only)
+            drive.permissions().create(
+                fileId=file_id,
+                body={"type": "anyone", "role": "reader"},
+                fields="id"
+            ).execute()
+
+        return jsonify({"ok": True})
+    except Exception as e:
+        # Don't blow up the UI on permission hiccups
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 
