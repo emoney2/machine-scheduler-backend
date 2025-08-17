@@ -5,3 +5,14 @@ creds.b64
 
 "credentials.json" 
 "credentials.json" 
+
+# Google OAuth secrets
+token.json
+work_credentials.json
+credentials.json
+*.pem
+*.p12
+
+# OS/editor
+.DS_Store
+Thumbs.db
