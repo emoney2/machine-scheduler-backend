@@ -140,6 +140,14 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
+# --- Quick session check ---
+@app.route("/api/ping", methods=["GET"])
+@login_required_session
+def api_ping():
+    # Minimal payload that proves auth + CORS + cookies are OK
+    return jsonify({"ok": True}), 200
+
+
 def fetch_company_info(headers, realm_id, env_override=None):
     """
     Fetch company info from QuickBooks (sandbox or production).
