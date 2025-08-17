@@ -252,59 +252,59 @@ def drive_token_status():
 
 @app.route("/api/drive/proxy/<file_id>", methods=["GET", "OPTIONS"])
 def drive_proxy(file_id):
-    try:
-        creds = _load_google_creds()   # <-- must align here
-        if not creds:
-            return jsonify({"error": "Missing Google credentials"}), 403
+    # --- CORS preflight ---
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed = {
+            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+        }
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        return resp
 
-        service = build("drive", "v3", credentials=creds)
-        request = service.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        fh.seek(0)
-        return send_file(fh, mimetype="image/jpeg")
-    except Exception as e:
-        print("drive_proxy error", e)
-        return jsonify({"error": str(e)}), 500
-
-
-    # Normal GET
-    size = request.args.get("sz", "w256")  # e.g., w256
+    # --- Query params ---
+    size = request.args.get("sz", "w256")          # e.g., w256
     use_thumb = request.args.get("thumb", "1") != "0"  # default to thumbnail
 
-  creds = _load_google_creds()
-  if not creds or not creds.token:
-      # Return a 1x1 PNG placeholder so UI doesn't break
-      pixel = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\xdac\xf8\xff\xff?\x00\x05\xfe\x02\xfeA\x1d\x0b\x85\x00\x00\x00\x00IEND\xaeB`\x82"
-      resp = Response(pixel, status=200, mimetype="image/png")
-      origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-      allowed = {
-          (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-          "https://machineschedule.netlify.app",
-          "http://localhost:3000",
-      }
-      if origin in allowed:
-          resp.headers["Access-Control-Allow-Origin"] = origin
-          resp.headers["Access-Control-Allow-Credentials"] = "true"
-      return resp
-
+    # --- Load/refresh creds ---
+    creds = _load_google_creds()
+    if not creds or not creds.token:
+        # Non-breaking 1x1 PNG so cards don't show broken images
+        pixel = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\xdac\xf8\xff"
+            b"\xff?\x00\x05\xfe\x02\xfeA\x1d\x0b\x85\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        resp = Response(pixel, status=200, mimetype="image/png")
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed = {
+            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+        }
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
 
     headers = {"Authorization": f"Bearer {creds.token}"}
 
     try:
+        # --- Fast path: Drive thumbnail ---
         if use_thumb:
-            # 1) Ask Drive for the thumbnailLink (metadata)
             meta_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=thumbnailLink,mimeType,name"
             meta = requests.get(meta_url, headers=headers, timeout=6)
             if meta.status_code == 200:
                 info = meta.json()
                 thumb = info.get("thumbnailLink")
                 if thumb:
-                    # Drive returns a URL like ...=s220; size hint tweak:
-                    # convert w256 → s256 for thumbnails
+                    # Convert w256 → s256 for Drive thumbnail URL
                     s_val = "s" + (size[1:] if size.startswith("w") else "256")
                     thumb = thumb.replace("=s220", f"={s_val}")
                     img = requests.get(thumb, headers=headers, timeout=8)
@@ -321,17 +321,15 @@ def drive_proxy(file_id):
                             resp.headers["Access-Control-Allow-Origin"] = origin
                             resp.headers["Access-Control-Allow-Credentials"] = "true"
                         return resp
-            # If thumbnail flow fails, fall through to alt=media
-        # 2) Fallback: full file bytes
+        # --- Fallback: full file bytes via alt=media ---
         media_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
         r = requests.get(media_url, headers=headers, timeout=10, stream=True)
         if r.status_code != 200:
             return make_response((f"Drive returned {r.status_code}", r.status_code))
-        # Pass-through bytes and content-type; force inline
+
         content_type = r.headers.get("Content-Type", "application/octet-stream")
-        content = r.content
-        resp = Response(content, status=200, mimetype=content_type)
-        resp.headers["Content-Disposition"] = 'inline'
+        resp = Response(r.content, status=200, mimetype=content_type)
+        resp.headers["Content-Disposition"] = "inline"
         resp.headers["Cache-Control"] = "public, max-age=3600"
         origin = (request.headers.get("Origin") or "").strip().rstrip("/")
         allowed = {
@@ -343,8 +341,10 @@ def drive_proxy(file_id):
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Credentials"] = "true"
         return resp
+
     except Exception as e:
         return make_response((f"Drive request error: {str(e)}", 502))
+
 # --- Handle ALL /api/* preflight requests (OPTIONS) ---
 @app.route("/api/<path:anypath>", methods=["OPTIONS"])
 def cors_preflight_any(anypath):
