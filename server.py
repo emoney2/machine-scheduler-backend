@@ -916,14 +916,19 @@ def _debug_session():
 @app.after_request
 def apply_cors(response):
     origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-    allowed = { (os.environ.get("FRONTEND_URL","https://machineschedule.netlify.app").strip().rstrip("/")),
-                "https://machineschedule.netlify.app",
-                "http://localhost:3000" }
+
+    allowed = {
+        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+        "https://machineschedule.netlify.app",
+        "http://localhost:3000",
+    }
+
     if origin in allowed:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+
     return response
 
 # ─── Session & Auth Helpers ──────────────────────────────────────────────────
@@ -935,11 +940,18 @@ def login_required_session(f):
     def decorated(*args, **kwargs):
         # 1) OPTIONS are always allowed (CORS preflight)
         if request.method == "OPTIONS":
+            origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+            allowed = {
+                (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+                "https://machineschedule.netlify.app",
+                "http://localhost:3000",
+            }
             response = make_response("", 204)
-            response.headers["Access-Control-Allow-Origin"]      = FRONTEND_URL
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-            response.headers["Access-Control-Allow-Headers"]     = "Content-Type,Authorization"
-            response.headers["Access-Control-Allow-Methods"]     = "GET,POST,PUT,OPTIONS"
+            if origin in allowed:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+                response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+                response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
             return response
 
         # 2) Must be logged in at all
@@ -994,17 +1006,19 @@ def login_required_session(f):
 
     return decorated
 
-# Socket.IO (same origin)
-# Allow your Netlify app + optionally localhost for dev
-ALLOWED_WS_ORIGINS = list({FRONTEND_URL, "https://machineschedule.netlify.app", "http://localhost:3000"})
+ALLOWED_WS_ORIGINS = list({
+    os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/"),
+    "https://machineschedule.netlify.app",
+    "http://localhost:3000",
+})
 
 socketio = SocketIO(
     app,
     cors_allowed_origins=ALLOWED_WS_ORIGINS,
     async_mode="eventlet",
-    path="/socket.io",        # ← explicit, matches the client
-    ping_interval=25,         # keepalive tuning (seconds)
-    ping_timeout=20
+    path="/socket.io",
+    ping_interval=25,
+    ping_timeout=20,
 )
 
 # --- Drive: make file public (anyone with link → reader) ---------------------
