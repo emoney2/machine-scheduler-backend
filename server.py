@@ -14,6 +14,7 @@ import secrets
 import io
 import tempfile
 import base64
+from flask import current_app
 from flask import request, jsonify
 from flask import request, make_response, jsonify, Response
 from google.oauth2.credentials import Credentials
@@ -110,6 +111,20 @@ if TOKEN_ENV:
         print("✅ token.json written from GOOGLE_TOKEN_JSON env")
     except Exception as e:
         print("⚠️ Failed to write token.json from env:", e)
+
+def _ensure_token_json():
+    """If GOOGLE_TOKEN_JSON env var is set, write it to token.json on disk."""
+    val = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
+    if not val:
+        return False
+    try:
+        # Validate it’s valid JSON
+        json.loads(val)
+        with open("token.json", "w", encoding="utf-8") as f:
+            f.write(val)
+        return True
+    except Exception:
+        return False
 
 def _load_google_creds():
     if not os.path.exists(TOKEN_PATH):
@@ -232,6 +247,11 @@ def apply_cors(response):
         response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
     return response
+
+@app.before_first_request
+def _bootstrap_token_file():
+    wrote = _ensure_token_json()
+    current_app.logger.info("BOOTSTRAP token.json from env: %s", "OK" if wrote else "SKIPPED")
 
 @app.route("/api/drive/token-status", methods=["GET"])
 def drive_token_status():
