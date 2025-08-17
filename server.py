@@ -91,6 +91,40 @@ def choose_box_for_item(length, width, height, volume):
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
 
+# ─── Google Drive Token/Scopes Config ──────────────────────────────
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    # keep broader scope if you already had it:
+    "https://www.googleapis.com/auth/drive",
+]
+
+TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
+
+# If the token is provided via env var, write it to token.json on boot (production-safe)
+TOKEN_ENV = os.environ.get("GOOGLE_TOKEN_JSON")
+if TOKEN_ENV:
+    try:
+        with open(TOKEN_PATH, "w") as f:
+            f.write(TOKEN_ENV)
+        print("✅ token.json written from GOOGLE_TOKEN_JSON env")
+    except Exception as e:
+        print("⚠️ Failed to write token.json from env:", e)
+
+def _load_google_creds():
+    if not os.path.exists(TOKEN_PATH):
+        return None
+    try:
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, GOOGLE_SCOPES)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(GoogleRequest())
+            with open(TOKEN_PATH, "w") as f:
+                f.write(creds.to_json())
+        return creds
+    except Exception:
+        return None
+
+
 START_TIME_COL_INDEX = 27
 
 from google.oauth2.credentials import Credentials as OAuthCredentials
@@ -199,6 +233,23 @@ def apply_cors(response):
         response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
     return response
 
+@app.route("/api/drive/token-status", methods=["GET"])
+def drive_token_status():
+    try:
+        creds = _load_google_creds()
+        if not creds:
+            return jsonify({"ok": False, "reason": "no token.json or invalid format"}), 502
+        info = {
+            "valid": bool(creds.token),
+            "expired": bool(creds.expired),
+            "has_refresh_token": bool(creds.refresh_token),
+            "scopes_ok": all(s in (creds.scopes or []) for s in GOOGLE_SCOPES),
+        }
+        return jsonify({"ok": True, **info}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/drive/proxy/<file_id>", methods=["GET", "OPTIONS"])
 def drive_proxy(file_id):
     # CORS preflight
@@ -221,9 +272,22 @@ def drive_proxy(file_id):
     size = request.args.get("sz", "w256")  # e.g., w256
     use_thumb = request.args.get("thumb", "1") != "0"  # default to thumbnail
 
-    creds = _load_google_creds()
-    if not creds or not creds.token:
-        return make_response(("Drive proxy not configured", 502))
+  creds = _load_google_creds()
+  if not creds or not creds.token:
+      # Return a 1x1 PNG placeholder so UI doesn't break
+      pixel = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\xdac\xf8\xff\xff?\x00\x05\xfe\x02\xfeA\x1d\x0b\x85\x00\x00\x00\x00IEND\xaeB`\x82"
+      resp = Response(pixel, status=200, mimetype="image/png")
+      origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+      allowed = {
+          (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+          "https://machineschedule.netlify.app",
+          "http://localhost:3000",
+      }
+      if origin in allowed:
+          resp.headers["Access-Control-Allow-Origin"] = origin
+          resp.headers["Access-Control-Allow-Credentials"] = "true"
+      return resp
+
 
     headers = {"Authorization": f"Bearer {creds.token}"}
 
