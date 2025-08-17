@@ -15,6 +15,7 @@ import io
 import tempfile
 import base64
 from flask import request, jsonify
+from flask import request, make_response, jsonify
 
 
 
@@ -191,6 +192,40 @@ def apply_cors(response):
         response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
     return response
+
+# --- Handle ALL /api/* preflight requests (OPTIONS) ---
+@app.route("/api/<path:anypath>", methods=["OPTIONS"])
+def cors_preflight_any(anypath):
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    allowed = {
+        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+        "https://machineschedule.netlify.app",
+        "http://localhost:3000",
+    }
+    resp = make_response("", 204)
+    if origin in allowed:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+    return resp
+
+@app.after_request
+def apply_cors(response):
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    allowed = {
+        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+        "https://machineschedule.netlify.app",
+        "http://localhost:3000",
+    }
+    if origin in allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+    return response
+
+
 
 @app.route("/api/ping", methods=["GET", "OPTIONS"])
 def api_ping():
@@ -949,24 +984,7 @@ from flask import session  # (if not already imported)
 def _debug_session():
     logger.info("🔑 Session data for %s → %s", request.path, dict(session))
 
-# After-request, echo back the real Origin so withCredentials can work
-@app.after_request
-def apply_cors(response):
-    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
 
-    allowed = {
-        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-        "https://machineschedule.netlify.app",
-        "http://localhost:3000",
-    }
-
-    if origin in allowed:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
-
-    return response
 
 # ─── Session & Auth Helpers ──────────────────────────────────────────────────
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
