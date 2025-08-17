@@ -37,6 +37,7 @@ from flask_cors import CORS, cross_origin
 from flask_socketio import SocketIO
 from flask import Response
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from httplib2 import Http
 from google_auth_httplib2 import AuthorizedHttp
@@ -95,6 +96,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets"
 ]
+
+
 
 QBO_SCOPE = ["com.intuit.quickbooks.accounting"]
 QBO_AUTH_BASE_URL = "https://appcenter.intuit.com/connect/oauth2"
@@ -192,6 +195,54 @@ def apply_cors(response):
         response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
     return response
+
+@app.route("/api/drive/proxy/<file_id>", methods=["GET"])
+def drive_proxy(file_id):
+    """
+    Proxies a Google Drive file/thumbnail through the backend using OAuth,
+    so we don't need to make the file public. Accepts optional ?sz=w256.
+    """
+    sz = request.args.get("sz", None)  # optional "w256" style hint
+
+    creds = _load_google_creds()
+    if not creds or not creds.token:
+        # No token.json or invalid token
+        return make_response(("Drive proxy not configured", 502))
+
+    # Decide what to fetch: thumbnail or full content.
+    # For speed, try the file media content; most image/PDF previews render fine.
+    # If you specifically want the Drive thumbnail, uncomment the thumbnail URL below.
+    drive_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+
+    # Example thumbnail link alternative (often JPEG). Uncomment to try thumbnails:
+    # base_thumb = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=thumbnailLink"
+    # (We'd need an extra API call to get thumbnailLink; using media keeps it simple.)
+
+    headers = {"Authorization": f"Bearer {creds.token}"}
+    try:
+        r = requests.get(drive_url, headers=headers, stream=True, timeout=8)
+    except Exception as e:
+        return make_response((f"Drive request failed: {e}", 502))
+
+    if r.status_code != 200:
+        return make_response((f"Drive returned {r.status_code}", r.status_code))
+
+    # Pass-through content type and lightweight caching
+    content_type = r.headers.get("Content-Type", "application/octet-stream")
+    resp = Response(r.content, status=200, mimetype=content_type)
+    resp.headers["Cache-Control"] = "public, max-age=3600"  # 1 hour
+    # CORS echo for your frontend
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    allowed = {
+        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+        "https://machineschedule.netlify.app",
+        "http://localhost:3000",
+    }
+    if origin in allowed:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
 
 # --- Handle ALL /api/* preflight requests (OPTIONS) ---
 @app.route("/api/<path:anypath>", methods=["OPTIONS"])
