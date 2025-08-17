@@ -15,7 +15,10 @@ import io
 import tempfile
 import base64
 from flask import request, jsonify
-from flask import request, make_response, jsonify
+from flask import request, make_response, jsonify, Response
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleRequest
+
 
 
 
@@ -195,6 +198,166 @@ def apply_cors(response):
         response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
     return response
+
+@app.route("/api/drive/proxy/<file_id>", methods=["GET", "OPTIONS"])
+def drive_proxy(file_id):
+    # CORS preflight
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed = {
+            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+        }
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        return resp
+
+    # Normal GET
+    size = request.args.get("sz", "w256")  # e.g., w256
+    use_thumb = request.args.get("thumb", "1") != "0"  # default to thumbnail
+
+    creds = _load_google_creds()
+    if not creds or not creds.token:
+        return make_response(("Drive proxy not configured", 502))
+
+    headers = {"Authorization": f"Bearer {creds.token}"}
+
+    try:
+        if use_thumb:
+            # 1) Ask Drive for the thumbnailLink (metadata)
+            meta_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=thumbnailLink,mimeType,name"
+            meta = requests.get(meta_url, headers=headers, timeout=6)
+            if meta.status_code == 200:
+                info = meta.json()
+                thumb = info.get("thumbnailLink")
+                if thumb:
+                    # Drive returns a URL like ...=s220; size hint tweak:
+                    # convert w256 → s256 for thumbnails
+                    s_val = "s" + (size[1:] if size.startswith("w") else "256")
+                    thumb = thumb.replace("=s220", f"={s_val}")
+                    img = requests.get(thumb, headers=headers, timeout=8)
+                    if img.status_code == 200 and img.content:
+                        resp = Response(img.content, status=200, mimetype="image/jpeg")
+                        resp.headers["Cache-Control"] = "public, max-age=3600"
+                        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+                        allowed = {
+                            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+                            "https://machineschedule.netlify.app",
+                            "http://localhost:3000",
+                        }
+                        if origin in allowed:
+                            resp.headers["Access-Control-Allow-Origin"] = origin
+                            resp.headers["Access-Control-Allow-Credentials"] = "true"
+                        return resp
+            # If thumbnail flow fails, fall through to alt=media
+        # 2) Fallback: full file bytes
+        media_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+        r = requests.get(media_url, headers=headers, timeout=10, stream=True)
+        if r.status_code != 200:
+            return make_response((f"Drive returned {r.status_code}", r.status_code))
+        # Pass-through bytes and content-type; force inline
+        content_type = r.headers.get("Content-Type", "application/octet-stream")
+        content = r.content
+        resp = Response(content, status=200, mimetype=content_type)
+        resp.headers["Content-Disposition"] = 'inline'
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed = {
+            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+        }
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
+    except Exception as e:
+        return make_response((f"Drive request error: {str(e)}", 502))
+@app.route("/api/drive/proxy/<file_id>", methods=["GET", "OPTIONS"])
+def drive_proxy(file_id):
+    # CORS preflight
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed = {
+            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+        }
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        return resp
+
+    # Normal GET
+    size = request.args.get("sz", "w256")  # e.g., w256
+    use_thumb = request.args.get("thumb", "1") != "0"  # default to thumbnail
+
+    creds = _load_google_creds()
+    if not creds or not creds.token:
+        return make_response(("Drive proxy not configured", 502))
+
+    headers = {"Authorization": f"Bearer {creds.token}"}
+
+    try:
+        if use_thumb:
+            # 1) Ask Drive for the thumbnailLink (metadata)
+            meta_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=thumbnailLink,mimeType,name"
+            meta = requests.get(meta_url, headers=headers, timeout=6)
+            if meta.status_code == 200:
+                info = meta.json()
+                thumb = info.get("thumbnailLink")
+                if thumb:
+                    # Drive returns a URL like ...=s220; size hint tweak:
+                    # convert w256 → s256 for thumbnails
+                    s_val = "s" + (size[1:] if size.startswith("w") else "256")
+                    thumb = thumb.replace("=s220", f"={s_val}")
+                    img = requests.get(thumb, headers=headers, timeout=8)
+                    if img.status_code == 200 and img.content:
+                        resp = Response(img.content, status=200, mimetype="image/jpeg")
+                        resp.headers["Cache-Control"] = "public, max-age=3600"
+                        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+                        allowed = {
+                            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+                            "https://machineschedule.netlify.app",
+                            "http://localhost:3000",
+                        }
+                        if origin in allowed:
+                            resp.headers["Access-Control-Allow-Origin"] = origin
+                            resp.headers["Access-Control-Allow-Credentials"] = "true"
+                        return resp
+            # If thumbnail flow fails, fall through to alt=media
+        # 2) Fallback: full file bytes
+        media_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+        r = requests.get(media_url, headers=headers, timeout=10, stream=True)
+        if r.status_code != 200:
+            return make_response((f"Drive returned {r.status_code}", r.status_code))
+        # Pass-through bytes and content-type; force inline
+        content_type = r.headers.get("Content-Type", "application/octet-stream")
+        content = r.content
+        resp = Response(content, status=200, mimetype=content_type)
+        resp.headers["Content-Disposition"] = 'inline'
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed = {
+            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+        }
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
+    except Exception as e:
+        return make_response((f"Drive request error: {str(e)}", 502))
+
 
 @app.route("/api/drive/proxy/<file_id>", methods=["GET"])
 def drive_proxy(file_id):
@@ -1126,6 +1289,32 @@ socketio = SocketIO(
     ping_interval=25,
     ping_timeout=20,
 )
+
+# ─── Google Drive Token/Scopes Config ──────────────────────────────
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    # keep broader scope if you already had it
+    "https://www.googleapis.com/auth/drive",
+]
+
+TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
+
+def _load_google_creds():
+    if not os.path.exists(TOKEN_PATH):
+        return None
+    try:
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, GOOGLE_SCOPES)
+        # Refresh if needed
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(GoogleRequest())
+            # persist refresh so future requests keep working
+            with open(TOKEN_PATH, "w") as f:
+                f.write(creds.to_json())
+        return creds
+    except Exception:
+        return None
+
 
 # --- Drive: make file public (anyone with link → reader) ---------------------
 @app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
