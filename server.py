@@ -184,6 +184,15 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
 app.secret_key = os.environ.get("FLASK_SECRET", "shhhh")
 
+# Materialize token.json from env once at import time
+_bootstrap_ok = _ensure_token_json()
+try:
+    app.logger.info("BOOTSTRAP token.json from env: %s", "OK" if _bootstrap_ok else "SKIPPED")
+except Exception:
+    # logger may not be ready in some environments; fall back to print
+    print(f"BOOTSTRAP token.json from env: {'OK' if _bootstrap_ok else 'SKIPPED'}")
+
+
 # ✅ Allow session cookies to be sent cross-site (Netlify → Render)
 app.config.update(
     SESSION_COOKIE_SAMESITE="None",  # Required for cross-domain cookies
@@ -247,11 +256,6 @@ def apply_cors(response):
         response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
     return response
-
-@app.before_first_request
-def _bootstrap_token_file():
-    wrote = _ensure_token_json()
-    current_app.logger.info("BOOTSTRAP token.json from env: %s", "OK" if wrote else "SKIPPED")
 
 @app.route("/api/drive/token-status", methods=["GET"])
 def drive_token_status():
