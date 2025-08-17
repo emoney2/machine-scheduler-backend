@@ -298,7 +298,7 @@ def drive_proxy(file_id):
     try:
         # --- Fast path: Drive thumbnail ---
         if use_thumb:
-            meta_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=thumbnailLink,mimeType,name"
+            meta_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
             meta = requests.get(meta_url, headers=headers, timeout=6)
             if meta.status_code == 200:
                 info = meta.json()
@@ -307,6 +307,44 @@ def drive_proxy(file_id):
                     # Convert w256 → s256 for Drive thumbnail URL
                     s_val = "s" + (size[1:] if size.startswith("w") else "256")
                     thumb = thumb.replace("=s220", f"={s_val}")
+
+                    # Build a deterministic ETag (file id + size + file version)
+                    etag = f'W/"{file_id}-t-{size}-{info.get("md5Checksum") or info.get("modifiedTime") or ""}"'
+
+                    # If client already has this version cached, return 304
+                    if request.headers.get("If-None-Match") == etag:
+                        resp = make_response("", 304)
+                        resp.headers["ETag"] = etag
+                        resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+                        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+                        allowed = {
+                            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+                            "https://machineschedule.netlify.app",
+                            "http://localhost:3000",
+                        }
+                        if origin in allowed:
+                            resp.headers["Access-Control-Allow-Origin"] = origin
+                            resp.headers["Access-Control-Allow-Credentials"] = "true"
+                        return resp
+
+            img = requests.get(thumb, headers=headers, timeout=8)
+            if img.status_code == 200 and img.content:
+                resp = Response(img.content, status=200, mimetype="image/jpeg")
+                # Cache one day; browsers/CDNs can reuse until ETag changes
+                resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+                resp.headers["ETag"] = etag
+                origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+                allowed = {
+                    (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+                    "https://machineschedule.netlify.app",
+                    "http://localhost:3000",
+                }
+                if origin in allowed:
+                    resp.headers["Access-Control-Allow-Origin"] = origin
+                    resp.headers["Access-Control-Allow-Credentials"] = "true"
+                return resp
+
+
                     img = requests.get(thumb, headers=headers, timeout=8)
                     if img.status_code == 200 and img.content:
                         resp = Response(img.content, status=200, mimetype="image/jpeg")
@@ -322,6 +360,30 @@ def drive_proxy(file_id):
                             resp.headers["Access-Control-Allow-Credentials"] = "true"
                         return resp
         # --- Fallback: full file bytes via alt=media ---
+        # --- Fallback: full file bytes via alt=media ---
+
+        # Build ETag for full file using file metadata (allows client 304s)
+        meta2_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=modifiedTime,md5Checksum,mimeType,name"
+        meta2 = requests.get(meta2_url, headers=headers, timeout=6)
+        info2 = meta2.json() if meta2.status_code == 200 else {}
+        etag_full = f'W/"{file_id}-f-{info2.get("md5Checksum") or info2.get("modifiedTime") or ""}"'
+
+        # If client already has this version cached, return 304
+        if request.headers.get("If-None-Match") == etag_full:
+            resp = make_response("", 304)
+            resp.headers["ETag"] = etag_full
+            resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+            origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+            allowed = {
+                (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+                "https://machineschedule.netlify.app",
+                "http://localhost:3000",
+            }
+            if origin in allowed:
+                resp.headers["Access-Control-Allow-Origin"] = origin
+                resp.headers["Access-Control-Allow-Credentials"] = "true"
+            return resp
+
         media_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
         r = requests.get(media_url, headers=headers, timeout=10, stream=True)
         if r.status_code != 200:
@@ -330,7 +392,9 @@ def drive_proxy(file_id):
         content_type = r.headers.get("Content-Type", "application/octet-stream")
         resp = Response(r.content, status=200, mimetype=content_type)
         resp.headers["Content-Disposition"] = "inline"
-        resp.headers["Cache-Control"] = "public, max-age=3600"
+        # Cache one day; ETag changes when file changes        
+        resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+        resp.headers["ETag"] = etag_full
         origin = (request.headers.get("Origin") or "").strip().rstrip("/")
         allowed = {
             (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
@@ -342,8 +406,6 @@ def drive_proxy(file_id):
             resp.headers["Access-Control-Allow-Credentials"] = "true"
         return resp
 
-    except Exception as e:
-        return make_response((f"Drive request error: {str(e)}", 502))
 
 # --- Handle ALL /api/* preflight requests (OPTIONS) ---
 @app.route("/api/<path:anypath>", methods=["OPTIONS"])
