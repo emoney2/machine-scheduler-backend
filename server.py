@@ -89,7 +89,10 @@ def _get_thumb_meta(file_id: str, size: str, headers: dict):
 
     # Convert Drive style (=s220) to requested size (w240 → s240, etc.)
     s_val = "s" + (size[1:] if size.startswith("w") else "256")
-    thumb = thumb.replace("=s220", f"={s_val}")
+    if re.search(r"=s\d+", thumb):
+        thumb = re.sub(r"=s\d+", f"={s_val}", thumb)
+    else:
+        thumb = f"{thumb}={s_val}"
 
     # Build an ETag based on file version info (no second meta call needed)
     etag = f'W/"{file_id}-t-{size}-{info.get("md5Checksum") or info.get("modifiedTime") or ""}"'
