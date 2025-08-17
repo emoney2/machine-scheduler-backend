@@ -1001,7 +1001,8 @@ def login_required_session(f):
 socketio = SocketIO(
     app,
     cors_allowed_origins=[FRONTEND_URL],
-    async_mode="eventlet"
+    async_mode="eventlet",
+    path="/socket.io"   # ← explicit default path to match the client
 )
 # --- Drive: make file public (anyone with link → reader) ---------------------
 @app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
@@ -3251,23 +3252,36 @@ def on_disconnect():
 
 # ─── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # --- Startup banner ---
     print("🚀 JRCO server.py loaded and running...")
     print("📡 Available Flask Routes:")
     for rule in app.url_map.iter_rules():
         print("✅", rule)
 
-    logger.info(f"Starting on port {os.environ.get('PORT', 10000)}")
+    # Prefer explicit port from env (Render sets PORT)
+    port = int(os.environ.get("PORT", 10000))
+    logger.info(f"Starting on port {port}")
 
-    # If you're using token creation for Google auth
-    if os.environ.get("GENERATE_GOOGLE_TOKEN") == "true":
+    # Optional one-off Google OAuth token generation
+    if os.environ.get("GENERATE_GOOGLE_TOKEN", "false").lower() == "true":
         from google_auth_oauthlib.flow import InstalledAppFlow
-        SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/spreadsheets']
+        SCOPES = [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/spreadsheets",
+        ]
         flow = InstalledAppFlow.from_client_secrets_file("oauth-credentials.json", SCOPES)
         creds = flow.run_local_server(port=0)
         with open("token.json", "w") as token:
             token.write(creds.to_json())
         print("✅ token.json created successfully.")
     else:
-        port = int(os.environ.get("PORT", 10000))
-        socketio.run(app, host="0.0.0.0", port=port, debug=True, use_reloader=False)
-
+        # IMPORTANT: run via SocketIO so websockets work in production.
+        # Make sure your SocketIO was created with the path you expect, e.g.:
+        # socketio = SocketIO(app, cors_allowed_origins=[FRONTEND_URL], async_mode="eventlet", path="/socket.io")
+        socketio.run(
+            app,
+            host="0.0.0.0",
+            port=port,
+            debug=False,        # Debug off in production
+            use_reloader=False  # Avoid double-start on Render
+        )
