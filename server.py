@@ -258,20 +258,29 @@ def apply_cors(response):
     return response
 
 @app.route("/api/drive/token-status", methods=["GET"])
-def drive_token_status():
-    try:
-        creds = _load_google_creds()
-        if not creds:
-            return jsonify({"ok": False, "reason": "no token.json or invalid format"}), 502
-        info = {
-            "valid": bool(creds.token),
-            "expired": bool(creds.expired),
-            "has_refresh_token": bool(creds.refresh_token),
-            "scopes_ok": all(s in (creds.scopes or []) for s in GOOGLE_SCOPES),
-        }
-        return jsonify({"ok": True, **info}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+def token_status():
+    env_present = bool(os.environ.get("GOOGLE_TOKEN_JSON", "").strip())
+    file_exists = os.path.exists("token.json")
+    cwd = os.getcwd()
+
+    creds = _load_google_creds()
+    info = {
+        "ok": bool(creds and creds.valid),
+        "expired": bool(creds and creds.expired),
+        "has_refresh_token": bool(creds and getattr(creds, "refresh_token", None)),
+        "valid": bool(creds and creds.valid),
+        "env_present": env_present,
+        "file_exists": file_exists,
+        "cwd": cwd,
+    }
+    # If not ok, include a short reason without leaking secrets
+    if not info["ok"]:
+        info["reason"] = (
+            "no creds" if not creds else
+            "expired without refresh_token" if creds and creds.expired and not creds.refresh_token else
+            "invalid"
+        )
+    return jsonify(info)
 
 
 @app.route("/api/drive/proxy/<file_id>", methods=["GET", "OPTIONS"])
@@ -1332,20 +1341,40 @@ GOOGLE_SCOPES = [
 
 TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
 
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
 def _load_google_creds():
-    if not os.path.exists(TOKEN_PATH):
-        return None
+    """
+    Load Google creds from GOOGLE_TOKEN_JSON env var (preferred) or token.json file.
+    Refresh if expired and refresh_token is present.
+    Return a google.oauth2.credentials.Credentials or None.
+    """
+    # 1) Try ENV first
+    env_val = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
+    if env_val:
+        try:
+            info = json.loads(env_val)
+            creds = Credentials.from_authorized_user_info(info, scopes=SCOPES)
+            if not creds.valid and creds.refresh_token:
+                creds.refresh(Request())
+            return creds
+        except Exception:
+            pass  # fall back to file
+
+    # 2) Try token.json file next
     try:
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, GOOGLE_SCOPES)
-        # Refresh if needed
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(GoogleRequest())
-            # persist refresh so future requests keep working
-            with open(TOKEN_PATH, "w") as f:
-                f.write(creds.to_json())
-        return creds
+        if os.path.exists("token.json"):
+            with open("token.json", "r", encoding="utf-8") as f:
+                info = json.load(f)
+            creds = Credentials.from_authorized_user_info(info, scopes=SCOPES)
+            if not creds.valid and creds.refresh_token:
+                creds.refresh(Request())
+            return creds
     except Exception:
         return None
+
+    # 3) Nothing available
+    return None
 
 
 # --- Drive: make file public (anyone with link → reader) ---------------------
