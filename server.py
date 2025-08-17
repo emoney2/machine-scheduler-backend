@@ -998,12 +998,18 @@ def login_required_session(f):
     return decorated
 
 # Socket.IO (same origin)
+# Allow your Netlify app + optionally localhost for dev
+ALLOWED_WS_ORIGINS = list({FRONTEND_URL, "https://machineschedule.netlify.app", "http://localhost:3000"})
+
 socketio = SocketIO(
     app,
-    cors_allowed_origins=[FRONTEND_URL],
+    cors_allowed_origins=ALLOWED_WS_ORIGINS,
     async_mode="eventlet",
-    path="/socket.io"   # ← explicit default path to match the client
+    path="/socket.io",        # ← explicit, matches the client
+    ping_interval=25,         # keepalive tuning (seconds)
+    ping_timeout=20
 )
+
 # --- Drive: make file public (anyone with link → reader) ---------------------
 @app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
 @login_required_session
