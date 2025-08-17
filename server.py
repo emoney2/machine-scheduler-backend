@@ -912,22 +912,19 @@ from flask import session  # (if not already imported)
 def _debug_session():
     logger.info("🔑 Session data for %s → %s", request.path, dict(session))
 
-
-
 # After-request, echo back the real Origin so withCredentials can work
 @app.after_request
 def apply_cors(response):
-    # 1) Grab whatever Origin header the browser sent
-    origin = request.headers.get("Origin", "").strip()
-
-    # 2) If it matches exactly our FRONTEND_URL, expose CORS headers
-    if origin == FRONTEND_URL:
-        response.headers["Access-Control-Allow-Origin"]      = origin
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    allowed = { (os.environ.get("FRONTEND_URL","https://machineschedule.netlify.app").strip().rstrip("/")),
+                "https://machineschedule.netlify.app",
+                "http://localhost:3000" }
+    if origin in allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Headers"]     = "Content-Type,Authorization"
-        response.headers["Access-Control-Allow-Methods"]     = "GET,POST,PUT,OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
     return response
-
 
 # ─── Session & Auth Helpers ──────────────────────────────────────────────────
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
