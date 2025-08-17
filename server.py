@@ -252,21 +252,24 @@ def drive_token_status():
 
 @app.route("/api/drive/proxy/<file_id>", methods=["GET", "OPTIONS"])
 def drive_proxy(file_id):
-    # CORS preflight
-    if request.method == "OPTIONS":
-        resp = make_response("", 204)
-        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-        allowed = {
-            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-            "https://machineschedule.netlify.app",
-            "http://localhost:3000",
-        }
-        if origin in allowed:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-        return resp
+    try:
+        creds = _load_google_creds()   # <-- must align here
+        if not creds:
+            return jsonify({"error": "Missing Google credentials"}), 403
+
+        service = build("drive", "v3", credentials=creds)
+        request = service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        fh.seek(0)
+        return send_file(fh, mimetype="image/jpeg")
+    except Exception as e:
+        print("drive_proxy error", e)
+        return jsonify({"error": str(e)}), 500
+
 
     # Normal GET
     size = request.args.get("sz", "w256")  # e.g., w256
