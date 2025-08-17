@@ -13,6 +13,10 @@ import urllib.parse
 import secrets
 import io
 import tempfile
+import base64
+from flask import request, jsonify
+
+
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
@@ -25,7 +29,7 @@ from dotenv import load_dotenv
 from urllib.parse import urlencode
 
 from eventlet.semaphore import Semaphore
-from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string, url_for, send_from_directory
+from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string, url_for, send_from_directory, abort
 from flask import make_response
 from flask_cors import CORS
 from flask_cors import CORS, cross_origin
@@ -49,6 +53,7 @@ from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib.utils import ImageReader
 from uuid import uuid4
+from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_shipment
 
 # ── HARD-CODED BOX INVENTORY & FIT-FUNCTION ─────────────────────────────────────
 BOX_TYPES = [
@@ -77,6 +82,17 @@ def choose_box_for_item(length, width, height, volume):
             return box["size"]
     # Fallback to largest box
     return BOX_TYPES[-1]["size"]
+
+@app.route("/labels/<path:filename>")
+def serve_label(filename):
+    # Serve tmp label files (PDF/PNG/ZPL) written by ups_service
+    tmp = tempfile.gettempdir()
+    safe = os.path.basename(filename)
+    full = os.path.join(tmp, safe)
+    if not os.path.exists(full):
+        return abort(404)
+    # Let browser open in a new tab for printing
+    return send_from_directory(tmp, safe, as_attachment=False)
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1131,6 +1147,29 @@ _http = Http(timeout=10)
 authed_http = AuthorizedHttp(creds, http=_http)
 service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 sheets  = service.spreadsheets()
+
+@app.route("/rate", methods=["POST"])
+@login_required_session
+def rate_all_services():
+    """
+    Accepts:
+      { 
+        "to": { "name","phone","addr1","addr2","city","state","zip","country" },
+        "packages": [ { "L":10,"W":10,"H":10,"weight":2 }, ... ]
+      }
+    Returns:
+      [ { code, method, rate, currency, delivery }, ... ]
+    """
+    p = request.get_json(force=True) or {}
+    to = p.get("to", {})
+    pkgs = p.get("packages", [])
+    try:
+        options = ups_get_rate(to, pkgs, ask_all_services=True)
+        return jsonify(options)  # an array that your Ship.jsx already expects
+    except Exception as e:
+        return jsonify([
+            { "method": "Manual Shipping", "rate": "N/A", "delivery": "TBD" }
+        ]), 200
 
 @app.route('/api/updateStartTime', methods=["POST"])
 @login_required_session
@@ -2688,6 +2727,7 @@ def process_shipment():
     }
     boxes = data.get("boxes", [])
     shipping_method = data.get("shipping_method", "")
+    service_code    = data.get("service_code")   # e.g., "03", "02", "01", etc.
 
     print("🔍 Received order_ids:", order_ids)
     print("🔍 Received shipped_quantities:", shipped_quantities)
@@ -2903,21 +2943,26 @@ def logout_all():
     socketio.emit("forceLogout")
     return jsonify({"status": "ok"}), 200
 
-@app.route('/api/rate', methods=['POST'])
+@app.route("/api/rate", methods=["POST"])
 @login_required_session
-def rate_shipment():
-    data = request.get_json() or {}
-    shipper   = data.get('shipper')
-    recipient = data.get('recipient')
-    packages  = data.get('packages', [])
-
+def api_rate():
+    """
+    Request body:
+    {
+      "to": { "name","phone","addr1","addr2","city","state","zip","country" },
+      "packages": [ { "L":10,"W":10,"H":10,"weight":2 }, ... ]
+    }
+    Returns list of options: [{code, method, rate, currency, delivery}, ...]
+    """
     try:
-        rates = get_rate(shipper, recipient, packages)
+        payload = request.get_json(force=True)
+        to = payload.get("to", {})
+        packages = payload.get("packages", [])
+        options = ups_get_rate(to, packages, ask_all_services=True)
+        return jsonify({"ok": True, "options": options})
     except Exception as e:
-        app.logger.error(f"UPS rating failed, falling back to empty rates: {e}")
-        rates = []
+        return jsonify({"ok": False, "error": str(e)}), 400
 
-    return jsonify(rates)
 
 @app.route("/api/list-folder-files")
 def list_folder_files():
