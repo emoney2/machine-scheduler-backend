@@ -92,6 +92,7 @@ def choose_box_for_item(length, width, height, volume):
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
 
+
 # ─── Google Drive Token/Scopes Config ──────────────────────────────
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
@@ -100,17 +101,21 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
+# Google token file path (your choice)
+GOOGLE_TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
 
-# If the token is provided via env var, write it to token.json on boot (production-safe)
-TOKEN_ENV = os.environ.get("GOOGLE_TOKEN_JSON")
-if TOKEN_ENV:
+# If GOOGLE_TOKEN_JSON is present, materialize it to token.json at boot
+GOOGLE_TOKEN_JSON = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
+if GOOGLE_TOKEN_JSON:
     try:
-        with open(TOKEN_PATH, "w") as f:
-            f.write(TOKEN_ENV)
+        # validate JSON then write
+        json.loads(GOOGLE_TOKEN_JSON)
+        with open(GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
+            f.write(GOOGLE_TOKEN_JSON)
         print("✅ token.json written from GOOGLE_TOKEN_JSON env")
     except Exception as e:
         print("⚠️ Failed to write token.json from env:", e)
+
 
 def _ensure_token_json():
     """If GOOGLE_TOKEN_JSON env var is set, write it to token.json on disk."""
@@ -126,20 +131,6 @@ def _ensure_token_json():
     except Exception:
         return False
 
-def _load_google_creds():
-    if not os.path.exists(TOKEN_PATH):
-        return None
-    try:
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, GOOGLE_SCOPES)
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(GoogleRequest())
-            with open(TOKEN_PATH, "w") as f:
-                f.write(creds.to_json())
-        return creds
-    except Exception:
-        return None
-
-
 START_TIME_COL_INDEX = 27
 
 from google.oauth2.credentials import Credentials as OAuthCredentials
@@ -149,23 +140,23 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets"
 ]
 
-
-
 QBO_SCOPE = ["com.intuit.quickbooks.accounting"]
 QBO_AUTH_BASE_URL = "https://appcenter.intuit.com/connect/oauth2"
 
 def get_oauth_credentials():
-    if os.path.exists("token.json"):
-        creds = OAuthCredentials.from_authorized_user_file("token.json", SCOPES)
+    # Uses the env-aware loader you added earlier, which checks:
+    # 1) GOOGLE_TOKEN_JSON env var, then 2) GOOGLE_TOKEN_PATH (token.json)
+    creds = _load_google_creds()
+    if creds:
         return creds
-    else:
-        raise Exception("🔑 token.json not found. Please authenticate via OAuth2.")
+    raise Exception("🔑 Google Drive credentials not available. Set GOOGLE_TOKEN_JSON or provide token.json.")
 
 def get_sheets_service():
     return build("sheets", "v4", credentials=get_oauth_credentials())
 
 def get_drive_service():
     return build("drive", "v3", credentials=get_oauth_credentials())
+
 
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
@@ -1332,43 +1323,49 @@ socketio = SocketIO(
 )
 
 # ─── Google Drive Token/Scopes Config ──────────────────────────────
+# ─── Google Drive Token/Scopes Config ──────────────────────────────
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
-    # keep broader scope if you already had it
     "https://www.googleapis.com/auth/drive",
 ]
 
-TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
-
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+# use the same path variable everywhere for Google token
+GOOGLE_TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
 
 def _load_google_creds():
     """
-    Load Google creds from GOOGLE_TOKEN_JSON env var (preferred) or token.json file.
+    Load Google Drive credentials from:
+      1) GOOGLE_TOKEN_JSON env var (preferred)
+      2) GOOGLE_TOKEN_PATH file (token.json)
     Refresh if expired and refresh_token is present.
     Return a google.oauth2.credentials.Credentials or None.
     """
-    # 1) Try ENV first
+    # 1) ENV first
     env_val = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
     if env_val:
         try:
             info = json.loads(env_val)
-            creds = Credentials.from_authorized_user_info(info, scopes=SCOPES)
+            creds = Credentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
             if not creds.valid and creds.refresh_token:
-                creds.refresh(Request())
+                from google.auth.transport.requests import Request as GoogleRequest
+                creds.refresh(GoogleRequest())
             return creds
         except Exception:
             pass  # fall back to file
 
-    # 2) Try token.json file next
+    # 2) File next
     try:
-        if os.path.exists("token.json"):
-            with open("token.json", "r", encoding="utf-8") as f:
+        if os.path.exists(GOOGLE_TOKEN_PATH):
+            with open(GOOGLE_TOKEN_PATH, "r", encoding="utf-8") as f:
                 info = json.load(f)
-            creds = Credentials.from_authorized_user_info(info, scopes=SCOPES)
+            creds = Credentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
             if not creds.valid and creds.refresh_token:
-                creds.refresh(Request())
+                from google.auth.transport.requests import Request as GoogleRequest
+                creds.refresh(GoogleRequest())
+                # persist refreshed token to disk
+                with open(GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
+                    f.write(creds.to_json())
             return creds
     except Exception:
         return None
