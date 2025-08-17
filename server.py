@@ -265,12 +265,12 @@ def drive_proxy(file_id):
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
         return resp
 
     # --- Query params ---
-    size = request.args.get("sz", "w256")          # e.g., w256
-    use_thumb = request.args.get("thumb", "1") != "0"  # default to thumbnail
+    size = request.args.get("sz", "w256")                 # e.g., w256
+    use_thumb = request.args.get("thumb", "1") != "0"     # default: True
 
     # --- Load/refresh creds ---
     creds = _load_google_creds()
@@ -298,17 +298,18 @@ def drive_proxy(file_id):
     try:
         # --- Fast path: Drive thumbnail ---
         if use_thumb:
+            # Ask a bit more metadata so we can build a stable ETag
             meta_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
             meta = requests.get(meta_url, headers=headers, timeout=6)
             if meta.status_code == 200:
                 info = meta.json()
                 thumb = info.get("thumbnailLink")
                 if thumb:
-                    # Convert w256 → s256 for Drive thumbnail URL
+                    # Convert w256 → sNNN for Drive thumbnail URL
                     s_val = "s" + (size[1:] if size.startswith("w") else "256")
                     thumb = thumb.replace("=s220", f"={s_val}")
 
-                    # Build a deterministic ETag (file id + size + file version)
+                    # Build deterministic ETag (file id + size + file version)
                     etag = f'W/"{file_id}-t-{size}-{info.get("md5Checksum") or info.get("modifiedTime") or ""}"'
 
                     # If client already has this version cached, return 304
@@ -345,7 +346,6 @@ def drive_proxy(file_id):
                             resp.headers["Access-Control-Allow-Credentials"] = "true"
                         return resp
 
-
         # --- Fallback: full file bytes via alt=media ---
 
         # Build ETag for full file using file metadata (allows client 304s)
@@ -378,7 +378,7 @@ def drive_proxy(file_id):
         content_type = r.headers.get("Content-Type", "application/octet-stream")
         resp = Response(r.content, status=200, mimetype=content_type)
         resp.headers["Content-Disposition"] = "inline"
-        # Cache one day; ETag changes when file changes        
+        # Cache one day; ETag changes when file changes
         resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
         resp.headers["ETag"] = etag_full
         origin = (request.headers.get("Origin") or "").strip().rstrip("/")
@@ -390,7 +390,29 @@ def drive_proxy(file_id):
         if origin in allowed:
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
         return resp
+
+    except Exception as e:
+        # If anything goes wrong, return a single-pixel so UI doesn't break
+        pixel = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\xdac\xf8\xff"
+            b"\xff?\x00\x05\xfe\x02\xfeA\x1d\x0b\x85\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        resp = Response(pixel, status=200, mimetype="image/png")
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed = {
+            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+        }
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
+
 
 
 # --- Handle ALL /api/* preflight requests (OPTIONS) ---
