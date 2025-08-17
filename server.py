@@ -327,28 +327,13 @@ def drive_proxy(file_id):
                             resp.headers["Access-Control-Allow-Credentials"] = "true"
                         return resp
 
-            img = requests.get(thumb, headers=headers, timeout=8)
-            if img.status_code == 200 and img.content:
-                resp = Response(img.content, status=200, mimetype="image/jpeg")
-                # Cache one day; browsers/CDNs can reuse until ETag changes
-                resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
-                resp.headers["ETag"] = etag
-                origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-                allowed = {
-                    (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-                    "https://machineschedule.netlify.app",
-                    "http://localhost:3000",
-                }
-                if origin in allowed:
-                    resp.headers["Access-Control-Allow-Origin"] = origin
-                    resp.headers["Access-Control-Allow-Credentials"] = "true"
-                return resp
-
-
+                    # Download the actual Drive thumbnail
                     img = requests.get(thumb, headers=headers, timeout=8)
                     if img.status_code == 200 and img.content:
                         resp = Response(img.content, status=200, mimetype="image/jpeg")
-                        resp.headers["Cache-Control"] = "public, max-age=3600"
+                        # Cache one day; browsers/CDNs can reuse until ETag changes
+                        resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+                        resp.headers["ETag"] = etag
                         origin = (request.headers.get("Origin") or "").strip().rstrip("/")
                         allowed = {
                             (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
@@ -359,7 +344,8 @@ def drive_proxy(file_id):
                             resp.headers["Access-Control-Allow-Origin"] = origin
                             resp.headers["Access-Control-Allow-Credentials"] = "true"
                         return resp
-        # --- Fallback: full file bytes via alt=media ---
+
+
         # --- Fallback: full file bytes via alt=media ---
 
         # Build ETag for full file using file metadata (allows client 304s)
