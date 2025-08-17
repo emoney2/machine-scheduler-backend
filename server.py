@@ -83,18 +83,6 @@ def choose_box_for_item(length, width, height, volume):
     # Fallback to largest box
     return BOX_TYPES[-1]["size"]
 
-@app.route("/labels/<path:filename>")
-def serve_label(filename):
-    # Serve tmp label files (PDF/PNG/ZPL) written by ups_service
-    tmp = tempfile.gettempdir()
-    safe = os.path.basename(filename)
-    full = os.path.join(tmp, safe)
-    if not os.path.exists(full):
-        return abort(404)
-    # Let browser open in a new tab for printing
-    return send_from_directory(tmp, safe, as_attachment=False)
-
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
 
@@ -170,6 +158,17 @@ def fetch_company_info(headers, realm_id, env_override=None):
         "Phone":       info.get("PrimaryPhone", {}).get("FreeFormNumber", ""),
     }
 
+
+@app.route("/labels/<path:filename>")
+def serve_label(filename):
+    # Serve tmp label files (PDF/PNG/ZPL) written by ups_service
+    tmp = tempfile.gettempdir()
+    safe = os.path.basename(filename)
+    full = os.path.join(tmp, safe)
+    if not os.path.exists(full):
+        return abort(404)
+    # Let browser open in a new tab for printing
+    return send_from_directory(tmp, safe, as_attachment=False)
 
 def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers, env_override=None):
     """
