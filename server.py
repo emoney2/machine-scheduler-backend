@@ -333,7 +333,7 @@ def drive_proxy(file_id):
         return resp
 
     # --- Query params ---
-    size = request.args.get("sz", "w256")                 # e.g., w256
+    size = request.args.get("sz", "w256")                 # e.g., w256 / w512
     use_thumb = request.args.get("thumb", "1") != "0"     # default: True
 
     # --- Load/refresh creds ---
@@ -362,7 +362,10 @@ def drive_proxy(file_id):
     try:
         # --- Fast path: Drive thumbnail ---
         if use_thumb:
-            meta_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
+            meta_url = (
+                f"https://www.googleapis.com/drive/v3/files/{file_id}"
+                f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
+            )
             meta = requests.get(meta_url, headers=headers, timeout=6)
             if meta.status_code == 200:
                 info = meta.json()
@@ -371,7 +374,7 @@ def drive_proxy(file_id):
                     # Convert wNNN → sNNN and apply robustly to the Drive thumb URL
                     desired = f"=s{size[1:] if size.startswith('w') else '256'}"
                     if "=s" in thumb:
-                        import re  # or keep at top of file
+                        import re
                         thumb = re.sub(r"=s\d+", desired, thumb)
                     else:
                         thumb = thumb + desired
@@ -425,58 +428,9 @@ def drive_proxy(file_id):
                                 resp.headers["Access-Control-Allow-Origin"] = origin
                                 resp.headers["Access-Control-Allow-Credentials"] = "true"
                             return resp
-                    # If we reach here, we intentionally do NOT return.
-                    # We'll fall through to the full-file fallback below.
-
-                    # Download the actual Drive thumbnail
-                    img = requests.get(thumb, headers=headers, timeout=8)
-
-                    # Debug log: see size Google returned
-                    try:
-                        app.logger.info(
-                            f"[thumb] id={file_id} sz={size} status={img.status_code} "
-                            f"bytes={len(img.content) if getattr(img,'content',None) else 0} url={thumb}"
-                        )
-                    except Exception:
-                        pass
-
-                    if img.status_code == 200 and img.content:
-                        resp = Response(img.content, status=200, mimetype="image/jpeg")
-                        # Cache one day; browsers/CDNs can reuse until ETag changes
-                        resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
-                        resp.headers["ETag"] = etag
-                        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-                        allowed = {
-                            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-                            "https://machineschedule.netlify.app",
-                            "http://localhost:3000",
-                        }
-                        if origin in allowed:
-                            resp.headers["Access-Control-Allow-Origin"] = origin
-                            resp.headers["Access-Control-Allow-Credentials"] = "true"
-                        return resp
-
-
-                # Download the actual thumbnail (single external request now)
-                img = requests.get(meta["thumb"], headers=headers, timeout=8)
-                app.logger.info(f"[thumb] id={file_id} sz={size} status={img.status_code} bytes={len(img.content) if img.content else 0} url={meta['thumb']}")
-                if img.status_code == 200 and img.content:
-                    resp = Response(img.content, status=200, mimetype="image/jpeg")
-                    resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
-                    resp.headers["ETag"] = etag
-                    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-                    allowed = {
-                        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-                        "https://machineschedule.netlify.app",
-                        "http://localhost:3000",
-                    }
-                    if origin in allowed:
-                        resp.headers["Access-Control-Allow-Origin"] = origin
-                        resp.headers["Access-Control-Allow-Credentials"] = "true"
-                    return resp
+            # If we reach here, fall through to the full-file fallback below.
 
         # --- Fallback: full file bytes via alt=media ---
-
         # Build ETag for full file using file metadata (allows client 304s)
         meta2_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=modifiedTime,md5Checksum,mimeType,name"
         meta2 = requests.get(meta2_url, headers=headers, timeout=6)
@@ -535,6 +489,26 @@ def drive_proxy(file_id):
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
         return resp
+
+    except Exception as e:
+        # If anything goes wrong, return a single-pixel so UI doesn't break
+        pixel = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\xdac\xf8\xff"
+            b"\xff?\x00\x05\xfe\x02\xfeA\x1d\x0b\x85\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        resp = Response(pixel, status=200, mimetype="image/png")
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed = {
+            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+        }
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
+
 
 # --- Handle ALL /api/* preflight requests (OPTIONS) ---
 @app.route("/api/<path:anypath>", methods=["OPTIONS"])
