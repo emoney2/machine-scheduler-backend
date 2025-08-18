@@ -1320,7 +1320,7 @@ def _load_google_creds():
     if env_val:
         try:
             info = json.loads(env_val)
-            creds = Credentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
             if not creds.valid and creds.refresh_token:
                 from google.auth.transport.requests import Request as GoogleRequest
                 creds.refresh(GoogleRequest())
@@ -1333,7 +1333,7 @@ def _load_google_creds():
         if os.path.exists(GOOGLE_TOKEN_PATH):
             with open(GOOGLE_TOKEN_PATH, "r", encoding="utf-8") as f:
                 info = json.load(f)
-            creds = Credentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
             if not creds.valid and creds.refresh_token:
                 from google.auth.transport.requests import Request as GoogleRequest
                 creds.refresh(GoogleRequest())
@@ -1444,6 +1444,7 @@ def get_qbo_oauth_credentials(env_override: str = None):
 # ─────────────────────────────────────────────────────────────────
 
 # Unified Google auth: always load from GOOGLE_TOKEN_JSON or token.json via _load_google_creds
+# Unified Google auth: always load from GOOGLE_TOKEN_JSON or token.json via _load_google_creds
 creds = _load_google_creds()
 if not creds:
     raise RuntimeError(
@@ -1451,30 +1452,7 @@ if not creds:
         "or place a valid token.json on disk."
     )
 
-# Unified Google auth — use your env/file token.json only (no TOKEN_JSON or token.pickle)
-from google.auth.transport.requests import Request as GoogleRequest
-from google.oauth2.credentials import Credentials as UserCredentials
-
-SCOPES = [
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
-
-# Prefer GOOGLE_TOKEN_JSON; fallback to token.json on disk
-token_raw = os.environ.get("GOOGLE_TOKEN_JSON", "")
-if not token_raw and os.path.exists("token.json"):
-    with open("token.json", "r", encoding="utf-8") as f:
-        token_raw = f.read()
-if not token_raw:
-    raise RuntimeError("No Google token. Set GOOGLE_TOKEN_JSON or provide token.json.")
-
-# Build creds and refresh now (fail fast if invalid)
-info = json.loads(token_raw)
-creds = UserCredentials.from_authorized_user_info(info, scopes=SCOPES)
-if creds and (not creds.valid) and creds.refresh_token:
-    creds.refresh(GoogleRequest())
-
-# Wire clients (these names are used elsewhere)
+# Wire clients once, using the creds from _load_google_creds()
 sh = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
 service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 sheets  = service.spreadsheets()
