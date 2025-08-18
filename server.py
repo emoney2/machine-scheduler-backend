@@ -316,92 +316,63 @@ def token_status():
 
 @app.route("/api/drive/proxy/<file_id>", methods=["GET", "OPTIONS"])
 def drive_proxy(file_id):
-    # --- CORS preflight ---
-    if request.method == "OPTIONS":
-        resp = make_response("", 204)
-        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-        allowed = {
-            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-            "https://machineschedule.netlify.app",
-            "http://localhost:3000",
-        }
-        if origin in allowed:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
-        return resp
+    # OPTIONS handled by before_request
 
     # --- Query params ---
-    size = request.args.get("sz", "w256")                 # e.g., w256 / w512
-    use_thumb = request.args.get("thumb", "1") != "0"     # default: True
+    size = request.args.get("sz", "w256")              # e.g., w256 / w512
+    use_thumb = request.args.get("thumb", "1") != "0"  # default True
+    debug_mode = request.args.get("debug") == "1"      # NEW: debug switch
 
-    # --- Load/refresh creds ---
+    # --- Load creds ---
     creds = _load_google_creds()
     if not creds or not creds.token:
-        # Non-breaking 1x1 PNG so cards don't show broken images
-        pixel = (
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\xdac\xf8\xff"
-            b"\xff?\x00\x05\xfe\x02\xfeA\x1d\x0b\x85\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
-        resp = Response(pixel, status=200, mimetype="image/png")
-        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-        allowed = {
-            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-            "https://machineschedule.netlify.app",
-            "http://localhost:3000",
-        }
-        if origin in allowed:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-        return resp
+        # No creds: return visible placeholder, or JSON if debug
+        if debug_mode:
+            return jsonify({"ok": False, "where": "no_creds"}), 502
+
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 56 56">'
+            '<rect width="56" height="56" fill="#e5e7eb"/>'
+            '<text x="50%" y="50%" dy=".35em" text-anchor="middle" font-size="8" fill="#9ca3af">no creds</text>'
+            '</svg>'
+        ).encode("utf-8")
+        return Response(svg, status=200, mimetype="image/svg+xml")
 
     headers = {"Authorization": f"Bearer {creds.token}"}
 
     try:
-        # --- Fast path: Drive thumbnail ---
+        # --- Fast path: Google Drive thumbnail ---
         if use_thumb:
             meta_url = (
                 f"https://www.googleapis.com/drive/v3/files/{file_id}"
                 f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
             )
             meta = requests.get(meta_url, headers=headers, timeout=6)
-            if meta.status_code == 200:
+            if meta.status_code != 200:
+                if debug_mode:
+                    return jsonify({"ok": False, "where": "thumb_meta", "status": meta.status_code}), 502
+            else:
                 info = meta.json()
                 thumb = info.get("thumbnailLink")
                 if thumb:
-                    # Convert wNNN → sNNN and apply robustly to the Drive thumb URL
+                    # force desired size (=sNNN) robustly
                     desired = f"=s{size[1:] if size.startswith('w') else '256'}"
                     if "=s" in thumb:
                         import re
-                        thumb = re.sub(r"=s\d+", desired, thumb)
+                        thumb = re.sub(r"=s\\d+", desired, thumb)
                     else:
                         thumb = thumb + desired
 
-                    # Build deterministic ETag (file id + size + file version)
+                    # thumb ETag
                     etag = f'W/"{file_id}-t-{size}-{info.get("md5Checksum") or info.get("modifiedTime") or ""}"'
-
-                    # If client already has this version cached, return 304
                     if request.headers.get("If-None-Match") == etag:
                         resp = make_response("", 304)
                         resp.headers["ETag"] = etag
                         resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
-                        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-                        allowed = {
-                            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-                            "https://machineschedule.netlify.app",
-                            "http://localhost:3000",
-                        }
-                        if origin in allowed:
-                            resp.headers["Access-Control-Allow-Origin"] = origin
-                            resp.headers["Access-Control-Allow-Credentials"] = "true"
                         return resp
 
-                    # Download the actual Drive thumbnail
+                    # fetch thumbnail bytes
                     img = requests.get(thumb, headers=headers, timeout=8)
-
-                    # Debug log: see size Google returned
                     try:
                         app.logger.info(
                             f"[thumb] id={file_id} sz={size} status={img.status_code} "
@@ -410,63 +381,47 @@ def drive_proxy(file_id):
                     except Exception:
                         pass
 
-                    # Only return the thumbnail if it's a real image and not tiny
                     if img.status_code == 200 and img.content:
                         ctype = img.headers.get("Content-Type", "image/jpeg")
-                        clen = len(img.content)
+                        clen  = len(img.content)
                         if ctype.startswith("image/") and clen >= 500:
                             resp = Response(img.content, status=200, mimetype="image/jpeg")
                             resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
                             resp.headers["ETag"] = etag
-                            origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-                            allowed = {
-                                (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-                                "https://machineschedule.netlify.app",
-                                "http://localhost:3000",
-                            }
-                            if origin in allowed:
-                                resp.headers["Access-Control-Allow-Origin"] = origin
-                                resp.headers["Access-Control-Allow-Credentials"] = "true"
                             return resp
-            # If we reach here, fall through to the full-file fallback below.
+                    else:
+                        if debug_mode:
+                            return jsonify({"ok": False, "where": "thumb_fetch", "status": img.status_code}), 502
+                else:
+                    if debug_mode:
+                        return jsonify({"ok": False, "where": "no_thumbnailLink"}), 502
+        # fall through to full file
 
-        # --- Fallback: full file bytes via alt=media ---
-        # Build ETag for full file using file metadata (allows client 304s)
+        # --- Fallback: full file via alt=media ---
         meta2_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=modifiedTime,md5Checksum,mimeType,name"
         meta2 = requests.get(meta2_url, headers=headers, timeout=6)
         info2 = meta2.json() if meta2.status_code == 200 else {}
         etag_full = f'W/"{file_id}-f-{info2.get("md5Checksum") or info2.get("modifiedTime") or ""}"'
-
-        # If client already has this version cached, return 304
         if request.headers.get("If-None-Match") == etag_full:
             resp = make_response("", 304)
             resp.headers["ETag"] = etag_full
             resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
-            origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-            allowed = {
-                (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-                "https://machineschedule.netlify.app",
-                "http://localhost:3000",
-            }
-            if origin in allowed:
-                resp.headers["Access-Control-Allow-Origin"] = origin
-                resp.headers["Access-Control-Allow-Credentials"] = "true"
             return resp
 
         media_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-        r = requests.get(media_url, headers=headers, timeout=10, stream=True)
+        r = requests.get(media_url, headers=headers, timeout=12, stream=True)
         if r.status_code != 200:
+            if debug_mode:
+                return jsonify({"ok": False, "where": "alt_media", "status": r.status_code}), 502
             return make_response((f"Drive returned {r.status_code}", r.status_code))
 
         content_type = r.headers.get("Content-Type", "application/octet-stream")
-
-        # If it's not an image (e.g., PDF/AI/DST), return a visible gray SVG placeholder
         if not content_type.startswith("image/"):
+            # Non-image -> visible placeholder (not a 1x1)
             svg = (
                 '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 56 56">'
                 '<rect width="56" height="56" fill="#e5e7eb"/>'
-                '<path d="M10 38l8-8 6 6 12-12 10 10v8H10z" fill="#cbd5e1"/>'
-                '<rect x="12" y="12" width="10" height="8" rx="1.5" fill="#cbd5e1"/>'
+                '<text x="50%" y="50%" dy=".35em" text-anchor="middle" font-size="8" fill="#9ca3af">no preview</text>'
                 '</svg>'
             ).encode("utf-8")
             resp = Response(svg, status=200, mimetype="image/svg+xml")
@@ -474,56 +429,22 @@ def drive_proxy(file_id):
             resp = Response(r.content, status=200, mimetype=content_type)
 
         resp.headers["Content-Disposition"] = "inline"
-        # Cache one day; ETag changes when file changes
         resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
         resp.headers["ETag"] = etag_full
-        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-        allowed = {
-            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-            "https://machineschedule.netlify.app",
-            "http://localhost:3000",
-        }
-        if origin in allowed:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
         return resp
 
     except Exception as e:
-        # If anything goes wrong, return a single-pixel so UI doesn't break
-        pixel = (
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\xdac\xf8\xff"
-            b"\xff?\x00\x05\xfe\x02\xfeA\x1d\x0b\x85\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
-        resp = Response(pixel, status=200, mimetype="image/png")
-        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-        allowed = {
-            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-            "https://machineschedule.netlify.app",
-            "http://localhost:3000",
-        }
-        if origin in allowed:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-        return resp
-
-@app.after_request
-def apply_cors(response):
-    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-    allowed = {
-        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-        "https://machineschedule.netlify.app",
-        "http://localhost:3000",
-    }
-    if origin in allowed:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
-    return response
-
+        app.logger.exception("drive_proxy error")
+        if debug_mode:
+            return jsonify({"ok": False, "where": "exception", "error": str(e)}), 500
+        # visible placeholder instead of 1×1
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 56 56">'
+            '<rect width="56" height="56" fill="#e5e7eb"/>'
+            '<text x="50%" y="50%" dy=".35em" text-anchor="middle" font-size="8" fill="#9ca3af">error</text>'
+            '</svg>'
+        ).encode("utf-8")
+        return Response(svg, status=200, mimetype="image/svg+xml")
 
 
 @app.route("/api/ping", methods=["GET", "OPTIONS"])
