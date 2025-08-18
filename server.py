@@ -1312,7 +1312,6 @@ def _load_google_creds():
         try:
             info = json.loads(env_val)
             creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
-           app.logger.info("Google creds type=%s, scopes=%s", type(creds).__name__, getattr(creds, "scopes", []))
             if not creds.valid and creds.refresh_token:
                 from google.auth.transport.requests import Request as GoogleRequest
                 creds.refresh(GoogleRequest())
@@ -1326,7 +1325,6 @@ def _load_google_creds():
             with open(GOOGLE_TOKEN_PATH, "r", encoding="utf-8") as f:
                 info = json.load(f)
             creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
-            app.logger.info("Google creds type=%s, scopes=%s", type(creds).__name__, getattr(creds, "scopes", []))
             if not creds.valid and creds.refresh_token:
                 from google.auth.transport.requests import Request as GoogleRequest
                 creds.refresh(GoogleRequest())
