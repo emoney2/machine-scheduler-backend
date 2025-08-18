@@ -60,6 +60,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.utils import ImageReader
 from uuid import uuid4
 from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_shipment
+from google.oauth2.credentials import Credentials as OAuthCredentials
 
 # Reuse one session for all Google calls (fewer TCP handshakes => faster)
 GOOGLE_HTTP = requests.Session()
@@ -1311,6 +1312,7 @@ def _load_google_creds():
         try:
             info = json.loads(env_val)
             creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+           app.logger.info("Google creds type=%s, scopes=%s", type(creds).__name__, getattr(creds, "scopes", []))
             if not creds.valid and creds.refresh_token:
                 from google.auth.transport.requests import Request as GoogleRequest
                 creds.refresh(GoogleRequest())
@@ -1324,6 +1326,7 @@ def _load_google_creds():
             with open(GOOGLE_TOKEN_PATH, "r", encoding="utf-8") as f:
                 info = json.load(f)
             creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            app.logger.info("Google creds type=%s, scopes=%s", type(creds).__name__, getattr(creds, "scopes", []))
             if not creds.valid and creds.refresh_token:
                 from google.auth.transport.requests import Request as GoogleRequest
                 creds.refresh(GoogleRequest())
