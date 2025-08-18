@@ -145,17 +145,45 @@ GOOGLE_SCOPES = [
 # Google token file path (your choice)
 GOOGLE_TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
 
-# If GOOGLE_TOKEN_JSON is present, materialize it to token.json at boot
-GOOGLE_TOKEN_JSON = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
-if GOOGLE_TOKEN_JSON:
+def _bootstrap_token_from_env():
+    """
+    Accept GOOGLE_TOKEN_JSON_B64 (base64 of token.json) or GOOGLE_TOKEN_JSON (raw JSON),
+    write token.json, and log whether a refresh_token is present.
+    """
+    raw = None
+    src = None
+
+    b64 = os.environ.get("GOOGLE_TOKEN_JSON_B64", "").strip()
+    if b64:
+        try:
+            raw = base64.b64decode(b64).decode("utf-8")
+            src = "GOOGLE_TOKEN_JSON_B64"
+        except Exception as e:
+            print("⚠️ Failed to decode GOOGLE_TOKEN_JSON_B64:", e)
+
+    if not raw:
+        val = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
+        if val:
+            raw = val
+            src = "GOOGLE_TOKEN_JSON"
+
+    if not raw:
+        print("ℹ️ No GOOGLE_TOKEN_JSON(_B64) provided; skipping token bootstrap.")
+        return False
+
     try:
-        # validate JSON then write
-        json.loads(GOOGLE_TOKEN_JSON)
+        info = json.loads(raw)
+        has_rt = bool(info.get("refresh_token"))
         with open(GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
-            f.write(GOOGLE_TOKEN_JSON)
-        print("✅ token.json written from GOOGLE_TOKEN_JSON env")
+            f.write(raw)
+        print(f"✅ token.json written from {src} (refresh_token={has_rt})")
+        return True
     except Exception as e:
         print("⚠️ Failed to write token.json from env:", e)
+        return False
+
+_bootstrap_token_from_env()
+
 
 
 def _ensure_token_json():
@@ -1316,8 +1344,8 @@ def _load_google_creds():
                 from google.auth.transport.requests import Request as GoogleRequest
                 creds.refresh(GoogleRequest())
             return creds
-        except Exception:
-            pass  # fall back to file
+        except Exception as e:
+            print("❌ ENV token could not build OAuthCredentials:", repr(e))
 
     # 2) File next
     try:
@@ -1332,7 +1360,8 @@ def _load_google_creds():
                 with open(GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
                     f.write(creds.to_json())
             return creds
-    except Exception:
+    except Exception as e:
+        print("❌ FILE token could not build OAuthCredentials:", repr(e))
         return None
 
     # 3) Nothing available
