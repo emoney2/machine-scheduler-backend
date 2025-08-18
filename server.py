@@ -371,7 +371,7 @@ def drive_proxy(file_id):
                     # Convert wNNN → sNNN and apply robustly to the Drive thumb URL
                     desired = f"=s{size[1:] if size.startswith('w') else '256'}"
                     if "=s" in thumb:
-                        import re  # ok to import here; or move to file top
+                        import re  # or keep at top of file
                         thumb = re.sub(r"=s\d+", desired, thumb)
                     else:
                         thumb = thumb + desired
@@ -394,6 +394,39 @@ def drive_proxy(file_id):
                             resp.headers["Access-Control-Allow-Origin"] = origin
                             resp.headers["Access-Control-Allow-Credentials"] = "true"
                         return resp
+
+                    # Download the actual Drive thumbnail
+                    img = requests.get(thumb, headers=headers, timeout=8)
+
+                    # Debug log: see size Google returned
+                    try:
+                        app.logger.info(
+                            f"[thumb] id={file_id} sz={size} status={img.status_code} "
+                            f"bytes={len(img.content) if getattr(img,'content',None) else 0} url={thumb}"
+                        )
+                    except Exception:
+                        pass
+
+                    # Only return the thumbnail if it's a real image and not tiny
+                    if img.status_code == 200 and img.content:
+                        ctype = img.headers.get("Content-Type", "image/jpeg")
+                        clen = len(img.content)
+                        if ctype.startswith("image/") and clen >= 500:
+                            resp = Response(img.content, status=200, mimetype="image/jpeg")
+                            resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+                            resp.headers["ETag"] = etag
+                            origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+                            allowed = {
+                                (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+                                "https://machineschedule.netlify.app",
+                                "http://localhost:3000",
+                            }
+                            if origin in allowed:
+                                resp.headers["Access-Control-Allow-Origin"] = origin
+                                resp.headers["Access-Control-Allow-Credentials"] = "true"
+                            return resp
+                    # If we reach here, we intentionally do NOT return.
+                    # We'll fall through to the full-file fallback below.
 
                     # Download the actual Drive thumbnail
                     img = requests.get(thumb, headers=headers, timeout=8)
@@ -472,7 +505,20 @@ def drive_proxy(file_id):
             return make_response((f"Drive returned {r.status_code}", r.status_code))
 
         content_type = r.headers.get("Content-Type", "application/octet-stream")
-        resp = Response(r.content, status=200, mimetype=content_type)
+
+        # If it's not an image (e.g., PDF/AI/DST), return a visible gray SVG placeholder
+        if not content_type.startswith("image/"):
+            svg = (
+                '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 56 56">'
+                '<rect width="56" height="56" fill="#e5e7eb"/>'
+                '<path d="M10 38l8-8 6 6 12-12 10 10v8H10z" fill="#cbd5e1"/>'
+                '<rect x="12" y="12" width="10" height="8" rx="1.5" fill="#cbd5e1"/>'
+                '</svg>'
+            ).encode("utf-8")
+            resp = Response(svg, status=200, mimetype="image/svg+xml")
+        else:
+            resp = Response(r.content, status=200, mimetype=content_type)
+
         resp.headers["Content-Disposition"] = "inline"
         # Cache one day; ETag changes when file changes
         resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
@@ -489,27 +535,6 @@ def drive_proxy(file_id):
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
         return resp
-
-    except Exception as e:
-        # If anything goes wrong, return a single-pixel so UI doesn't break
-        pixel = (
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\xdac\xf8\xff"
-            b"\xff?\x00\x05\xfe\x02\xfeA\x1d\x0b\x85\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
-        resp = Response(pixel, status=200, mimetype="image/png")
-        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-        allowed = {
-            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-            "https://machineschedule.netlify.app",
-            "http://localhost:3000",
-        }
-        if origin in allowed:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-        return resp
-
-
 
 # --- Handle ALL /api/* preflight requests (OPTIONS) ---
 @app.route("/api/<path:anypath>", methods=["OPTIONS"])
