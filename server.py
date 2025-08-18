@@ -509,24 +509,6 @@ def drive_proxy(file_id):
             resp.headers["Access-Control-Allow-Credentials"] = "true"
         return resp
 
-
-# --- Handle ALL /api/* preflight requests (OPTIONS) ---
-@app.route("/api/<path:anypath>", methods=["OPTIONS"])
-def cors_preflight_any(anypath):
-    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-    allowed = {
-        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-        "https://machineschedule.netlify.app",
-        "http://localhost:3000",
-    }
-    resp = make_response("", 204)
-    if origin in allowed:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
-    return resp
-
 @app.after_request
 def apply_cors(response):
     origin = (request.headers.get("Origin") or "").strip().rstrip("/")
