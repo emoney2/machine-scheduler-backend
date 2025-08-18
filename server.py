@@ -1328,43 +1328,51 @@ GOOGLE_TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
 
 def _load_google_creds():
     """
-    Load Google Drive credentials from:
-      1) GOOGLE_TOKEN_JSON env var (preferred)
-      2) GOOGLE_TOKEN_PATH file (token.json)
-    Refresh if expired and refresh_token is present.
-    Return a google.oauth2.credentials.Credentials or None.
+    Load Google OAuth user credentials from:
+      1) GOOGLE_TOKEN_JSON env var (preferred, raw token.json contents)
+      2) token.json on disk (GOOGLE_TOKEN_PATH)
+    If the token already contains scopes, do not override them (avoids invalid_scope).
+    Returns an OAuthCredentials object or None.
     """
     # 1) ENV first
     env_val = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
     if env_val:
         try:
             info = json.loads(env_val)
-            creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            token_scopes = info.get("scopes")
+            # If token already has scopes, don't override (prevents invalid_scope)
+            if token_scopes:
+                creds = OAuthCredentials.from_authorized_user_info(info)
+            else:
+                creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            print("🔎 token (env) scopes:", token_scopes)
             if not creds.valid and creds.refresh_token:
                 from google.auth.transport.requests import Request as GoogleRequest
                 creds.refresh(GoogleRequest())
             return creds
         except Exception as e:
             print("❌ ENV token could not build OAuthCredentials:", repr(e))
+            # fall through to file
 
     # 2) File next
     try:
         if os.path.exists(GOOGLE_TOKEN_PATH):
             with open(GOOGLE_TOKEN_PATH, "r", encoding="utf-8") as f:
                 info = json.load(f)
-            creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            token_scopes = info.get("scopes")
+            if token_scopes:
+                creds = OAuthCredentials.from_authorized_user_info(info)
+            else:
+                creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            print("🔎 token (file) scopes:", token_scopes)
             if not creds.valid and creds.refresh_token:
                 from google.auth.transport.requests import Request as GoogleRequest
                 creds.refresh(GoogleRequest())
-                # persist refreshed token to disk
-                with open(GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
-                    f.write(creds.to_json())
             return creds
     except Exception as e:
         print("❌ FILE token could not build OAuthCredentials:", repr(e))
-        return None
 
-    # 3) Nothing available
+    # 3) Nothing worked
     return None
 
 
