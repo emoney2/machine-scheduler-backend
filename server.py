@@ -1443,54 +1443,43 @@ def get_qbo_oauth_credentials(env_override: str = None):
     return QBO_SANDBOX_CLIENT_ID, QBO_SANDBOX_CLIENT_SECRET
 # ─────────────────────────────────────────────────────────────────
 
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+# Unified Google auth: always load from GOOGLE_TOKEN_JSON or token.json via _load_google_creds
+creds = _load_google_creds()
+if not creds:
+    raise RuntimeError(
+        "No Google credentials. Set GOOGLE_TOKEN_JSON to your token.json contents, "
+        "or place a valid token.json on disk."
+    )
+
+# Unified Google auth — use your env/file token.json only (no TOKEN_JSON or token.pickle)
+from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials as UserCredentials
-import pickle
 
-SCOPES = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 
-creds = None
-if os.path.exists("token.pickle"):
-    with open("token.pickle", "rb") as token:
-        creds = pickle.load(token)
+# Prefer GOOGLE_TOKEN_JSON; fallback to token.json on disk
+token_raw = os.environ.get("GOOGLE_TOKEN_JSON", "")
+if not token_raw and os.path.exists("token.json"):
+    with open("token.json", "r", encoding="utf-8") as f:
+        token_raw = f.read()
+if not token_raw:
+    raise RuntimeError("No Google token. Set GOOGLE_TOKEN_JSON or provide token.json.")
 
-if not creds or not creds.valid:
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    else:
-        import json
-        from google.oauth2.credentials import Credentials
+# Build creds and refresh now (fail fast if invalid)
+info = json.loads(token_raw)
+creds = UserCredentials.from_authorized_user_info(info, scopes=SCOPES)
+if creds and (not creds.valid) and creds.refresh_token:
+    creds.refresh(GoogleRequest())
 
-        oauth_client_id     = os.environ["OAUTH_CLIENT_ID"]
-        oauth_client_secret = os.environ["OAUTH_CLIENT_SECRET"]
-        oauth_redirect_uri  = os.environ["OAUTH_REDIRECT_URI"]
-
-        client_config = {
-            "installed": {
-                "client_id":     oauth_client_id,
-                "client_secret": oauth_client_secret,
-                "redirect_uris": [oauth_redirect_uri],
-                "auth_uri":      "https://accounts.google.com/o/oauth2/auth",
-                "token_uri":     "https://oauth2.googleapis.com/token"
-            }
-        }
-
-        token_json_str = os.environ["TOKEN_JSON"]
-        token_data = json.loads(token_json_str)
-
-        creds = Credentials.from_authorized_user_info(token_data, SCOPES)
-    with open("token.pickle", "wb") as token:
-        pickle.dump(creds, token)
-
+# Wire clients (these names are used elsewhere)
 sh = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
-sheet_cache = sh.worksheet("Embroidery List")
-
-
-_http = Http(timeout=10)
-authed_http = AuthorizedHttp(creds, http=_http)
 service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 sheets  = service.spreadsheets()
+
+
 
 @app.route("/rate", methods=["POST"])
 @login_required_session

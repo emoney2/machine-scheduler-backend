@@ -1,20 +1,24 @@
-from __future__ import print_function
+# generate_token.py
 from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import json
 
-# Drive scope
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 
 def main():
     flow = InstalledAppFlow.from_client_secrets_file(
-        "work_credentials.json",  # your desktop OAuth client from WORK project
-        SCOPES,
+        "new.json", SCOPES
     )
-    # Force a refresh_token to be issued
-    creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
-
+    # force an offline refresh token
+    creds = flow.run_local_server(
+        port=0, prompt="consent", access_type="offline", include_granted_scopes="true"
+    )
     with open("token.json", "w", encoding="utf-8") as f:
         f.write(creds.to_json())
-    print("✅ token.json created (with offline access).")
+    print("Wrote token.json with refresh_token.")
 
 if __name__ == "__main__":
     main()

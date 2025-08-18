@@ -16,3 +16,6 @@ credentials.json
 # OS/editor
 .DS_Store
 Thumbs.db
+new.json
+token.json
+token.b64.txt
