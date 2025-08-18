@@ -62,9 +62,6 @@ from uuid import uuid4
 from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_shipment
 from google.oauth2.credentials import Credentials as OAuthCredentials
 
-# Reuse one session for all Google calls (fewer TCP handshakes => faster)
-GOOGLE_HTTP = requests.Session()
-
 # Cache the Drive thumbnail URL + version for 10 minutes to avoid refetching metadata every image
 THUMB_META_CACHE = {}  # key: (file_id, size) -> {"thumb": str, "etag": str, "ts": float}
 THUMB_META_TTL = 600   # seconds
@@ -351,8 +348,11 @@ def drive_proxy(file_id):
                 f"https://www.googleapis.com/drive/v3/files/{file_id}"
                 f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
             )
-            meta = GOOGLE_HTTP.get(meta_url, headers=headers, timeout=6)
-            if meta.status_code == 200:
+            meta = requests.get(meta_url, headers=headers, timeout=6)
+            if meta.status_code != 200:
+                if debug_mode:
+                    return jsonify({"ok": False, "where": "thumb_meta", "status": meta.status_code}), 502
+            else:
                 info = meta.json()
                 thumb = info.get("thumbnailLink")
                 if thumb:
@@ -364,42 +364,41 @@ def drive_proxy(file_id):
                         sep = "&" if "?" in thumb else "?"
                         thumb = f"{thumb}{sep}{size}"
 
-                    # strong ETag for client cache
+                    # ETag for client cache
                     etag = f'W/"{file_id}-t-{size}-{info.get("md5Checksum") or info.get("modifiedTime") or ""}"'
                     if request.headers.get("If-None-Match") == etag:
                         resp = make_response("", 304)
                         resp.headers["ETag"] = etag
-                        resp.headers["Cache-Control"] = "public, max-age=604800, s-maxage=604800"
+                        resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
                         return resp
 
-                    # fetch thumbnail bytes (reuse session)
-                    img = GOOGLE_HTTP.get(thumb, headers=headers, timeout=8)
+                    # fetch thumbnail bytes
+                    img = requests.get(thumb, headers=headers, timeout=8)
                     if img.status_code == 200 and img.content:
                         ctype = img.headers.get("Content-Type", "image/jpeg")
                         clen  = len(img.content)
                         if ctype.startswith("image/") and clen >= 500:
                             resp = Response(img.content, status=200, mimetype="image/jpeg")
-                            resp.headers["Cache-Control"] = "public, max-age=604800, s-maxage=604800"
+                            resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
                             resp.headers["ETag"] = etag
                             return resp
+                else:
                     if debug_mode:
-                        return jsonify({"ok": False, "where": "thumb_fetch", "status": img.status_code}), 502
-            elif debug_mode:
-                return jsonify({"ok": False, "where": "thumb_meta", "status": meta.status_code}), 502
+                        return jsonify({"ok": False, "where": "no_thumbnailLink"}), 502
 
         # --- Fallback: full file via alt=media ---
         meta2_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=modifiedTime,md5Checksum,mimeType,name"
-        meta2 = GOOGLE_HTTP.get(meta2_url, headers=headers, timeout=6)
+        meta2 = requests.get(meta2_url, headers=headers, timeout=6)
         info2 = meta2.json() if meta2.status_code == 200 else {}
         etag_full = f'W/"{file_id}-f-{info2.get("md5Checksum") or info2.get("modifiedTime") or ""}"'
         if request.headers.get("If-None-Match") == etag_full:
             resp = make_response("", 304)
             resp.headers["ETag"] = etag_full
-            resp.headers["Cache-Control"] = "public, max-age=604800, s-maxage=604800"
+            resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
             return resp
 
         media_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-        r = GOOGLE_HTTP.get(media_url, headers=headers, timeout=12, stream=True)
+        r = requests.get(media_url, headers=headers, timeout=12, stream=True)
         if r.status_code != 200:
             if debug_mode:
                 return jsonify({"ok": False, "where": "alt_media", "status": r.status_code}), 502
@@ -419,9 +418,10 @@ def drive_proxy(file_id):
             resp = Response(r.content, status=200, mimetype=content_type)
 
         resp.headers["Content-Disposition"] = "inline"
-        resp.headers["Cache-Control"] = "public, max-age=604800, s-maxage=604800"
+        resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
         resp.headers["ETag"] = etag_full
         return resp
+
 
 
     except Exception as e:
