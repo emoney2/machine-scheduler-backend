@@ -32,6 +32,8 @@ from ups_service import get_rate
 from functools import wraps
 from dotenv import load_dotenv
 from urllib.parse import urlencode
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from eventlet.semaphore import Semaphore
 from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string, url_for, send_from_directory, abort
@@ -61,6 +63,26 @@ from reportlab.lib.utils import ImageReader
 from uuid import uuid4
 from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_shipment
 from google.oauth2.credentials import Credentials as OAuthCredentials
+
+# put this near your other helpers
+def _iso_to_eastern_display(iso_str: str) -> str:
+    """
+    Convert ISO8601 (with or without 'Z') to America/New_York display string:
+    M/D/YYYY H:MM AM/PM (no leading zeros on month/day/hour).
+    """
+    try:
+        s = iso_str.replace("Z", "+00:00")
+        dt_utc = datetime.fromisoformat(s)
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=ZoneInfo("UTC"))
+        dt_et = dt_utc.astimezone(ZoneInfo("America/New_York"))
+        h = dt_et.hour
+        ap = "AM" if h < 12 else "PM"
+        h12 = (h % 12) or 12
+        return f"{dt_et.month}/{dt_et.day}/{dt_et.year} {h12}:{dt_et.minute:02d} {ap}"
+    except Exception:
+        return iso_str
+
 
 # Cache the Drive thumbnail URL + version for 10 minutes to avoid refetching metadata every image
 THUMB_META_CACHE = {}  # key: (file_id, size) -> {"thumb": str, "etag": str, "ts": float}
@@ -1510,24 +1532,27 @@ def rate_all_services():
             { "method": "Manual Shipping", "rate": "N/A", "delivery": "TBD" }
         ]), 200
 
-@app.route('/api/updateStartTime', methods=["POST"])
+
+@app.route("/api/updateStartTime", methods=["POST"])
 @login_required_session
 def update_start_time():
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         job_id = data.get("id")
-        start_time = data.get("startTime")
+        iso_start = data.get("startTime")
 
-        if not job_id or not start_time:
+        if not job_id or not iso_start:
             return jsonify({"error": "Missing job ID or start time"}), 400
 
-        print(f"🧵 Updating embroidery start time for job {job_id} → {start_time}")
-        update_embroidery_start_time_in_sheet(job_id, start_time)
-        return jsonify({"status": "success"})  # ✅ This line was missing
+        display_time = _iso_to_eastern_display(iso_start)  # <-- write ET text
+        print(f"🧵 Embroidery Start Time for {job_id} → {display_time}")
+        update_embroidery_start_time_in_sheet(job_id, display_time)
 
+        return jsonify({"status": "success"})
     except Exception as e:
-        print("🔥 Error in update_start_time:", e)
+        print("❌ Error in update_start_time:", e)
         return jsonify({"error": str(e)}), 500
+
 
 # ✅ You must define or update this function to match your actual Google Sheet logic
 import traceback
