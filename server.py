@@ -1539,19 +1539,17 @@ def update_start_time():
     try:
         data = request.get_json() or {}
         job_id = data.get("id")
-        iso_start = data.get("startTime")
+        iso_start = data.get("startTime")         # ISO from client
 
         if not job_id or not iso_start:
             return jsonify({"error": "Missing job ID or start time"}), 400
 
-        display_time = _iso_to_eastern_display(iso_start)  # <-- write ET text
-        print(f"🧵 Embroidery Start Time for {job_id} → {display_time}")
-        update_embroidery_start_time_in_sheet(job_id, display_time)
-
+        # Write ISO directly; sheet will show Z, UI will show ET
+        update_embroidery_start_time_in_sheet(job_id, iso_start)
         return jsonify({"status": "success"})
     except Exception as e:
-        print("❌ Error in update_start_time:", e)
         return jsonify({"error": str(e)}), 500
+
 
 
 # ✅ You must define or update this function to match your actual Google Sheet logic
