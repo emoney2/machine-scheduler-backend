@@ -2852,6 +2852,44 @@ def submit_material_inventory():
         logging.exception("❌ submit_material_inventory failed")
         return jsonify({"error": str(e)}), 500
 
+# server.py (or routes file)
+from flask import request, jsonify
+from datetime import datetime
+
+@app.route("/api/directory-row", methods=["GET"])
+@login_required_session
+def directory_row():
+    company = (request.args.get("company") or "").strip()
+    if not company:
+        return jsonify({"error": "Missing company"}), 400
+
+    # Read your 'Directory' tab (A:K or whatever your full header range is)
+    sheet = sheets.values()
+    resp = sheet.get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Directory!A1:K10000",
+        valueRenderOption="UNFORMATTED_VALUE"
+    ).execute()
+    rows = resp.get("values", [])
+    if not rows:
+        return jsonify({"error": "No Directory data"}), 404
+
+    headers = rows[0]
+    # Find row where 'Company Name' matches (case-insensitive, trimmed)
+    target = None
+    for r in rows[1:]:
+        row = { headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers)) }
+        name = str(row.get("Company Name", "")).strip()
+        if name.lower() == company.lower():
+            target = row
+            break
+
+    if not target:
+        return jsonify({"error": f"Company not found: {company}"}), 404
+
+    return jsonify(target)
+
+
 @app.route("/api/products", methods=["GET"])
 @login_required_session
 def get_products():
