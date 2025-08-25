@@ -19,11 +19,7 @@ from flask import request, jsonify
 from flask import request, make_response, jsonify, Response
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
-
-
-
-
-
+from math import ceil
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
@@ -1774,59 +1770,152 @@ def overview_upcoming():
     return jsonify({ "jobs": jobs })
 
 
-# ── Overview: Materials Needed (Summary Tab grouped by vendor) ────────────
 @app.route("/api/overview/materials-needed")
 @login_required_session
 def overview_materials_needed():
-    # We’ll be forgiving about header names
-    data = fetch_sheet(SPREADSHEET_ID, "Summary Tab!A1:Z")
-    if not data or not data[0]:
-        return jsonify({ "vendors": [] })
+    """
+    Build the Materials-to-Order list straight from the Google Sheet tabs,
+    using the same logic as the user's formula:
 
-    headers = [str(h).strip() for h in data[0]]
-    idx = { h.lower(): i for i, h in enumerate(headers) }
+      include if (Inventory + On Order) < Min Inv.
+      qty_to_order = ROUNDUP(Reorder - (Inventory + On Order))
 
-    # Try to resolve typical headers
-    def gi(*names):
-        for n in names:
-            i = idx.get(n.lower())
-            if i is not None:
-                return i
-        return None
+    Group by Vendor. Also include thread shortages from "Thread Inventory"
+    (vendor = "Madeira USA" unless a Vendor column exists).
+    """
+    def get_values(range_a1, value_render="UNFORMATTED_VALUE"):
+        vals = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=range_a1,
+            valueRenderOption=value_render
+        ).execute().get("values", [])
+        return vals
 
-    v_col = gi("Vendor")
-    n_col = gi("Item","Material","Name")
-    q_col = gi("Qty","Quantity")
-    u_col = gi("Unit")
-    t_col = gi("Type")  # may not exist
+    def norm(s):
+        return str(s or "").strip()
 
-    groups = {}
-    for row in data[1:]:
-        # pad
-        while len(row) < len(headers):
-            row.append("")
-        vendor = (str(row[v_col]).strip() if v_col is not None else "Unknown") or "Unknown"
-        name   = (str(row[n_col]).strip() if n_col is not None else "")
-        if not name:
-            continue
-        qty    = row[q_col] if q_col is not None else ""
-        unit   = (str(row[u_col]).strip() if u_col is not None else "")
-        typ    = (str(row[t_col]).strip() if (t_col is not None and row[t_col]) else "Material")
-
-        # only include positive/needed rows
+    def num(x):
         try:
-            qnum = float(str(qty).strip())
+            # UNFORMATTED_VALUE gives us numbers when possible; still coerce
+            return float(x)
         except Exception:
-            qnum = None
-        if qnum is not None and qnum <= 0:
-            continue
+            try:
+                return float(str(x).replace(",", "").strip())
+            except Exception:
+                return None
 
-        groups.setdefault(vendor, []).append({
-            "name": name, "qty": qty, "unit": unit, "type": typ
-        })
+    vendors = {}
 
-    vendors = [{"vendor": v, "items": items} for v, items in groups.items()]
-    return jsonify({ "vendors": vendors })
+    # ─────────────────────────────────────────────────────────────────────────
+    # Materials: "Material Inventory" (A:I)
+    # Columns: Materials, Inventory, On Order, Unit, Min. Inv., Reorder, Cost, Value, Vendor
+    # ─────────────────────────────────────────────────────────────────────────
+    mat_rows = get_values("Material Inventory!A1:I")
+    if mat_rows:
+        m_headers = [norm(h) for h in mat_rows[0]]
+        m_idx = { h.lower(): i for i, h in enumerate(m_headers) }
+
+        def gi(*names):
+            for n in names:
+                i = m_idx.get(n.lower())
+                if i is not None:
+                    return i
+            return None
+
+        c_name    = gi("Materials","Material","Name","Item")
+        c_inv     = gi("Inventory")
+        c_onorder = gi("On Order","OnOrder")
+        c_unit    = gi("Unit")
+        c_min     = gi("Min. Inv.","Min Inv.","MinInv")
+        c_reorder = gi("Reorder")
+        c_vendor  = gi("Vendor")
+
+        for row in mat_rows[1:]:
+            # pad
+            if len(row) < len(m_headers):
+                row = row + [""] * (len(m_headers) - len(row))
+
+            name = norm(row[c_name]) if c_name is not None else ""
+            if not name:
+                continue
+
+            inv     = num(row[c_inv]) if c_inv is not None else 0
+            onord   = num(row[c_onorder]) if c_onorder is not None else 0
+            mininv  = num(row[c_min]) if c_min is not None else 0
+            reorder = num(row[c_reorder]) if c_reorder is not None else 0
+            unit    = norm(row[c_unit]) if c_unit is not None else ""
+            vendor  = norm(row[c_vendor]) if c_vendor is not None else "Unknown"
+
+            inv = inv or 0
+            onord = onord or 0
+            mininv = mininv or 0
+            reorder = reorder or 0
+
+            # Include only if below min inventory threshold
+            if (inv + onord) < mininv:
+                qty_needed = ceil((reorder - (inv + onord)))
+                if qty_needed > 0:
+                    vendors.setdefault(vendor or "Unknown", []).append({
+                        "name": name,
+                        "qty": qty_needed,
+                        "unit": unit,
+                        "type": "Material",
+                    })
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Threads: "Thread Inventory" (A:G)
+    # Columns (per your note): Thread Colors, Inventory.., On Order.., Min Inv.., Reorder.., Cost, Value
+    # Assume vendor = "Madeira USA" and unit = "cones" (can make configurable later)
+    # ─────────────────────────────────────────────────────────────────────────
+    thr_rows = get_values("Thread Inventory!A1:G")
+    if thr_rows:
+        t_headers = [norm(h) for h in thr_rows[0]]
+        t_idx = { h.lower(): i for i, h in enumerate(t_headers) }
+
+        def gi_t(*names):
+            for n in names:
+                i = t_idx.get(n.lower())
+                if i is not None:
+                    return i
+            return None
+
+        c_tname   = gi_t("Thread Colors","Thread","Color","Name")
+        c_tinv    = gi_t("Inventory..","Inventory")
+        c_tonord  = gi_t("On Order..","On Order","OnOrder")
+        c_tmin    = gi_t("Min Inv..","Min Inv","MinInv")
+        c_treord  = gi_t("Reorder..","Reorder")
+
+        for row in thr_rows[1:]:
+            if len(row) < len(t_headers):
+                row = row + [""] * (len(t_headers) - len(row))
+
+            tname = norm(row[c_tname]) if c_tname is not None else ""
+            if not tname:
+                continue
+
+            inv     = num(row[c_tinv])   if c_tinv   is not None else 0
+            onord   = num(row[c_tonord]) if c_tonord is not None else 0
+            mininv  = num(row[c_tmin])   if c_tmin   is not None else 0
+            reorder = num(row[c_treord]) if c_treord is not None else 0
+
+            inv = inv or 0
+            onord = onord or 0
+            mininv = mininv or 0
+            reorder = reorder or 0
+
+            if (inv + onord) < mininv:
+                qty_needed = ceil((reorder - (inv + onord)))
+                if qty_needed > 0:
+                    vendors.setdefault("Madeira USA", []).append({
+                        "name": tname,
+                        "qty": qty_needed,
+                        "unit": "cones",
+                        "type": "Thread",
+                    })
+
+    # shape for frontend
+    vendor_list = [{"vendor": v, "items": items} for v, items in vendors.items()]
+    return jsonify({ "vendors": vendor_list })
 
 
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
