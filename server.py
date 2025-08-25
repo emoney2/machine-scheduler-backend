@@ -241,10 +241,25 @@ def get_oauth_credentials():
     raise Exception("🔑 Google Drive credentials not available. Set GOOGLE_TOKEN_JSON or provide token.json.")
 
 def get_sheets_service():
-    return build("sheets", "v4", credentials=get_oauth_credentials())
+    import time as _t
+    global _sheets_service, _service_ts
+    if _sheets_service and (_t.time() - _service_ts) < SERVICE_TTL:
+        return _sheets_service
+    creds = get_oauth_credentials()
+    _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    _service_ts = _t.time()
+    return _sheets_service
 
 def get_drive_service():
-    return build("drive", "v3", credentials=get_oauth_credentials())
+    import time as _t
+    global _drive_service, _service_ts
+    if _drive_service and (_t.time() - _service_ts) < SERVICE_TTL:
+        return _drive_service
+    creds = get_oauth_credentials()
+    _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    _service_ts = _t.time()
+    return _drive_service
+
 
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
@@ -1584,6 +1599,13 @@ _overview_upcoming_ts    = 0.0
 _materials_needed_cache  = None  # {"vendors": [...]}
 _materials_needed_ts     = 0.0
 
+# ─── Google client singletons ───────────────────────────────────────────────
+_sheets_service = None
+_drive_service  = None
+_service_ts     = 0
+SERVICE_TTL     = 900  # 15 minutes
+# ────────────────────────────────────────────────────────────────────────────
+
 # ---- helpers: clear overview caches ----------------------------------------
 def invalidate_materials_needed_cache():
     global _materials_needed_cache, _materials_needed_ts
@@ -1714,6 +1736,85 @@ def login():
 def logout():
     session.clear()
     return redirect("/login")
+
+@app.route("/api/overview")
+@login_required_session
+def overview_combined():
+    """
+    Fast combined overview:
+      - Upcoming:  Overview!A3:K  (11 columns pre-filtered/sorted in Sheet)
+      - Materials: Overview!M3:M  (single text column: 'Item Qty Unit - Vendor')
+    Returns: { upcoming: [...], materials: [...] }
+    """
+    try:
+        svc = get_sheets_service().spreadsheets().values()
+        vr = svc.batchGet(
+            spreadsheetId=SPREADSHEET_ID,
+            ranges=["Overview!A3:K", "Overview!M3:M"],
+            valueRenderOption="UNFORMATTED_VALUE"
+        ).execute().get("valueRanges", [])
+
+        # ---- Upcoming rows (already filtered/sorted in Sheet)
+        up_vals = (vr[0].get("values") if len(vr) > 0 else []) or []
+        headers = ["Order #","Preview","Company Name","Design","Quantity","Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"]
+
+        def thumb(link):
+            s = str(link or "")
+            fid = ""
+            if "id=" in s: fid = s.split("id=")[-1].split("&")[0]
+            elif "file/d/" in s: fid = s.split("file/d/")[-1].split("/")[0]
+            return f"https://drive.google.com/thumbnail?id={fid}&sz=w160" if fid else ""
+
+        upcoming = []
+        for r in up_vals:
+            r = r + [""] * (len(headers) - len(r))
+            row = dict(zip(headers, r))
+            row["image"] = thumb(row.get("Preview"))
+            upcoming.append(row)
+
+        # ---- Materials lines (single text column)
+        mat_vals = (vr[1].get("values") if len(vr) > 1 else []) or []
+        lines = [str(a[0]).strip() for a in mat_vals if a and str(a[0]).strip()]
+        # Group by vendor from "Item … - Vendor"
+        grouped = {}
+        for s in lines:
+            vendor = "Misc."
+            left = s
+            if " - " in s:
+                left, vendor = s.rsplit(" - ", 1)
+                vendor = vendor.strip() or "Misc."
+            toks = left.split()
+            name, qty, unit = left, 0, ""
+            if len(toks) >= 3:
+                unit = toks[-1]
+                qty_str = toks[-2]
+                name = " ".join(toks[:-2]).strip()
+                try:
+                    qty = int(round(float(qty_str)))
+                except Exception:
+                    qty = 0
+            typ = "Thread" if unit.lower().startswith("cone") else "Material"
+            if name:
+                grouped.setdefault(vendor, []).append({"name": name, "qty": qty, "unit": unit, "type": typ})
+
+        materials = [{"vendor": v, "items": items} for v, items in grouped.items()]
+
+        # optional 60s cache using your existing globals
+        if CACHE_TTL:
+            import time as _t
+            global _overview_upcoming_cache, _overview_upcoming_ts
+            global _materials_needed_cache, _materials_needed_ts
+            _overview_upcoming_cache[7] = {"jobs": upcoming}
+            _overview_upcoming_ts = _t.time()
+            _materials_needed_cache = {"vendors": materials}
+            _materials_needed_ts = _t.time()
+
+        return jsonify({"upcoming": upcoming, "materials": materials})
+
+    except Exception as e:
+        app.logger.exception("overview_combined failed")
+        return jsonify({"error": "overview failed"}), 500
+
 
 import traceback
 from googleapiclient.errors import HttpError
