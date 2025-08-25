@@ -1548,29 +1548,6 @@ def update_start_time():
         return jsonify({"error": str(e)}), 500
 
 
-
-# ✅ You must define or update this function to match your actual Google Sheet logic
-import traceback
-
-def update_embroidery_start_time_in_sheet(order_id, new_start_time):
-    try:
-        sheet = sh.worksheet("Production Orders")
-        data = sheet.get_all_records()
-        col_names = sheet.row_values(1)
-        id_col = col_names.index("Order #") + 1
-        start_col = col_names.index("Embroidery Start Time") + 1
-
-        for i, row in enumerate(data, start=2):
-            if str(row.get("Order #")).strip() == str(order_id).strip():
-                sheet.update_cell(i, start_col, new_start_time)
-                          # ✅ optional: embroidery start changed → just clear upcoming cache
-                          invalidate_upcoming_cache()
-                print(f"✅ Embroidery Start Time updated for Order #{order_id}")
-                return
-
-        print(f"⚠️ Order ID {order_id} not found in Embroidery List")
-    except Exception as e:
-        print(f"❌ Error updating start time for Order #{order_id}: {e}")
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
 CACHE_TTL           = 10
@@ -1610,6 +1587,29 @@ def invalidate_upcoming_cache():
     _overview_upcoming_cache = {}   # keyed by days
     _overview_upcoming_ts = 0.0
 # ---------------------------------------------------------------------------
+
+# ✅ You must define or update this function to match your actual Google Sheet logic
+import traceback
+
+def update_embroidery_start_time_in_sheet(order_id, new_start_time):
+    try:
+        sheet = sh.worksheet("Production Orders")
+        data = sheet.get_all_records()
+        col_names = sheet.row_values(1)
+        id_col = col_names.index("Order #") + 1
+        start_col = col_names.index("Embroidery Start Time") + 1
+
+        for i, row in enumerate(data, start=2):
+            if str(row.get("Order #")).strip() == str(order_id).strip():
+                sheet.update_cell(i, start_col, new_start_time)
+                # ✅ optional: embroidery start changed → clear upcoming cache
+                invalidate_upcoming_cache()
+                print(f"✅ Embroidery Start Time updated for Order #{order_id}")
+                return
+
+        print(f"⚠️ Order ID {order_id} not found in Embroidery List")
+    except Exception as e:
+        print(f"❌ Error updating start time for Order #{order_id}: {e}")
 
 
 
