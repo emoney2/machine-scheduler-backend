@@ -62,6 +62,182 @@ from uuid import uuid4
 from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_shipment
 from google.oauth2.credentials import Credentials as OAuthCredentials
 
+# ─── Purchase Orders config ─────────────────────────────────────────────────
+PURCHASE_ORDERS_FOLDER_ID = os.getenv("PURCHASE_ORDERS_FOLDER_ID", "")  # Drive folder for POs (optional)
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")  # if set, server will send the email
+# ────────────────────────────────────────────────────────────────────────────
+def _hdr_idx(headers):
+    d = {}
+    for i, h in enumerate(headers or []):
+        k = str(h or "").strip().lower()
+        d[k] = i
+    return d
+
+def get_vendor_directory():
+    """Reads Vendors!A1:E → { vendor_name: {method,email,cc,website} }"""
+    svc = get_sheets_service().spreadsheets().values()
+    vals = svc.get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Vendors!A1:E",
+        valueRenderOption="FORMATTED_VALUE"
+    ).execute().get("values", [])
+    if not vals:
+        return {}
+    hdr = _hdr_idx(vals[0])
+    out = {}
+    for r in vals[1:]:
+        def gv(key):
+            i = hdr.get(key, None)
+            return (r[i] if i is not None and i < len(r) else "").strip()
+        vname = gv("vendor")
+        if not vname:
+            continue
+        out[vname] = {
+            "method": (gv("method") or "email").lower(),
+            "email": gv("email"),
+            "cc": gv("cc"),
+            "website": gv("website"),
+        }
+    return out
+
+def _po_number():
+    """Simple sequential PO number: count rows in POs!A2:A + 1 (create the tab first)."""
+    svc = get_sheets_service().spreadsheets().values()
+    vals = svc.get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="POs!A2:A",
+        valueRenderOption="UNFORMATTED_VALUE"
+    ).execute().get("values", [])
+    n = (len(vals) or 0) + 1
+    return f"PO-{n:05d}"
+
+def _write_po_log(po_num, vendor, method, pdf_url, notes):
+    svc = get_sheets_service().spreadsheets().values()
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    svc.append(
+        spreadsheetId=SPREADSHEET_ID,
+        range="POs!A:K",
+        valueInputOption="USER_ENTERED",
+        body={"values": [[po_num, vendor, ts, method, pdf_url, notes]]}
+    ).execute()
+
+def _create_po_document(vendor, items, po_num, notes="", request_by=""):
+    """
+    Creates a PO file; tries PDF via reportlab, falls back to .txt.
+    Uploads to Drive (optional folder), returns a shareable link.
+    """
+    # Build plain text content
+    lines = [f"{po_num}  |  {vendor}", "-"*60]
+    if request_by:
+        lines.append(f"Requested By: {request_by}")
+    if notes:
+        lines.append(f"Notes: {notes}")
+    lines.append("")
+    lines.append("Qty   Unit   Item")
+    lines.append("----  -----  ---------------------------------------------")
+    for it in items:
+        qty = str(it.get("qty") or "")
+        unit = str(it.get("unit") or "")
+        name = str(it.get("name") or "")
+        lines.append(f"{qty:<4}  {unit:<5}  {name}")
+    content_txt = "\n".join(lines)
+
+    # Try to render a PDF (optional)
+    pdf_bytes = None
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import inch
+        import io
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=letter)
+        width, height = letter
+        y = height - 0.75*inch
+        c.setFont("Helvetica-Bold", 14); c.drawString(0.75*inch, y, f"Purchase Order {po_num}"); y -= 0.3*inch
+        c.setFont("Helvetica", 11);      c.drawString(0.75*inch, y, f"Vendor: {vendor}"); y -= 0.2*inch
+        if request_by:                    c.drawString(0.75*inch, y, f"Requested By: {request_by}"); y -= 0.2*inch
+        if notes:                         c.drawString(0.75*inch, y, f"Notes: {notes}"); y -= 0.3*inch
+        c.setFont("Helvetica-Bold", 11);  c.drawString(0.75*inch, y, "Qty"); c.drawString(1.3*inch, y, "Unit"); c.drawString(1.9*inch, y, "Item"); y -= 0.18*inch
+        c.setLineWidth(0.5); c.line(0.75*inch, y, 7.75*inch, y); y -= 0.18*inch
+        c.setFont("Helvetica", 10)
+        for it in items:
+            if y < 1*inch:
+                c.showPage(); y = height - 0.75*inch; c.setFont("Helvetica", 10)
+            c.drawString(0.75*inch, y, str(it.get("qty") or "")); 
+            c.drawString(1.3*inch, y, str(it.get("unit") or "")); 
+            c.drawString(1.9*inch, y, str(it.get("name") or "")); 
+            y -= 0.18*inch
+        c.showPage(); c.save()
+        pdf_bytes = buf.getvalue()
+    except Exception:
+        pdf_bytes = None
+
+    drive = get_drive_service()
+    if pdf_bytes:
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
+        meta = {"name": f"{po_num}.pdf", "mimeType": "application/pdf"}
+        if PURCHASE_ORDERS_FOLDER_ID:
+            meta["parents"] = [PURCHASE_ORDERS_FOLDER_ID]
+        media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf")
+        f = drive.files().create(body=meta, media_body=media, fields="id,webViewLink").execute()
+        # Make public
+        drive.permissions().create(fileId=f["id"], body={"role":"reader","type":"anyone"}).execute()
+        return f.get("webViewLink")
+    else:
+        # fallback: upload .txt
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
+        meta = {"name": f"{po_num}.txt", "mimeType": "text/plain"}
+        if PURCHASE_ORDERS_FOLDER_ID:
+            meta["parents"] = [PURCHASE_ORDERS_FOLDER_ID]
+        media = MediaIoBaseUpload(io.BytesIO(content_txt.encode("utf-8")), mimetype="text/plain")
+        f = drive.files().create(body=meta, media_body=media, fields="id,webViewLink").execute()
+        drive.permissions().create(fileId=f["id"], body={"role":"reader","type":"anyone"}).execute()
+        return f.get("webViewLink")
+
+def _send_email_or_mailto(vendor, to, cc, subject, body_text, attachment_link=None):
+    """
+    If SENDGRID_API_KEY set → send email.
+    Else → return a mailto: link for the client to open.
+    """
+    if SENDGRID_API_KEY and to:
+        try:
+            import requests, json
+            msg = {
+                "personalizations": [{
+                    "to": [{"email": e.strip()} for e in to.split(",") if e.strip()],
+                    "cc": [{"email": e.strip()} for e in (cc or "").split(",") if e.strip()]
+                }],
+                "from": {"email": "no-reply@po.local"},
+                "subject": subject,
+                "content": [{"type":"text/plain","value": body_text + (f"\n\nPO Link: {attachment_link}" if attachment_link else "")}],
+            }
+            r = requests.post(
+                "https://api.sendgrid.com/v3/mail/send",
+                headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type":"application/json"},
+                data=json.dumps(msg),
+                timeout=10
+            )
+            r.raise_for_status()
+            return {"emailed": True}
+        except Exception as e:
+            return {"emailed": False, "error": str(e)}
+
+    # mailto fallback
+    import urllib.parse as u
+    addr = (to or "").split(",")[0].strip() if to else ""
+    q = {
+        "subject": subject,
+        "body": body_text + (f"\n\nPO Link: {attachment_link}" if attachment_link else "")
+    }
+    if cc:
+        q["cc"] = cc
+    mailto = f"mailto:{addr}?{u.urlencode(q)}"
+    return {"mailtoUrl": mailto, "emailed": False}
+
+
 # put this near your other helpers
 def _iso_to_eastern_display(iso_str: str) -> str:
     """
@@ -358,6 +534,55 @@ def apply_cors(response):
         response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
     return response
+
+@app.route("/api/purchase-orders", methods=["POST"])
+@login_required_session
+def create_purchase_order():
+    try:
+        data = request.get_json(force=True)
+        vendor = (data.get("vendor") or "").strip()
+        items  = data.get("items") or []  # [{name, qty, unit, type}]
+        method = (data.get("method") or "").strip().lower()
+        notes  = (data.get("notes") or "").strip()
+        request_by = (data.get("requestBy") or "").strip()
+
+        if not vendor or not items:
+            return jsonify({"error":"vendor and items are required"}), 400
+
+        vdir = get_vendor_directory()
+        vrec = vdir.get(vendor, {})
+        method = method or vrec.get("method") or "email"
+        to = data.get("email") or vrec.get("email") or ""
+        cc = data.get("cc") or vrec.get("cc") or ""
+        website = vrec.get("website") or ""
+
+        po_num = _po_number()
+        pdf_url = _create_po_document(vendor, items, po_num, notes=notes, request_by=request_by)
+        _write_po_log(po_num, vendor, method, pdf_url, notes)
+
+        emailed = False
+        mailtoUrl = None
+
+        if method == "email" and to:
+            subject = f"{po_num} – {vendor}"
+            body = "Please see the attached purchase order.\n\nItems:\n" + "\n".join(
+                [f"- {i.get('qty','')} {i.get('unit','')} {i.get('name','')}" for i in items]
+            )
+            res = _send_email_or_mailto(vendor, to, cc, subject, body, attachment_link=pdf_url)
+            emailed = bool(res.get("emailed"))
+            mailtoUrl = res.get("mailtoUrl")
+
+        return jsonify({
+            "poNumber": po_num,
+            "pdfUrl": pdf_url,
+            "emailed": emailed,
+            "mailtoUrl": mailtoUrl,
+            "website": website if method == "website" else ""
+        })
+    except Exception as e:
+        app.logger.exception("create_purchase_order failed")
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/drive/token-status", methods=["GET"])
 def token_status():
