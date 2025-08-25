@@ -23,16 +23,17 @@ from google.auth.transport.requests import Request as GoogleRequest
 
 
 
+
+
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from ups_service import get_rate
 from functools import wraps
 from dotenv import load_dotenv
 from urllib.parse import urlencode
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from eventlet.semaphore import Semaphore
@@ -1684,6 +1685,149 @@ def login():
 def logout():
     session.clear()
     return redirect("/login")
+
+# ── Overview: Upcoming Jobs (Ship Date window) ─────────────────────────────
+@app.route("/api/overview/upcoming")
+@login_required_session
+def overview_upcoming():
+    try:
+        days = int(request.args.get("days", "7"))
+    except Exception:
+        days = 7
+
+    data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
+    headers = data[0]
+    jobs = []
+
+    def parse_date(val):
+        if not val:
+            return None
+        if isinstance(val, (int, float)):
+            # gspread may give serials; let’s NOT rely on serials here
+            # (your sheet likely sends strings). Fallback to None.
+            return None
+        s = str(val).strip()
+        try:
+            if "-" in s and len(s.split("-")[0]) == 4:
+                y, m, d = s.split("T")[0].split("-")
+                return date(int(y), int(m), int(d))
+            parts = s.replace("-", "/").split("/")
+            if len(parts) >= 2:
+                m = int(parts[0]); d = int(parts[1])
+                y = int(parts[2]) if len(parts) >= 3 else date.today().year
+                if y < 100: y += 2000
+                return date(y, m, d)
+        except Exception:
+            return None
+        return None
+
+    today = date.today()
+    max_day = today + timedelta(days=days)
+
+    for row in data[1:]:
+        while len(row) < len(headers):
+            row.append("")
+        rd = dict(zip(headers, row))
+
+        stage = str(rd.get("Stage", "")).strip().lower()
+        if stage == "complete":
+            continue
+
+        ship_dt = parse_date(rd.get("Ship Date"))
+        if not ship_dt:
+            continue
+        if not (today <= ship_dt <= max_day):
+            continue
+
+        # Build preview image same as jobs-for-company
+        image_link = str(rd.get("Image", "")).strip()
+        file_id = ""
+        if "id=" in image_link:
+            file_id = image_link.split("id=")[-1].split("&")[0]
+        elif "file/d/" in image_link:
+            file_id = image_link.split("file/d/")[-1].split("/")[0]
+        preview_url = f"https://drive.google.com/thumbnail?id={file_id}" if file_id else ""
+
+        rd["image"] = preview_url
+
+        # Make sure keys match the columns you requested
+        keep = [
+            "Order #","Preview","Company Name","Design","Quantity","Product",
+            "Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"
+        ]
+        job = {k: rd.get(k, "") for k in keep}
+        job["image"] = preview_url
+        jobs.append(job)
+
+    # Sort: Due Date asc, then Order # (numeric)
+    def dd_key(j):
+        dd = parse_date(j.get("Due Date"))
+        return (dd or date(2999,12,31))
+
+    def order_key(j):
+        raw = str(j.get("Order #","")).strip()
+        num = int("".join([c for c in raw if c.isdigit()]) or 0)
+        return num
+
+    jobs.sort(key=lambda j: (dd_key(j), order_key(j)))
+
+    return jsonify({ "jobs": jobs })
+
+
+# ── Overview: Materials Needed (Summary Tab grouped by vendor) ────────────
+@app.route("/api/overview/materials-needed")
+@login_required_session
+def overview_materials_needed():
+    # We’ll be forgiving about header names
+    data = fetch_sheet(SPREADSHEET_ID, "Summary Tab!A1:Z")
+    if not data or not data[0]:
+        return jsonify({ "vendors": [] })
+
+    headers = [str(h).strip() for h in data[0]]
+    idx = { h.lower(): i for i, h in enumerate(headers) }
+
+    # Try to resolve typical headers
+    def gi(*names):
+        for n in names:
+            i = idx.get(n.lower())
+            if i is not None:
+                return i
+        return None
+
+    v_col = gi("Vendor")
+    n_col = gi("Item","Material","Name")
+    q_col = gi("Qty","Quantity")
+    u_col = gi("Unit")
+    t_col = gi("Type")  # may not exist
+
+    groups = {}
+    for row in data[1:]:
+        # pad
+        while len(row) < len(headers):
+            row.append("")
+        vendor = (str(row[v_col]).strip() if v_col is not None else "Unknown") or "Unknown"
+        name   = (str(row[n_col]).strip() if n_col is not None else "")
+        if not name:
+            continue
+        qty    = row[q_col] if q_col is not None else ""
+        unit   = (str(row[u_col]).strip() if u_col is not None else "")
+        typ    = (str(row[t_col]).strip() if (t_col is not None and row[t_col]) else "Material")
+
+        # only include positive/needed rows
+        try:
+            qnum = float(str(qty).strip())
+        except Exception:
+            qnum = None
+        if qnum is not None and qnum <= 0:
+            continue
+
+        groups.setdefault(vendor, []).append({
+            "name": name, "qty": qty, "unit": unit, "type": typ
+        })
+
+    vendors = [{"vendor": v, "items": items} for v, items in groups.items()]
+    return jsonify({ "vendors": vendors })
+
 
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
 
