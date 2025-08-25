@@ -2999,9 +2999,6 @@ def add_materials():
             body={"values": inv_rows}
         ).execute(); invalidate_upcoming_cache()
 
-         # ✅ invalidate materials-needed cache
-         invalidate_materials_needed_cache()
-
     return jsonify({"status":"submitted"}), 200
 
 
