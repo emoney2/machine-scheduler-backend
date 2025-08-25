@@ -1706,41 +1706,64 @@ def logout():
     session.clear()
     return redirect("/login")
 
+import traceback
+from googleapiclient.errors import HttpError
+
 @app.route("/api/overview/upcoming")
 @login_required_session
 def overview_upcoming():
     debug = request.args.get("debug") == "1"
-    try:
-        days = int(request.args.get("days", "7"))
-    except Exception:
-        days = 7
-    # ---- CACHE: early return if fresh ----
-    global _overview_upcoming_cache, _overview_upcoming_ts
-    now = time.time()
-    cached = _overview_upcoming_cache.get(days)
-    if cached and (now - _overview_upcoming_ts) < CACHE_TTL and not debug:
-        return jsonify(cached)
-    # --------------------------------------
 
+    def svc_values():
+        return get_sheets_service().spreadsheets().values()
+
+    def safe_get(range_a1):
+        try:
+            return svc_values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=range_a1,
+                valueRenderOption="UNFORMATTED_VALUE"
+            ).execute().get("values", [])
+        except HttpError:
+            return []
 
     try:
-        data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
+        try:
+            days = int(request.args.get("days", "7"))
+        except Exception:
+            days = 7
+
+        # Try main range; fallback to narrower if needed
+        data = safe_get("Production Orders!A1:AM") or safe_get("Production Orders!A1:Z")
         if not data or not data[0]:
             return jsonify({"jobs": []})
 
         headers = data[0]
         jobs = []
 
+        from datetime import date, timedelta
+
         def parse_date(val):
-            if not val:
+            if val is None or val == "":
                 return None
+            # Google Sheets serials (numbers)
             if isinstance(val, (int, float)):
-                return None
+                # Excel epoch 1899-12-30
+                base = date(1899, 12, 30)
+                try:
+                    return base + timedelta(days=int(val))
+                except Exception:
+                    return None
             s = str(val).strip()
+            # ISO
             try:
                 if "-" in s and len(s.split("-")[0]) == 4:
                     y, m, d = s.split("T")[0].split("-")
                     return date(int(y), int(m), int(d))
+            except Exception:
+                pass
+            # M/D[/Y]
+            try:
                 parts = s.replace("-", "/").split("/")
                 if len(parts) >= 2:
                     m = int(parts[0]); d = int(parts[1])
@@ -1755,8 +1778,8 @@ def overview_upcoming():
         max_day = today + timedelta(days=days)
 
         for row in data[1:]:
-            while len(row) < len(headers):
-                row.append("")
+            if len(row) < len(headers):
+                row = row + [""] * (len(headers) - len(row))
             rd = dict(zip(headers, row))
 
             stage = str(rd.get("Stage", "")).strip().lower()
@@ -1764,11 +1787,10 @@ def overview_upcoming():
                 continue
 
             ship_dt = parse_date(rd.get("Ship Date"))
-            if not ship_dt:
-                continue
-            if not (today <= ship_dt <= max_day):
+            if not ship_dt or not (today <= ship_dt <= max_day):
                 continue
 
+            # Build preview image the same way your other endpoints do
             image_link = str(rd.get("Image", "")).strip()
             file_id = ""
             if "id=" in image_link:
@@ -1785,25 +1807,31 @@ def overview_upcoming():
             job["image"] = preview_url
             jobs.append(job)
 
+        # Sort by Due Date (then Order # numeric) as requested
         def dd_key(j):
             dd = parse_date(j.get("Due Date"))
-            return (dd or date(2999,12,31))
+            # push blanks to end
+            return (dd or date(2999, 12, 31))
 
         def order_key(j):
-            raw = str(j.get("Order #","")).strip()
-            num = int("".join([c for c in raw if c.isdigit()]) or 0)
-            return num
+            raw = str(j.get("Order #", "")).strip()
+            digits = "".join(c for c in raw if c.isdigit())
+            return int(digits) if digits else 0
 
         jobs.sort(key=lambda j: (dd_key(j), order_key(j)))
 
         if debug:
             return jsonify({"count": len(jobs), "first": jobs[0] if jobs else None})
 
-        # ---- CACHE: store result and return ----
-        _overview_upcoming_cache[days] = {"jobs": jobs}
-        _overview_upcoming_ts = time()
-        return jsonify(_overview_upcoming_cache[days])
-        # ----------------------------------------
+        # cache write (if you added it)
+        global _overview_upcoming_cache, _overview_upcoming_ts
+        if CACHE_TTL:
+            import time as _t
+            _overview_upcoming_cache[days] = {"jobs": jobs}
+            _overview_upcoming_ts = _t.time()
+            return jsonify(_overview_upcoming_cache[days])
+
+        return jsonify({"jobs": jobs})
 
     except Exception as e:
         app.logger.exception("overview_upcoming failed")
@@ -1812,36 +1840,31 @@ def overview_upcoming():
         return jsonify({"error": "overview_upcoming failed"}), 500
 
 
+from math import ceil
+import re
+import traceback
+from googleapiclient.errors import HttpError
+
 @app.route("/api/overview/materials-needed")
 @login_required_session
 def overview_materials_needed():
-    """
-    Build Materials-to-Order direct from:
-      - Material Inventory (columns: Materials, Inventory, On Order, Unit, Min. Inv., Reorder, Cost, Value, Vendor)
-      - Thread Inventory   (columns: Thread Colors, Inventory.., On Order.., Min Inv.., Reorder.., Cost, Value)
-    Include if (Inventory + On Order) < Min. Inv.
-    qty_to_order = ROUNDUP(Reorder − (Inventory + On Order))
-    Group by Vendor (threads default to 'Madeira USA', unit='cones').
-    """
     debug = request.args.get("debug") == "1"
-    # ---- CACHE: early return if fresh ----
-    global _materials_needed_cache, _materials_needed_ts
-    now = time()
-    if _materials_needed_cache is not None and (now - _materials_needed_ts) < CACHE_TTL and not debug:
-        return jsonify(_materials_needed_cache)
-    # --------------------------------------
 
-    def get_values(range_a1, value_render="UNFORMATTED_VALUE"):
-        # self-contained Sheets call (no global dependency)
-        svc = get_sheets_service().spreadsheets().values()
-        return svc.get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=range_a1,
-            valueRenderOption=value_render
-        ).execute().get("values", [])
+    def svc_values():
+        return get_sheets_service().spreadsheets().values()
+
+    def safe_get(range_a1, value_render="UNFORMATTED_VALUE"):
+        try:
+            return svc_values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=range_a1,
+                valueRenderOption=value_render
+            ).execute().get("values", [])
+        except HttpError:
+            return []
 
     def norm(s): return str(s or "").strip()
-    def hkey(s): return re.sub(r'[^a-z0-9]+', '', str(s or '').lower())
+    def hkey(s): return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
 
     def num(x):
         try:
@@ -1852,24 +1875,35 @@ def overview_materials_needed():
             except Exception:
                 return None
 
-    try:
-        vendors = {}
-        diags = {"materials_headers": [], "threads_headers": []}
+    diags = {"materials_headers": [], "threads_headers": [], "ranges_tried": []}
+    vendors = {}
 
-        # ── Materials: Material Inventory!A:I ────────────────────────────────
-        mat_rows = get_values("Material Inventory!A1:I")
+    try:
+        # ── MATERIALS: try common tab names ─────────────────────────────────
+        mat_ranges = [
+            "Material Inventory!A1:I",
+            "Materials!A1:Z",
+            "MaterialInventory!A1:Z",
+        ]
+        mat_rows = []
+        for r in mat_ranges:
+            diags["ranges_tried"].append(r)
+            mat_rows = safe_get(r)
+            if mat_rows and mat_rows[0]:
+                break
+
         if mat_rows:
             m_headers = [norm(h) for h in mat_rows[0]]
             diags["materials_headers"] = m_headers
-            m_idx = { hkey(h): i for i, h in enumerate(m_headers) }
+            m_idx = {hkey(h): i for i, h in enumerate(m_headers)}
 
             def gi(*names):
-                # exact normalized match first
+                # exact normalized
                 for n in names:
                     i = m_idx.get(hkey(n))
                     if i is not None:
                         return i
-                # then partial (if someone edited headers)
+                # partial contains
                 for k, i in m_idx.items():
                     if any(hkey(n) in k for n in names):
                         return i
@@ -1898,20 +1932,30 @@ def overview_materials_needed():
                 vendor  = norm(row[c_vendor]) if c_vendor  is not None else "Unknown"
 
                 inv, onord, mininv, reorder = inv or 0, onord or 0, mininv or 0, reorder or 0
-
                 if (inv + onord) < mininv:
-                    qty_needed = ceil(reorder - (inv + onord))
-                    if qty_needed > 0:
+                    qty = ceil(reorder - (inv + onord))
+                    if qty > 0:
                         vendors.setdefault(vendor or "Unknown", []).append({
-                            "name": name, "qty": qty_needed, "unit": unit, "type": "Material"
+                            "name": name, "qty": qty, "unit": unit, "type": "Material"
                         })
 
-        # ── Threads: Thread Inventory!A:G ───────────────────────────────────
-        thr_rows = get_values("Thread Inventory!A1:G")
+        # ── THREADS: try common tab names ───────────────────────────────────
+        thr_ranges = [
+            "Thread Inventory!A1:Z",
+            "Thread Data!A1:Z",
+            "Threads!A1:Z",
+        ]
+        thr_rows = []
+        for r in thr_ranges:
+            diags["ranges_tried"].append(r)
+            thr_rows = safe_get(r)
+            if thr_rows and thr_rows[0]:
+                break
+
         if thr_rows:
             t_headers = [norm(h) for h in thr_rows[0]]
             diags["threads_headers"] = t_headers
-            t_idx = { hkey(h): i for i, h in enumerate(t_headers) }
+            t_idx = {hkey(h): i for i, h in enumerate(t_headers)}
 
             def tgi(*names):
                 for n in names:
@@ -1925,65 +1969,80 @@ def overview_materials_needed():
 
             c_tname  = tgi("Thread Colors","Thread","Color","Name")
             c_tinv   = tgi("Inventory","Inventory..")
-            c_tonord = tgi("On Order","OnOrder","On Order..","OnOrder..")
+            c_ton    = tgi("On Order","OnOrder","On Order..","OnOrder..")
             c_tmin   = tgi("Min Inv","Min Inv..","MinInv")
-            c_treord = tgi("Reorder","Reorder..","Re-order")
+            c_tre    = tgi("Reorder","Reorder..","Re-order")
+
             default_vendor = "Madeira USA"
 
             for row in thr_rows[1:]:
                 if len(row) < len(t_headers):
                     row = row + [""] * (len(t_headers) - len(row))
 
-                tname   = norm(row[c_tname])   if c_tname   is not None else ""
+                tname   = norm(row[c_tname]) if c_tname is not None else ""
                 if not tname:
                     continue
-                inv     = num(row[c_tinv])     if c_tinv    is not None else 0
-                onord   = num(row[c_tonord])   if c_tonord  is not None else 0
-                mininv  = num(row[c_tmin])     if c_tmin    is not None else 0
-                reorder = num(row[c_treord])   if c_treord  is not None else 0
+                inv     = num(row[c_tinv]) if c_tinv is not None else 0
+                onord   = num(row[c_ton])  if c_ton  is not None else 0
+                mininv  = num(row[c_tmin]) if c_tmin is not None else 0
+                reorder = num(row[c_tre])  if c_tre  is not None else 0
 
                 inv, onord, mininv, reorder = inv or 0, onord or 0, mininv or 0, reorder or 0
-
                 if (inv + onord) < mininv:
-                    qty_needed = ceil(reorder - (inv + onord))
-                    if qty_needed > 0:
+                    qty = ceil(reorder - (inv + onord))
+                    if qty > 0:
                         vendors.setdefault(default_vendor, []).append({
-                            "name": tname, "qty": qty_needed, "unit": "cones", "type": "Thread"
+                            "name": tname, "qty": qty, "unit": "cones", "type": "Thread"
                         })
 
+        # ── FALLBACK: parse Summary Tab strings (e.g., "Item 8 Yards - Vendor") ──
+        if not vendors:
+            summary_rows = safe_get("Summary Tab!A2:A", value_render="FORMATTED_VALUE")
+            for r in summary_rows:
+                s = norm(r[0]) if r else ""
+                if not s or " - " not in s:
+                    continue
+                try:
+                    left, vendor = s.rsplit(" - ", 1)
+                    parts = left.rsplit(" ", 2)
+                    if len(parts) < 3:
+                        continue
+                    name = parts[0]
+                    qty  = float(parts[1])
+                    unit = parts[2]
+                    if qty > 0:
+                        vendors.setdefault(vendor or "Unknown", []).append({
+                            "name": name, "qty": int(ceil(qty)), "unit": unit, "type": "Material"
+                        })
+                except Exception:
+                    continue
+
         vendor_list = [{"vendor": v, "items": items} for v, items in vendors.items()]
 
         if debug:
-            # Show what we matched so we can diagnose quickly
             return jsonify({
-                "matched_material_headers": diags["materials_headers"],
-                "matched_thread_headers": diags["threads_headers"],
+                "ranges_tried": diags["ranges_tried"],
+                "materials_headers": diags["materials_headers"],
+                "threads_headers": diags["threads_headers"],
                 "vendors_preview": {k: len(v) for k, v in vendors.items()},
                 "sample_vendor": vendor_list[0] if vendor_list else None,
             })
 
-        vendor_list = [{"vendor": v, "items": items} for v, items in vendors.items()]
+        # cache write (if you added it)
+        global _materials_needed_cache, _materials_needed_ts
+        if CACHE_TTL:
+            import time as _t
+            _materials_needed_cache = {"vendors": vendor_list}
+            _materials_needed_ts = _t.time()
+            return jsonify(_materials_needed_cache)
 
-        if debug:
-            # keep your existing debug payload if you have one; otherwise OK to leave
-            return jsonify({
-                "vendors_preview": {k: len(v) for k, v in vendors.items()},
-                "sample_vendor": vendor_list[0] if vendor_list else None,
-            })
-
-        # ---- CACHE: store result and return ----
-        _materials_needed_cache = {"vendors": vendor_list}
-        _materials_needed_ts = time()
-        return jsonify(_materials_needed_cache)
-        # ----------------------------------------
-
+        return jsonify({"vendors": vendor_list})
 
     except Exception as e:
         app.logger.exception("materials-needed failed")
         if debug:
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
         return jsonify({"error": "materials-needed failed"}), 500
-
 
 
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
