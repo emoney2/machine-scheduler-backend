@@ -245,6 +245,8 @@ def get_sheets_service():
 def get_drive_service():
     return build("drive", "v3", credentials=get_oauth_credentials())
 
+sheets = get_sheets_service().spreadsheets()
+
 
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
@@ -1590,13 +1592,16 @@ _id_cache           = None
 _id_ts              = 0
 
 
-def fetch_sheet(spreadsheet_id, sheet_range):
+def fetch_sheet(spreadsheet_id, sheet_range, value_render_option="UNFORMATTED_VALUE"):
+    svc = get_sheets_service().spreadsheets().values()
     with sheet_lock:
-        res = sheets.values().get(
+        res = svc.get(
             spreadsheetId=spreadsheet_id,
-            range=sheet_range
+            range=sheet_range,
+            valueRenderOption=value_render_option,
         ).execute()
     return res.get("values", [])
+
 
 def write_sheet(spreadsheet_id, range_, values):
     service = get_sheets_service()
@@ -1780,13 +1785,14 @@ def overview_materials_needed():
     Group by Vendor. Threads default vendor = Madeira USA.
     """
 
-    def get_values(range_a1, value_render="UNFORMATTED_VALUE"):
-        vals = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=range_a1,
-            valueRenderOption=value_render
-        ).execute().get("values", [])
-        return vals
+def get_values(range_a1, value_render="UNFORMATTED_VALUE"):
+    svc = get_sheets_service().spreadsheets().values()
+    return svc.get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=range_a1,
+        valueRenderOption=value_render,
+    ).execute().get("values", [])
+
 
     def norm(s):
         return str(s or "").strip()
