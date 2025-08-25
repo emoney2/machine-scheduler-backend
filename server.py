@@ -1684,121 +1684,124 @@ def logout():
     session.clear()
     return redirect("/login")
 
-# ── Overview: Upcoming Jobs (Ship Date window) ─────────────────────────────
 @app.route("/api/overview/upcoming")
 @login_required_session
 def overview_upcoming():
+    debug = request.args.get("debug") == "1"
     try:
         days = int(request.args.get("days", "7"))
     except Exception:
         days = 7
 
-    data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
-    headers = data[0]
-    jobs = []
+    try:
+        data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
+        if not data or not data[0]:
+            return jsonify({"jobs": []})
 
-    def parse_date(val):
-        if not val:
+        headers = data[0]
+        jobs = []
+
+        def parse_date(val):
+            if not val:
+                return None
+            if isinstance(val, (int, float)):
+                return None
+            s = str(val).strip()
+            try:
+                if "-" in s and len(s.split("-")[0]) == 4:
+                    y, m, d = s.split("T")[0].split("-")
+                    return date(int(y), int(m), int(d))
+                parts = s.replace("-", "/").split("/")
+                if len(parts) >= 2:
+                    m = int(parts[0]); d = int(parts[1])
+                    y = int(parts[2]) if len(parts) >= 3 else date.today().year
+                    if y < 100: y += 2000
+                    return date(y, m, d)
+            except Exception:
+                return None
             return None
-        if isinstance(val, (int, float)):
-            # gspread may give serials; let’s NOT rely on serials here
-            # (your sheet likely sends strings). Fallback to None.
-            return None
-        s = str(val).strip()
-        try:
-            if "-" in s and len(s.split("-")[0]) == 4:
-                y, m, d = s.split("T")[0].split("-")
-                return date(int(y), int(m), int(d))
-            parts = s.replace("-", "/").split("/")
-            if len(parts) >= 2:
-                m = int(parts[0]); d = int(parts[1])
-                y = int(parts[2]) if len(parts) >= 3 else date.today().year
-                if y < 100: y += 2000
-                return date(y, m, d)
-        except Exception:
-            return None
-        return None
 
-    today = date.today()
-    max_day = today + timedelta(days=days)
+        today = date.today()
+        max_day = today + timedelta(days=days)
 
-    for row in data[1:]:
-        while len(row) < len(headers):
-            row.append("")
-        rd = dict(zip(headers, row))
+        for row in data[1:]:
+            while len(row) < len(headers):
+                row.append("")
+            rd = dict(zip(headers, row))
 
-        stage = str(rd.get("Stage", "")).strip().lower()
-        if stage == "complete":
-            continue
+            stage = str(rd.get("Stage", "")).strip().lower()
+            if stage == "complete":
+                continue
 
-        ship_dt = parse_date(rd.get("Ship Date"))
-        if not ship_dt:
-            continue
-        if not (today <= ship_dt <= max_day):
-            continue
+            ship_dt = parse_date(rd.get("Ship Date"))
+            if not ship_dt:
+                continue
+            if not (today <= ship_dt <= max_day):
+                continue
 
-        # Build preview image same as jobs-for-company
-        image_link = str(rd.get("Image", "")).strip()
-        file_id = ""
-        if "id=" in image_link:
-            file_id = image_link.split("id=")[-1].split("&")[0]
-        elif "file/d/" in image_link:
-            file_id = image_link.split("file/d/")[-1].split("/")[0]
-        preview_url = f"https://drive.google.com/thumbnail?id={file_id}" if file_id else ""
+            image_link = str(rd.get("Image", "")).strip()
+            file_id = ""
+            if "id=" in image_link:
+                file_id = image_link.split("id=")[-1].split("&")[0]
+            elif "file/d/" in image_link:
+                file_id = image_link.split("file/d/")[-1].split("/")[0]
+            preview_url = f"https://drive.google.com/thumbnail?id={file_id}" if file_id else ""
 
-        rd["image"] = preview_url
+            keep = [
+                "Order #","Preview","Company Name","Design","Quantity","Product",
+                "Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"
+            ]
+            job = {k: rd.get(k, "") for k in keep}
+            job["image"] = preview_url
+            jobs.append(job)
 
-        # Make sure keys match the columns you requested
-        keep = [
-            "Order #","Preview","Company Name","Design","Quantity","Product",
-            "Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"
-        ]
-        job = {k: rd.get(k, "") for k in keep}
-        job["image"] = preview_url
-        jobs.append(job)
+        def dd_key(j):
+            dd = parse_date(j.get("Due Date"))
+            return (dd or date(2999,12,31))
 
-    # Sort: Due Date asc, then Order # (numeric)
-    def dd_key(j):
-        dd = parse_date(j.get("Due Date"))
-        return (dd or date(2999,12,31))
+        def order_key(j):
+            raw = str(j.get("Order #","")).strip()
+            num = int("".join([c for c in raw if c.isdigit()]) or 0)
+            return num
 
-    def order_key(j):
-        raw = str(j.get("Order #","")).strip()
-        num = int("".join([c for c in raw if c.isdigit()]) or 0)
-        return num
+        jobs.sort(key=lambda j: (dd_key(j), order_key(j)))
 
-    jobs.sort(key=lambda j: (dd_key(j), order_key(j)))
+        if debug:
+            return jsonify({"count": len(jobs), "first": jobs[0] if jobs else None})
 
-    return jsonify({ "jobs": jobs })
+        return jsonify({ "jobs": jobs })
+
+    except Exception as e:
+        app.logger.exception("overview_upcoming failed")
+        if debug:
+            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
+        return jsonify({"error": "overview_upcoming failed"}), 500
 
 
 @app.route("/api/overview/materials-needed")
 @login_required_session
 def overview_materials_needed():
     """
-    Build the Materials-to-Order list from inventory tabs.
-    Include if (Inventory + On Order) < Min Inv.
-    qty_to_order = ROUNDUP(Reorder - (Inventory + On Order))
-    Group by Vendor. Threads default vendor = Madeira USA.
+    Build Materials-to-Order direct from:
+      - Material Inventory (columns: Materials, Inventory, On Order, Unit, Min. Inv., Reorder, Cost, Value, Vendor)
+      - Thread Inventory   (columns: Thread Colors, Inventory.., On Order.., Min Inv.., Reorder.., Cost, Value)
+    Include if (Inventory + On Order) < Min. Inv.
+    qty_to_order = ROUNDUP(Reorder − (Inventory + On Order))
+    Group by Vendor (threads default to 'Madeira USA', unit='cones').
     """
+    debug = request.args.get("debug") == "1"
 
-def get_values(range_a1, value_render="UNFORMATTED_VALUE"):
-    svc = get_sheets_service().spreadsheets().values()
-    return svc.get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=range_a1,
-        valueRenderOption=value_render,
-    ).execute().get("values", [])
+    def get_values(range_a1, value_render="UNFORMATTED_VALUE"):
+        # self-contained Sheets call (no global dependency)
+        svc = get_sheets_service().spreadsheets().values()
+        return svc.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=range_a1,
+            valueRenderOption=value_render
+        ).execute().get("values", [])
 
-
-    def norm(s):
-        return str(s or "").strip()
-
-    # NEW: robust header normalizer — remove all non a–z/0–9 so “Min Inv..”,
-    # “Min. Inv.”, “min inv” all normalize to “mininv”
-    import re
-    def hkey(s):
-        return re.sub(r'[^a-z0-9]+', '', str(s or '').lower())
+    def norm(s): return str(s or "").strip()
+    def hkey(s): return re.sub(r'[^a-z0-9]+', '', str(s or '').lower())
 
     def num(x):
         try:
@@ -1809,136 +1812,123 @@ def get_values(range_a1, value_render="UNFORMATTED_VALUE"):
             except Exception:
                 return None
 
-    vendors = {}
+    try:
+        vendors = {}
+        diags = {"materials_headers": [], "threads_headers": []}
 
-    # ── Materials: Material Inventory!A:I ───────────────────────────────────
-    mat_rows = get_values("Material Inventory!A1:I")
-    if mat_rows:
-        m_headers = [norm(h) for h in mat_rows[0]]
-        m_idx = { hkey(h): i for i, h in enumerate(m_headers) }  # CHANGED
+        # ── Materials: Material Inventory!A:I ────────────────────────────────
+        mat_rows = get_values("Material Inventory!A1:I")
+        if mat_rows:
+            m_headers = [norm(h) for h in mat_rows[0]]
+            diags["materials_headers"] = m_headers
+            m_idx = { hkey(h): i for i, h in enumerate(m_headers) }
 
-        # CHANGED: look up by normalized keys and accept multiple aliases
-        def gi(*names):
-            for n in names:
-                i = m_idx.get(hkey(n))
-                if i is not None:
-                    return i
-            # extra: if caller passed a partial, match contains
-            for k, i in m_idx.items():
-                if any(hkey(n) in k for n in names):
-                    return i
-            return None
+            def gi(*names):
+                # exact normalized match first
+                for n in names:
+                    i = m_idx.get(hkey(n))
+                    if i is not None:
+                        return i
+                # then partial (if someone edited headers)
+                for k, i in m_idx.items():
+                    if any(hkey(n) in k for n in names):
+                        return i
+                return None
 
-        c_name    = gi("Materials","Material","Name","Item")
-        c_inv     = gi("Inventory","Inventory..")
-        c_onorder = gi("On Order","OnOrder","On Order..","OnOrder..")
-        c_unit    = gi("Unit")
-        c_min     = gi("Min Inv","Min. Inv.","MinInv","Min Inv..","MinInv..")
-        c_reorder = gi("Reorder","Re-order")
-        c_vendor  = gi("Vendor")
+            c_name    = gi("Materials","Material","Name","Item")
+            c_inv     = gi("Inventory","Inventory..")
+            c_onorder = gi("On Order","OnOrder","On Order..","OnOrder..")
+            c_unit    = gi("Unit")
+            c_min     = gi("Min Inv","Min. Inv.","MinInv","Min Inv..","MinInv..")
+            c_reorder = gi("Reorder","Re-order")
+            c_vendor  = gi("Vendor")
 
-        for row in mat_rows[1:]:
-            if len(row) < len(m_headers):
-                row = row + [""] * (len(m_headers) - len(row))
+            for row in mat_rows[1:]:
+                if len(row) < len(m_headers):
+                    row = row + [""] * (len(m_headers) - len(row))
 
-            name = norm(row[c_name]) if c_name is not None else ""
-            if not name:
-                continue
-
-            inv     = num(row[c_inv])      if c_inv     is not None else 0
-            onord   = num(row[c_onorder])  if c_onorder is not None else 0
-            mininv  = num(row[c_min])      if c_min     is not None else 0
-            reorder = num(row[c_reorder])  if c_reorder is not None else 0
-            unit    = norm(row[c_unit])    if c_unit    is not None else ""
-            vendor  = norm(row[c_vendor])  if c_vendor  is not None else "Unknown"
-
-            inv     = inv or 0
-            onord   = onord or 0
-            mininv  = mininv or 0
-            reorder = reorder or 0
-
-            if (inv + onord) < mininv:
-                qty_needed = ceil(reorder - (inv + onord))
-                if qty_needed > 0:
-                    vendors.setdefault(vendor or "Unknown", []).append({
-                        "name": name, "qty": qty_needed, "unit": unit, "type": "Material"
-                    })
-
-    # ── Threads: Thread Inventory!A:G ───────────────────────────────────────
-    thr_rows = get_values("Thread Inventory!A1:G")
-    if thr_rows:
-        t_headers = [norm(h) for h in thr_rows[0]]
-        t_idx = { hkey(h): i for i, h in enumerate(t_headers) }  # CHANGED
-
-        def tgi(*names):
-            for n in names:
-                i = t_idx.get(hkey(n))
-                if i is not None:
-                    return i
-            for k, i in t_idx.items():
-                if any(hkey(n) in k for n in names):
-                    return i
-            return None
-
-        c_color   = tgi("Thread Colors","Color","Thread")
-        c_inv     = tgi("Inventory","Inventory..")
-        c_onorder = tgi("On Order","OnOrder","On Order..","OnOrder..")
-        c_min     = tgi("Min Inv","Min Inv..","MinInv")
-        c_reorder = tgi("Reorder","Re-order")
-        # If you later add a Vendor column for threads, also tgi("Vendor")
-        default_vendor = "Madeira USA"
-
-        for row in thr_rows[1:]:
-            if len(row) < len(t_headers):
-                row = row + [""] * (len(t_headers) - len(row))
-
-            color   = norm(row[c_color]) if c_color is not None else ""
-            inv     = num(row[c_inv])    if c_inv   is not None else 0
-            onord   = num(row[c_onorder]) if c_onorder is not None else 0
-            mininv  = num(row[c_min])    if c_min   is not None else 0
-            reorder = num(row[c_reorder]) if c_reorder is not None else 0
-
-            inv = inv or 0; onord = onord or 0; mininv = mininv or 0; reorder = reorder or 0
-
-            if color and (inv + onord) < mininv:
-                qty_needed = ceil(reorder - (inv + onord))
-                if qty_needed > 0:
-                    vendors.setdefault(default_vendor, []).append({
-                        "name": color, "qty": qty_needed, "unit": "cones", "type": "Thread"
-                    })
-
-    # OPTIONAL: Fallback to your Summary Tab strings if nothing matched
-    if not vendors:
-        rows = get_values("Summary Tab!A2:A", value_render="FORMATTED_VALUE")
-        for r in rows:
-            s = norm(r[0]) if r else ""
-            if not s or " - " not in s:
-                continue
-            try:
-                left, vendor = s.rsplit(" - ", 1)
-                # left looks like "ItemName 41 Sqft" → split off last two tokens
-                parts = left.rsplit(" ", 2)
-                if len(parts) < 3:
+                name   = norm(row[c_name])    if c_name    is not None else ""
+                if not name:
                     continue
-                name = parts[0]
-                qty  = int(float(parts[1]))
-                unit = parts[2]
-                vendors.setdefault(vendor or "Unknown", []).append({
-                    "name": name, "qty": qty, "unit": unit, "type": "Material"
-                })
-            except Exception:
-                continue
+                inv     = num(row[c_inv])     if c_inv     is not None else 0
+                onord   = num(row[c_onorder]) if c_onorder is not None else 0
+                mininv  = num(row[c_min])     if c_min     is not None else 0
+                reorder = num(row[c_reorder]) if c_reorder is not None else 0
+                unit    = norm(row[c_unit])   if c_unit    is not None else ""
+                vendor  = norm(row[c_vendor]) if c_vendor  is not None else "Unknown"
 
-    # OPTIONAL: quick diagnostics
-    if request.args.get("debug") == "1":
-        return jsonify({
-            "matched_material_headers": list(m_idx.keys()) if 'm_idx' in locals() else [],
-            "matched_thread_headers": list(t_idx.keys()) if 't_idx' in locals() else [],
-            "vendors_preview": {k: len(v) for k, v in vendors.items()}
-        })
+                inv, onord, mininv, reorder = inv or 0, onord or 0, mininv or 0, reorder or 0
 
-    vendor_list = [{"vendor": v, "items": items} for v, items in vendors.items()]
-    return jsonify({ "vendors": vendor_list })
+                if (inv + onord) < mininv:
+                    qty_needed = ceil(reorder - (inv + onord))
+                    if qty_needed > 0:
+                        vendors.setdefault(vendor or "Unknown", []).append({
+                            "name": name, "qty": qty_needed, "unit": unit, "type": "Material"
+                        })
+
+        # ── Threads: Thread Inventory!A:G ───────────────────────────────────
+        thr_rows = get_values("Thread Inventory!A1:G")
+        if thr_rows:
+            t_headers = [norm(h) for h in thr_rows[0]]
+            diags["threads_headers"] = t_headers
+            t_idx = { hkey(h): i for i, h in enumerate(t_headers) }
+
+            def tgi(*names):
+                for n in names:
+                    i = t_idx.get(hkey(n))
+                    if i is not None:
+                        return i
+                for k, i in t_idx.items():
+                    if any(hkey(n) in k for n in names):
+                        return i
+                return None
+
+            c_tname  = tgi("Thread Colors","Thread","Color","Name")
+            c_tinv   = tgi("Inventory","Inventory..")
+            c_tonord = tgi("On Order","OnOrder","On Order..","OnOrder..")
+            c_tmin   = tgi("Min Inv","Min Inv..","MinInv")
+            c_treord = tgi("Reorder","Reorder..","Re-order")
+            default_vendor = "Madeira USA"
+
+            for row in thr_rows[1:]:
+                if len(row) < len(t_headers):
+                    row = row + [""] * (len(t_headers) - len(row))
+
+                tname   = norm(row[c_tname])   if c_tname   is not None else ""
+                if not tname:
+                    continue
+                inv     = num(row[c_tinv])     if c_tinv    is not None else 0
+                onord   = num(row[c_tonord])   if c_tonord  is not None else 0
+                mininv  = num(row[c_tmin])     if c_tmin    is not None else 0
+                reorder = num(row[c_treord])   if c_treord  is not None else 0
+
+                inv, onord, mininv, reorder = inv or 0, onord or 0, mininv or 0, reorder or 0
+
+                if (inv + onord) < mininv:
+                    qty_needed = ceil(reorder - (inv + onord))
+                    if qty_needed > 0:
+                        vendors.setdefault(default_vendor, []).append({
+                            "name": tname, "qty": qty_needed, "unit": "cones", "type": "Thread"
+                        })
+
+        vendor_list = [{"vendor": v, "items": items} for v, items in vendors.items()]
+
+        if debug:
+            # Show what we matched so we can diagnose quickly
+            return jsonify({
+                "matched_material_headers": diags["materials_headers"],
+                "matched_thread_headers": diags["threads_headers"],
+                "vendors_preview": {k: len(v) for k, v in vendors.items()},
+                "sample_vendor": vendor_list[0] if vendor_list else None,
+            })
+
+        return jsonify({ "vendors": vendor_list })
+
+    except Exception as e:
+        app.logger.exception("materials-needed failed")
+        if debug:
+            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
+        return jsonify({"error": "materials-needed failed"}), 500
 
 
 
