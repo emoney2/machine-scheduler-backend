@@ -1759,7 +1759,7 @@ def overview_combined():
 
         TARGET_HEADERS = ["Order #","Preview","Company Name","Design","Quantity","Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"]
 
-        # If the first row is the header row from the sheet, remove it
+        # Drop header row if present
         if up_vals:
             first_row = [str(x or "").strip() for x in up_vals[0]]
             if [h.strip().lower() for h in first_row] == [h.strip().lower() for h in TARGET_HEADERS]:
@@ -1767,20 +1767,71 @@ def overview_combined():
 
         headers = TARGET_HEADERS
 
-        def thumb(link):
+        def drive_thumb(link, size="w160"):
             s = str(link or "")
             fid = ""
-            if "id=" in s: fid = s.split("id=")[-1].split("&")[0]
-            elif "file/d/" in s: fid = s.split("file/d/")[-1].split("/")[0]
-            return f"https://drive.google.com/thumbnail?id={fid}&sz=w160" if fid else ""
+            if "id=" in s:
+                fid = s.split("id=")[-1].split("&")[0]
+            elif "/file/d/" in s:
+                fid = s.split("/file/d/")[-1].split("/")[0]
+            return f"https://drive.google.com/thumbnail?id={fid}&sz={size}" if fid else ""
+
+        # Build a lightweight map: Order # -> Image link from Production Orders
+        # 1) Read header row to find the "Image" column index
+        po_hdr = (get_sheets_service().spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Production Orders!A1:AM1",
+            valueRenderOption="UNFORMATTED_VALUE"
+        ).execute().get("values", [[]]) or [[]])[0]
+
+        img_idx = -1
+        for i, h in enumerate(po_hdr):
+            if str(h or "").strip().lower() == "image":
+                img_idx = i
+                break
+
+        order_to_image = {}
+
+        if img_idx >= 0:
+            # Convert 0-based index -> column letter
+            def col_letter(idx0):
+                n = idx0 + 1
+                s = ""
+                while n:
+                    n, r = divmod(n - 1, 26)
+                    s = chr(65 + r) + s
+                return s
+
+            img_col = col_letter(img_idx)
+
+            # 2) Fetch Order # (A) and Image column only (compact)
+            pr = get_sheets_service().spreadsheets().values().batchGet(
+                spreadsheetId=SPREADSHEET_ID,
+                ranges=[ "Production Orders!A2:A", f"Production Orders!{img_col}2:{img_col}" ],
+                valueRenderOption="FORMATTED_VALUE"
+            ).execute().get("valueRanges", [])
+
+            orders_col = (pr[0].get("values") if len(pr) > 0 else []) or []
+            images_col = (pr[1].get("values") if len(pr) > 1 else []) or []
+
+            max_len = max(len(orders_col), len(images_col))
+            for i in range(max_len):
+                ord_val = (orders_col[i][0] if i < len(orders_col) and orders_col[i] else "").strip()
+                img_val = (images_col[i][0] if i < len(images_col) and images_col[i] else "").strip()
+                if ord_val:
+                    order_to_image[ord_val] = img_val
+
+        def prefer_image(preview, order_no):
+            # Prefer Production Orders → Image; else fall back to Preview-derived thumb
+            img = order_to_image.get(str(order_no).strip(), "")
+            return drive_thumb(img) or drive_thumb(preview)
 
         upcoming = []
         for r in up_vals:
             r = r + [""] * (len(headers) - len(r))
             row = dict(zip(headers, r))
-            row["image"] = thumb(row.get("Preview"))
+            row["image"] = prefer_image(row.get("Preview"), row.get("Order #"))
             upcoming.append(row)
-
 
         # ---- Materials lines (single text column)
         mat_vals = (vr[1].get("values") if len(vr) > 1 else []) or []
