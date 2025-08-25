@@ -24,6 +24,14 @@ from flask_compress import Compress
 
 # after you create `app = Flask(__name__)` (or right after other app config)
 Compress(app)
+# Optional GZIP compression (no-op if package isn't installed)
+try:
+    from flask_compress import Compress
+    Compress(app)
+except Exception:
+    # Compression not available; continue without it
+    pass
+
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
