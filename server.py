@@ -20,17 +20,6 @@ from flask import request, make_response, jsonify, Response
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
 from math import ceil
-from flask_compress import Compress
-
-# after you create `app = Flask(__name__)` (or right after other app config)
-Compress(app)
-# Optional GZIP compression (no-op if package isn't installed)
-try:
-    from flask_compress import Compress
-    Compress(app)
-except Exception:
-    # Compression not available; continue without it
-    pass
 
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
@@ -271,6 +260,14 @@ FRONTEND_URL = raw_frontend.strip()
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
+# Optional GZIP compression (safe if package missing)
+try:
+    from flask_compress import Compress
+    Compress(app)
+except Exception:
+    # gzip not available; continue without it
+    pass
+
 CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
 app.secret_key = os.environ.get("FLASK_SECRET", "shhhh")
 

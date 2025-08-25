@@ -12,5 +12,6 @@ flask-cors>=4.0.0
 gspread
 requests
 reportlab
+flask-compress>=1.14
 
 
