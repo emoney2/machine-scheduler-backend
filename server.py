@@ -1774,15 +1774,12 @@ def overview_upcoming():
 @login_required_session
 def overview_materials_needed():
     """
-    Build the Materials-to-Order list straight from the Google Sheet tabs,
-    using the same logic as the user's formula:
-
-      include if (Inventory + On Order) < Min Inv.
-      qty_to_order = ROUNDUP(Reorder - (Inventory + On Order))
-
-    Group by Vendor. Also include thread shortages from "Thread Inventory"
-    (vendor = "Madeira USA" unless a Vendor column exists).
+    Build the Materials-to-Order list from inventory tabs.
+    Include if (Inventory + On Order) < Min Inv.
+    qty_to_order = ROUNDUP(Reorder - (Inventory + On Order))
+    Group by Vendor. Threads default vendor = Madeira USA.
     """
+
     def get_values(range_a1, value_render="UNFORMATTED_VALUE"):
         vals = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
@@ -1794,9 +1791,14 @@ def overview_materials_needed():
     def norm(s):
         return str(s or "").strip()
 
+    # NEW: robust header normalizer — remove all non a–z/0–9 so “Min Inv..”,
+    # “Min. Inv.”, “min inv” all normalize to “mininv”
+    import re
+    def hkey(s):
+        return re.sub(r'[^a-z0-9]+', '', str(s or '').lower())
+
     def num(x):
         try:
-            # UNFORMATTED_VALUE gives us numbers when possible; still coerce
             return float(x)
         except Exception:
             try:
@@ -1806,32 +1808,33 @@ def overview_materials_needed():
 
     vendors = {}
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Materials: "Material Inventory" (A:I)
-    # Columns: Materials, Inventory, On Order, Unit, Min. Inv., Reorder, Cost, Value, Vendor
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Materials: Material Inventory!A:I ───────────────────────────────────
     mat_rows = get_values("Material Inventory!A1:I")
     if mat_rows:
         m_headers = [norm(h) for h in mat_rows[0]]
-        m_idx = { h.lower(): i for i, h in enumerate(m_headers) }
+        m_idx = { hkey(h): i for i, h in enumerate(m_headers) }  # CHANGED
 
+        # CHANGED: look up by normalized keys and accept multiple aliases
         def gi(*names):
             for n in names:
-                i = m_idx.get(n.lower())
+                i = m_idx.get(hkey(n))
                 if i is not None:
+                    return i
+            # extra: if caller passed a partial, match contains
+            for k, i in m_idx.items():
+                if any(hkey(n) in k for n in names):
                     return i
             return None
 
         c_name    = gi("Materials","Material","Name","Item")
-        c_inv     = gi("Inventory")
-        c_onorder = gi("On Order","OnOrder")
+        c_inv     = gi("Inventory","Inventory..")
+        c_onorder = gi("On Order","OnOrder","On Order..","OnOrder..")
         c_unit    = gi("Unit")
-        c_min     = gi("Min. Inv.","Min Inv.","MinInv")
-        c_reorder = gi("Reorder")
+        c_min     = gi("Min Inv","Min. Inv.","MinInv","Min Inv..","MinInv..")
+        c_reorder = gi("Reorder","Re-order")
         c_vendor  = gi("Vendor")
 
         for row in mat_rows[1:]:
-            # pad
             if len(row) < len(m_headers):
                 row = row + [""] * (len(m_headers) - len(row))
 
@@ -1839,83 +1842,101 @@ def overview_materials_needed():
             if not name:
                 continue
 
-            inv     = num(row[c_inv]) if c_inv is not None else 0
-            onord   = num(row[c_onorder]) if c_onorder is not None else 0
-            mininv  = num(row[c_min]) if c_min is not None else 0
-            reorder = num(row[c_reorder]) if c_reorder is not None else 0
-            unit    = norm(row[c_unit]) if c_unit is not None else ""
-            vendor  = norm(row[c_vendor]) if c_vendor is not None else "Unknown"
+            inv     = num(row[c_inv])      if c_inv     is not None else 0
+            onord   = num(row[c_onorder])  if c_onorder is not None else 0
+            mininv  = num(row[c_min])      if c_min     is not None else 0
+            reorder = num(row[c_reorder])  if c_reorder is not None else 0
+            unit    = norm(row[c_unit])    if c_unit    is not None else ""
+            vendor  = norm(row[c_vendor])  if c_vendor  is not None else "Unknown"
 
-            inv = inv or 0
-            onord = onord or 0
-            mininv = mininv or 0
+            inv     = inv or 0
+            onord   = onord or 0
+            mininv  = mininv or 0
             reorder = reorder or 0
 
-            # Include only if below min inventory threshold
             if (inv + onord) < mininv:
-                qty_needed = ceil((reorder - (inv + onord)))
+                qty_needed = ceil(reorder - (inv + onord))
                 if qty_needed > 0:
                     vendors.setdefault(vendor or "Unknown", []).append({
-                        "name": name,
-                        "qty": qty_needed,
-                        "unit": unit,
-                        "type": "Material",
+                        "name": name, "qty": qty_needed, "unit": unit, "type": "Material"
                     })
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Threads: "Thread Inventory" (A:G)
-    # Columns (per your note): Thread Colors, Inventory.., On Order.., Min Inv.., Reorder.., Cost, Value
-    # Assume vendor = "Madeira USA" and unit = "cones" (can make configurable later)
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Threads: Thread Inventory!A:G ───────────────────────────────────────
     thr_rows = get_values("Thread Inventory!A1:G")
     if thr_rows:
         t_headers = [norm(h) for h in thr_rows[0]]
-        t_idx = { h.lower(): i for i, h in enumerate(t_headers) }
+        t_idx = { hkey(h): i for i, h in enumerate(t_headers) }  # CHANGED
 
-        def gi_t(*names):
+        def tgi(*names):
             for n in names:
-                i = t_idx.get(n.lower())
+                i = t_idx.get(hkey(n))
                 if i is not None:
+                    return i
+            for k, i in t_idx.items():
+                if any(hkey(n) in k for n in names):
                     return i
             return None
 
-        c_tname   = gi_t("Thread Colors","Thread","Color","Name")
-        c_tinv    = gi_t("Inventory..","Inventory")
-        c_tonord  = gi_t("On Order..","On Order","OnOrder")
-        c_tmin    = gi_t("Min Inv..","Min Inv","MinInv")
-        c_treord  = gi_t("Reorder..","Reorder")
+        c_color   = tgi("Thread Colors","Color","Thread")
+        c_inv     = tgi("Inventory","Inventory..")
+        c_onorder = tgi("On Order","OnOrder","On Order..","OnOrder..")
+        c_min     = tgi("Min Inv","Min Inv..","MinInv")
+        c_reorder = tgi("Reorder","Re-order")
+        # If you later add a Vendor column for threads, also tgi("Vendor")
+        default_vendor = "Madeira USA"
 
         for row in thr_rows[1:]:
             if len(row) < len(t_headers):
                 row = row + [""] * (len(t_headers) - len(row))
 
-            tname = norm(row[c_tname]) if c_tname is not None else ""
-            if not tname:
-                continue
+            color   = norm(row[c_color]) if c_color is not None else ""
+            inv     = num(row[c_inv])    if c_inv   is not None else 0
+            onord   = num(row[c_onorder]) if c_onorder is not None else 0
+            mininv  = num(row[c_min])    if c_min   is not None else 0
+            reorder = num(row[c_reorder]) if c_reorder is not None else 0
 
-            inv     = num(row[c_tinv])   if c_tinv   is not None else 0
-            onord   = num(row[c_tonord]) if c_tonord is not None else 0
-            mininv  = num(row[c_tmin])   if c_tmin   is not None else 0
-            reorder = num(row[c_treord]) if c_treord is not None else 0
+            inv = inv or 0; onord = onord or 0; mininv = mininv or 0; reorder = reorder or 0
 
-            inv = inv or 0
-            onord = onord or 0
-            mininv = mininv or 0
-            reorder = reorder or 0
-
-            if (inv + onord) < mininv:
-                qty_needed = ceil((reorder - (inv + onord)))
+            if color and (inv + onord) < mininv:
+                qty_needed = ceil(reorder - (inv + onord))
                 if qty_needed > 0:
-                    vendors.setdefault("Madeira USA", []).append({
-                        "name": tname,
-                        "qty": qty_needed,
-                        "unit": "cones",
-                        "type": "Thread",
+                    vendors.setdefault(default_vendor, []).append({
+                        "name": color, "qty": qty_needed, "unit": "cones", "type": "Thread"
                     })
 
-    # shape for frontend
+    # OPTIONAL: Fallback to your Summary Tab strings if nothing matched
+    if not vendors:
+        rows = get_values("Summary Tab!A2:A", value_render="FORMATTED_VALUE")
+        for r in rows:
+            s = norm(r[0]) if r else ""
+            if not s or " - " not in s:
+                continue
+            try:
+                left, vendor = s.rsplit(" - ", 1)
+                # left looks like "ItemName 41 Sqft" → split off last two tokens
+                parts = left.rsplit(" ", 2)
+                if len(parts) < 3:
+                    continue
+                name = parts[0]
+                qty  = int(float(parts[1]))
+                unit = parts[2]
+                vendors.setdefault(vendor or "Unknown", []).append({
+                    "name": name, "qty": qty, "unit": unit, "type": "Material"
+                })
+            except Exception:
+                continue
+
+    # OPTIONAL: quick diagnostics
+    if request.args.get("debug") == "1":
+        return jsonify({
+            "matched_material_headers": list(m_idx.keys()) if 'm_idx' in locals() else [],
+            "matched_thread_headers": list(t_idx.keys()) if 't_idx' in locals() else [],
+            "vendors_preview": {k: len(v) for k, v in vendors.items()}
+        })
+
     vendor_list = [{"vendor": v, "items": items} for v, items in vendors.items()]
     return jsonify({ "vendors": vendor_list })
+
 
 
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
