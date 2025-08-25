@@ -1751,7 +1751,7 @@ def overview_combined():
         vr = svc.batchGet(
             spreadsheetId=SPREADSHEET_ID,
             ranges=["Overview!A3:K", "Overview!M3:M"],
-            valueRenderOption="UNFORMATTED_VALUE"
+            valueRenderOption="FORMATTED_VALUE"
         ).execute().get("valueRanges", [])
 
         # ---- Upcoming rows (already filtered/sorted in Sheet)
