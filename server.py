@@ -2997,7 +2997,7 @@ def add_materials():
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": inv_rows}
-        ).execute()
+        ).execute(); invalidate_upcoming_cache()
 
          # ✅ invalidate materials-needed cache
          invalidate_materials_needed_cache()
