@@ -2363,12 +2363,12 @@ def get_manual_state():
         # first row: machine lists in I–Z (cols 8–25)
         first = rows[0] if rows else [""] * 26
         machines = first[8:26]
-        machine_columns = [[s for s in col.split(",") if s] for col in machines]
+        machine_columns = [[s for s in str(col or "").split(",") if s] for col in machines]
 
         # rest: placeholders from A–H (cols 0–7)
         phs = []
         for r in rows:
-            if r[0].strip():  # only if ID in col A
+            if str(r[0]).strip():  # only if ID in col A
                 phs.append({
                     "id":          r[0],
                     "company":     r[1],
