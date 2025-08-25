@@ -245,9 +245,6 @@ def get_sheets_service():
 def get_drive_service():
     return build("drive", "v3", credentials=get_oauth_credentials())
 
-sheets = get_sheets_service().spreadsheets()
-
-
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
 logging.basicConfig(
