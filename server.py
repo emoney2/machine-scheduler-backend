@@ -1928,11 +1928,11 @@ def overview_materials_needed():
                 if len(row) < len(mh): row += [""] * (len(mh) - len(row))
                 name = norm(row[c_name]) if c_name is not None else ""
                 if not name: continue
-                inv, on, mn, re = num(row[c_inv]), num(row[c_on]), num(row[c_min]), num(row[c_re])
+                inv, on, mn, reord = num(row[c_inv]), num(row[c_on]), num(row[c_min]), num(row[c_re])
                 if (inv + on) < mn:
-                    qty = ceil(re - (inv + on))
+                    qty = ceil(reord - (inv + on))
                     if qty > 0:
-                        unit   = norm(row[c_unit])  if c_unit  is not None else ""
+                        unit   = norm(row[c_unit])   if c_unit   is not None else ""
                         vendor = norm(row[c_vendor]) if c_vendor is not None else "Unknown"
                         vendors.setdefault(vendor or "Unknown", []).append(
                             {"name": name, "qty": qty, "unit": unit, "type": "Material"}
@@ -1962,9 +1962,9 @@ def overview_materials_needed():
                 if len(row) < len(th): row += [""] * (len(th) - len(row))
                 name = norm(row[c_tname]) if c_tname is not None else ""
                 if not name: continue
-                inv, on, mn, re = num(row[c_tinv]), num(row[c_ton]), num(row[c_tmin]), num(row[c_tre])
+                inv, on, mn, reord = num(row[c_tinv]), num(row[c_ton]), num(row[c_tmin]), num(row[c_tre])
                 if (inv + on) < mn:
-                    qty = ceil(re - (inv + on))
+                    qty = ceil(reord - (inv + on))
                     if qty > 0:
                         vendors.setdefault("Madeira USA", []).append(
                             {"name": name, "qty": qty, "unit": "cones", "type": "Thread"}
@@ -1995,8 +1995,6 @@ def overview_materials_needed():
         if debug:
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
         return jsonify({"error":"materials-needed failed"}), 500
-
-
 
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
 
