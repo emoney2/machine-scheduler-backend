@@ -1601,15 +1601,14 @@ def update_embroidery_start_time_in_sheet(order_id, new_start_time):
 
         for i, row in enumerate(data, start=2):
             if str(row.get("Order #")).strip() == str(order_id).strip():
-                sheet.update_cell(i, start_col, new_start_time)
-                # ✅ optional: embroidery start changed → clear upcoming cache
-                invalidate_upcoming_cache()
+                sheet.update_cell(i, start_col, new_start_time); invalidate_upcoming_cache()
                 print(f"✅ Embroidery Start Time updated for Order #{order_id}")
                 return
 
         print(f"⚠️ Order ID {order_id} not found in Embroidery List")
     except Exception as e:
         print(f"❌ Error updating start time for Order #{order_id}: {e}")
+
 
 
 
@@ -2661,11 +2660,7 @@ def submit_order():
             range=f"Production Orders!AF{next_row}",
             valueInputOption="USER_ENTERED",
             body={"values": [[new_f]]}
-        ).execute()
-
-
-             # ✅ invalidate upcoming cache (new/changed order affects Ship Date window)
-             invalidate_upcoming_cache()
+        ).execute(); invalidate_upcoming_cache()
 
         return jsonify({"status":"ok","order":new_order}), 200
 
