@@ -25,7 +25,6 @@ from math import ceil
 logout_all_ts = 0.0
 from io import BytesIO
 from datetime import date, datetime, timedelta
-from time import time
 from zoneinfo import ZoneInfo
 from ups_service import get_rate
 from functools import wraps
@@ -1717,7 +1716,7 @@ def overview_upcoming():
         days = 7
     # ---- CACHE: early return if fresh ----
     global _overview_upcoming_cache, _overview_upcoming_ts
-    now = time()
+    now = time.time()
     cached = _overview_upcoming_cache.get(days)
     if cached and (now - _overview_upcoming_ts) < CACHE_TTL and not debug:
         return jsonify(cached)
