@@ -25,6 +25,7 @@ from math import ceil
 logout_all_ts = 0.0
 from io import BytesIO
 from datetime import date, datetime, timedelta
+from time import time
 from zoneinfo import ZoneInfo
 from ups_service import get_rate
 from functools import wraps
@@ -1562,6 +1563,8 @@ def update_embroidery_start_time_in_sheet(order_id, new_start_time):
         for i, row in enumerate(data, start=2):
             if str(row.get("Order #")).strip() == str(order_id).strip():
                 sheet.update_cell(i, start_col, new_start_time)
+                          # ✅ optional: embroidery start changed → just clear upcoming cache
+                          invalidate_upcoming_cache()
                 print(f"✅ Embroidery Start Time updated for Order #{order_id}")
                 return
 
@@ -1587,6 +1590,27 @@ _manual_state_ts    = 0
 # ID-column cache for updateStartTime
 _id_cache           = None
 _id_ts              = 0
+
+# overview: upcoming jobs cache (keyed by days) + timestamp
+_overview_upcoming_cache = {}   # { int(days): {"jobs": [...]} }
+_overview_upcoming_ts    = 0.0
+
+# overview: materials-needed cache + timestamp
+_materials_needed_cache  = None  # {"vendors": [...]}
+_materials_needed_ts     = 0.0
+
+# ---- helpers: clear overview caches ----------------------------------------
+def invalidate_materials_needed_cache():
+    global _materials_needed_cache, _materials_needed_ts
+    _materials_needed_cache = None
+    _materials_needed_ts = 0.0
+
+def invalidate_upcoming_cache():
+    global _overview_upcoming_cache, _overview_upcoming_ts
+    _overview_upcoming_cache = {}   # keyed by days
+    _overview_upcoming_ts = 0.0
+# ---------------------------------------------------------------------------
+
 
 
 def fetch_sheet(spreadsheet_id, sheet_range, value_render_option="UNFORMATTED_VALUE"):
@@ -1692,6 +1716,14 @@ def overview_upcoming():
         days = int(request.args.get("days", "7"))
     except Exception:
         days = 7
+    # ---- CACHE: early return if fresh ----
+    global _overview_upcoming_cache, _overview_upcoming_ts
+    now = time()
+    cached = _overview_upcoming_cache.get(days)
+    if cached and (now - _overview_upcoming_ts) < CACHE_TTL and not debug:
+        return jsonify(cached)
+    # --------------------------------------
+
 
     try:
         data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
@@ -1769,7 +1801,11 @@ def overview_upcoming():
         if debug:
             return jsonify({"count": len(jobs), "first": jobs[0] if jobs else None})
 
-        return jsonify({ "jobs": jobs })
+        # ---- CACHE: store result and return ----
+        _overview_upcoming_cache[days] = {"jobs": jobs}
+        _overview_upcoming_ts = time()
+        return jsonify(_overview_upcoming_cache[days])
+        # ----------------------------------------
 
     except Exception as e:
         app.logger.exception("overview_upcoming failed")
@@ -1790,6 +1826,12 @@ def overview_materials_needed():
     Group by Vendor (threads default to 'Madeira USA', unit='cones').
     """
     debug = request.args.get("debug") == "1"
+    # ---- CACHE: early return if fresh ----
+    global _materials_needed_cache, _materials_needed_ts
+    now = time()
+    if _materials_needed_cache is not None and (now - _materials_needed_ts) < CACHE_TTL and not debug:
+        return jsonify(_materials_needed_cache)
+    # --------------------------------------
 
     def get_values(range_a1, value_render="UNFORMATTED_VALUE"):
         # self-contained Sheets call (no global dependency)
@@ -1922,7 +1964,21 @@ def overview_materials_needed():
                 "sample_vendor": vendor_list[0] if vendor_list else None,
             })
 
-        return jsonify({ "vendors": vendor_list })
+        vendor_list = [{"vendor": v, "items": items} for v, items in vendors.items()]
+
+        if debug:
+            # keep your existing debug payload if you have one; otherwise OK to leave
+            return jsonify({
+                "vendors_preview": {k: len(v) for k, v in vendors.items()},
+                "sample_vendor": vendor_list[0] if vendor_list else None,
+            })
+
+        # ---- CACHE: store result and return ----
+        _materials_needed_cache = {"vendors": vendor_list}
+        _materials_needed_ts = time()
+        return jsonify(_materials_needed_cache)
+        # ----------------------------------------
+
 
     except Exception as e:
         app.logger.exception("materials-needed failed")
@@ -2607,6 +2663,10 @@ def submit_order():
             body={"values": [[new_f]]}
         ).execute()
 
+
+             # ✅ invalidate upcoming cache (new/changed order affects Ship Date window)
+             invalidate_upcoming_cache()
+
         return jsonify({"status":"ok","order":new_order}), 200
 
     except Exception as e:
@@ -2944,7 +3004,11 @@ def add_materials():
             body={"values": inv_rows}
         ).execute()
 
+         # ✅ invalidate materials-needed cache
+         invalidate_materials_needed_cache()
+
     return jsonify({"status":"submitted"}), 200
+
 
 # ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
 @app.route("/api/materialInventory", methods=["OPTIONS"])
@@ -3205,6 +3269,9 @@ def submit_thread_inventory():
             insertDataOption="INSERT_ROWS",
             body={"values": to_log}
         ).execute()
+
+    # ✅ invalidate materials-needed cache
+    invalidate_materials_needed_cache()
 
     return jsonify({"added": len(to_log)}), 200
 
