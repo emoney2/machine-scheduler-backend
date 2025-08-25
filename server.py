@@ -1723,145 +1723,44 @@ from googleapiclient.errors import HttpError
 def overview_upcoming():
     debug = request.args.get("debug") == "1"
     try:
-        try:
-            days = int(request.args.get("days", "7"))
-        except Exception:
-            days = 7
-
         svc = get_sheets_service().spreadsheets().values()
+        vals = svc.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Overview!A3:K",
+            valueRenderOption="UNFORMATTED_VALUE"
+        ).execute().get("values", [])
 
-        # Pull only columns we actually render (11 ranges):
-        ranges = [
-            "Production Orders!A1:A",  # Order #
-            "Production Orders!C1:C",  # Preview (formula / link)
-            "Production Orders!D1:D",  # Company Name
-            "Production Orders!E1:E",  # Design
-            "Production Orders!F1:F",  # Quantity
-            "Production Orders!H1:H",  # Product
-            "Production Orders!I1:I",  # Stage
-            "Production Orders!K1:K",  # Due Date
-            "Production Orders!L1:L",  # Print
-            "Production Orders!V1:V",  # Ship Date
-            "Production Orders!X1:X",  # Hard/Soft Date
-        ]
-
-        try:
-            vr = svc.batchGet(
-                spreadsheetId=SPREADSHEET_ID,
-                ranges=ranges,
-                valueRenderOption="UNFORMATTED_VALUE"
-            ).execute().get("valueRanges", [])
-        except HttpError:
-            return jsonify({"jobs": []})
-
-        cols = [r.get("values", []) for r in vr]
-        # align by row, skipping the first row (headers)
-        rows = list(zip(*[(c[1:] if c else []) for c in cols]))
-
-        from datetime import date, timedelta
-
-        def parse_date(val):
-            if val is None or val == "":
-                return None
-            # numeric (Sheets serial)
-            if isinstance(val, (int, float)):
-                base = date(1899, 12, 30)  # Sheets epoch
-                try:
-                    return base + timedelta(days=int(val))
-                except Exception:
-                    return None
-            s = str(val).strip()
-            # ISO yyyy-mm-dd
-            try:
-                if "-" in s and len(s.split("-")[0]) == 4:
-                    y, m, d = s.split("T")[0].split("-")
-                    return date(int(y), int(m), int(d))
-            except Exception:
-                pass
-            # m/d[/y]
-            try:
-                parts = s.replace("-", "/").split("/")
-                if len(parts) >= 2:
-                    m = int(parts[0]); d = int(parts[1])
-                    y = int(parts[2]) if len(parts) >= 3 else date.today().year
-                    if y < 100: y += 2000
-                    return date(y, m, d)
-            except Exception:
-                return None
-            return None
-
-        today = date.today()
-        max_day = today + timedelta(days=days)
+        headers = ["Order #","Preview","Company Name","Design","Quantity","Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"]
+        def thumb(link):
+            s = str(link or "")
+            fid = ""
+            if "id=" in s: fid = s.split("id=")[-1].split("&")[0]
+            elif "file/d/" in s: fid = s.split("file/d/")[-1].split("/")[0]
+            return f"https://drive.google.com/thumbnail?id={fid}&sz=w160" if fid else ""
 
         jobs = []
-        for r in rows:
-            order_no, preview_cell, company, design, qty, product, stage, due, print_flag, ship, hardsoft = (
-                r + ("",) * max(0, 11 - len(r))
-            )
+        for r in vals:
+            r = r + [""] * (len(headers) - len(r))
+            row = dict(zip(headers, r))
+            row["image"] = thumb(row.get("Preview"))
+            jobs.append(row)
 
-            if str(stage).strip().lower() == "complete":
-                continue
-
-            ship_dt = parse_date(ship)
-            if not ship_dt or not (today <= ship_dt <= max_day):
-                continue
-
-            # Try to build a small thumbnail if preview looks like a Drive link
-            preview_url = ""
-            try:
-                s = str(preview_cell or "")
-                file_id = ""
-                if "id=" in s:
-                    file_id = s.split("id=")[-1].split("&")[0]
-                elif "file/d/" in s:
-                    file_id = s.split("file/d/")[-1].split("/")[0]
-                if file_id:
-                    preview_url = f"https://drive.google.com/thumbnail?id={file_id}&sz=w160"
-            except Exception:
-                preview_url = ""
-
-            jobs.append({
-                "Order #": order_no,
-                "Company Name": company,
-                "Design": design,
-                "Quantity": qty,
-                "Product": product,
-                "Stage": stage,
-                "Due Date": due,
-                "Print": print_flag,
-                "Ship Date": ship,
-                "Hard Date/Soft Date": hardsoft,
-                "image": preview_url,
-            })
-
-        # Sort by Due Date, then numeric Order #
-        def dd_key(j):
-            dd = parse_date(j.get("Due Date"))
-            return (dd or date(2999, 12, 31))
-
-        def order_key(j):
-            raw = str(j.get("Order #", "")).strip()
-            digits = "".join(c for c in raw if c.isdigit())
-            return int(digits) if digits else 0
-
-        jobs.sort(key=lambda j: (dd_key(j), order_key(j)))
+        # optional cache
+        if CACHE_TTL:
+            import time as _t
+            global _overview_upcoming_cache, _overview_upcoming_ts
+            _overview_upcoming_cache[7] = {"jobs": jobs}
+            _overview_upcoming_ts = _t.time()
+            return jsonify(_overview_upcoming_cache[7])
 
         if debug:
             return jsonify({"count": len(jobs), "first": jobs[0] if jobs else None})
-
-        # write to cache
-        global _overview_upcoming_cache, _overview_upcoming_ts
-        if CACHE_TTL:
-            import time as _t
-            _overview_upcoming_cache[days] = {"jobs": jobs}
-            _overview_upcoming_ts = _t.time()
-            return jsonify(_overview_upcoming_cache[days])
-
         return jsonify({"jobs": jobs})
 
     except Exception as e:
         app.logger.exception("overview_upcoming failed")
         if debug:
+            import traceback
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
         return jsonify({"error": "overview_upcoming failed"}), 500
 
@@ -1875,126 +1774,65 @@ from googleapiclient.errors import HttpError
 @login_required_session
 def overview_materials_needed():
     debug = request.args.get("debug") == "1"
-
-    def norm(s): return str(s or "").strip()
-    def hkey(s): return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
-
-    def num(x):
-        try:
-            return float(x)
-        except Exception:
-            try:
-                return float(str(x).replace(",", "").strip())
-            except Exception:
-                return 0.0
-
     try:
         svc = get_sheets_service().spreadsheets().values()
-        # ONE request instead of two:
-        vr = svc.batchGet(
+        resp = svc.get(
             spreadsheetId=SPREADSHEET_ID,
-            ranges=["Material Inventory!A1:I", "Thread Inventory!A1:G"],
-            valueRenderOption="UNFORMATTED_VALUE"
-        ).execute().get("valueRanges", [])
+            range="Overview!M3:M",
+            valueRenderOption="FORMATTED_VALUE"
+        ).execute()
+        vals = resp.get("values", [])
+        lines = [str(r[0]).strip() for r in vals if r and str(r[0]).strip()]
 
-        mat_rows = (vr[0].get("values") if len(vr) > 0 else []) or []
-        thr_rows = (vr[1].get("values") if len(vr) > 1 else []) or []
+        grouped = {}
+        for s in lines:
+            # Split "Item Qty Unit - Vendor"
+            vendor = "Misc."
+            left = s
+            if " - " in s:
+                left, vendor = s.rsplit(" - ", 1)
+                vendor = vendor.strip() or "Misc."
 
-        vendors = {}
+            tokens = left.split()
+            # Expect ... <qty> <unit> at the end
+            if len(tokens) >= 3:
+                unit = tokens[-1]
+                qty_str = tokens[-2]
+                name = " ".join(tokens[:-2]).strip()
+                try:
+                    qty = int(round(float(qty_str)))
+                except Exception:
+                    qty = 0
+            else:
+                name, qty, unit = left, 0, ""
 
-        # ---- Materials
-        if mat_rows:
-            mh = [norm(h) for h in mat_rows[0]]
-            m_idx = {hkey(h): i for i, h in enumerate(mh)}
-            def gi(*names):
-                for n in names:
-                    i = m_idx.get(hkey(n))
-                    if i is not None:
-                        return i
-                for k, i in m_idx.items():
-                    if any(hkey(n) in k for n in names):
-                        return i
-                return None
-
-            c_name    = gi("materials","material","name","item")
-            c_inv     = gi("inventory","inventory..")
-            c_on      = gi("on order","onorder","on order..","onorder..")
-            c_unit    = gi("unit")
-            c_min     = gi("min inv","min. inv.","min inv..","mininv","mininv..")
-            c_re      = gi("reorder","re-order")
-            c_vendor  = gi("vendor")
-
-            for row in mat_rows[1:]:
-                if len(row) < len(mh): row += [""] * (len(mh) - len(row))
-                name = norm(row[c_name]) if c_name is not None else ""
-                if not name: continue
-                inv, on, mn, reord = num(row[c_inv]), num(row[c_on]), num(row[c_min]), num(row[c_re])
-                if (inv + on) < mn:
-                    qty = ceil(reord - (inv + on))
-                    if qty > 0:
-                        unit   = norm(row[c_unit])   if c_unit   is not None else ""
-                        vendor = norm(row[c_vendor]) if c_vendor is not None else "Unknown"
-                        vendors.setdefault(vendor or "Unknown", []).append(
-                            {"name": name, "qty": qty, "unit": unit, "type": "Material"}
-                        )
-
-        # ---- Threads (default vendor: Madeira USA)
-        if thr_rows:
-            th = [norm(h) for h in thr_rows[0]]
-            t_idx = {hkey(h): i for i, h in enumerate(th)}
-            def tgi(*names):
-                for n in names:
-                    i = t_idx.get(hkey(n))
-                    if i is not None:
-                        return i
-                for k, i in t_idx.items():
-                    if any(hkey(n) in k for n in names):
-                        return i
-                return None
-
-            c_tname = tgi("thread colors","thread","color","name")
-            c_tinv  = tgi("inventory","inventory..")
-            c_ton   = tgi("on order","onorder","on order..","onorder..")
-            c_tmin  = tgi("min inv","min inv..","mininv")
-            c_tre   = tgi("reorder","reorder..","re-order")
-
-            for row in thr_rows[1:]:
-                if len(row) < len(th): row += [""] * (len(th) - len(row))
-                name = norm(row[c_tname]) if c_tname is not None else ""
-                if not name: continue
-                inv, on, mn, reord = num(row[c_tinv]), num(row[c_ton]), num(row[c_tmin]), num(row[c_tre])
-                if (inv + on) < mn:
-                    qty = ceil(reord - (inv + on))
-                    if qty > 0:
-                        vendors.setdefault("Madeira USA", []).append(
-                            {"name": name, "qty": qty, "unit": "cones", "type": "Thread"}
-                        )
-
-        vendor_list = [{"vendor": v, "items": items} for v, items in vendors.items()]
-
-        if debug:
-            return jsonify({
-                "materials_headers": (mat_rows[0] if mat_rows else []),
-                "threads_headers": (thr_rows[0] if thr_rows else []),
-                "vendors_preview": {k: len(v) for k, v in vendors.items()},
-                "sample_vendor": vendor_list[0] if vendor_list else None,
+            if not name:
+                continue
+            typ = "Thread" if unit.lower().startswith("cone") else "Material"
+            grouped.setdefault(vendor, []).append({
+                "name": name, "qty": qty, "unit": unit, "type": typ
             })
 
-        # cache write
-        global _materials_needed_cache, _materials_needed_ts
+        vendor_list = [{"vendor": v, "items": items} for v, items in grouped.items()]
+
+        # optional cache
         if CACHE_TTL:
             import time as _t
+            global _materials_needed_cache, _materials_needed_ts
             _materials_needed_cache = {"vendors": vendor_list}
             _materials_needed_ts = _t.time()
             return jsonify(_materials_needed_cache)
 
+        if debug:
+            return jsonify({"count_vendors": len(vendor_list), "sample": vendor_list[:1]})
         return jsonify({"vendors": vendor_list})
 
     except Exception as e:
         app.logger.exception("materials-needed failed")
         if debug:
+            import traceback
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
-        return jsonify({"error":"materials-needed failed"}), 500
+        return jsonify({"error": "materials-needed failed"}), 500
 
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
 
