@@ -1756,7 +1756,16 @@ def overview_combined():
 
         # ---- Upcoming rows (already filtered/sorted in Sheet)
         up_vals = (vr[0].get("values") if len(vr) > 0 else []) or []
-        headers = ["Order #","Preview","Company Name","Design","Quantity","Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"]
+
+        TARGET_HEADERS = ["Order #","Preview","Company Name","Design","Quantity","Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"]
+
+        # If the first row is the header row from the sheet, remove it
+        if up_vals:
+            first_row = [str(x or "").strip() for x in up_vals[0]]
+            if [h.strip().lower() for h in first_row] == [h.strip().lower() for h in TARGET_HEADERS]:
+                up_vals = up_vals[1:]
+
+        headers = TARGET_HEADERS
 
         def thumb(link):
             s = str(link or "")
@@ -1771,6 +1780,7 @@ def overview_combined():
             row = dict(zip(headers, r))
             row["image"] = thumb(row.get("Preview"))
             upcoming.append(row)
+
 
         # ---- Materials lines (single text column)
         mat_vals = (vr[1].get("values") if len(vr) > 1 else []) or []
