@@ -1887,84 +1887,6 @@ def logout():
     session.clear()
     return redirect("/login")
 
-@app.route("/api/inventoryOrdered/quantity", methods=["PATCH"])
-@login_required_session
-def update_inventory_ordered_quantity():
-    """
-    Update the 'ordered' quantity for an entry that is still in Ordered status.
-    Expects JSON:
-      {
-        "type": "Material" | "Thread",
-        "row":  <number>,         # 1-based row index in the sheet (we send this from the UI)
-        "quantity": <string|number>
-      }
-    For Materials: updates the quantity column in Material Log.
-    For Threads:   updates the 'Length (ft)' column in Thread Data.
-    """
-    try:
-        data      = request.get_json(silent=True) or {}
-        sheetType = (data.get("type") or "").strip()
-        row       = data.get("row")
-        qty       = data.get("quantity")
-
-        try:
-            row = int(row)
-        except Exception:
-            return jsonify({"error": "Invalid 'row'"}), 400
-
-        if not sheetType or qty is None:
-            return jsonify({"error": "Missing 'type' or 'quantity'"}), 400
-
-        # helper: zero-based column index -> A1 column letters
-        def col_to_a1(idx0: int) -> str:
-            n = idx0 + 1
-            s = ""
-            while n:
-                n, rem = divmod(n - 1, 26)
-                s = chr(65 + rem) + s
-            return s
-
-        if sheetType == "Material":
-            rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
-            if not rows:
-                return jsonify({"error": "Material Log is empty"}), 500
-
-            hdr     = rows[0]
-            i_or    = hdr.index("O/R")
-            qty_idx = i_or - 2                 # quantity column relative to O/R
-            colA1   = col_to_a1(qty_idx)
-
-            sheets.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Material Log!{colA1}{row}",
-                valueInputOption="USER_ENTERED",
-                body={"values": [[qty]]}
-            ).execute()
-
-        else:
-            # Threads: update the "Length (ft)" column in Thread Data
-            rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
-            if not rows:
-                return jsonify({"error": "Thread Data is empty"}), 500
-
-            hdr   = rows[0]
-            i_len = hdr.index("Length (ft)")
-            colA1 = col_to_a1(i_len)
-
-            sheets.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Thread Data!{colA1}{row}",
-                valueInputOption="USER_ENTERED",
-                body={"values": [[qty]]}
-            ).execute()
-
-        return jsonify({"status": "ok"}), 200
-
-    except Exception as e:
-        print("🔥 update_inventory_ordered_quantity error:", str(e))
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
-
-
 @app.route("/api/overview")
 @login_required_session
 def overview_combined():
@@ -3622,6 +3544,103 @@ def mark_inventory_received():
     ).execute()
 
     return jsonify({"status":"ok"}), 200
+
+@app.route("/api/inventoryOrdered/quantity", methods=["PATCH"])
+@login_required_session
+def update_inventory_ordered_quantity():
+    """
+    Update the ordered quantity for an item still in 'Ordered' status.
+
+    JSON body:
+    {
+      "type": "Material" | "Thread",
+      "row":  <number>,             # 1-based sheet row (as returned by GET /inventoryOrdered)
+      "quantity": <string|number>   # new value (e.g., "14", "14 sqft", "14.0")
+    }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        sheet_type = (data.get("type") or "").strip()
+        row = data.get("row")
+        qty = data.get("quantity")
+
+        # Validate row
+        try:
+            row = int(row)
+        except Exception:
+            return jsonify({"error": "Invalid 'row'"}), 400
+
+        if not sheet_type or qty is None:
+            return jsonify({"error": "Missing 'type' or 'quantity'"}), 400
+
+        # Helper: column index -> A1 “letters”
+        def col_to_a1(idx0: int) -> str:
+            n = idx0 + 1
+            s = ""
+            while n:
+                n, rem = divmod(n - 1, 26)
+                s = chr(65 + rem) + s
+            return s
+
+        # MATERIALS: update the numeric quantity column in Material Log
+        if sheet_type.lower() == "material":
+            rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
+            if not rows:
+                return jsonify({"error": "Material Log empty"}), 500
+
+            hdr = rows[0]
+
+            # Prefer a named column; fall back to position relative to O/R
+            candidates = {"quantity", "qty", "qty ordered", "ordered qty", "amount"}
+            idx_qty = None
+            for i, name in enumerate(hdr):
+                if str(name).strip().lower() in candidates:
+                    idx_qty = i
+                    break
+
+            if idx_qty is None:
+                if "O/R" not in hdr:
+                    return jsonify({"error": "Could not locate Quantity column"}), 500
+                i_or = hdr.index("O/R")
+                # Your GET uses i_or - 2 for quantity; mirror that here
+                idx_qty = i_or - 2
+                if idx_qty < 0:
+                    return jsonify({"error": "Invalid Quantity position"}), 500
+
+            colA1 = col_to_a1(idx_qty)
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Log!{colA1}{row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[qty]]}
+            ).execute()
+
+        # THREADS: update "Length (ft)" in Thread Data
+        else:
+            rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
+            if not rows:
+                return jsonify({"error": "Thread Data empty"}), 500
+
+            hdr = rows[0]
+            if "Length (ft)" not in hdr:
+                return jsonify({"error": "Could not find 'Length (ft)' in Thread Data"}), 500
+
+            idx_len = hdr.index("Length (ft)")
+            colA1 = col_to_a1(idx_len)
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Thread Data!{colA1}{row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[qty]]}
+            ).execute()
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as e:
+        print("🔥 update_inventory_ordered_quantity error:", str(e))
+        traceback.print_exc()
+        return jsonify({"error": "Internal server error"}), 500
+
 
 @app.route("/api/company-list")
 @login_required_session
