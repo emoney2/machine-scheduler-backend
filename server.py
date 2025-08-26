@@ -1653,17 +1653,25 @@ def rate_all_services():
 def update_start_time():
     try:
         data = request.get_json() or {}
-        job_id = data.get("id")
-        iso_start = data.get("startTime")         # ISO from client
+        job_id    = data.get("id")
+        iso_start = data.get("startTime")  # ISO from client
 
         if not job_id or not iso_start:
             return jsonify({"error": "Missing job ID or start time"}), 400
 
-        # Write ISO directly; sheet will show Z, UI will show ET
+        # Write ISO directly to Production Orders
         update_embroidery_start_time_in_sheet(job_id, iso_start)
-        return jsonify({"status": "success"})
+
+        # 🔔 Notify all clients so UIs patch immediately
+        try:
+            socketio.emit("startTimeUpdated", {"orderId": str(job_id), "startTime": iso_start})
+        except Exception:
+            app.logger.exception("socket emit failed for startTimeUpdated")
+
+        return jsonify({"status": "success"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
