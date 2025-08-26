@@ -1561,7 +1561,7 @@ def drive_make_public():
 # ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
 sheet_lock = Semaphore(1)
 SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
-ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
+ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:ZZ")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
@@ -1725,23 +1725,47 @@ def invalidate_upcoming_cache():
 import traceback
 
 def update_embroidery_start_time_in_sheet(order_id, new_start_time):
+    """Write ISO start time into the 'Embroidery Start Time' column for the given Order #."""
     try:
-        sheet = sh.worksheet("Production Orders")
-        data = sheet.get_all_records()
-        col_names = sheet.row_values(1)
-        id_col = col_names.index("Order #") + 1
-        start_col = col_names.index("Embroidery Start Time") + 1
+        # 1) Read headers & rows
+        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render_option="UNFORMATTED_VALUE")
+        if not rows:
+            raise RuntimeError("orders range returned no rows")
+        headers = [str(h).strip() for h in rows[0]]
+        try:
+            id_idx    = headers.index("Order #")
+            start_idx = headers.index("Embroidery Start Time")
+        except ValueError as e:
+            raise RuntimeError("Missing 'Order #' or 'Embroidery Start Time' header") from e
 
-        for i, row in enumerate(data, start=2):
-            if str(row.get("Order #")).strip() == str(order_id).strip():
-                sheet.update_cell(i, start_col, new_start_time); invalidate_upcoming_cache()
-                print(f"✅ Embroidery Start Time updated for Order #{order_id}")
-                return
+        # 2) Locate target row
+        row_num = None
+        for i, r in enumerate(rows[1:], start=2):
+            val = "" if id_idx >= len(r) else r[id_idx]
+            if str(val).strip() == str(order_id).strip():
+                row_num = i
+                break
+        if not row_num:
+            raise RuntimeError(f"Order # {order_id} not found in range {ORDERS_RANGE}")
 
-        print(f"⚠️ Order ID {order_id} not found in Embroidery List")
+        # 3) Compute A1 for the start cell
+        def col_to_a1(idx0):
+            n = idx0 + 1
+            s = ""
+            while n:
+                n, rem = divmod(n - 1, 26)
+                s = chr(65 + rem) + s
+            return s
+
+        start_col_a1 = col_to_a1(start_idx)
+        target_range = f"Production Orders!{start_col_a1}{row_num}"
+
+        # 4) Write ISO string exactly
+        write_sheet(SPREADSHEET_ID, target_range, [[new_start_time]])
+        return True
     except Exception as e:
-        print(f"❌ Error updating start time for Order #{order_id}: {e}")
-
+        app.logger.exception("Failed to update Embroidery Start Time")
+        raise
 
 
 
@@ -2105,13 +2129,21 @@ def overview_materials_needed():
 @login_required_session
 def get_orders():
     try:
-        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
-        headers = rows[0] if rows else []
-        data    = [dict(zip(headers,r)) for r in rows[1:]] if rows else []
+        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)  # UNFORMATTED_VALUE
+        if not rows:
+            return jsonify([]), 200
+        headers = [str(h).strip() for h in rows[0]]
+
+        data = []
+        for r in rows[1:]:
+            r = r or []
+            if len(r) < len(headers):
+                r = r + ["" for _ in range(len(headers) - len(r))]
+            data.append(dict(zip(headers, r)))
         return jsonify(data), 200
     except Exception:
         logger.exception("Error fetching orders")
-        return jsonify([]), 200
+        return jsonify({"error": "orders fetch failed"}), 500
 
 
 
