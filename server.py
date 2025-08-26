@@ -62,6 +62,29 @@ from uuid import uuid4
 from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_shipment
 from google.oauth2.credentials import Credentials as OAuthCredentials
 
+def clamp_iso_to_next_830_et(iso_str: str) -> str:
+    """
+    If the given ISO time falls between 4:30 PM and 8:30 AM (America/New_York),
+    return ISO at the *next day's* 8:30 AM ET. Otherwise return the original.
+    """
+    try:
+        s = (iso_str or "").replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        et = dt.astimezone(ZoneInfo("America/New_York"))
+
+        after_end   = (et.hour > 16) or (et.hour == 16 and et.minute >= 30)
+        before_start= (et.hour < 8)  or (et.hour == 8  and et.minute < 30)
+        if after_end or before_start:
+            # "following time": always move to *next* work morning
+            et = (et + timedelta(days=1)).replace(hour=8, minute=30, second=0, microsecond=0)
+
+        out = et.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00","Z")
+        return out
+    except Exception:
+        return iso_str
+
 def _hdr_idx(headers):
     d = {}
     for i, h in enumerate(headers or []):
@@ -1654,7 +1677,7 @@ def update_start_time():
     try:
         data = request.get_json() or {}
         job_id    = data.get("id")
-        iso_start = data.get("startTime")  # ISO from client
+        iso_start = clamp_iso_to_next_830_et(data.get("startTime"))  # enforce window server-side
 
         if not job_id or not iso_start:
             return jsonify({"error": "Missing job ID or start time"}), 400
