@@ -1391,6 +1391,65 @@ socketio = SocketIO(
     ping_timeout=20,
 )
 
+# ─── Vendor Directory Cache ─────────────────────────────────────────────────
+_vendor_dir_cache = None
+_vendor_dir_ts    = 0
+VENDOR_TTL        = 600  # 10 minutes
+
+def _hdr_index(headers):
+    return {str(h or "").strip().lower(): i for i, h in enumerate(headers or [])}
+
+def read_vendor_directory_from_material_inventory():
+    """Reads Material Inventory!K1:O as: Vendor | Method | Email | CC | Website"""
+    import time as _t
+    global _vendor_dir_cache, _vendor_dir_ts
+    now = _t.time()
+    if _vendor_dir_cache and (now - _vendor_dir_ts) < VENDOR_TTL:
+        return _vendor_dir_cache
+
+    svc = get_sheets_service().spreadsheets().values()
+    vals = svc.get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Material Inventory!K1:O",
+        valueRenderOption="FORMATTED_VALUE"
+    ).execute().get("values", []) or []
+
+    out = {}
+    if vals:
+        idx = _hdr_index(vals[0])
+        for r in vals[1:]:
+            def gv(key):
+                i = idx.get(key)
+                return (r[i].strip() if i is not None and i < len(r) and r[i] is not None else "")
+            vname = gv("vendor").strip()
+            if not vname:
+                continue
+            key = vname.lower()
+            out[key] = {
+                "vendor":  vname,                          # keep original for display if needed
+                "method":  (gv("method") or "").lower(),
+                "email":   gv("email"),
+                "cc":      gv("cc"),
+                "website": gv("website"),
+            }
+
+    _vendor_dir_cache = out
+    _vendor_dir_ts = now
+    return out
+
+
+@app.route("/api/vendors")
+@login_required_session
+def get_vendors():
+    """Returns [{vendor, method, email, cc, website}, ...] from Material Inventory tab (K:O)."""
+    try:
+        m = read_vendor_directory_from_material_inventory()
+        return jsonify({"vendors": [{"vendor": k, **v} for k, v in m.items()]})
+    except Exception:
+        app.logger.exception("vendors failed")
+        return jsonify({"error":"vendors failed"}), 500
+
+
 # ─── Google Drive Token/Scopes Config ──────────────────────────────
 # ─── Google Drive Token/Scopes Config ──────────────────────────────
 GOOGLE_SCOPES = [
@@ -1450,6 +1509,8 @@ def _load_google_creds():
 
     # 3) Nothing worked
     return None
+
+
 
 
 # --- Drive: make file public (anyone with link → reader) ---------------------
