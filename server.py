@@ -3441,12 +3441,17 @@ def submit_thread_inventory():
 def get_inventory_ordered():
     orders = []
 
-    # 0) Build Material→Unit map from Inventory sheet A2:D
-    inv_rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:D")
+    # 0) Build Material→Unit and Material→Vendor maps (from Inventory sheet A2:I)
+    inv_rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:I")
     unit_map = {
         r[0]: (r[3] if len(r) > 3 else "")
-        for r in inv_rows if r and r[0].strip()
+        for r in inv_rows if r and str(r[0]).strip()
     }
+    vendor_map = {
+        r[0]: (r[8] if len(r) > 8 else "")
+        for r in inv_rows if r and str(r[0]).strip()
+    }
+
 
     # 1) Material Log sheet
     mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
@@ -3467,8 +3472,10 @@ def get_inventory_ordered():
                     "type":     "Material",
                     "name":     name,
                     "quantity": qty,
-                    "unit":     unit_map.get(name, "")
+                    "unit":     unit_map.get(name, ""),
+                    "vendor":   vendor_map.get(name, "")
                 })
+
 
     # 2) Thread Data sheet (unchanged)
     th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
