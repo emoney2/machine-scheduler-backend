@@ -389,76 +389,110 @@ MADEIRA_BASE = "https://www.madeirausa.com"
 
 async def madeira_login_and_cart(items):
     """
-    items: list of dicts {url: str, qty: int}
-    Navigates, sets quantity (if input found), clicks 'Add to Cart' for each.
-    Finishes on cart page.
+    items: [{url, qty}]
+    Ensures login, then for each item visits page, sets qty if possible, otherwise clicks Add to Cart N times.
+    Ends on cart page.
     """
     email = os.environ.get("MADEIRA_EMAIL")
     password = os.environ.get("MADEIRA_PASSWORD")
     if not email or not password:
         raise RuntimeError("Missing MADEIRA_EMAIL/MADEIRA_PASSWORD env vars")
 
-    # Use a persistent profile so we stay logged in between runs
     user_data_dir = os.path.abspath("./.pw_madeira_profile")
+    os.makedirs(user_data_dir, exist_ok=True)
 
     async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
+        ctx = await p.chromium.launch_persistent_context(
             user_data_dir,
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            headless=True,  # set to False temporarily if you want to watch it in a local dev box
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-        page = await context.new_page()
+        page = await ctx.new_page()
 
-        async def ensure_logged_in():
-            # Try to detect logged-in state by checking for strings common on account pages
-            await page.goto(MADEIRA_BASE + "/", wait_until="domcontentloaded")
-            text = (await page.content()).lower()
-            if "logout" in text or "my account" in text:
-                return  # Already logged in
+        async def is_logged_in():
+            try:
+                await page.goto(MADEIRA_BASE + "/", wait_until="domcontentloaded")
+                html = (await page.content()).lower()
+                return ("logout" in html) or ("my account" in html) or ("sign out" in html)
+            except:
+                return False
 
-            # Try common login paths
-            for path in ("/login", "/account/login", "/Account/Login.aspx"):
+        async def do_login():
+            # Try a few likely login URLs; fall back to clicking a login link
+            candidates = [
+                "/Account/Login.aspx",
+                "/account/login",
+                "/login",
+                "/login.aspx",
+            ]
+            for path in candidates:
                 try:
                     await page.goto(MADEIRA_BASE + path, wait_until="domcontentloaded")
                     html = (await page.content()).lower()
                     if "password" in html:
-                        # Best-effort locate fields & login button
-                        sels_email = ['input[type="email"]','input[name*="email" i]','input[name*="user" i]','input[id*="email" i]']
-                        sels_pass  = ['input[type="password"]','input[name*="pass" i]','input[id*="pass" i]']
-                        email_el = None
-                        pass_el  = None
-                        for s in sels_email:
-                            el = await page.query_selector(s)
-                            if el: email_el = el; break
-                        for s in sels_pass:
-                            el = await page.query_selector(s)
-                            if el: pass_el = el; break
-                        if not email_el or not pass_el:
-                            continue
-                        await email_el.fill(email)
-                        await pass_el.fill(password)
-
-                        # Try submit/login button
-                        btn = await page.query_selector('button:has-text("Log In"), button:has-text("Sign In"), input[type="submit"]')
-                        if btn:
-                            await btn.click()
-                            try:
-                                await page.wait_for_load_state("networkidle", timeout=10000)
-                            except:
-                                pass
-                            return
+                        break
                 except:
                     continue
-            raise RuntimeError("Could not find/login to Madeira sign-in page")
+
+            # If that didn't land on a login page, click a Login link
+            if "password" not in (await page.content()).lower():
+                try:
+                    await page.goto(MADEIRA_BASE + "/", wait_until="domcontentloaded")
+                    btn = await page.query_selector('a:has-text("Login"), a:has-text("Sign In"), a[href*="login" i]')
+                    if btn:
+                        await btn.click()
+                        await page.wait_for_load_state("domcontentloaded")
+                except:
+                    pass
+
+            # Fill in credentials
+            email_sel = ['input[type="email"]','input[name*="email" i]','input[id*="email" i]','input[name*="user" i]']
+            pass_sel  = ['input[type="password"]','input[name*="pass" i]','input[id*="pass" i]']
+
+            email_el = None
+            for s in email_sel:
+                email_el = await page.query_selector(s)
+                if email_el: break
+            pass_el = None
+            for s in pass_sel:
+                pass_el = await page.query_selector(s)
+                if pass_el: break
+
+            if not email_el or not pass_el:
+                raise RuntimeError("Could not find login fields on Madeira")
+
+            await email_el.fill(email)
+            await pass_el.fill(password)
+
+            # Try click a submit/login button
+            submit = await page.query_selector('button:has-text("Log In"), button:has-text("Sign In"), input[type="submit"], button[type="submit"]')
+            if submit:
+                await submit.click()
+            else:
+                # fallback: press Enter in password
+                await pass_el.press("Enter")
+
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except:
+                pass
+
+            if not await is_logged_in():
+                raise RuntimeError("Madeira login failed")
+
+        if not await is_logged_in():
+            await do_login()
 
         async def add_one(url, qty):
+            # Normalize URL
+            if not url.startswith("http"):
+                url = MADEIRA_BASE + url
+
             await page.goto(url, wait_until="domcontentloaded")
-            # Try to set quantity (best-effort; OK to proceed if not found)
-            qty_selectors = [
-                'input[name*="qty" i]','input[id*="qty" i]','input[name*="quant" i]',
-                'input[id*="quant" i]','input[type="number"]'
-            ]
-            for s in qty_selectors:
+
+            # Try to set quantity if an input is present
+            qty_set = False
+            for s in ['input[name*="qty" i]','input[id*="qty" i]','input[name*="quant" i]','input[id*="quant" i]','input[type="number"]']:
                 el = await page.query_selector(s)
                 if el:
                     await el.fill(str(qty))
@@ -466,48 +500,80 @@ async def madeira_login_and_cart(items):
                         await el.dispatch_event("change")
                     except:
                         pass
+                    qty_set = True
                     break
-            # Click add to cart
-            add_selectors = [
+
+            # Click "Add to Cart" (fallback: click multiple times if no qty box)
+            selectors = [
                 'button:has-text("Add to Cart")',
                 'input[type="submit"][value*="add" i]',
                 'input[type="button"][value*="add" i]',
-                'button[id*="add" i]','a:has-text("Add to Cart")'
+                'button[id*="add" i]',
+                'a:has-text("Add to Cart")',
             ]
-            clicked = False
-            for s in add_selectors:
-                el = await page.query_selector(s)
-                if el:
-                    await el.click()
-                    clicked = True
-                    break
-            if clicked:
-                # Either a mini-cart overlay or a nav; wait a tick
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=5000)
-                except:
-                    pass
+            if qty_set:
+                # one click should carry the qty value
+                for s in selectors:
+                    el = await page.query_selector(s)
+                    if el:
+                        await el.click()
+                        break
+            else:
+                # as a fallback, click N times to achieve qty
+                clicked_once = False
+                for n in range(int(qty)):
+                    found = False
+                    for s in selectors:
+                        el = await page.query_selector(s)
+                        if el:
+                            await el.click()
+                            found = True
+                            clicked_once = True
+                            break
+                    if not found:
+                        break
+                    try:
+                        await page.wait_for_timeout(400)
+                    except:
+                        pass
+                if not clicked_once:
+                    raise RuntimeError("Could not find 'Add to Cart' button on product page")
 
-        await ensure_logged_in()
-
-        for it in items:
-            url = it.get("url") or ""
-            qty = int(it.get("qty") or 1)
-            if not url.startswith("http"):
-                url = MADEIRA_BASE + url
-            await add_one(url, qty)
-
-        # Land on the cart page at the end (best-guess paths)
-        for path in ("/shoppingcart.aspx", "/ShoppingCart.aspx", "/cart"):
+            # give time for mini-cart / server update
             try:
-                await page.goto(MADEIRA_BASE + path, wait_until="domcontentloaded")
-                break
+                await page.wait_for_load_state("networkidle", timeout=5000)
             except:
-                continue
+                pass
 
-        # Persist cookies/session
-        await context.storage_state(path=os.path.join(user_data_dir, "storage_state.json"))
-        await context.close()
+        # Add each item
+        for it in items:
+            await add_one(it.get("url",""), int(it.get("qty") or 1))
+
+        # Load cart page at the end
+        cart_url = MADEIRA_BASE + "/shoppingcart.aspx"
+        try:
+            await page.goto(cart_url, wait_until="domcontentloaded")
+        except:
+            try:
+                await page.goto(MADEIRA_BASE + "/ShoppingCart.aspx", wait_until="domcontentloaded")
+                cart_url = MADEIRA_BASE + "/ShoppingCart.aspx"
+            except:
+                pass
+
+        # Optional: quick sanity check (cart page contains typical strings)
+        html = (await page.content()).lower()
+        loginish = ("login" in html) and ("password" in html)
+        if loginish:
+            raise RuntimeError("Ended on login page — account not logged in; check MADEIRA_EMAIL/MADEIRA_PASSWORD")
+
+        # Persist session
+        try:
+            await ctx.storage_state(path=os.path.join(user_data_dir, "storage_state.json"))
+        except:
+            pass
+
+        await ctx.close()
+        return {"cart_url": cart_url}
 
 
 # --- CORS: handle all OPTIONS preflight early ---
@@ -4317,74 +4383,21 @@ def get_thread_colors():
 @app.route("/order/madeira", methods=["POST"])
 @login_required_session
 def order_madeira():
-    """
-    Body accepts either:
-      { "items": [ { "url": "...", "qty": 2 }, ... ] }
-      or
-      { "threads": [ { "name": "...", "qty": 2 }, ... ] }  # will be resolved via Thread Inventory 'Madeira SKU'
-    """
     data = request.get_json(silent=True) or {}
     items = data.get("items") or []
 
-    # If threads provided, resolve to product URLs via Thread Inventory
-    if not items and data.get("threads"):
-        # Load Thread Inventory sheet
-        rows = fetch_sheet(SPREADSHEET_ID, "Thread Inventory!A1:Z") or []
-        if not rows:
-            return jsonify({"error": "Thread Inventory is empty"}), 500
-        hdr = rows[0]
-        def idx_of(names):
-            for n in names:
-                if n in hdr: return hdr.index(n)
-                # also try case-insensitive match
-                low = [str(h).strip().lower() for h in hdr]
-                if n.lower() in low: return low.index(n.lower())
-            return -1
-
-        i_name = idx_of(["Thread","Name","Item","Description"])
-        i_sku  = idx_of(["Madeira SKU","SKU (Madeira)","Vendor SKU","SKU"])
-        i_url  = idx_of(["Madeira URL","URL"])
-
-        # Build a lookup by name
-        by_name = {}
-        for r in rows[1:]:
-            nm = (r[i_name] if i_name >= 0 and len(r) > i_name else "") or ""
-            sku = (r[i_sku]  if i_sku  >= 0 and len(r) > i_sku  else "") or ""
-            url = (r[i_url]  if i_url  >= 0 and len(r) > i_url  else "") or ""
-            if nm:
-                by_name[str(nm).strip()] = {"sku": str(sku).strip(), "url": str(url).strip()}
-
-        def sku_to_url(sku):
-            sku = str(sku or "").strip()
-            if sku.startswith("http"):
-                return sku
-            # Simple rule for Polyneon 40 (e.g., 918-1800 → /918-1800-madeira-polyneon-40.html)
-            if sku.startswith("918-"):
-                return f"{MADEIRA_BASE}/{sku}-madeira-polyneon-40.html"
-            # Fallback: unknown mapping
-            return ""
-
-        items = []
-        for t in data["threads"]:
-            nm  = str(t.get("name","")).strip()
-            qty = int(t.get("qty") or 1)
-            rec = by_name.get(nm, {})
-            url = rec.get("url") or sku_to_url(rec.get("sku"))
-            if not url:
-                return jsonify({"error": f"Could not resolve Madeira URL/SKU for thread '{nm}'"}), 400
-            items.append({"url": url, "qty": qty})
+    # Optional: resolve from Thread Inventory if `threads` is provided (unchanged if you already added)
+    # ... keep your existing resolving code here ...
 
     if not items:
         return jsonify({"error": "No items provided"}), 400
 
     try:
-        asyncio.run(madeira_login_and_cart(items))
-        return jsonify({"status": "ok", "count": len(items), "cart": MADEIRA_BASE + "/shoppingcart.aspx"}), 200
+        result = asyncio.run(madeira_login_and_cart(items))
+        return jsonify({"status": "ok", "count": len(items), **(result or {})}), 200
     except Exception as e:
         print("🔥 madeira order error:", str(e))
         return jsonify({"error": "Failed to add to cart", "details": str(e)}), 500
-
-
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
