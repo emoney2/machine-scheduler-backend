@@ -413,7 +413,7 @@ def apply_cors(response):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,OPTIONS"
     return response
 
 @app.route("/api/drive/token-status", methods=["GET"])
@@ -1344,7 +1344,7 @@ def login_required_session(f):
                 response.headers["Access-Control-Allow-Origin"] = origin
                 response.headers["Access-Control-Allow-Credentials"] = "true"
                 response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-                response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+                response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,OPTIONS"
             return response
 
         # 2) Must be logged in at all
@@ -3551,12 +3551,8 @@ def update_inventory_ordered_quantity():
     """
     Update the ordered quantity for an item still in 'Ordered' status.
 
-    JSON body:
-    {
-      "type": "Material" | "Thread",
-      "row":  <number>,             # 1-based sheet row (as returned by GET /inventoryOrdered)
-      "quantity": <string|number>   # new value (e.g., "14", "14 sqft", "14.0")
-    }
+    JSON:
+      { "type": "Material" | "Thread", "row": <1-based row>, "quantity": <str|num> }
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -3564,7 +3560,6 @@ def update_inventory_ordered_quantity():
         row = data.get("row")
         qty = data.get("quantity")
 
-        # Validate row
         try:
             row = int(row)
         except Exception:
@@ -3573,7 +3568,7 @@ def update_inventory_ordered_quantity():
         if not sheet_type or qty is None:
             return jsonify({"error": "Missing 'type' or 'quantity'"}), 400
 
-        # Helper: column index -> A1 “letters”
+        # helper: 0-based index → A1
         def col_to_a1(idx0: int) -> str:
             n = idx0 + 1
             s = ""
@@ -3582,30 +3577,19 @@ def update_inventory_ordered_quantity():
                 s = chr(65 + rem) + s
             return s
 
-        # MATERIALS: update the numeric quantity column in Material Log
         if sheet_type.lower() == "material":
+            # Material Log: quantity is 2 columns left of "O/R" (matches your GET)
             rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
             if not rows:
                 return jsonify({"error": "Material Log empty"}), 500
 
             hdr = rows[0]
-
-            # Prefer a named column; fall back to position relative to O/R
-            candidates = {"quantity", "qty", "qty ordered", "ordered qty", "amount"}
-            idx_qty = None
-            for i, name in enumerate(hdr):
-                if str(name).strip().lower() in candidates:
-                    idx_qty = i
-                    break
-
-            if idx_qty is None:
-                if "O/R" not in hdr:
-                    return jsonify({"error": "Could not locate Quantity column"}), 500
-                i_or = hdr.index("O/R")
-                # Your GET uses i_or - 2 for quantity; mirror that here
-                idx_qty = i_or - 2
-                if idx_qty < 0:
-                    return jsonify({"error": "Invalid Quantity position"}), 500
+            if "O/R" not in hdr:
+                return jsonify({"error": "Could not find 'O/R' in Material Log"}), 500
+            i_or = hdr.index("O/R")
+            idx_qty = i_or - 2
+            if idx_qty < 0:
+                return jsonify({"error": "Invalid Quantity position"}), 500
 
             colA1 = col_to_a1(idx_qty)
             sheets.values().update(
@@ -3615,8 +3599,8 @@ def update_inventory_ordered_quantity():
                 body={"values": [[qty]]}
             ).execute()
 
-        # THREADS: update "Length (ft)" in Thread Data
         else:
+            # Threads: update "Length (ft)" in Thread Data
             rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
             if not rows:
                 return jsonify({"error": "Thread Data empty"}), 500
@@ -3640,6 +3624,7 @@ def update_inventory_ordered_quantity():
         print("🔥 update_inventory_ordered_quantity error:", str(e))
         traceback.print_exc()
         return jsonify({"error": "Internal server error"}), 500
+
 
 
 @app.route("/api/company-list")
