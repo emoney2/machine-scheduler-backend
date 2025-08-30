@@ -4342,10 +4342,24 @@ def quickbooks_login_redirect():
     auth_url = get_quickbooks_auth_url(redirect_uri, state=next_path)
     return redirect(auth_url)
 
-@app.route("/slips/<filename>", methods=["GET"])
-def serve_slip(filename):
-    # Serve the PDF from the temp directory
-    return send_from_directory(tempfile.gettempdir(), filename, as_attachment=False)
+# --- Protected thread images (behind login) ---
+THREAD_IMG_DIR = os.path.join(os.path.dirname(__file__), "static", "thread-images")
+
+@app.route("/thread-images/<int:num>.<ext>", methods=["GET", "OPTIONS"])
+@login_required_session
+def serve_thread_image(num, ext):
+    ext = (ext or "").lower()
+    if ext not in ("jpg", "png", "webp"):
+        return make_response(("Unsupported extension", 400))
+    filename = f"{num}.{ext}"
+    full_path = os.path.join(THREAD_IMG_DIR, filename)
+    if not os.path.exists(full_path):
+        return make_response(("Not found", 404))
+    resp = make_response(send_from_directory(THREAD_IMG_DIR, filename, conditional=True))
+    resp.headers["Cache-Control"] = "private, max-age=2592000, immutable"
+    return resp
+
+
 
 @app.route("/api/thread-colors", methods=["GET"])
 @login_required_session
