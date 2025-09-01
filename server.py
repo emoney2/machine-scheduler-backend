@@ -63,6 +63,16 @@ from reportlab.lib.utils import ImageReader
 from uuid import uuid4
 from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_shipment
 from google.oauth2.credentials import Credentials as OAuthCredentials
+from flask import send_file
+
+# --- Thumbnail disk cache (persists across requests; consider a Persistent Disk on Render) ---
+THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_cache")
+os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
+
+def _thumb_cache_path(file_id: str, size: str, version: str) -> str:
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f"{file_id}_{size}_{version or 'nov'}.jpg")
+    return os.path.join(THUMB_CACHE_DIR, safe)
+
 
 def clamp_iso_to_next_830_et(iso_str: str) -> str:
     """
@@ -4154,6 +4164,77 @@ def proxy_drive_file():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/drive/warmThumbnails", methods=["POST"])
+@login_required_session
+def warm_thumbnails():
+    """
+    Pre-fetch & cache thumbnails on the server so the frontend loads instantly.
+    Body: { "pairs": [ { "id": "<fileId>", "v": "<version>", "sz": "w240" }, ... ] }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        pairs = data.get("pairs") or []
+        # de-dup by (id, v, sz)
+        uniq = {}
+        for p in pairs:
+            fid = str(p.get("id") or "").strip()
+            ver = str(p.get("v") or "").strip()
+            sz  = str(p.get("sz") or "w240").strip()
+            if fid and ver:
+                uniq[(fid, ver, sz)] = 1
+        pairs = [{"id": fid, "v": ver, "sz": sz} for (fid, ver, sz) in uniq.keys()]
+        if not pairs:
+            return jsonify({"ok": True, "warmed": 0}), 200
+
+        # auth
+        creds = _load_google_creds()
+        if not creds or not creds.token:
+            return jsonify({"ok": False, "error": "no_creds"}), 502
+        headers = {"Authorization": f"Bearer {creds.token}"}
+
+        warmed = 0
+        for p in pairs:
+            fid, ver, sz = p["id"], p["v"], p["sz"]
+            cpath = _thumb_cache_path(fid, sz, ver)
+            if os.path.exists(cpath):
+                continue
+
+            # Use the same fast-path thumbnail flow as /proxy
+            meta_url = (
+                f"https://www.googleapis.com/drive/v3/files/{fid}"
+                f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
+            )
+            meta = requests.get(meta_url, headers=headers, timeout=6)
+            if meta.status_code != 200:
+                continue
+            info = meta.json() or {}
+            thumb = info.get("thumbnailLink")
+            if not thumb:
+                continue
+
+            # Adjust size (Drive uses "=s<N>")
+            m = re.search(r"([?&])sz?=s(\d+)", thumb)
+            if m:
+                thumb = re.sub(r"([?&])sz?=s(\d+)", f"\\1s={re.sub('[^0-9]','', sz)}", thumb)
+            else:
+                sep = "&" if "?" in thumb else "?"
+                thumb = f"{thumb}{sep}s={re.sub('[^0-9]','', sz)}"
+
+            img = requests.get(thumb, headers=headers, timeout=8)
+            if img.status_code == 200 and img.content and img.headers.get("Content-Type","").startswith("image/"):
+                try:
+                    with open(cpath, "wb") as f:
+                        f.write(img.content)
+                    warmed += 1
+                except Exception:
+                    logger.exception("warm cache write failed")
+
+        return jsonify({"ok": True, "warmed": warmed}), 200
+    except Exception as e:
+        logger.exception("warm_thumbnails error")
+        return jsonify({"ok": False, "error": str(e)}), 200
+
 
 @app.route("/api/drive/metaBatch", methods=["POST"])
 @login_required_session
