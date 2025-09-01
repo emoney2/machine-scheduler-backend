@@ -2702,33 +2702,64 @@ MANUAL_CLEAR_RANGE = "Manual State!A2:Z"
 @app.route("/api/manualState", methods=["GET"])
 @login_required_session
 def get_manual_state():
+    """
+    Read manual state from the sheet, but PRUNE any order IDs whose Stage is
+    'Sewing' or 'Complete' in Production Orders. If pruning occurs, write the
+    cleaned lists back to Manual State I2:J2 so the sheet self-heals.
+    """
     global _manual_state_cache, _manual_state_ts
     now = time.time()
-    if _manual_state_cache is not None and (now - _manual_state_ts) < CACHE_TTL:
-        return jsonify(_manual_state_cache), 200
 
     try:
-        # fetch A2:Z...
+        # 1) Read Manual State rows (A2:Z) and parse machine columns (I–Z)
         resp = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE  # "Manual State!A2:Z"
+            range=MANUAL_RANGE  # e.g., "Manual State!A2:Z"
         ).execute()
-        rows = resp.get("values", [])
+        rows = resp.get("values", []) or []
 
-        # pad each row to 26 cols (A–Z)
+        # pad each row to 26 columns
         for i in range(len(rows)):
             while len(rows[i]) < 26:
                 rows[i].append("")
 
-        # first row: machine lists in I–Z (cols 8–25)
         first = rows[0] if rows else [""] * 26
-        machines = first[8:26]
+        machines = first[8:26]  # I–Z
         machine_columns = [[s for s in str(col or "").split(",") if s] for col in machines]
 
-        # rest: placeholders from A–H (cols 0–7)
+        # 2) Build set of ACTIVE (not Sewing/Complete) order IDs from Production Orders
+        ord_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+        active_ids = set()
+        if ord_rows:
+            hdr = {str(h).strip().lower(): idx for idx, h in enumerate(ord_rows[0])}
+            id_idx = hdr.get("order #", 0)
+            stage_idx = hdr.get("stage", None)
+            for r in ord_rows[1:]:
+                oid = str(r[id_idx] if id_idx < len(r) else "").strip()
+                stage = str(r[stage_idx] if stage_idx is not None and stage_idx < len(r) else "").strip().lower()
+                # keep only if NOT Sewing or Complete
+                if oid and stage not in ("sewing", "complete"):
+                    active_ids.add(oid)
+
+        # 3) Prune completed/sewing/unknown IDs from each machine list
+        cleaned = [[oid for oid in col if oid in active_ids] for col in machine_columns]
+
+        # 4) If cleaned differs, write fixed strings back to I2:J2
+        if cleaned != machine_columns:
+            i2 = ",".join(cleaned[0]) if len(cleaned) > 0 else ""
+            j2 = ",".join(cleaned[1]) if len(cleaned) > 1 else ""
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{MANUAL_RANGE.split('!')[0]}!I2:J2",
+                valueInputOption="RAW",
+                body={"values": [[i2, j2]]}
+            ).execute()
+            machine_columns = cleaned
+
+        # 5) Gather placeholders from A–H (unchanged)
         phs = []
         for r in rows:
-            if str(r[0]).strip():  # only if ID in col A
+            if str(r[0]).strip():
                 phs.append({
                     "id":          r[0],
                     "company":     r[1],
@@ -2744,7 +2775,6 @@ def get_manual_state():
             "machineColumns": machine_columns,
             "placeholders":   phs
         }
-
         _manual_state_cache = result
         _manual_state_ts    = now
         return jsonify(result), 200
@@ -2756,90 +2786,67 @@ def get_manual_state():
         return jsonify({"machineColumns": [], "placeholders": []}), 200
 
 
+
+
 # ─── MANUAL STATE ENDPOINT (POST) ──────────────────────────────────────────────
 @app.route("/api/manualState", methods=["POST"])
 @login_required_session
 def save_manual_state():
-    global _manual_state_cache, _manual_state_ts
-
+    """
+    Save manual state (machine1/machine2 order + placeholders), but FIRST
+    prune any order IDs whose Stage is 'Sewing' or 'Complete' in Production Orders.
+    """
     try:
-        data = request.get_json(silent=True) or {}
-        phs  = data.get("placeholders", [])
-        m1   = data.get("machine1", [])
-        m2   = data.get("machine2", [])
+        data = request.get_json(force=True) or {}
+        incoming_m1 = [str(x).strip() for x in data.get("machine1", []) if str(x).strip()]
+        incoming_m2 = [str(x).strip() for x in data.get("machine2", []) if str(x).strip()]
+        placeholders = data.get("placeholders", [])
 
-        # 1) Clear A2:Z
-        sheets.values().clear(
-            spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_CLEAR_RANGE  # "Manual State!A2:Z"
-        ).execute()
+        # --- Build ACTIVE ID set from Production Orders (exclude Stage == 'sewing' or 'complete') ---
+        active_ids = set()
+        try:
+            ord_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+            if ord_rows:
+                headers = {str(h).strip().lower(): idx for idx, h in enumerate(ord_rows[0])}
+                id_idx = headers.get("order #", 0)
+                stage_idx = headers.get("stage", None)
+                for r in ord_rows[1:]:
+                    oid = str(r[id_idx] if id_idx < len(r) else "").strip()
+                    stage = str(r[stage_idx] if stage_idx is not None and stage_idx < len(r) else "").strip().lower()
+                    # ✅ Keep only if not Sewing or Complete
+                    if oid and stage not in ("sewing", "complete"):
+                        active_ids.add(oid)
+        except Exception:
+            # If orders can't be fetched, fail-open: keep whatever came in
+            logger.exception("Could not fetch Production Orders; skipping prune in POST /api/manualState")
+            active_ids = set(incoming_m1 + incoming_m2)
 
-        # 2) Build new rows
-        rows = []
+        # --- Prune off jobs no longer active ---
+        pruned_m1 = [oid for oid in incoming_m1 if oid in active_ids]
+        pruned_m2 = [oid for oid in incoming_m2 if oid in active_ids]
+        removed_ids = (set(incoming_m1 + incoming_m2) - set(pruned_m1 + pruned_m2))
 
-        # --- first row: placeholders[0] in A–H, machines in I & J, rest blank
-        first = []
-        if phs:
-            p0 = phs[0]
-            first += [
-                p0.get("id",""),
-                p0.get("company",""),
-                str(p0.get("quantity","")),
-                str(p0.get("stitchCount","")),
-                p0.get("inHand",""),
-                p0.get("dueType",""),
-                p0.get("fieldG",""),
-                p0.get("fieldH","")
-            ]
-        else:
-            first += [""] * 8
-        # columns I & J
-        first.append(",".join(m1))
-        first.append(",".join(m2))
-        # columns K–Z blank
-        first += [""] * (26 - len(first))
-        rows.append(first)
-
-        # --- subsequent placeholders in A–H, I–Z blank
-        for p in phs[1:]:
-            row = [
-                p.get("id",""),
-                p.get("company",""),
-                str(p.get("quantity","")),
-                str(p.get("stitchCount","")),
-                p.get("inHand",""),
-                p.get("dueType",""),
-                p.get("fieldG",""),
-                p.get("fieldH","")
-            ]
-            row += [""] * 18  # fill cols I–Z
-            rows.append(row)
-
-        # 3) Write back A2:Z{end_row}
-        num = max(1, len(rows))
-        end_row = 2 + num - 1
-        sheet_name = MANUAL_CLEAR_RANGE.split("!")[0]
-        write_range = f"{sheet_name}!A2:Z{end_row}"
+        # --- Write the pruned lists back to Manual State (I2:J2) ---
+        i2 = ",".join(pruned_m1)
+        j2 = ",".join(pruned_m2)
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=write_range,
+            range=f"{MANUAL_RANGE.split('!')[0]}!I2:J2",
             valueInputOption="RAW",
-            body={"values": rows}
+            body={"values": [[i2, j2]]}
         ).execute()
 
-        # 4) Update cache & broadcast
-        _manual_state_cache = {
-            "machineColumns": [m1, m2],  # still expose as list-of-lists
-            "placeholders": phs
-        }
-        _manual_state_ts = time.time()
-        socketio.emit("manualStateUpdated", _manual_state_cache)
-
-        return jsonify({"status": "ok"}), 200
+        return jsonify({
+            "ok": True,
+            "machineColumns": [pruned_m1, pruned_m2],
+            "placeholders": placeholders,
+            "removed": sorted(list(removed_ids))
+        }), 200
 
     except Exception as e:
-        logger.exception("Error in save_manual_state")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        logger.exception("Error in POST /api/manualState")
+        return jsonify({"ok": False, "error": str(e)}), 200
+
 
 
 # ─────────────────────────────────────────────
