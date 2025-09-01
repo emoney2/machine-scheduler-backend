@@ -63,9 +63,9 @@ from reportlab.lib.utils import ImageReader
 from uuid import uuid4
 from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_shipment
 from google.oauth2.credentials import Credentials as OAuthCredentials
-from flask import send_file
+from flask import send_file  # ADD if not present
 
-# --- Thumbnail disk cache (persists across requests; consider a Persistent Disk on Render) ---
+# ---- Disk cache for thumbnails ----
 THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_cache")
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
@@ -645,130 +645,110 @@ def token_status():
     return jsonify(info)
 
 
-@app.route("/api/drive/proxy/<file_id>", methods=["GET", "OPTIONS"])
+@app.route("/api/drive/proxy/<file_id>", methods=["GET"])
+@login_required_session
 def drive_proxy(file_id):
-    # OPTIONS handled by before_request
-
-    # --- Query params ---
-    size = request.args.get("sz", "w256")              # e.g., w256 / w512
-    use_thumb = request.args.get("thumb", "1") != "0"  # default True
-    debug_mode = request.args.get("debug") == "1"      # NEW: debug switch
-    v_param = request.args.get("v")                    # version token from the frontend
-    cache_control = "public, max-age=31536000, immutable" if v_param else "public, max-age=86400, s-maxage=86400"
-
-    # --- Load creds ---
-    creds = _load_google_creds()
-    if not creds or not creds.token:
-        # No creds: return visible placeholder, or JSON if debug
-        if debug_mode:
-            return jsonify({"ok": False, "where": "no_creds"}), 502
-
-        svg = (
-            '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 56 56">'
-            '<rect width="56" height="56" fill="#e5e7eb"/>'
-            '<text x="50%" y="50%" dy=".35em" text-anchor="middle" font-size="8" fill="#9ca3af">no creds</text>'
-            '</svg>'
-        ).encode("utf-8")
-        return Response(svg, status=200, mimetype="image/svg+xml")
-
-    headers = {"Authorization": f"Bearer {creds.token}"}
-
+    """
+    Serve a Drive thumbnail (or original image) with strong caching.
+    - If 'v' query param is present: use immutable caching and disk cache keyed by (id, size, v).
+    - Otherwise: short cache.
+    """
     try:
-        # --- Fast path: Google Drive thumbnail ---
-        if use_thumb:
-            meta_url = (
-                f"https://www.googleapis.com/drive/v3/files/{file_id}"
-                f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
-            )
-            meta = requests.get(meta_url, headers=headers, timeout=6)
-            if meta.status_code != 200:
-                if debug_mode:
-                    return jsonify({"ok": False, "where": "thumb_meta", "status": meta.status_code}), 502
-            else:
-                info = meta.json()
-                thumb = info.get("thumbnailLink")
-                if thumb:
-                    # force desired size (=wNNN or =hNNN or =sNNN)
-                    if size and ("=s" in thumb or "=w" in thumb or "=h" in thumb):
-                        base = thumb.split("=s")[0].split("=w")[0].split("=h")[0]
-                        thumb = f"{base}={size}"
-                    elif size:
-                        sep = "&" if "?" in thumb else "?"
-                        thumb = f"{thumb}{sep}{size}"
+        # --- Query params ---
+        size = request.args.get("sz", "w256")               # "w240", "w512" etc (numbers only are used)
+        use_thumb = request.args.get("thumb", "1") != "0"   # default True
+        debug_mode = request.args.get("debug") == "1"
+        v_param = request.args.get("v")                     # version token (md5Checksum or modifiedTime)
 
-                    # ETag for client cache
-                    etag = f'W/"{file_id}-t-{size}-{info.get("md5Checksum") or info.get("modifiedTime") or ""}"'
-                    if request.headers.get("If-None-Match") == etag:
-                        resp = make_response("", 304)
-                        resp.headers["ETag"] = etag
-                        v_param = request.args.get("v")  # if present, we can make this URL immutable
-                        cache_control = "public, max-age=31536000, immutable" if v_param else "public, max-age=86400, s-maxage=86400"
-                        return resp
+        cache_control = "public, max-age=31536000, immutable" if v_param else "public, max-age=86400, s-maxage=86400"
+        etag = f'W/"{file_id}-{size}-{v_param or "nov"}"'
 
-                    # fetch thumbnail bytes
-                    img = requests.get(thumb, headers=headers, timeout=8)
-                    if img.status_code == 200 and img.content:
-                        ctype = img.headers.get("Content-Type", "image/jpeg")
-                        clen  = len(img.content)
-                        if ctype.startswith("image/") and clen >= 500:
-                            resp = Response(img.content, status=200, mimetype="image/jpeg")
-                            resp.headers["Cache-Control"] = cache_control
-                            resp.headers["ETag"] = etag
-                            return resp
-                else:
-                    if debug_mode:
-                        return jsonify({"ok": False, "where": "no_thumbnailLink"}), 502
+        # Serve from disk cache if versioned and present
+        if v_param:
+            cpath = _thumb_cache_path(file_id, size, v_param)
+            if os.path.exists(cpath) and not debug_mode:
+                resp = send_file(cpath, mimetype="image/jpeg", as_attachment=False, download_name=os.path.basename(cpath))
+                resp.headers["Cache-Control"] = cache_control
+                resp.headers["ETag"] = etag
+                return resp
 
-        # --- Fallback: full file via alt=media ---
-        meta2_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=modifiedTime,md5Checksum,mimeType,name"
-        meta2 = requests.get(meta2_url, headers=headers, timeout=6)
-        info2 = meta2.json() if meta2.status_code == 200 else {}
-        etag_full = f'W/"{file_id}-f-{info2.get("md5Checksum") or info2.get("modifiedTime") or ""}"'
-        if request.headers.get("If-None-Match") == etag_full:
+        # Short-circuit on client revalidation (when we control ETag)
+        inm = request.headers.get("If-None-Match", "")
+        if inm and etag in inm and v_param:
             resp = make_response("", 304)
-            resp.headers["ETag"] = etag_full
+            resp.headers["ETag"] = etag
             resp.headers["Cache-Control"] = cache_control
             return resp
 
-        media_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-        r = requests.get(media_url, headers=headers, timeout=12, stream=True)
-        if r.status_code != 200:
-            if debug_mode:
-                return jsonify({"ok": False, "where": "alt_media", "status": r.status_code}), 502
-            return make_response((f"Drive returned {r.status_code}", r.status_code))
+        # ---- Drive request ----
+        creds = _load_google_creds()
+        if not creds or not creds.token:
+            return jsonify({"error": "no_creds"}), 502
+        headers = {"Authorization": f"Bearer {creds.token}"}
 
-        content_type = r.headers.get("Content-Type", "application/octet-stream")
-        if not content_type.startswith("image/"):
-            # Non-image -> visible placeholder (not a 1x1)
-            svg = (
-                '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 56 56">'
-                '<rect width="56" height="56" fill="#e5e7eb"/>'
-                '<text x="50%" y="50%" dy=".35em" text-anchor="middle" font-size="8" fill="#9ca3af">no preview</text>'
-                '</svg>'
-            ).encode("utf-8")
-            resp = Response(svg, status=200, mimetype="image/svg+xml")
-        else:
-            resp = Response(r.content, status=200, mimetype=content_type)
+        # Get thumbnailLink (cached metadata reduces chatter)
+        meta_url = (
+            f"https://www.googleapis.com/drive/v3/files/{file_id}"
+            f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
+        )
+        meta = requests.get(meta_url, headers=headers, timeout=6)
+        if meta.status_code != 200:
+            return jsonify({"error": "meta_failed", "code": meta.status_code}), 502
+        info = meta.json() or {}
+        thumb = info.get("thumbnailLink")
+        mime  = (info.get("mimeType") or "").lower()
 
-        resp.headers["Content-Disposition"] = "inline"
-        resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
-        resp.headers["ETag"] = etag_full
-        return resp
+        # Prefer native Drive thumbnail if available
+        if use_thumb and thumb:
+            # Ensure correct size param for Drive thumbnail ("s=<px>")
+            px = re.sub(r"[^0-9]", "", size) or "240"
+            if "?" in thumb:
+                # normalize size
+                if re.search(r"[?&](sz|s)=", thumb):
+                    thumb = re.sub(r"([?&])(sz|s)=\d+", rf"\1s={px}", thumb)
+                else:
+                    thumb = f"{thumb}&s={px}"
+            else:
+                thumb = f"{thumb}?s={px}"
 
+            img = requests.get(thumb, headers=headers, timeout=10)
+            if img.status_code == 200 and img.content:
+                if v_param:
+                    # Save to disk cache
+                    try:
+                        with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
+                            f.write(img.content)
+                    except Exception:
+                        logger.exception("thumb cache write failed")
 
+                resp = Response(img.content, status=200, mimetype="image/jpeg")
+                resp.headers["Cache-Control"] = cache_control
+                resp.headers["ETag"] = etag
+                return resp
+
+        # Fallback: if original is an image, fetch it and cache
+        if mime.startswith("image/"):
+            file_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+            r = requests.get(file_url, headers=headers, timeout=15, stream=False)
+            if r.status_code == 200 and r.content:
+                if v_param:
+                    try:
+                        with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
+                            f.write(r.content)
+                    except Exception:
+                        logger.exception("thumb cache write failed (full-file)")
+                resp = Response(r.content, status=200, mimetype=mime or "image/jpeg")
+                resp.headers["Cache-Control"] = cache_control
+                resp.headers["ETag"] = etag
+                return resp
+
+        # No thumbnail and not an image
+        return jsonify({"error": "no_thumbnail"}), 404
 
     except Exception as e:
-        app.logger.exception("drive_proxy error")
-        if debug_mode:
-            return jsonify({"ok": False, "where": "exception", "error": str(e)}), 500
-        # visible placeholder instead of 1×1
-        svg = (
-            '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 56 56">'
-            '<rect width="56" height="56" fill="#e5e7eb"/>'
-            '<text x="50%" y="50%" dy=".35em" text-anchor="middle" font-size="8" fill="#9ca3af">error</text>'
-            '</svg>'
-        ).encode("utf-8")
-        return Response(svg, status=200, mimetype="image/svg+xml")
+        logger.exception("drive_proxy error")
+        return jsonify({"error": str(e)}), 502
+
 
 
 @app.route("/api/ping", methods=["GET", "OPTIONS"])
@@ -4175,7 +4155,8 @@ def warm_thumbnails():
     try:
         data = request.get_json(force=True) or {}
         pairs = data.get("pairs") or []
-        # de-dup by (id, v, sz)
+
+        # De-dup and skip already-cached
         uniq = {}
         for p in pairs:
             fid = str(p.get("id") or "").strip()
@@ -4183,54 +4164,67 @@ def warm_thumbnails():
             sz  = str(p.get("sz") or "w240").strip()
             if fid and ver:
                 uniq[(fid, ver, sz)] = 1
-        pairs = [{"id": fid, "v": ver, "sz": sz} for (fid, ver, sz) in uniq.keys()]
-        if not pairs:
+        work = [{"id": fid, "v": ver, "sz": sz} for (fid, ver, sz) in uniq.keys()]
+        work = [p for p in work if not os.path.exists(_thumb_cache_path(p["id"], p["sz"], p["v"]))]
+
+        if not work:
             return jsonify({"ok": True, "warmed": 0}), 200
 
-        # auth
+        # Auth once
         creds = _load_google_creds()
         if not creds or not creds.token:
             return jsonify({"ok": False, "error": "no_creds"}), 502
         headers = {"Authorization": f"Bearer {creds.token}"}
 
-        warmed = 0
-        for p in pairs:
-            fid, ver, sz = p["id"], p["v"], p["sz"]
-            cpath = _thumb_cache_path(fid, sz, ver)
-            if os.path.exists(cpath):
-                continue
+        # Worker fn (fetches Drive thumbnail and writes cache)
+        def _warm_one(p):
+            try:
+                fid, ver, sz = p["id"], p["v"], p["sz"]
+                cpath = _thumb_cache_path(fid, sz, ver)
+                if os.path.exists(cpath):
+                    return True
 
-            # Use the same fast-path thumbnail flow as /proxy
-            meta_url = (
-                f"https://www.googleapis.com/drive/v3/files/{fid}"
-                f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
-            )
-            meta = requests.get(meta_url, headers=headers, timeout=6)
-            if meta.status_code != 200:
-                continue
-            info = meta.json() or {}
-            thumb = info.get("thumbnailLink")
-            if not thumb:
-                continue
+                meta_url = (
+                    f"https://www.googleapis.com/drive/v3/files/{fid}"
+                    f"?fields=thumbnailLink,mimeType"
+                )
+                meta = requests.get(meta_url, headers=headers, timeout=6)
+                if meta.status_code != 200:
+                    return False
+                info = meta.json() or {}
+                thumb = info.get("thumbnailLink")
+                if not thumb:
+                    return False
 
-            # Adjust size (Drive uses "=s<N>")
-            m = re.search(r"([?&])sz?=s(\d+)", thumb)
-            if m:
-                thumb = re.sub(r"([?&])sz?=s(\d+)", f"\\1s={re.sub('[^0-9]','', sz)}", thumb)
-            else:
-                sep = "&" if "?" in thumb else "?"
-                thumb = f"{thumb}{sep}s={re.sub('[^0-9]','', sz)}"
+                px = re.sub(r"[^0-9]", "", sz) or "240"
+                if "?" in thumb:
+                    if re.search(r"[?&](sz|s)=", thumb):
+                        thumb = re.sub(r"([?&])(sz|s)=\d+", rf"\1s={px}", thumb)
+                    else:
+                        thumb = f"{thumb}&s={px}"
+                else:
+                    thumb = f"{thumb}?s={px}"
 
-            img = requests.get(thumb, headers=headers, timeout=8)
-            if img.status_code == 200 and img.content and img.headers.get("Content-Type","").startswith("image/"):
-                try:
+                img = requests.get(thumb, headers=headers, timeout=10)
+                if img.status_code == 200 and img.content and img.headers.get("Content-Type","").startswith("image/"):
                     with open(cpath, "wb") as f:
                         f.write(img.content)
+                    return True
+            except Exception:
+                logger.exception("warm one failed")
+            return False
+
+        # Fetch in parallel to speed up warm-up
+        warmed = 0
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = [ex.submit(_warm_one, p) for p in work]
+            for fut in as_completed(futures):
+                if fut.result():
                     warmed += 1
-                except Exception:
-                    logger.exception("warm cache write failed")
 
         return jsonify({"ok": True, "warmed": warmed}), 200
+
     except Exception as e:
         logger.exception("warm_thumbnails error")
         return jsonify({"ok": False, "error": str(e)}), 200
