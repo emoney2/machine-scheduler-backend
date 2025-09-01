@@ -643,6 +643,8 @@ def drive_proxy(file_id):
     size = request.args.get("sz", "w256")              # e.g., w256 / w512
     use_thumb = request.args.get("thumb", "1") != "0"  # default True
     debug_mode = request.args.get("debug") == "1"      # NEW: debug switch
+    v_param = request.args.get("v")                    # version token from the frontend
+    cache_control = "public, max-age=31536000, immutable" if v_param else "public, max-age=86400, s-maxage=86400"
 
     # --- Load creds ---
     creds = _load_google_creds()
@@ -689,7 +691,8 @@ def drive_proxy(file_id):
                     if request.headers.get("If-None-Match") == etag:
                         resp = make_response("", 304)
                         resp.headers["ETag"] = etag
-                        resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+                        v_param = request.args.get("v")  # if present, we can make this URL immutable
+                        cache_control = "public, max-age=31536000, immutable" if v_param else "public, max-age=86400, s-maxage=86400"
                         return resp
 
                     # fetch thumbnail bytes
@@ -699,7 +702,7 @@ def drive_proxy(file_id):
                         clen  = len(img.content)
                         if ctype.startswith("image/") and clen >= 500:
                             resp = Response(img.content, status=200, mimetype="image/jpeg")
-                            resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+                            resp.headers["Cache-Control"] = cache_control
                             resp.headers["ETag"] = etag
                             return resp
                 else:
@@ -714,7 +717,7 @@ def drive_proxy(file_id):
         if request.headers.get("If-None-Match") == etag_full:
             resp = make_response("", 304)
             resp.headers["ETag"] = etag_full
-            resp.headers["Cache-Control"] = "public, max-age=86400, s-maxage=86400"
+            resp.headers["Cache-Control"] = cache_control
             return resp
 
         media_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
@@ -4151,6 +4154,41 @@ def proxy_drive_file():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/drive/metaBatch", methods=["POST"])
+@login_required_session
+def drive_meta_batch():
+    """
+    Return a version token per Drive file ID so the frontend can cache-bust only when artwork changes.
+    Version = md5Checksum if present, else modifiedTime, else "".
+    Request body: {"ids": ["<fileId1>", "<fileId2>", ...]}
+    Response:     {"versions": {"<id>": "<ver>", ...}}
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        ids = [str(x).strip() for x in (data.get("ids") or []) if str(x).strip()]
+        versions = {}
+        if not ids:
+            return jsonify({"versions": versions}), 200
+
+        svc = get_drive_service()
+        for fid in ids:
+            try:
+                info = svc.files().get(
+                    fileId=fid,
+                    fields="id, md5Checksum, modifiedTime"
+                ).execute()
+                ver = info.get("md5Checksum") or info.get("modifiedTime") or ""
+                versions[fid] = ver
+            except Exception:
+                logger.exception(f"drive_meta_batch: failed for {fid}")
+                versions[fid] = ""
+
+        return jsonify({"versions": versions}), 200
+    except Exception as e:
+        logger.exception("drive_meta_batch error")
+        return jsonify({"error": str(e), "versions": {}}), 200
+
 
 @app.route("/api/drive-file-metadata")
 def drive_file_metadata():
