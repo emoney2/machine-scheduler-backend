@@ -4462,3 +4462,13 @@ def first_blank_row(rows):
     return len(rows) + 1  # Replace with actual logic
 
 # Ensure all undefined variables are addressed
+
+if __name__ == "__main__":
+    # Ensure eventlet is used (matches your async_mode="eventlet")
+    import eventlet
+    eventlet.monkey_patch()
+
+    port = int(os.environ.get("PORT", "10000"))  # Render provides $PORT
+    # Prefer socketio.run for Flask-SocketIO apps
+    socketio.run(app, host="0.0.0.0", port=port)
+
