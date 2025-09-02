@@ -1884,7 +1884,7 @@ def update_start_time():
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
-CACHE_TTL           = 30
+CACHE_TTL           = 120  # Increased cache TTL for better performance
 
 # orders cache + timestamp
 _orders_cache       = None
@@ -2336,18 +2336,31 @@ def overview_materials_needed():
 @app.route("/api/orders", methods=["GET"])
 @login_required_session
 def get_orders():
+    global _orders_cache, _orders_ts
     try:
-        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)  # UNFORMATTED_VALUE
-        if not rows:
-            return jsonify([]), 200
-        headers = [str(h).strip() for h in rows[0]]
+        now = time.time()
+        # Check cache
+        if _orders_cache is not None and (now - _orders_ts) < CACHE_TTL:
+            data = _orders_cache
+        else:
+            rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)  # UNFORMATTED_VALUE
+            if not rows:
+                return jsonify([]), 200
+            headers = [str(h).strip() for h in rows[0]]
+            data = []
+            for r in rows[1:]:
+                r = r or []
+                if len(r) < len(headers):
+                    r = r + ["" for _ in range(len(headers) - len(r))]
+                data.append(dict(zip(headers, r)))
+            _orders_cache = data
+            _orders_ts = now
 
-        data = []
-        for r in rows[1:]:
-            r = r or []
-            if len(r) < len(headers):
-                r = r + ["" for _ in range(len(headers) - len(r))]
-            data.append(dict(zip(headers, r)))
+        # Optional: filter for active/incomplete jobs
+        only_active = request.args.get("active", "false").lower() == "true"
+        if only_active:
+            data = [d for d in data if str(d.get("Stage", "")).lower() not in ("complete", "sewing")]
+
         return jsonify(data), 200
     except Exception:
         logger.exception("Error fetching orders")
@@ -2612,7 +2625,7 @@ def get_embroidery_list():
         # ─── Spot A: CACHE CHECK ────────────────────────────────────
         global _emb_cache, _emb_ts
         now = time.time()
-        if _emb_cache is not None and (now - _emb_ts) < 10:
+        if _emb_cache is not None and (now - _emb_ts) < CACHE_TTL:
             return jsonify(_emb_cache), 200
 
         # ─── Fetch the full sheet ──────────────────────────────────
@@ -2660,7 +2673,9 @@ def update_order(order_id):
                 valueInputOption="RAW",
                 body={"values": [[ data.get("embroidery_start","") ]]}
             ).execute()
+        # Emit both orderUpdated (single) and ordersUpdated (global) for real-time UI refresh
         socketio.emit("orderUpdated", {"orderId": order_id})
+        socketio.emit("ordersUpdated", {"orderId": order_id}, broadcast=True)
         return jsonify({"status":"ok"}), 200
     except Exception:
         logger.exception("Error updating order")
@@ -2787,7 +2802,9 @@ def save_manual_state():
     """
     Save manual state (machine1/machine2 order + placeholders), but FIRST
     prune any order IDs whose Stage is 'Sewing' or 'Complete' in Production Orders.
+    Also invalidate manual state and orders cache.
     """
+    global _manual_state_cache, _manual_state_ts, _orders_cache, _orders_ts
     try:
         data = request.get_json(force=True) or {}
         incoming_m1 = [str(x).strip() for x in data.get("machine1", []) if str(x).strip()]
@@ -2827,6 +2844,12 @@ def save_manual_state():
             valueInputOption="RAW",
             body={"values": [[i2, j2]]}
         ).execute()
+
+        # Invalidate manual state and orders cache
+        _manual_state_cache = None
+        _manual_state_ts = 0
+        _orders_cache = None
+        _orders_ts = 0
 
         return jsonify({
             "ok": True,
@@ -4065,9 +4088,9 @@ def set_product_specs():
         target = f"Table!{col}{row_index}"
         sheet.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"Material Inventory!A{target_row}:P{target_row}",  # <- now includes column P
+            range=target,
             valueInputOption="USER_ENTERED",
-            body={"values": [inventory_row]}
+            body={"values": [[val]]}
         ).execute()
 
     return jsonify({"status": "ok"}), 200

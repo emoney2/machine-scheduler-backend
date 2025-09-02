@@ -1,0 +1,15 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Push and Deploy to Netlify and Render",
+      "type": "shell",
+      "command": "git add .; git commit -m 'Deploy latest changes'; git push; netlify deploy --prod; render deploy",
+      "group": "build",
+      "presentation": {
+        "reveal": "always"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
