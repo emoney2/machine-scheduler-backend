@@ -2,9 +2,9 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Push and Deploy to Netlify and Render",
+      "label": "Push and Deploy to Netlify",
       "type": "shell",
-      "command": "git add .; git commit -m 'Deploy latest changes'; git push; netlify deploy --prod; render deploy",
+      "command": "git add .; git commit -m 'Deploy latest changes'; git push; netlify deploy --prod",
       "group": "build",
       "presentation": {
         "reveal": "always"
