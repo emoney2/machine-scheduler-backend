@@ -14,5 +14,6 @@ requests
 reportlab
 flask-compress>=1.14
 playwright==1.46.0
+httpx
 
 
