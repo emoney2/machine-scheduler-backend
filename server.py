@@ -369,8 +369,23 @@ except Exception:
     # gzip not available; continue without it
     pass
 
-CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
+# ONE unified CORS setup for everything (incl. /socket.io)
+from flask_cors import CORS
+
+_ALLOWED_ORIGINS = [
+    os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/"),
+    "https://machineschedule.netlify.app",
+    "http://localhost:3000",
+]
+
+CORS(
+    app,
+    resources={r"/*": {"origins": _ALLOWED_ORIGINS}},
+    supports_credentials=True
+)
+
 app.secret_key = os.environ.get("FLASK_SECRET", "shhhh")
+
 
 # Materialize token.json from env once at import time
 _bootstrap_ok = _ensure_token_json()
@@ -1400,17 +1415,7 @@ app.config.update(
     SESSION_COOKIE_SECURE=True,
 )
 
-# only allow our Netlify front-end on /api/* and support cookies
-CORS(
-    app,
-    resources={
-        r"/":             {"origins": FRONTEND_URL},
-        r"/api/*":        {"origins": FRONTEND_URL},
-        r"/api/threads":  {"origins": FRONTEND_URL},
-        r"/submit":       {"origins": FRONTEND_URL},
-    },
-    supports_credentials=True
-)
+
 
 
 from flask import session  # (if not already imported)
@@ -1504,12 +1509,16 @@ ALLOWED_WS_ORIGINS = list({
 
 socketio = SocketIO(
     app,
+    async_mode="threading",              # ← simpler & stable on Render
     cors_allowed_origins=ALLOWED_WS_ORIGINS,
-    async_mode="eventlet",
+    cors_credentials=True,
     path="/socket.io",
     ping_interval=25,
     ping_timeout=20,
+    logger=True,
+    engineio_logger=True,
 )
+
 
 # ─── Vendor Directory Cache ─────────────────────────────────────────────────
 _vendor_dir_cache = None
@@ -4473,5 +4482,5 @@ def first_blank_row(rows):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    # async_mode="eventlet" is fine if you initialized SocketIO that way
     socketio.run(app, host="0.0.0.0", port=port)
+
