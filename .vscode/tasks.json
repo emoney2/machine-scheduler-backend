@@ -5,6 +5,9 @@
       "label": "Push and Deploy to Netlify",
       "type": "shell",
       "command": "git add .; git commit -m 'Deploy latest changes'; git push; netlify deploy --prod",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
       "group": "build",
       "presentation": {
         "reveal": "always"
