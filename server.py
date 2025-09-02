@@ -1,4 +1,12 @@
 # ─── Imports & Logger Setup ─────────────────────────────────────────────────
+# --- MUST BE FIRST LINES IN THE FILE ---
+import os as _os
+_os.environ.setdefault("EVENTLET_NO_GREENDNS", "yes")
+
+import eventlet
+eventlet.monkey_patch()
+# ---------------------------------------
+
 import os
 import json
 import logging
@@ -4464,11 +4472,6 @@ def first_blank_row(rows):
 # Ensure all undefined variables are addressed
 
 if __name__ == "__main__":
-    # Ensure eventlet is used (matches your async_mode="eventlet")
-    import eventlet
-    eventlet.monkey_patch()
-
-    port = int(os.environ.get("PORT", "10000"))  # Render provides $PORT
-    # Prefer socketio.run for Flask-SocketIO apps
+    port = int(os.environ.get("PORT", "10000"))
+    # async_mode="eventlet" is fine if you initialized SocketIO that way
     socketio.run(app, host="0.0.0.0", port=port)
-
