@@ -1,12 +1,4 @@
 # ─── Imports & Logger Setup ─────────────────────────────────────────────────
-# --- MUST BE FIRST LINES IN THE FILE ---
-import os as _os
-_os.environ.setdefault("EVENTLET_NO_GREENDNS", "yes")
-
-import eventlet
-eventlet.monkey_patch()
-# ---------------------------------------
-
 import os
 import json
 import logging
@@ -1509,7 +1501,7 @@ ALLOWED_WS_ORIGINS = list({
 
 socketio = SocketIO(
     app,
-    async_mode="threading",              # ← simpler & stable on Render
+    async_mode="threading",
     cors_allowed_origins=ALLOWED_WS_ORIGINS,
     cors_credentials=True,
     path="/socket.io",
@@ -1518,6 +1510,7 @@ socketio = SocketIO(
     logger=True,
     engineio_logger=True,
 )
+
 
 
 # ─── Vendor Directory Cache ─────────────────────────────────────────────────
@@ -4486,5 +4479,5 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=port,
-        allow_unsafe_werkzeug=True  # ← unblock prod with Werkzeug
+        allow_unsafe_werkzeug=True
     )
