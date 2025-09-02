@@ -1,6 +1,6 @@
 [build]
   # tell Netlify to cd into the frontend folder first
-  base    = "frontend"
+  base = "../frontend"
 
   # how to build your React app
   command = "npm run build"
