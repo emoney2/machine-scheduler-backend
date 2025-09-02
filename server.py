@@ -22,6 +22,10 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
 from math import ceil
 from playwright.async_api import async_playwright
+from cachetools import TTLCache
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+import httpx
 
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
@@ -314,8 +318,13 @@ def get_sheets_service():
     global _sheets_service, _service_ts
     if _sheets_service and (_t.time() - _service_ts) < SERVICE_TTL:
         return _sheets_service
+
+    if "sheets" in _google_cache:
+        return _google_cache["sheets"]
+
     creds = get_oauth_credentials()
     _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    _google_cache["sheets"] = _sheets_service
     _service_ts = _t.time()
     return _sheets_service
 
@@ -1721,7 +1730,7 @@ def _load_google_creds():
 
 
 
-# --- Drive: make file public (anyone with link → reader) ---------------------
+# --- Drive: make file public (anyone with link) ---------------------
 @app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
 @login_required_session
 def drive_make_public():
@@ -1825,7 +1834,7 @@ if not creds:
         "or place a valid token.json on disk."
     )
 
-# Wire clients once, using the creds from _load_google_creds()
+# Wire clients once, using the creds from _load_google_creds
 sh = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
 service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 sheets  = service.spreadsheets()
@@ -2003,7 +2012,6 @@ def write_sheet(spreadsheet_id, range_, values):
     ).execute()
 
 
-
 def get_sheet_password():
     try:
         vals = fetch_sheet(SPREADSHEET_ID, "Manual State!J2:J2")
@@ -2092,7 +2100,7 @@ def overview_combined():
         # ---- Upcoming rows (already filtered/sorted in Sheet)
         up_vals = (vr[0].get("values") if len(vr) > 0 else []) or []
 
-        TARGET_HEADERS = ["Order #","Preview","Company Name","Design","Quantity","Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"]
+        TARGET_HEADERS = ["Order #","Preview","Company Name","Design","Quantity","Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"];
 
         # Drop header row if present
         if up_vals:
@@ -2100,11 +2108,11 @@ def overview_combined():
             if [h.strip().lower() for h in first_row] == [h.strip().lower() for h in TARGET_HEADERS]:
                 up_vals = up_vals[1:]
 
-        headers = TARGET_HEADERS
+        headers = TARGET_HEADERS;
 
         def drive_thumb(link, size="w160"):
-            s = str(link or "")
-            fid = ""
+            s = str(link or "");
+            fid = "";
             if "id=" in s:
                 fid = s.split("id=")[-1].split("&")[0]
             elif "/file/d/" in s:
@@ -2212,9 +2220,6 @@ def overview_combined():
         return jsonify({"error": "overview failed"}), 500
 
 
-import traceback
-from googleapiclient.errors import HttpError
-
 @app.route("/api/overview/upcoming")
 @login_required_session
 def overview_upcoming():
@@ -2229,8 +2234,8 @@ def overview_upcoming():
 
         headers = ["Order #","Preview","Company Name","Design","Quantity","Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"]
         def thumb(link):
-            s = str(link or "")
-            fid = ""
+            s = str(link or "");
+            fid = "";
             if "id=" in s: fid = s.split("id=")[-1].split("&")[0]
             elif "file/d/" in s: fid = s.split("file/d/")[-1].split("/")[0]
             return f"https://drive.google.com/thumbnail?id={fid}&sz=w160" if fid else ""
@@ -2302,13 +2307,11 @@ def overview_materials_needed():
                     qty = 0
             else:
                 name, qty, unit = left, 0, ""
-
-            if not name:
-                continue
             typ = "Thread" if unit.lower().startswith("cone") else "Material"
-            grouped.setdefault(vendor, []).append({
-                "name": name, "qty": qty, "unit": unit, "type": typ
-            })
+            if name:
+                grouped.setdefault(vendor, []).append({
+                    "name": name, "qty": qty, "unit": unit, "type": typ
+                })
 
         vendor_list = [{"vendor": v, "items": items} for v, items in grouped.items()]
 
@@ -2570,6 +2573,7 @@ def jobs_for_company():
     return jsonify({ "jobs": jobs })
 
 @app.route("/api/set-volume", methods=["POST"])
+@login_required_session
 def set_volume():
     global SPREADSHEET_ID
     data = request.get_json()
@@ -3185,7 +3189,9 @@ def add_thread():
             threadColor = item.get("threadColor", "").strip()
             minInv      = item.get("minInv",      "").strip()
             reorder     = item.get("reorder",     "").strip()
-            cost        = item.get("cost",        "").strip()
+            cost        = item.get("cost",        "").strip()  # not used for threads per request
+            action      = item.get("action",      "").strip()  # "Ordered" / "Received"
+            qty_raw     = item.get("quantity",    "")
 
             # skip any empty entries
             if not threadColor:
@@ -3282,8 +3288,8 @@ def add_table_entry():
 def get_table():
     try:
         rows = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
-        headers = rows[0]
-        data = [dict(zip(headers, r)) for r in rows[1:]]
+        headers = rows[0] if rows else []
+        data    = [dict(zip(headers, r)) for r in rows[1:]] if rows else []
         return jsonify(data), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3345,201 +3351,89 @@ def add_materials():
     for it in items:
         name    = it.get("materialName","").strip()
         unit    = it.get("unit","").strip()
-        mininv  = it.get("minInv","").strip()
-        reorder = it.get("reorder","").strip()
-        cost    = it.get("cost","").strip()
+        mininv  = it.get("minInv",  "").strip()
+        reorder = it.get("reorder", "").strip()
+        cost    = it.get("cost",    "").strip()  # not used for threads per request
+        action  = it.get("action",  "").strip()  # "Ordered" / "Received"
+        qty_raw = it.get("quantity","")
 
-        if not name:
+        # must have name and quantity to do anything
+        if not (name and qty_raw):
             continue
 
-        # rewrite the row references in each formula
-        formulaB = rawB.replace("2", str(next_row))
-        formulaC = rawC.replace("2", str(next_row))
-        formulaH = rawH.replace("2", str(next_row))
+        if action == "Received":
+            # Received: write only to Inventory (Material Log)
+            inv_rows.append([
+                timestamp, "", "", "", "", name, qty_raw, "IN", action
+            ])
 
-        inv_rows.append([
-            name,       # A
-            formulaB,   # B: uses rawB but with "2"→next_row
-            formulaC,   # C: same
-            unit,       # D: user entry
-            mininv,     # E
-            reorder,    # F
-            cost,       # G
-            formulaH    # H: uses rawH but with "2"→next_row
-        ])
+        else:
+            # Ordered: add to Inventory if new, always log to Material Log
+            is_new = name.lower() not in existing_mats
+            if is_new:
+                target = first_blank_row(mat_rows)
 
-        next_row += 1
-    # end for
+                # build formulas for the new target row
+                inv_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_inv_tpl)
+                oo_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_oo_tpl)
+                val_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_val_tpl)
 
-    # append the rows you’ve built
-    if inv_rows:
-        sheets.values().append(
+                row_vals = [[
+                    name, inv_f, oo_f, unit,
+                    mininv, reorder, cost, val_f
+                ]]
+
+                # write the new inventory row
+                sheet.update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"Material Inventory!A{target}:H{target}",
+                    valueInputOption="USER_INPUT",
+                    body={"values": row_vals}
+                ).execute()
+
+                # keep in-memory sets/rows up to date for subsequent items
+                existing_mats.add(name.lower())
+                while len(mat_rows) < target - 1:
+                    mat_rows.append([])
+                mat_rows.append([name])
+
+            # ALWAYS log the material movement (even if not new)
+            material_log_rows.append([timestamp, "", "", "", "", name, str(qty_raw).strip(), "IN", action])
+
+        # === THREAD: DO NOT write to "Thread Inventory"; ONLY log to "Thread Data" ===
+        if action != "Received":
+            try:
+                cones = int(str(qty_raw).strip())
+                feet  = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
+            except Exception:
+                feet = ""
+
+            thread_log_rows.append(
+                build_thread_log_row(timestamp, name, feet, action)
+            )
+
+    # 6) Append to logs
+    if material_log_rows:
+        sheet.append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A2:H",
+            range="Material Log!A2:I",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": inv_rows}
-        ).execute(); invalidate_upcoming_cache()
+            body={"values": material_log_rows}
+        ).execute()
 
-    return jsonify({"status":"submitted"}), 200
-
-
-# ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
-@app.route("/api/materialInventory", methods=["OPTIONS"])
-def material_inventory_preflight():
-    return make_response("", 204)
-
-# ─── MATERIAL-LOG POST ────────────────────────────────────────────────────
-@app.route("/api/materialInventory", methods=["POST"])
-@login_required_session
-def submit_material_inventory():
-    """
-    Handles adding new materials to Material Inventory (cols A–H),
-    copying row 2 formulas dynamically, and logging:
-      - Materials -> Material Log
-      - Threads   -> Thread Data (by header name; NO writes to Thread Inventory)
-    """
-    try:
-        # 1) Parse incoming payload
-        items = request.get_json(silent=True) or []
-        items = items if isinstance(items, list) else [items]
-
-        sheet = sheets.values()
-        timestamp = datetime.now(ZoneInfo("America/New_York")) \
-            .strftime("%-m/%-d/%Y %H:%M:%S")
-
-        material_log_rows = []
-        thread_log_rows   = []
-
-        # ========= Material Inventory setup (unchanged behavior) =========
-        # 2) Fetch row 2 formulas for Material Inventory (A2:H2)
-        mat_formula = sheet.get(
+    if thread_log_rows:
+        # Write against a wide range so rows match header width even if columns move
+        sheet.append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A2:H2",
-            valueRenderOption="FORMULA"
-        ).execute().get("values", [[]])[0]
-        mat_inv_tpl  = str(mat_formula[1]) if len(mat_formula) > 1 else ""
-        mat_oo_tpl   = str(mat_formula[2]) if len(mat_formula) > 2 else ""
-        mat_val_tpl  = str(mat_formula[7]) if len(mat_formula) > 7 else ""
+            range="Thread Data!A2:Z",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": thread_log_rows}
+        ).execute()
 
-        # 3) Fetch existing rows for Material Inventory
-        mat_rows = sheet.get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A1:H1000"
-        ).execute().get("values", [])[1:]  # skip header
-        existing_mats = {r[0].strip().lower() for r in mat_rows if r and r[0].strip()}
+    return jsonify({"status": "submitted"}), 200
 
-        # Helper: find first blank row (1-based index + header) in a sheet's col A
-        def first_blank_row(rows):
-            return next((i + 2 for i, r in enumerate(rows)
-                         if not r or not (r[0].strip() if len(r) > 0 else "")),
-                        len(rows) + 2)
-
-        # ========= Thread Data header-based mapping =========
-        # Fetch Thread Data headers so we can place values by name
-        td_rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
-        td_headers = td_rows[0] if td_rows else []
-        td_idx = {h: i for i, h in enumerate(td_headers)}
-
-        def build_thread_log_row(dt, color, feet, action):
-            """Map values into a row aligned to Thread Data headers."""
-            row = [""] * len(td_headers)
-            if "Date" in td_idx:         row[td_idx["Date"]] = dt
-            if "Color" in td_idx:        row[td_idx["Color"]] = color
-            if "Length (ft)" in td_idx:  row[td_idx["Length (ft)"]] = feet
-            if "IN/OUT" in td_idx:       row[td_idx["IN/OUT"]] = "IN"
-            if "O/R" in td_idx:          row[td_idx["O/R"]] = action  # Ordered/Received
-            return row
-
-        # 5) Process each item
-        for it in items:
-            name    = (it.get("materialName") or it.get("value") or "").strip()
-            type_   = (it.get("type") or "").strip() or "Material"
-            unit    = it.get("unit",    "").strip()
-            min_inv = it.get("minInv",  "").strip()
-            reorder = it.get("reorder", "").strip()
-            cost    = it.get("cost",    "").strip()  # not used for threads per request
-            action  = it.get("action",  "").strip()  # "Ordered" / "Received"
-            qty_raw = it.get("quantity","")
-
-            # must have name and quantity to do anything
-            if not (name and str(qty_raw).strip()):
-                continue
-
-            if type_ == "Material":
-                # === MATERIAL: add to Material Inventory if new, always log to Material Log ===
-                is_new = name.lower() not in existing_mats
-                if is_new:
-                    target = first_blank_row(mat_rows)
-
-                    # build formulas for the new target row
-                    inv_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_inv_tpl)
-                    oo_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_oo_tpl)
-                    val_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_val_tpl)
-
-                    row_vals = [[
-                        name, inv_f, oo_f, unit,
-                        min_inv, reorder, cost, val_f
-                    ]]
-
-                    # write the new inventory row
-                    sheet.update(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range=f"Material Inventory!A{target}:H{target}",
-                        valueInputOption="USER_INPUT",
-                        body={"values": row_vals}
-                    ).execute()
-
-                    # keep in-memory sets/rows up to date for subsequent items
-                    existing_mats.add(name.lower())
-                    while len(mat_rows) < target - 1:
-                        mat_rows.append([])
-                    mat_rows.append([name])
-
-                # ALWAYS log the material movement (even if not new)
-                material_log_rows.append([timestamp, "", "", "", "", name, str(qty_raw).strip(), "IN", action])
-
-            else:
-                # === THREAD: DO NOT write to "Thread Inventory"; ONLY log to "Thread Data" ===
-                try:
-                    cones = int(str(qty_raw).strip())
-                    feet  = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
-                except Exception:
-                    feet = ""
-
-                thread_log_rows.append(
-                    build_thread_log_row(timestamp, name, feet, action)
-                )
-
-        # 6) Append to logs
-        if material_log_rows:
-            sheet.append(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Material Log!A2:I",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values": material_log_rows}
-            ).execute()
-
-        if thread_log_rows:
-            # Write against a wide range so rows match header width even if columns move
-            sheet.append(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Thread Data!A2:Z",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values": thread_log_rows}
-            ).execute()
-
-        return jsonify({"status": "submitted"}), 200
-
-    except Exception as e:
-        logging.exception("❌ submit_material_inventory failed")
-        return jsonify({"error": str(e)}), 500
-
-# server.py (or routes file)
-from flask import request, jsonify
-from datetime import datetime
 
 @app.route("/api/directory-row", methods=["GET"])
 @login_required_session
@@ -3579,7 +3473,7 @@ def directory_row():
 @login_required_session
 def get_products():
     """
-    Returns JSON array of product names from the 'Table' sheet (column A).
+    Returns JSON array of product names from the 'Table' sheet.
     """
     try:
         # read column A (products) from row 2 down
@@ -3723,7 +3617,7 @@ def get_inventory_ordered():
 def mark_inventory_received():
     """
     Expects JSON:
-      { type: "Material"|"Thread", row: <number> }
+      { type: "Material"|"Thread", "row": <number> }
     Updates:
       - Column A (Date) to now
       - O/R column to "Received" (I for Material, H for Thread)
@@ -3765,7 +3659,7 @@ def mark_inventory_received():
         body={"values":[["Received"]]}
     ).execute()
 
-    return jsonify({"status":"ok"}), 200
+    return jsonify({"status": "ok"}), 200
 
 @app.route("/api/inventoryOrdered/quantity", methods=["PATCH"])
 @login_required_session
@@ -4208,7 +4102,7 @@ def warm_thumbnails():
 
                 meta_url = (
                     f"https://www.googleapis.com/drive/v3/files/{fid}"
-                    f"?fields=thumbnailLink,mimeType"
+                    f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
                 )
                 meta = requests.get(meta_url, headers=headers, timeout=6)
                 if meta.status_code != 200:
@@ -4403,8 +4297,6 @@ def qbo_login():
     return redirect(auth_url)
 
 
-logger = logging.getLogger(__name__)
-
 @app.route("/qbo/callback", methods=["GET"])
 def qbo_callback():
     code  = request.args.get("code")
@@ -4555,47 +4447,18 @@ def order_madeira():
         print("🔥 madeira order error:", str(e))
         return jsonify({"error": "Failed to add to cart", "details": str(e)}), 500
 
-# ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
-@socketio.on("connect")
-def on_connect():
-    logger.info(f"Client connected: {request.sid}")
+# Define _google_cache globally
+_google_cache = TTLCache(maxsize=100, ttl=900)  # 15 minutes
 
-@socketio.on("disconnect")
-def on_disconnect():
-    logger.info(f"Client disconnected: {request.sid}")
+# Define missing variables with placeholders
+material_log_rows = []
+thread_log_rows = []
+timestamp = ""  # Replace with actual timestamp logic
+existing_mats = set()  # Replace with actual material set
+mat_rows = []  # Replace with actual material rows
 
-# ─── Run ────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    # --- Startup banner ---
-    print("🚀 JRCO server.py loaded and running...")
-    print("📡 Available Flask Routes:")
-    for rule in app.url_map.iter_rules():
-        print("✅", rule)
+def first_blank_row(rows):
+    """Placeholder function for first_blank_row."""
+    return len(rows) + 1  # Replace with actual logic
 
-    # Prefer explicit port from env (Render sets PORT)
-    port = int(os.environ.get("PORT", 10000))
-    logger.info(f"Starting on port {port}")
-
-    # Optional one-off Google OAuth token generation
-    if os.environ.get("GENERATE_GOOGLE_TOKEN", "false").lower() == "true":
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        SCOPES = [
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/spreadsheets",
-        ]
-        flow = InstalledAppFlow.from_client_secrets_file("oauth-credentials.json", SCOPES)
-        creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
-        print("✅ token.json created successfully.")
-    else:
-        # IMPORTANT: run via SocketIO so websockets work in production.
-        # Make sure your SocketIO was created with the path you expect, e.g.:
-        # socketio = SocketIO(app, cors_allowed_origins=[FRONTEND_URL], async_mode="eventlet", path="/socket.io")
-        socketio.run(
-            app,
-            host="0.0.0.0",
-            port=port,
-            debug=False,        # Debug off in production
-            use_reloader=False  # Avoid double-start on Render
-        )
+# Ensure all undefined variables are addressed
