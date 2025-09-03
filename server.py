@@ -25,6 +25,10 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
 from math import ceil
 from playwright.async_api import async_playwright
+from functools import wraps
+from flask import request, session, jsonify, redirect, url_for, make_response
+from datetime import datetime, timedelta
+
 
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
@@ -356,7 +360,80 @@ except Exception:
     pass
 
 CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
-app.secret_key = os.environ.get("FLASK_SECRET", "shhhh")
+app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
+
+logout_all_ts = int(os.environ.get("LOGOUT_ALL_TS", "0"))
+
+def login_required_session(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # 1) OPTIONS are always allowed (CORS preflight)
+        if request.method == "OPTIONS":
+            origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+            allowed = {
+                (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+                "https://machineschedule.netlify.app",
+                "http://localhost:3000",
+            }
+            response = make_response("", 204)
+            if origin in allowed:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+                response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+                response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,OPTIONS"
+            return response
+
+        # 2) Must be logged in at all
+        if not session.get("user"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "authentication required"}), 401
+            return redirect(url_for("login", next=request.path))
+
+        # 3) Token‐match check
+        ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "")
+        token_at_login = session.get("token_at_login", "")
+        print("🔐 Comparing tokens — token_at_login =", token_at_login, "vs ADMIN_TOKEN =", ADMIN_TOKEN)
+        if token_at_login != ADMIN_TOKEN:
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "session invalidated"}), 401
+            return redirect(url_for("login", next=request.path))
+
+        # 4) Idle timeout: 3 hours
+        last = session.get("last_activity")
+        if last:
+            try:
+                last_dt = datetime.fromisoformat(last)
+            except:
+                session.clear()
+                if request.path.startswith("/api/"):
+                    return jsonify({"error": "authentication required"}), 401
+                return redirect(url_for("login", next=request.path))
+
+            if datetime.utcnow() - last_dt > timedelta(hours=3):
+                session.clear()
+                if request.path.startswith("/api/"):
+                    return jsonify({"error": "session expired"}), 401
+                return redirect(url_for("login", next=request.path))
+        else:
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "authentication required"}), 401
+            return redirect(url_for("login", next=request.path))
+
+        # 5) Forced‐logout check
+        #    any session logged in before logout_all_ts is invalidated
+        if session.get("login_time", 0) < logout_all_ts:
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "forced logout"}), 401
+            return redirect(url_for("login", next=request.path))
+
+        # 6) All good—update last_activity and proceed
+        session["last_activity"] = datetime.utcnow().isoformat()
+        return f(*args, **kwargs)
+
+    return decorated
 
 # Materialize token.json from env once at import time
 _bootstrap_ok = _ensure_token_json()
@@ -1514,79 +1591,6 @@ def _debug_session():
 
 
 # ─── Session & Auth Helpers ──────────────────────────────────────────────────
-app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
-
-
-def login_required_session(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        # 1) OPTIONS are always allowed (CORS preflight)
-        if request.method == "OPTIONS":
-            origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-            allowed = {
-                (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-                "https://machineschedule.netlify.app",
-                "http://localhost:3000",
-            }
-            response = make_response("", 204)
-            if origin in allowed:
-                response.headers["Access-Control-Allow-Origin"] = origin
-                response.headers["Access-Control-Allow-Credentials"] = "true"
-                response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-                response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,OPTIONS"
-            return response
-
-        # 2) Must be logged in at all
-        if not session.get("user"):
-            if request.path.startswith("/api/"):
-                return jsonify({"error": "authentication required"}), 401
-            return redirect(url_for("login", next=request.path))
-
-        # 3) Token‐match check
-        ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "")
-        token_at_login = session.get("token_at_login", "")
-        print("🔐 Comparing tokens — token_at_login =", token_at_login, "vs ADMIN_TOKEN =", ADMIN_TOKEN)
-        if token_at_login != ADMIN_TOKEN:
-            session.clear()
-            if request.path.startswith("/api/"):
-                return jsonify({"error": "session invalidated"}), 401
-            return redirect(url_for("login", next=request.path))
-
-        # 4) Idle timeout: 3 hours
-        last = session.get("last_activity")
-        if last:
-            try:
-                last_dt = datetime.fromisoformat(last)
-            except:
-                session.clear()
-                if request.path.startswith("/api/"):
-                    return jsonify({"error": "authentication required"}), 401
-                return redirect(url_for("login", next=request.path))
-
-            if datetime.utcnow() - last_dt > timedelta(hours=3):
-                session.clear()
-                if request.path.startswith("/api/"):
-                    return jsonify({"error": "session expired"}), 401
-                return redirect(url_for("login", next=request.path))
-        else:
-            session.clear()
-            if request.path.startswith("/api/"):
-                return jsonify({"error": "authentication required"}), 401
-            return redirect(url_for("login", next=request.path))
-
-        # 5) Forced‐logout check
-        #    any session logged in before logout_all_ts is invalidated
-        if session.get("login_time", 0) < logout_all_ts:
-            session.clear()
-            if request.path.startswith("/api/"):
-                return jsonify({"error": "forced logout"}), 401
-            return redirect(url_for("login", next=request.path))
-
-        # 6) All good—update last_activity and proceed
-        session["last_activity"] = datetime.utcnow().isoformat()
-        return f(*args, **kwargs)
-
-    return decorated
 
 ALLOWED_WS_ORIGINS = list({
     os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/"),
