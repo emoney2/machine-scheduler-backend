@@ -2158,7 +2158,7 @@ def overview_combined():
             # 2) Fetch Order # (A) and Image column only (compact)
             pr = get_sheets_service().spreadsheets().values().batchGet(
                 spreadsheetId=SPREADSHEET_ID,
-                ranges=[ "Production Orders!A2:A", f"Production Orders!{img_col}2:{img_col}" ],
+                ranges=["Production Orders!A2:A", f"Production Orders!{img_col}2:{img_col}"],
                 valueRenderOption="FORMATTED_VALUE"
             ).execute().get("valueRanges", [])
 
@@ -2223,13 +2223,12 @@ def overview_combined():
 
         resp_data = {"upcoming": upcoming, "materials": materials}
         _overview_cache = resp_data
-         _overview_ts = now
+        _overview_ts = now
         return jsonify(resp_data)
 
     except Exception as e:
         app.logger.exception("overview_combined failed")
         return jsonify({"error": "overview failed"}), 500
-
 
 import traceback
 from googleapiclient.errors import HttpError
