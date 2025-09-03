@@ -2095,29 +2095,34 @@ def overview_combined():
       - Materials: Overview!M3:M  (single text column: 'Item Qty Unit - Vendor')
     Returns: { upcoming: [...], materials: [...] }
     """
-    # 🔸 15s micro-cache
+    # 15s micro-cache
     global _overview_cache, _overview_ts
     now = time.time()
     if _overview_cache is not None and (now - _overview_ts) < 15:
         return jsonify(_overview_cache), 200
 
     try:
+        # Pull both ranges in one locked request
         svc = get_sheets_service().spreadsheets().values()
-        vr = svc.batchGet(
-            spreadsheetId=SPREADSHEET_ID,
-            ranges=["Overview!A3:K", "Overview!M3:M"],
-            valueRenderOption="FORMATTED_VALUE"
-        ).execute().get("valueRanges", [])
+        with sheet_lock:
+            resp = svc.batchGet(
+                spreadsheetId=SPREADSHEET_ID,
+                ranges=["Overview!A3:K", "Overview!M3:M"],
+                valueRenderOption="UNFORMATTED_VALUE"
+            ).execute()
+        vrs = resp.get("valueRanges", [])
 
-        # ---- Upcoming rows (already filtered/sorted in Sheet)
-        up_vals = (vr[0].get("values") if len(vr) > 0 else []) or []
+        # ---------- UPCOMING ----------
+        up_vals = (vrs[0].get("values") if len(vrs) > 0 else []) or []
+        TARGET_HEADERS = [
+            "Order #","Preview","Company Name","Design","Quantity",
+            "Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"
+        ]
 
-        TARGET_HEADERS = ["Order #","Preview","Company Name","Design","Quantity","Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"]
-
-        # Drop header row if present
+        # If the first row looks like headers, drop it
         if up_vals:
             first_row = [str(x or "").strip() for x in up_vals[0]]
-            if [h.strip().lower() for h in first_row] == [h.strip().lower() for h in TARGET_HEADERS]:
+            if [h.lower() for h in first_row] == [h.lower() for h in TARGET_HEADERS]:
                 up_vals = up_vals[1:]
 
         headers = TARGET_HEADERS
@@ -2131,74 +2136,72 @@ def overview_combined():
                 fid = s.split("/file/d/")[-1].split("/")[0]
             return f"https://drive.google.com/thumbnail?id={fid}&sz={size}" if fid else ""
 
-        # Build a lightweight map: Order # -> Image link from Production Orders
-        # 1) Read header row to find the "Image" column index
-        po_hdr = (get_sheets_service().spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Production Orders!A1:AM1",
-            valueRenderOption="UNFORMATTED_VALUE"
-        ).execute().get("values", [[]]) or [[]])[0]
-
-        img_idx = -1
-        for i, h in enumerate(po_hdr):
-            if str(h or "").strip().lower() == "image":
-                img_idx = i
-                break
-
+        # Optional: look up Production Orders "Image" column to prefer its thumbnail
         order_to_image = {}
+        try:
+            with sheet_lock:
+                po_hdr = (svc.get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range="Production Orders!A1:AM1",
+                    valueRenderOption="UNFORMATTED_VALUE"
+                ).execute().get("values", [[]]) or [[]])[0]
 
-        if img_idx >= 0:
-            # Convert 0-based index -> column letter
-            def col_letter(idx0):
-                n = idx0 + 1
-                s = ""
-                while n:
-                    n, r = divmod(n - 1, 26)
-                    s = chr(65 + r) + s
-                return s
+            img_idx = next(
+                (i for i, h in enumerate(po_hdr) if str(h or "").strip().lower() == "image"),
+                -1
+            )
 
-            img_col = col_letter(img_idx)
+            if img_idx >= 0:
+                def col_letter(idx0):
+                    n = idx0 + 1
+                    s = ""
+                    while n:
+                        n, r = divmod(n - 1, 26)
+                        s = chr(65 + r) + s
+                    return s
+                img_col = col_letter(img_idx)
 
-            # 2) Fetch Order # (A) and Image column only (compact)
-            pr = get_sheets_service().spreadsheets().values().batchGet(
-                spreadsheetId=SPREADSHEET_ID,
-                ranges=["Production Orders!A2:A", f"Production Orders!{img_col}2:{img_col}"],
-                valueRenderOption="FORMATTED_VALUE"
-            ).execute().get("valueRanges", [])
+                with sheet_lock:
+                    pr = svc.batchGet(
+                        spreadsheetId=SPREADSHEET_ID,
+                        ranges=["Production Orders!A2:A", f"Production Orders!{img_col}2:{img_col}"],
+                        valueRenderOption="UNFORMATTED_VALUE"
+                    ).execute().get("valueRanges", [])
 
-            orders_col = (pr[0].get("values") if len(pr) > 0 else []) or []
-            images_col = (pr[1].get("values") if len(pr) > 1 else []) or []
-
-            max_len = max(len(orders_col), len(images_col))
-            for i in range(max_len):
-                ord_val = (orders_col[i][0] if i < len(orders_col) and orders_col[i] else "").strip()
-                img_val = (images_col[i][0] if i < len(images_col) and images_col[i] else "").strip()
-                if ord_val:
-                    order_to_image[ord_val] = img_val
+                orders_col = (pr[0].get("values") if len(pr) > 0 else []) or []
+                images_col = (pr[1].get("values") if len(pr) > 1 else []) or []
+                max_len = max(len(orders_col), len(images_col))
+                for i in range(max_len):
+                    ord_val = (orders_col[i][0] if i < len(orders_col) and orders_col[i] else "").strip()
+                    img_val = (images_col[i][0] if i < len(images_col) and images_col[i] else "").strip()
+                    if ord_val:
+                        order_to_image[ord_val] = img_val
+        except Exception:
+            # If this enrichment fails, just keep going with Overview data only
+            order_to_image = {}
 
         def prefer_image(preview, order_no):
-            # Prefer Production Orders → Image; else fall back to Preview-derived thumb
-            img = order_to_image.get(str(order_no).strip(), "")
+            img = order_to_image.get(str(order_no or "").strip(), "")
             return drive_thumb(img) or drive_thumb(preview)
 
         upcoming = []
         for r in up_vals:
-            r = r + [""] * (len(headers) - len(r))
+            if len(r) < len(headers):
+                r = r + [""] * (len(headers) - len(r))
             row = dict(zip(headers, r))
             row["image"] = prefer_image(row.get("Preview"), row.get("Order #"))
             upcoming.append(row)
 
-        # ---- Materials lines (single text column)
-        mat_vals = (vr[1].get("values") if len(vr) > 1 else []) or []
+        # ---------- MATERIALS ----------
+        mat_vals = (vrs[1].get("values") if len(vrs) > 1 else []) or []
         lines = [str(a[0]).strip() for a in mat_vals if a and str(a[0]).strip()]
-        # Group by vendor from "Item … - Vendor"
         grouped = {}
         for s in lines:
             vendor = "Misc."
             left = s
             if " - " in s:
                 left, vendor = s.rsplit(" - ", 1)
-                vendor = vendor.strip() or "Misc."
+                vendor = (vendor or "Misc.").strip() or "Misc."
             toks = left.split()
             name, qty, unit = left, 0, ""
             if len(toks) >= 3:
@@ -2215,24 +2218,19 @@ def overview_combined():
 
         materials = [{"vendor": v, "items": items} for v, items in grouped.items()]
 
-        # optional 60s cache using your existing globals
-        if CACHE_TTL:
-            import time as _t
-            global _overview_upcoming_cache, _overview_upcoming_ts
-            global _materials_needed_cache, _materials_needed_ts
-            _overview_upcoming_cache[7] = {"jobs": upcoming}
-            _overview_upcoming_ts = _t.time()
-            _materials_needed_cache = {"vendors": materials}
-            _materials_needed_ts = _t.time()
-
+        # Build response + save micro-cache
         resp_data = {"upcoming": upcoming, "materials": materials}
         _overview_cache = resp_data
         _overview_ts = now
-        return jsonify(resp_data)
+        return jsonify(resp_data), 200
 
-    except Exception as e:
+    except Exception:
+        # Log and fall back to last good payload if we have one
         app.logger.exception("overview_combined failed")
-        return jsonify({"error": "overview failed"}), 500
+        if _overview_cache is not None:
+            return jsonify(_overview_cache), 200
+        return jsonify({"upcoming": [], "materials": []}), 200
+
 
 import traceback
 from googleapiclient.errors import HttpError
