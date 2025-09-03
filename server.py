@@ -2580,9 +2580,10 @@ def jobs_for_company():
             row_dict["orderId"] = str(row_dict.get("Order #", "")).strip()
             jobs.append(row_dict)
 
-     data = {"jobs": jobs}
+    data = {"jobs": jobs}
     _jobs_company_cache[company] = {"ts": now, "data": data}
     return jsonify(data)
+
 
 
 @app.route("/api/set-volume", methods=["POST"])
