@@ -1657,9 +1657,11 @@ socketio = SocketIO(
     path="/socket.io",
     ping_interval=25,
     ping_timeout=20,
-    # NEW: keep individual WS/HTTP messages small (~1 MB)
     max_http_buffer_size=1_000_000,
+    logger=False,            # NEW: silence Socket.IO logs
+    engineio_logger=False,   # NEW: silence low-level engine logs
 )
+
 
 
 # ─── Vendor Directory Cache ─────────────────────────────────────────────────
