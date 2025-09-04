@@ -29,6 +29,11 @@ from functools import wraps
 from flask import request, session, jsonify, redirect, url_for, make_response
 from datetime import datetime, timedelta
 
+from flask import g
+import psutil, tracemalloc, gc
+tracemalloc.start()
+_process = psutil.Process(os.getpid())
+
 
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
@@ -162,6 +167,9 @@ def _iso_to_eastern_display(iso_str: str) -> str:
 THUMB_META_CACHE = {}  # key: (file_id, size) -> {"thumb": str, "etag": str, "ts": float}
 THUMB_META_TTL = 600   # seconds
 
+THUMB_META_MAX_ENTRIES = 2000
+_THUMB_META_INSERTS = 0
+
 def _get_thumb_meta(file_id: str, size: str, headers: dict):
     """Return {'thumb': url, 'etag': str} using a short-lived cache."""
     now = time.time()
@@ -195,6 +203,24 @@ def _get_thumb_meta(file_id: str, size: str, headers: dict):
     etag = f'W/"{file_id}-t-{size}-{info.get("md5Checksum") or info.get("modifiedTime") or ""}"'
 
     THUMB_META_CACHE[key] = {"thumb": thumb, "etag": etag, "ts": now}
+
+    # NEW: periodic purge to prevent unbounded growth
+    global _THUMB_META_INSERTS
+    _THUMB_META_INSERTS += 1
+    if _THUMB_META_INSERTS % 50 == 0:  # every ~50 inserts
+        # 1) drop expired entries
+        cutoff = time.time() - THUMB_META_TTL
+        for k, v in list(THUMB_META_CACHE.items()):
+            if v.get("ts", 0) < cutoff:
+                THUMB_META_CACHE.pop(k, None)
+
+        # 2) if still too big, drop oldest entries by timestamp
+        if len(THUMB_META_CACHE) > THUMB_META_MAX_ENTRIES:
+            oldest = sorted(THUMB_META_CACHE.items(), key=lambda kv: kv[1].get("ts", 0))
+            to_drop = len(THUMB_META_CACHE) - THUMB_META_MAX_ENTRIES
+            for k, _ in oldest[:to_drop]:
+                THUMB_META_CACHE.pop(k, None)
+
     return {"thumb": thumb, "etag": etag}
 
 
@@ -694,10 +720,34 @@ def apply_cors(response):
     }
     if origin in allowed:
         response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,OPTIONS"
-    return response
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+    return response  # short-circuit OPTIONS
+
+# NEW: capture RSS before each request
+@app.before_request
+def _mem_before():
+    try:
+        g._rss_before = _process.memory_info().rss
+    except Exception:
+        g._rss_before = None
+
+# NEW: log RSS delta after each request and trigger opportunistic GC
+@app.after_request
+def _mem_after(resp):
+    try:
+        rss_now = _process.memory_info().rss
+        rss_before = getattr(g, "_rss_before", None)
+        if rss_before is not None:
+            delta_mb = (rss_now - rss_before) / (1024 * 1024)
+            app.logger.info(f"[MEM] {request.method} {request.path} Δ={delta_mb:.2f}MB rss={rss_now/1024/1024:.2f}MB")
+        # Opportunistic GC to curb fragmentation during bursts
+        gc.collect()
+    except Exception:
+        pass
+    return resp
+
 
 @app.route("/api/drive/token-status", methods=["GET"])
 def token_status():
@@ -1605,7 +1655,10 @@ socketio = SocketIO(
     path="/socket.io",
     ping_interval=25,
     ping_timeout=20,
+    # NEW: keep individual WS/HTTP messages small (~1 MB)
+    max_http_buffer_size=1_000_000,
 )
+
 
 # ─── Vendor Directory Cache ─────────────────────────────────────────────────
 _vendor_dir_cache = None
@@ -2714,20 +2767,22 @@ def save_links():
     socketio.emit("linksUpdated", _links_store)
     return jsonify({"status":"ok"}), 200
 
-# 🔹 NEW: batch the cold-load into one Sheets call
+# 🔹 Trim payload: fetch Orders only and project to required fields
 @app.route("/api/combined", methods=["GET"])
 @login_required_session
 def get_combined():
     try:
+        # 1) Fetch only Orders sheet in a single call
         svc = get_sheets_service().spreadsheets().values()
         with sheet_lock:
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
-                ranges=[ORDERS_RANGE, EMBROIDERY_RANGE],
+                ranges=[ORDERS_RANGE],  # drop EMBROIDERY_RANGE here
                 valueRenderOption="UNFORMATTED_VALUE"
             ).execute()
         vrs = resp.get("valueRanges", [])
 
+        # 2) Convert rows -> dicts
         def rows_to_dicts(rows):
             if not rows:
                 return []
@@ -2741,12 +2796,23 @@ def get_combined():
             return out
 
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
-        emb_rows    = (vrs[1].get("values") if len(vrs) > 1 else []) or []
+        orders_full = rows_to_dicts(orders_rows)
 
+        # 3) Keep only the columns the frontend actually uses
+        KEEP = {
+            'Order #', 'Company Name', 'Product', 'Design', 'Quantity',
+            'Stitch Count', 'Due Date', 'Hard Date/Soft Date',
+            'Embroidery Start Time', 'Stage', 'Threads', 'Image'
+        }
+        orders_slim = [
+            {k: v for k, v in row.items() if k in KEEP}
+            for row in orders_full
+        ]
+
+        # 4) Return smaller payload (no embroideryList)
         return jsonify({
-            "orders":         rows_to_dicts(orders_rows),
-            "embroideryList": rows_to_dicts(emb_rows),
-            "links":          _links_store
+            "orders": orders_slim,
+            "links":  _links_store
         }), 200
     except Exception:
         logger.exception("Error building /api/combined")
