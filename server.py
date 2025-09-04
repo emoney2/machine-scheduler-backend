@@ -185,7 +185,7 @@ def _get_thumb_meta(file_id: str, size: str, headers: dict):
         f"https://www.googleapis.com/drive/v3/files/{file_id}"
         f"?fields=thumbnailLink,modifiedTime,md5Checksum"
     )
-    meta = requests.get(meta_url, headers=headers, timeout=6)
+    meta = requests.get(meta_url, headers=headers, timeout=20)
     if meta.status_code != 200:
         return None
 
@@ -843,7 +843,7 @@ def drive_proxy(file_id):
             else:
                 thumb = f"{thumb}?s={px}"
 
-            img = requests.get(thumb, headers=headers, timeout=10)
+            img = requests.get(thumb, headers=headers, timeout=20)
             if img.status_code == 200 and img.content:
                 if v_param:
                     # Save to disk cache
@@ -4354,7 +4354,7 @@ def warm_thumbnails():
         # Fetch in parallel to speed up warm-up
         warmed = 0
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=8) as ex:
+        with ThreadPoolExecutor(max_workers=3) as ex:
             futures = [ex.submit(_warm_one, p) for p in work]
             for fut in as_completed(futures):
                 if fut.result():
