@@ -14,3 +14,4 @@ requests
 reportlab
 playwright==1.46.0
 httpx
+psutil==5.9.8
