@@ -1,5 +1,6 @@
 import eventlet
 eventlet.monkey_patch()
+eventlet.debug.hub_prevent_multiple_readers(False)
 
 # ─── Imports & Logger Setup ─────────────────────────────────────────────────
 import os
