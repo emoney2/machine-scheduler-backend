@@ -2774,17 +2774,41 @@ def save_links():
 @login_required_session
 def get_combined():
     try:
-        # 1) Fetch only Orders sheet in a single call
         svc = get_sheets_service().spreadsheets().values()
+
+        # 1) Primary fetch: whatever ORDERS_RANGE is set to
         with sheet_lock:
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
-                ranges=[ORDERS_RANGE],  # drop EMBROIDERY_RANGE here
-                valueRenderOption="UNFORMATTED_VALUE"
+                ranges=[ORDERS_RANGE],
+                valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
-        vrs = resp.get("valueRanges", [])
+        vrs = resp.get("valueRanges", []) or []
+        orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
 
-        # 2) Convert rows -> dicts
+        # 2) Fallback #1: try a broad A1:Z pull from the "Production Orders" sheet
+        if not orders_rows:
+            app.logger.warning("ORDERS_RANGE returned no rows; falling back to 'Production Orders!A1:Z' (UNFORMATTED_VALUE)")
+            with sheet_lock:
+                resp2 = svc.get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range="Production Orders!A1:Z",
+                    valueRenderOption="UNFORMATTED_VALUE",
+                ).execute()
+            orders_rows = resp2.get("values", []) or []
+
+        # 3) Fallback #2: try FORMATTED_VALUE (sometimes formulas render better)
+        if not orders_rows:
+            app.logger.warning("A1:Z (UNFORMATTED_VALUE) empty; trying FORMATTED_VALUE")
+            with sheet_lock:
+                resp3 = svc.get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range="Production Orders!A1:Z",
+                    valueRenderOption="FORMATTED_VALUE",
+                ).execute()
+            orders_rows = resp3.get("values", []) or []
+
+        # 4) Convert rows to dicts
         def rows_to_dicts(rows):
             if not rows:
                 return []
@@ -2797,28 +2821,15 @@ def get_combined():
                 out.append(dict(zip(headers, r)))
             return out
 
-        orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
         orders_full = rows_to_dicts(orders_rows)
 
-        # 3) Keep only the columns the frontend actually uses
-        KEEP = {
-            'Order #', 'Company Name', 'Product', 'Design', 'Quantity',
-            'Stitch Count', 'Due Date', 'Hard Date/Soft Date',
-            'Embroidery Start Time', 'Stage', 'Threads', 'Image'
-        }
-        orders_slim = [
-            {k: v for k, v in row.items() if k in KEEP}
-            for row in orders_full
-        ]
+        # 5) Return everything (let the UI pick columns); this avoids empty lists due to header mismatches
+        return jsonify({"orders": orders_full, "links": _links_store}), 200
 
-        # 4) Return smaller payload (no embroideryList)
-        return jsonify({
-            "orders": orders_slim,
-            "links":  _links_store
-        }), 200
     except Exception:
         logger.exception("Error building /api/combined")
-        return jsonify({"orders": [], "embroideryList": [], "links": {}}), 200
+        return jsonify({"orders": [], "links": {}}), 200
+
 
 @socketio.on("placeholdersUpdated")
 def handle_placeholders_updated(data):
