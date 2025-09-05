@@ -1990,6 +1990,12 @@ _sheets_service = None
 _drive_service  = None
 _service_ts     = 0
 SERVICE_TTL     = 900  # 15 minutes
+
+# ─── /api/combined In-Memory Cache ───────────────────────────────────────────
+_COMBINED_CACHE      = None      # dict payload { "orders": [...], "links": {...} }
+_COMBINED_CACHE_TS   = 0.0       # epoch seconds
+_COMBINED_CACHE_TTL  = 15.0      # seconds (serve instantly if fresh)
+
 # ────────────────────────────────────────────────────────────────────────────
 
 # ---- helpers: clear overview caches ----------------------------------------
@@ -2779,62 +2785,99 @@ def save_links():
 @app.route("/api/combined", methods=["GET"])
 @login_required_session
 def get_combined():
+    """
+    Fast path: serve a fresh (< TTL) cached payload immediately.
+    Slow path: rebuild in background or synchronously with a hard timeout.
+    """
+    from time import time as _now
+    global _COMBINED_CACHE, _COMBINED_CACHE_TS
+
     try:
-        svc = get_sheets_service().spreadsheets().values()
+        # 0) If cache is fresh, return instantly
+        if _COMBINED_CACHE and (_now() - _COMBINED_CACHE_TS) < _COMBINED_CACHE_TTL:
+            return jsonify(_COMBINED_CACHE), 200
 
-        # 1) Primary fetch: whatever ORDERS_RANGE is set to
-        with sheet_lock:
-            resp = svc.batchGet(
-                spreadsheetId=SPREADSHEET_ID,
-                ranges=[ORDERS_RANGE],
-                valueRenderOption="UNFORMATTED_VALUE",
-            ).execute()
-        vrs = resp.get("valueRanges", []) or []
-        orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
+        # 1) Build a fresh payload with a hard timeout around Sheets work
+        def _build_payload():
+            svc = get_sheets_service().spreadsheets().values()
 
-        # 2) Fallback #1: try a broad A1:Z pull from the "Production Orders" sheet
-        if not orders_rows:
-            app.logger.warning("ORDERS_RANGE returned no rows; falling back to 'Production Orders!A1:Z' (UNFORMATTED_VALUE)")
+            # Primary fetch
             with sheet_lock:
-                resp2 = svc.get(
+                resp = svc.batchGet(
                     spreadsheetId=SPREADSHEET_ID,
-                    range="Production Orders!A1:Z",
+                    ranges=[ORDERS_RANGE],
                     valueRenderOption="UNFORMATTED_VALUE",
                 ).execute()
-            orders_rows = resp2.get("values", []) or []
+            vrs = resp.get("valueRanges", []) or []
+            orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
 
-        # 3) Fallback #2: try FORMATTED_VALUE (sometimes formulas render better)
-        if not orders_rows:
-            app.logger.warning("A1:Z (UNFORMATTED_VALUE) empty; trying FORMATTED_VALUE")
-            with sheet_lock:
-                resp3 = svc.get(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range="Production Orders!A1:Z",
-                    valueRenderOption="FORMATTED_VALUE",
-                ).execute()
-            orders_rows = resp3.get("values", []) or []
+            # Fallback #1
+            if not orders_rows:
+                app.logger.warning("ORDERS_RANGE returned no rows; falling back to 'Production Orders!A1:Z' (UNFORMATTED_VALUE)")
+                with sheet_lock:
+                    resp2 = svc.get(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range="Production Orders!A1:Z",
+                        valueRenderOption="UNFORMATTED_VALUE",
+                    ).execute()
+                orders_rows = resp2.get("values", []) or []
 
-        # 4) Convert rows to dicts
-        def rows_to_dicts(rows):
-            if not rows:
-                return []
-            headers = [str(h).strip() for h in rows[0]]
-            out = []
-            for r in rows[1:]:
-                r = r or []
-                if len(r) < len(headers):
-                    r += [""] * (len(headers) - len(r))
-                out.append(dict(zip(headers, r)))
-            return out
+            # Fallback #2
+            if not orders_rows:
+                app.logger.warning("A1:Z (UNFORMATTED_VALUE) empty; trying FORMATTED_VALUE")
+                with sheet_lock:
+                    resp3 = svc.get(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range="Production Orders!A1:Z",
+                        valueRenderOption="FORMATTED_VALUE",
+                    ).execute()
+                orders_rows = resp3.get("values", []) or []
 
-        orders_full = rows_to_dicts(orders_rows)
+            # Convert rows to dicts (preserve ALL headers, let UI choose)
+            def rows_to_dicts(rows):
+                if not rows:
+                    return []
+                headers = [str(h).strip() for h in rows[0]]
+                out = []
+                for r in rows[1:]:
+                    r = (r or [])
+                    if len(r) < len(headers):
+                        r += [""] * (len(headers) - len(r))
+                    out.append(dict(zip(headers, r)))
+                return out
 
-        # 5) Return everything (let the UI pick columns); this avoids empty lists due to header mismatches
-        return jsonify({"orders": orders_full, "links": _links_store}), 200
+            orders_full = rows_to_dicts(orders_rows)
+            return {"orders": orders_full, "links": _links_store}
+
+        # 2) Use a hard timeout for the Sheets roundtrip so we don't hang the request
+        try:
+            with eventlet.Timeout(8, False):  # seconds; on timeout, False prevents exception
+                payload = _build_payload()
+                if payload:
+                    _COMBINED_CACHE = payload
+                    _COMBINED_CACHE_TS = _now()
+                    return jsonify(payload), 200
+
+            # Timed out building fresh payload — serve stale if available
+            if _COMBINED_CACHE:
+                app.logger.warning("get_combined: Sheets timed out; serving cached payload")
+                return jsonify(_COMBINED_CACHE), 200
+
+            # No cache to fall back to
+            return jsonify({"orders": [], "links": _links_store, "warn": "timeout"}), 200
+
+        except Exception:
+            # On error, return cached if possible
+            app.logger.exception("Error building /api/combined (will try cache)")
+            if _COMBINED_CACHE:
+                return jsonify(_COMBINED_CACHE), 200
+            return jsonify({"orders": [], "links": _links_store}), 200
 
     except Exception:
-        logger.exception("Error building /api/combined")
-        return jsonify({"orders": [], "links": {}}), 200
+        app.logger.exception("get_combined: outer error")
+        # final fallback
+        return jsonify({"orders": [], "links": _links_store}), 200
+
 
 
 @socketio.on("placeholdersUpdated")
