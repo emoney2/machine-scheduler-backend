@@ -87,9 +87,25 @@ _DRIVE_VER_TTL   = 6 * 60 * 60  # 6 hours
 THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_cache")
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
-def _thumb_cache_path(file_id: str, size: str, version: str) -> str:
-    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f"{file_id}_{size}_{version or 'nov'}.jpg")
-    return os.path.join(THUMB_CACHE_DIR, safe)
+def _thumb_cache_latest(file_id: str, size: str) -> str | None:
+    """
+    Return the newest cached thumbnail path for (file_id, size) regardless of version.
+    Used as a stale fallback if Drive metadata/thumbnail fetch fails.
+    """
+    try:
+        prefix = re.sub(r'[^A-Za-z0-9_.-]', '_', f"{file_id}_{size}_")
+        candidates = [
+            os.path.join(THUMB_CACHE_DIR, fn)
+            for fn in os.listdir(THUMB_CACHE_DIR)
+            if fn.startswith(prefix)
+        ]
+        candidates = [p for p in candidates if os.path.isfile(p)]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return candidates[0]
+    except Exception:
+        return None
 
 
 def clamp_iso_to_next_830_et(iso_str: str) -> str:
@@ -827,12 +843,27 @@ def drive_proxy(file_id):
             f"https://www.googleapis.com/drive/v3/files/{file_id}"
             f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
         )
-        meta = requests.get(meta_url, headers=headers, timeout=6)
-        if meta.status_code != 200:
-            return jsonify({"error": "meta_failed", "code": meta.status_code}), 502
-        info = meta.json() or {}
+        try:
+            meta = requests.get(meta_url, headers=headers, timeout=6)
+            if meta.status_code != 200:
+                raise RuntimeError(f"meta_status_{meta.status_code}")
+            info = meta.json() or {}
+        except Exception:
+            # Transient network error (e.g., RemoteDisconnected). Serve stale cache if we have it.
+            if not v_param:
+                cpath_latest = _thumb_cache_latest(file_id, size)
+                if cpath_latest and os.path.exists(cpath_latest):
+                    resp = send_file(cpath_latest, mimetype="image/jpeg", as_attachment=False, download_name=os.path.basename(cpath_latest))
+                    # short TTL because we don't know the version
+                    resp.headers["Cache-Control"] = "public, max-age=300, s-maxage=300"
+                    resp.headers["ETag"] = etag
+                    return resp
+            # No stale file available — keep behavior but be explicit
+            return jsonify({"error": "meta_failed"}), 502
+
         thumb = info.get("thumbnailLink")
         mime  = (info.get("mimeType") or "").lower()
+
 
         # Prefer native Drive thumbnail if available
         if use_thumb and thumb:
