@@ -878,20 +878,26 @@ def drive_proxy(file_id):
             else:
                 thumb = f"{thumb}?s={px}"
 
-            img = requests.get(thumb, headers=headers, timeout=20)
-            if img.status_code == 200 and img.content:
-                if v_param:
-                    # Save to disk cache
-                    try:
-                        with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
-                            f.write(img.content)
-                    except Exception:
-                        logger.exception("thumb cache write failed")
-
-                resp = Response(img.content, status=200, mimetype="image/jpeg")
-                resp.headers["Cache-Control"] = cache_control
-                resp.headers["ETag"] = etag
-                return resp
+            try:
+                img = requests.get(thumb, headers=headers, timeout=20)
+                if img.status_code == 200 and img.content:
+                    with open(cache_path, 'wb') as f:
+                        f.write(img.content)
+                    resp = send_file(cache_path, mimetype='image/jpeg', as_attachment=False, download_name=os.path.basename(cache_path))
+                    resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable' if v_param else 'public, max-age=300, s-maxage=300'
+                    resp.headers['ETag'] = etag
+                    return resp
+                else:
+                    raise RuntimeError(f"thumb_status_{img.status_code}")
+            except Exception:
+                # Serve stale cached thumb (no version) if available, instead of 502
+                if not v_param:
+                    cpath_latest = _thumb_cache_latest(file_id, size)
+                    if cpath_latest and os.path.exists(cpath_latest):
+                        resp = send_file(cpath_latest, mimetype='image/jpeg', as_attachment=False, download_name=os.path.basename(cpath_latest))
+                        resp.headers['Cache-Control'] = 'public, max-age=300, s-maxage=300'
+                        resp.headers['ETag'] = etag
+                        return resp
 
         # Fallback: if original is an image, fetch it and cache
         if mime.startswith("image/"):
