@@ -4402,54 +4402,74 @@ def warm_thumbnails():
         logger.exception("warm_thumbnails error")
         return jsonify({"ok": False, "error": str(e)}), 200
 
+# ─── cache for Drive version lookups ──────────────────────────────────────────
+_DRIVE_VER_CACHE = {}       # {file_id: (version, expires_at)}
+_DRIVE_VER_TTL   = 6 * 60 * 60  # 6 hours
 
 @app.route("/api/drive/metaBatch", methods=["POST"])
 @login_required_session
 def drive_meta_batch():
+    """
+    Return a version token per Drive file ID so the frontend can cache-bust only when artwork changes.
+    Version = md5Checksum if present, else modifiedTime, else "".
+    Body:    {"ids": ["<fileId1>", ...]}
+    Reply:   {"versions": {"<id>": "<ver>", ...}}
+    """
+    import time
     try:
         data = request.get_json(force=True) or {}
-        ids = [str(x).strip() for x in (data.get("ids") or []) if str(x).strip()]
+        # dedupe + sanitize
+        ids = []
+        seen = set()
+        for x in (data.get("ids") or []):
+            s = str(x).strip()
+            if s and s not in seen:
+                seen.add(s)
+                ids.append(s)
+
         versions = {}
         if not ids:
             return jsonify({"versions": versions}), 200
 
-        now = _now()
+        now = time.time()
         to_fetch = []
-        # 1) Serve what we can from cache
+
+        # 1) serve what we can from cache
         for fid in ids:
-            v = None
             cached = _DRIVE_VER_CACHE.get(fid)
             if cached:
                 ver, exp = cached
                 if exp > now:
-                    v = ver
-            if v is not None:
-                versions[fid] = v
-            else:
-                to_fetch.append(fid)
+                    versions[fid] = ver
+                    continue
+            to_fetch.append(fid)
 
-        # 2) Fetch remaining uncached IDs from Drive
+        # 2) fetch the rest with a hard timeout (avoid gateway 502s)
         if to_fetch:
             svc = get_drive_service()
-            for fid in to_fetch:
-                try:
-                    info = svc.files().get(
-                        fileId=fid,
-                        fields="id, md5Checksum, modifiedTime"
-                    ).execute()
-                    ver = info.get("md5Checksum") or info.get("modifiedTime") or ""
-                except Exception:
-                    logger.exception(f"drive_meta_batch: failed for {fid}")
-                    ver = ""
-                versions[fid] = ver
-                _DRIVE_VER_CACHE[fid] = (ver, now + _DRIVE_VER_TTL)
+            import eventlet
+            with eventlet.Timeout(4, False):  # 4s max; partial results are OK
+                for fid in to_fetch:
+                    try:
+                        info = svc.files().get(
+                            fileId=fid,
+                            fields="id, md5Checksum, modifiedTime"
+                        ).execute()
+                        ver = info.get("md5Checksum") or info.get("modifiedTime") or ""
+                    except Exception:
+                        # leave as empty string if we fail this round
+                        ver = ""
+                        logger.exception(f"drive_meta_batch: failed for {fid}")
+
+                    versions[fid] = ver
+                    _DRIVE_VER_CACHE[fid] = (ver, now + _DRIVE_VER_TTL)
 
         return jsonify({"versions": versions}), 200
+
     except Exception as e:
         logger.exception("drive_meta_batch error")
+        # Always return a well-formed object so the client can proceed
         return jsonify({"error": str(e), "versions": {}}), 200
-
-
 
 @app.route("/api/drive-file-metadata")
 def drive_file_metadata():
