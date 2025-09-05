@@ -2887,6 +2887,7 @@ def handle_placeholders_updated(data):
 # ─── MANUAL STATE ENDPOINTS (multi-row placeholders) ─────────────────────────
 MANUAL_RANGE       = "Manual State!A2:Z"
 MANUAL_CLEAR_RANGE = "Manual State!A2:Z"
+MANUAL_MACHINE_RANGE = "Manual State!I2:J2"
 
 # ─── /api/manualState cache ───────────────────────────────────────────────────
 _MANUAL_STATE_CACHE    = None
@@ -2898,67 +2899,52 @@ MANUAL_CACHE_TTL       = 30.0  # seconds; adjust if you want
 @login_required_session
 def get_manual_state():
     """
-    Read manual state from the sheet and return:
+    Returns:
       {
         "machineColumns": [machine1_ids[], machine2_ids[]],
-        "placeholders": []   # (kept as [] for speed/safety unless you want me to parse them too)
+        "placeholders": []   # left empty here for speed/stability
       }
-    Uses an in-memory cache and a hard timeout so it never blocks long.
+    Uses in-memory cache and a hard timeout so it never blocks long.
     """
     import time
     global _MANUAL_STATE_CACHE, _MANUAL_STATE_CACHE_TS
 
     now = time.time()
 
-    # 🚀 Fast path: if cache is fresh, return immediately
+    # 🚀 Fast path: fresh cache
     if _MANUAL_STATE_CACHE and (now - _MANUAL_STATE_CACHE_TS) < MANUAL_CACHE_TTL:
         return jsonify(_MANUAL_STATE_CACHE), 200
 
-    # ---- local builder so we keep changes self-contained ----
     def _build_payload():
-        # Pull Manual State!A2:Z
+        # Read only I2:J2 (machine1, machine2)
         svc = get_sheets_service().spreadsheets().values()
         resp = svc.get(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE  # "Manual State!A2:Z"
+            range=MANUAL_MACHINE_RANGE  # "Manual State!I2:J2"
         ).execute()
-        rows = resp.get("values", []) or []
-
-        # Normalize at least one row
-        if not rows:
-            return {"machineColumns": [[], []], "placeholders": []}
-
-        # Pad first data row to 26 cols (A..Z) so indices exist
-        r0 = list(rows[0])
-        if len(r0) < 26:
-            r0 += [""] * (26 - len(r0))
-
-        # Machine columns are I and J in the first data row (index 8, 9)
-        raw_m1 = str(r0[8] or "").strip()
-        raw_m2 = str(r0[9] or "").strip()
+        vals = resp.get("values", []) or []
+        row = vals[0] if vals else []
+        raw_m1 = str(row[0] if len(row) > 0 else "").strip()
+        raw_m2 = str(row[1] if len(row) > 1 else "").strip()
         m1 = [s.strip() for s in raw_m1.split(",") if s.strip()]
         m2 = [s.strip() for s in raw_m2.split(",") if s.strip()]
+        return {"machineColumns": [m1, m2], "placeholders": []}
 
-        # If you want placeholders parsed later, we can add it.
-        placeholders = []
-
-        return {"machineColumns": [m1, m2], "placeholders": placeholders}
-
-    # ⏱️ Build with a hard timeout; if it times out, serve stale (or minimal)
+    # ⏱️ Build with a hard timeout shorter than the client timeout
     try:
-        with eventlet.Timeout(6, False):  # seconds; don't let this hang the request
+        with eventlet.Timeout(4, False):  # 4s so the server responds before axios(6.5s) cancels
             payload = _build_payload()
             if payload:
                 _MANUAL_STATE_CACHE = payload
                 _MANUAL_STATE_CACHE_TS = now
                 return jsonify(payload), 200
 
-        # Timed out — serve last good cache if we have it
+        # Timed out — serve last good cache if available
         if _MANUAL_STATE_CACHE:
             app.logger.warning("/api/manualState: timeout; serving cached payload")
             return jsonify(_MANUAL_STATE_CACHE), 200
 
-        # No cache? Return minimal response so client keeps moving
+        # No cache? Minimal response so client keeps moving
         return jsonify({"machineColumns": [[], []], "placeholders": []}), 200
 
     except Exception:
