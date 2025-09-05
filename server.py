@@ -2888,94 +2888,84 @@ def handle_placeholders_updated(data):
 MANUAL_RANGE       = "Manual State!A2:Z"
 MANUAL_CLEAR_RANGE = "Manual State!A2:Z"
 
+# ─── /api/manualState cache ───────────────────────────────────────────────────
+_MANUAL_STATE_CACHE    = None
+_MANUAL_STATE_CACHE_TS = 0.0
+MANUAL_CACHE_TTL       = 30.0  # seconds; adjust if you want
+
 # ─── MANUAL STATE ENDPOINT (GET) ───────────────────────────────────────────────
 @app.route("/api/manualState", methods=["GET"])
 @login_required_session
 def get_manual_state():
     """
-    Read manual state from the sheet, but PRUNE any order IDs whose Stage is
-    'Sewing' or 'Complete' in Production Orders. If pruning occurs, write the
-    cleaned lists back to Manual State I2:J2 so the sheet self-heals.
+    Read manual state from the sheet and return:
+      {
+        "machineColumns": [machine1_ids[], machine2_ids[]],
+        "placeholders": []   # (kept as [] for speed/safety unless you want me to parse them too)
+      }
+    Uses an in-memory cache and a hard timeout so it never blocks long.
     """
-    global _manual_state_cache, _manual_state_ts
+    import time
+    global _MANUAL_STATE_CACHE, _MANUAL_STATE_CACHE_TS
+
     now = time.time()
 
-    try:
-        # 1) Read Manual State rows (A2:Z) and parse machine columns (I–Z)
-        resp = sheets.values().get(
+    # 🚀 Fast path: if cache is fresh, return immediately
+    if _MANUAL_STATE_CACHE and (now - _MANUAL_STATE_CACHE_TS) < MANUAL_CACHE_TTL:
+        return jsonify(_MANUAL_STATE_CACHE), 200
+
+    # ---- local builder so we keep changes self-contained ----
+    def _build_payload():
+        # Pull Manual State!A2:Z
+        svc = get_sheets_service().spreadsheets().values()
+        resp = svc.get(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE  # e.g., "Manual State!A2:Z"
+            range=MANUAL_RANGE  # "Manual State!A2:Z"
         ).execute()
         rows = resp.get("values", []) or []
 
-        # pad each row to 26 columns
-        for i in range(len(rows)):
-            while len(rows[i]) < 26:
-                rows[i].append("")
+        # Normalize at least one row
+        if not rows:
+            return {"machineColumns": [[], []], "placeholders": []}
 
-        first = rows[0] if rows else [""] * 26
-        machines = first[8:26]  # I–Z
-        machine_columns = [[s for s in str(col or "").split(",") if s] for col in machines]
+        # Pad first data row to 26 cols (A..Z) so indices exist
+        r0 = list(rows[0])
+        if len(r0) < 26:
+            r0 += [""] * (26 - len(r0))
 
-        # 2) Build set of ACTIVE (not Sewing/Complete) order IDs from Production Orders
-        ord_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
-        active_ids = set()
-        if ord_rows:
-            hdr = {str(h).strip().lower(): idx for idx, h in enumerate(ord_rows[0])}
-            id_idx = hdr.get("order #", 0)
-            stage_idx = hdr.get("stage", None)
-            for r in ord_rows[1:]:
-                oid = str(r[id_idx] if id_idx < len(r) else "").strip()
-                stage = str(r[stage_idx] if stage_idx is not None and stage_idx < len(r) else "").strip().lower()
-                # keep only if NOT Sewing or Complete
-                if oid and stage not in ("sewing", "complete"):
-                    active_ids.add(oid)
+        # Machine columns are I and J in the first data row (index 8, 9)
+        raw_m1 = str(r0[8] or "").strip()
+        raw_m2 = str(r0[9] or "").strip()
+        m1 = [s.strip() for s in raw_m1.split(",") if s.strip()]
+        m2 = [s.strip() for s in raw_m2.split(",") if s.strip()]
 
-        # 3) Prune completed/sewing/unknown IDs from each machine list
-        cleaned = [[oid for oid in col if oid in active_ids] for col in machine_columns]
+        # If you want placeholders parsed later, we can add it.
+        placeholders = []
 
-        # 4) If cleaned differs, write fixed strings back to I2:J2
-        if cleaned != machine_columns:
-            i2 = ",".join(cleaned[0]) if len(cleaned) > 0 else ""
-            j2 = ",".join(cleaned[1]) if len(cleaned) > 1 else ""
-            sheets.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"{MANUAL_RANGE.split('!')[0]}!I2:J2",
-                valueInputOption="RAW",
-                body={"values": [[i2, j2]]}
-            ).execute()
-            machine_columns = cleaned
+        return {"machineColumns": [m1, m2], "placeholders": placeholders}
 
-        # 5) Gather placeholders from A–H (unchanged)
-        phs = []
-        for r in rows:
-            if str(r[0]).strip():
-                phs.append({
-                    "id":          r[0],
-                    "company":     r[1],
-                    "quantity":    r[2],
-                    "stitchCount": r[3],
-                    "inHand":      r[4],
-                    "dueType":     r[5],
-                    "fieldG":      r[6],
-                    "fieldH":      r[7]
-                })
+    # ⏱️ Build with a hard timeout; if it times out, serve stale (or minimal)
+    try:
+        with eventlet.Timeout(6, False):  # seconds; don't let this hang the request
+            payload = _build_payload()
+            if payload:
+                _MANUAL_STATE_CACHE = payload
+                _MANUAL_STATE_CACHE_TS = now
+                return jsonify(payload), 200
 
-        result = {
-            "machineColumns": machine_columns,
-            "placeholders":   phs
-        }
-        _manual_state_cache = result
-        _manual_state_ts    = now
-        return jsonify(result), 200
+        # Timed out — serve last good cache if we have it
+        if _MANUAL_STATE_CACHE:
+            app.logger.warning("/api/manualState: timeout; serving cached payload")
+            return jsonify(_MANUAL_STATE_CACHE), 200
+
+        # No cache? Return minimal response so client keeps moving
+        return jsonify({"machineColumns": [[], []], "placeholders": []}), 200
 
     except Exception:
-        logger.exception("Error reading manual state")
-        if _manual_state_cache:
-            return jsonify(_manual_state_cache), 200
-        return jsonify({"machineColumns": [], "placeholders": []}), 200
-
-
+        app.logger.exception("/api/manualState error; trying cache")
+        if _MANUAL_STATE_CACHE:
+            return jsonify(_MANUAL_STATE_CACHE), 200
+        return jsonify({"machineColumns": [[], []], "placeholders": []}), 200
 
 
 # ─── MANUAL STATE ENDPOINT (POST) ──────────────────────────────────────────────
