@@ -79,33 +79,13 @@ from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
-# In-memory cache: {file_id: (version, expires_at)}
-_DRIVE_VER_CACHE = {}
-_DRIVE_VER_TTL   = 6 * 60 * 60  # 6 hours
-
 # ---- Disk cache for thumbnails ----
 THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_cache")
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
-def _thumb_cache_latest(file_id: str, size: str) -> str | None:
-    """
-    Return the newest cached thumbnail path for (file_id, size) regardless of version.
-    Used as a stale fallback if Drive metadata/thumbnail fetch fails.
-    """
-    try:
-        prefix = re.sub(r'[^A-Za-z0-9_.-]', '_', f"{file_id}_{size}_")
-        candidates = [
-            os.path.join(THUMB_CACHE_DIR, fn)
-            for fn in os.listdir(THUMB_CACHE_DIR)
-            if fn.startswith(prefix)
-        ]
-        candidates = [p for p in candidates if os.path.isfile(p)]
-        if not candidates:
-            return None
-        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        return candidates[0]
-    except Exception:
-        return None
+def _thumb_cache_path(file_id: str, size: str, version: str) -> str:
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f"{file_id}_{size}_{version or 'nov'}.jpg")
+    return os.path.join(THUMB_CACHE_DIR, safe)
 
 
 def clamp_iso_to_next_830_et(iso_str: str) -> str:
@@ -843,27 +823,12 @@ def drive_proxy(file_id):
             f"https://www.googleapis.com/drive/v3/files/{file_id}"
             f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
         )
-        try:
-            meta = requests.get(meta_url, headers=headers, timeout=6)
-            if meta.status_code != 200:
-                raise RuntimeError(f"meta_status_{meta.status_code}")
-            info = meta.json() or {}
-        except Exception:
-            # Transient network error (e.g., RemoteDisconnected). Serve stale cache if we have it.
-            if not v_param:
-                cpath_latest = _thumb_cache_latest(file_id, size)
-                if cpath_latest and os.path.exists(cpath_latest):
-                    resp = send_file(cpath_latest, mimetype="image/jpeg", as_attachment=False, download_name=os.path.basename(cpath_latest))
-                    # short TTL because we don't know the version
-                    resp.headers["Cache-Control"] = "public, max-age=300, s-maxage=300"
-                    resp.headers["ETag"] = etag
-                    return resp
-            # No stale file available — keep behavior but be explicit
-            return jsonify({"error": "meta_failed"}), 502
-
+        meta = requests.get(meta_url, headers=headers, timeout=6)
+        if meta.status_code != 200:
+            return jsonify({"error": "meta_failed", "code": meta.status_code}), 502
+        info = meta.json() or {}
         thumb = info.get("thumbnailLink")
         mime  = (info.get("mimeType") or "").lower()
-
 
         # Prefer native Drive thumbnail if available
         if use_thumb and thumb:
@@ -878,26 +843,20 @@ def drive_proxy(file_id):
             else:
                 thumb = f"{thumb}?s={px}"
 
-            try:
-                img = requests.get(thumb, headers=headers, timeout=20)
-                if img.status_code == 200 and img.content:
-                    with open(cache_path, 'wb') as f:
-                        f.write(img.content)
-                    resp = send_file(cache_path, mimetype='image/jpeg', as_attachment=False, download_name=os.path.basename(cache_path))
-                    resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable' if v_param else 'public, max-age=300, s-maxage=300'
-                    resp.headers['ETag'] = etag
-                    return resp
-                else:
-                    raise RuntimeError(f"thumb_status_{img.status_code}")
-            except Exception:
-                # Serve stale cached thumb (no version) if available, instead of 502
-                if not v_param:
-                    cpath_latest = _thumb_cache_latest(file_id, size)
-                    if cpath_latest and os.path.exists(cpath_latest):
-                        resp = send_file(cpath_latest, mimetype='image/jpeg', as_attachment=False, download_name=os.path.basename(cpath_latest))
-                        resp.headers['Cache-Control'] = 'public, max-age=300, s-maxage=300'
-                        resp.headers['ETag'] = etag
-                        return resp
+            img = requests.get(thumb, headers=headers, timeout=20)
+            if img.status_code == 200 and img.content:
+                if v_param:
+                    # Save to disk cache
+                    try:
+                        with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
+                            f.write(img.content)
+                    except Exception:
+                        logger.exception("thumb cache write failed")
+
+                resp = Response(img.content, status=200, mimetype="image/jpeg")
+                resp.headers["Cache-Control"] = cache_control
+                resp.headers["ETag"] = etag
+                return resp
 
         # Fallback: if original is an image, fetch it and cache
         if mime.startswith("image/"):
@@ -2027,12 +1986,6 @@ _sheets_service = None
 _drive_service  = None
 _service_ts     = 0
 SERVICE_TTL     = 900  # 15 minutes
-
-# ─── /api/combined In-Memory Cache ───────────────────────────────────────────
-_COMBINED_CACHE      = None      # dict payload { "orders": [...], "links": {...} }
-_COMBINED_CACHE_TS   = 0.0       # epoch seconds
-_COMBINED_CACHE_TTL  = 15.0      # seconds (serve instantly if fresh)
-
 # ────────────────────────────────────────────────────────────────────────────
 
 # ---- helpers: clear overview caches ----------------------------------------
@@ -2822,99 +2775,62 @@ def save_links():
 @app.route("/api/combined", methods=["GET"])
 @login_required_session
 def get_combined():
-    """
-    Fast path: serve a fresh (< TTL) cached payload immediately.
-    Slow path: rebuild in background or synchronously with a hard timeout.
-    """
-    from time import time as _now
-    global _COMBINED_CACHE, _COMBINED_CACHE_TS
-
     try:
-        # 0) If cache is fresh, return instantly
-        if _COMBINED_CACHE and (_now() - _COMBINED_CACHE_TS) < _COMBINED_CACHE_TTL:
-            return jsonify(_COMBINED_CACHE), 200
+        svc = get_sheets_service().spreadsheets().values()
 
-        # 1) Build a fresh payload with a hard timeout around Sheets work
-        def _build_payload():
-            svc = get_sheets_service().spreadsheets().values()
+        # 1) Primary fetch: whatever ORDERS_RANGE is set to
+        with sheet_lock:
+            resp = svc.batchGet(
+                spreadsheetId=SPREADSHEET_ID,
+                ranges=[ORDERS_RANGE],
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        vrs = resp.get("valueRanges", []) or []
+        orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
 
-            # Primary fetch
+        # 2) Fallback #1: try a broad A1:Z pull from the "Production Orders" sheet
+        if not orders_rows:
+            app.logger.warning("ORDERS_RANGE returned no rows; falling back to 'Production Orders!A1:Z' (UNFORMATTED_VALUE)")
             with sheet_lock:
-                resp = svc.batchGet(
+                resp2 = svc.get(
                     spreadsheetId=SPREADSHEET_ID,
-                    ranges=[ORDERS_RANGE],
+                    range="Production Orders!A1:Z",
                     valueRenderOption="UNFORMATTED_VALUE",
                 ).execute()
-            vrs = resp.get("valueRanges", []) or []
-            orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
+            orders_rows = resp2.get("values", []) or []
 
-            # Fallback #1
-            if not orders_rows:
-                app.logger.warning("ORDERS_RANGE returned no rows; falling back to 'Production Orders!A1:Z' (UNFORMATTED_VALUE)")
-                with sheet_lock:
-                    resp2 = svc.get(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range="Production Orders!A1:Z",
-                        valueRenderOption="UNFORMATTED_VALUE",
-                    ).execute()
-                orders_rows = resp2.get("values", []) or []
+        # 3) Fallback #2: try FORMATTED_VALUE (sometimes formulas render better)
+        if not orders_rows:
+            app.logger.warning("A1:Z (UNFORMATTED_VALUE) empty; trying FORMATTED_VALUE")
+            with sheet_lock:
+                resp3 = svc.get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range="Production Orders!A1:Z",
+                    valueRenderOption="FORMATTED_VALUE",
+                ).execute()
+            orders_rows = resp3.get("values", []) or []
 
-            # Fallback #2
-            if not orders_rows:
-                app.logger.warning("A1:Z (UNFORMATTED_VALUE) empty; trying FORMATTED_VALUE")
-                with sheet_lock:
-                    resp3 = svc.get(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range="Production Orders!A1:Z",
-                        valueRenderOption="FORMATTED_VALUE",
-                    ).execute()
-                orders_rows = resp3.get("values", []) or []
+        # 4) Convert rows to dicts
+        def rows_to_dicts(rows):
+            if not rows:
+                return []
+            headers = [str(h).strip() for h in rows[0]]
+            out = []
+            for r in rows[1:]:
+                r = r or []
+                if len(r) < len(headers):
+                    r += [""] * (len(headers) - len(r))
+                out.append(dict(zip(headers, r)))
+            return out
 
-            # Convert rows to dicts (preserve ALL headers, let UI choose)
-            def rows_to_dicts(rows):
-                if not rows:
-                    return []
-                headers = [str(h).strip() for h in rows[0]]
-                out = []
-                for r in rows[1:]:
-                    r = (r or [])
-                    if len(r) < len(headers):
-                        r += [""] * (len(headers) - len(r))
-                    out.append(dict(zip(headers, r)))
-                return out
+        orders_full = rows_to_dicts(orders_rows)
 
-            orders_full = rows_to_dicts(orders_rows)
-            return {"orders": orders_full, "links": _links_store}
-
-        # 2) Use a hard timeout for the Sheets roundtrip so we don't hang the request
-        try:
-            with eventlet.Timeout(8, False):  # seconds; on timeout, False prevents exception
-                payload = _build_payload()
-                if payload:
-                    _COMBINED_CACHE = payload
-                    _COMBINED_CACHE_TS = _now()
-                    return jsonify(payload), 200
-
-            # Timed out building fresh payload — serve stale if available
-            if _COMBINED_CACHE:
-                app.logger.warning("get_combined: Sheets timed out; serving cached payload")
-                return jsonify(_COMBINED_CACHE), 200
-
-            # No cache to fall back to
-            return jsonify({"orders": [], "links": _links_store, "warn": "timeout"}), 200
-
-        except Exception:
-            # On error, return cached if possible
-            app.logger.exception("Error building /api/combined (will try cache)")
-            if _COMBINED_CACHE:
-                return jsonify(_COMBINED_CACHE), 200
-            return jsonify({"orders": [], "links": _links_store}), 200
+        # 5) Return everything (let the UI pick columns); this avoids empty lists due to header mismatches
+        return jsonify({"orders": orders_full, "links": _links_store}), 200
 
     except Exception:
-        app.logger.exception("get_combined: outer error")
-        # final fallback
-        return jsonify({"orders": [], "links": _links_store}), 200
-
+        logger.exception("Error building /api/combined")
+        return jsonify({"orders": [], "links": {}}), 200
 
 
 @socketio.on("placeholdersUpdated")
@@ -2924,71 +2840,95 @@ def handle_placeholders_updated(data):
 # ─── MANUAL STATE ENDPOINTS (multi-row placeholders) ─────────────────────────
 MANUAL_RANGE       = "Manual State!A2:Z"
 MANUAL_CLEAR_RANGE = "Manual State!A2:Z"
-MANUAL_MACHINE_RANGE = "Manual State!I2:J2"
-
-# ─── /api/manualState cache ───────────────────────────────────────────────────
-_MANUAL_STATE_CACHE    = None
-_MANUAL_STATE_CACHE_TS = 0.0
-MANUAL_CACHE_TTL       = 30.0  # seconds; adjust if you want
 
 # ─── MANUAL STATE ENDPOINT (GET) ───────────────────────────────────────────────
 @app.route("/api/manualState", methods=["GET"])
 @login_required_session
 def get_manual_state():
     """
-    Returns:
-      {
-        "machineColumns": [machine1_ids[], machine2_ids[]],
-        "placeholders": []   # left empty here for speed/stability
-      }
-    Uses in-memory cache and a hard timeout so it never blocks long.
+    Read manual state from the sheet, but PRUNE any order IDs whose Stage is
+    'Sewing' or 'Complete' in Production Orders. If pruning occurs, write the
+    cleaned lists back to Manual State I2:J2 so the sheet self-heals.
     """
-    import time
-    global _MANUAL_STATE_CACHE, _MANUAL_STATE_CACHE_TS
-
+    global _manual_state_cache, _manual_state_ts
     now = time.time()
 
-    # 🚀 Fast path: fresh cache
-    if _MANUAL_STATE_CACHE and (now - _MANUAL_STATE_CACHE_TS) < MANUAL_CACHE_TTL:
-        return jsonify(_MANUAL_STATE_CACHE), 200
-
-    def _build_payload():
-        # Read only I2:J2 (machine1, machine2)
-        svc = get_sheets_service().spreadsheets().values()
-        resp = svc.get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_MACHINE_RANGE  # "Manual State!I2:J2"
-        ).execute()
-        vals = resp.get("values", []) or []
-        row = vals[0] if vals else []
-        raw_m1 = str(row[0] if len(row) > 0 else "").strip()
-        raw_m2 = str(row[1] if len(row) > 1 else "").strip()
-        m1 = [s.strip() for s in raw_m1.split(",") if s.strip()]
-        m2 = [s.strip() for s in raw_m2.split(",") if s.strip()]
-        return {"machineColumns": [m1, m2], "placeholders": []}
-
-    # ⏱️ Build with a hard timeout shorter than the client timeout
     try:
-        with eventlet.Timeout(4, False):  # 4s so the server responds before axios(6.5s) cancels
-            payload = _build_payload()
-            if payload:
-                _MANUAL_STATE_CACHE = payload
-                _MANUAL_STATE_CACHE_TS = now
-                return jsonify(payload), 200
+        # 1) Read Manual State rows (A2:Z) and parse machine columns (I–Z)
+        resp = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=MANUAL_RANGE  # e.g., "Manual State!A2:Z"
+        ).execute()
+        rows = resp.get("values", []) or []
 
-        # Timed out — serve last good cache if available
-        if _MANUAL_STATE_CACHE:
-            app.logger.warning("/api/manualState: timeout; serving cached payload")
-            return jsonify(_MANUAL_STATE_CACHE), 200
+        # pad each row to 26 columns
+        for i in range(len(rows)):
+            while len(rows[i]) < 26:
+                rows[i].append("")
 
-        # No cache? Minimal response so client keeps moving
-        return jsonify({"machineColumns": [[], []], "placeholders": []}), 200
+        first = rows[0] if rows else [""] * 26
+        machines = first[8:26]  # I–Z
+        machine_columns = [[s for s in str(col or "").split(",") if s] for col in machines]
+
+        # 2) Build set of ACTIVE (not Sewing/Complete) order IDs from Production Orders
+        ord_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+        active_ids = set()
+        if ord_rows:
+            hdr = {str(h).strip().lower(): idx for idx, h in enumerate(ord_rows[0])}
+            id_idx = hdr.get("order #", 0)
+            stage_idx = hdr.get("stage", None)
+            for r in ord_rows[1:]:
+                oid = str(r[id_idx] if id_idx < len(r) else "").strip()
+                stage = str(r[stage_idx] if stage_idx is not None and stage_idx < len(r) else "").strip().lower()
+                # keep only if NOT Sewing or Complete
+                if oid and stage not in ("sewing", "complete"):
+                    active_ids.add(oid)
+
+        # 3) Prune completed/sewing/unknown IDs from each machine list
+        cleaned = [[oid for oid in col if oid in active_ids] for col in machine_columns]
+
+        # 4) If cleaned differs, write fixed strings back to I2:J2
+        if cleaned != machine_columns:
+            i2 = ",".join(cleaned[0]) if len(cleaned) > 0 else ""
+            j2 = ",".join(cleaned[1]) if len(cleaned) > 1 else ""
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{MANUAL_RANGE.split('!')[0]}!I2:J2",
+                valueInputOption="RAW",
+                body={"values": [[i2, j2]]}
+            ).execute()
+            machine_columns = cleaned
+
+        # 5) Gather placeholders from A–H (unchanged)
+        phs = []
+        for r in rows:
+            if str(r[0]).strip():
+                phs.append({
+                    "id":          r[0],
+                    "company":     r[1],
+                    "quantity":    r[2],
+                    "stitchCount": r[3],
+                    "inHand":      r[4],
+                    "dueType":     r[5],
+                    "fieldG":      r[6],
+                    "fieldH":      r[7]
+                })
+
+        result = {
+            "machineColumns": machine_columns,
+            "placeholders":   phs
+        }
+        _manual_state_cache = result
+        _manual_state_ts    = now
+        return jsonify(result), 200
 
     except Exception:
-        app.logger.exception("/api/manualState error; trying cache")
-        if _MANUAL_STATE_CACHE:
-            return jsonify(_MANUAL_STATE_CACHE), 200
-        return jsonify({"machineColumns": [[], []], "placeholders": []}), 200
+        logger.exception("Error reading manual state")
+        if _manual_state_cache:
+            return jsonify(_manual_state_cache), 200
+        return jsonify({"machineColumns": [], "placeholders": []}), 200
+
+
 
 
 # ─── MANUAL STATE ENDPOINT (POST) ──────────────────────────────────────────────
@@ -4439,9 +4379,6 @@ def warm_thumbnails():
         logger.exception("warm_thumbnails error")
         return jsonify({"ok": False, "error": str(e)}), 200
 
-# ─── cache for Drive version lookups ──────────────────────────────────────────
-_DRIVE_VER_CACHE = {}       # {file_id: (version, expires_at)}
-_DRIVE_VER_TTL   = 6 * 60 * 60  # 6 hours
 
 @app.route("/api/drive/metaBatch", methods=["POST"])
 @login_required_session
@@ -4449,64 +4386,34 @@ def drive_meta_batch():
     """
     Return a version token per Drive file ID so the frontend can cache-bust only when artwork changes.
     Version = md5Checksum if present, else modifiedTime, else "".
-    Body:    {"ids": ["<fileId1>", ...]}
-    Reply:   {"versions": {"<id>": "<ver>", ...}}
+    Request body: {"ids": ["<fileId1>", "<fileId2>", ...]}
+    Response:     {"versions": {"<id>": "<ver>", ...}}
     """
-    import time
     try:
         data = request.get_json(force=True) or {}
-        # dedupe + sanitize
-        ids = []
-        seen = set()
-        for x in (data.get("ids") or []):
-            s = str(x).strip()
-            if s and s not in seen:
-                seen.add(s)
-                ids.append(s)
-
+        ids = [str(x).strip() for x in (data.get("ids") or []) if str(x).strip()]
         versions = {}
         if not ids:
             return jsonify({"versions": versions}), 200
 
-        now = time.time()
-        to_fetch = []
-
-        # 1) serve what we can from cache
+        svc = get_drive_service()
         for fid in ids:
-            cached = _DRIVE_VER_CACHE.get(fid)
-            if cached:
-                ver, exp = cached
-                if exp > now:
-                    versions[fid] = ver
-                    continue
-            to_fetch.append(fid)
-
-        # 2) fetch the rest with a hard timeout (avoid gateway 502s)
-        if to_fetch:
-            svc = get_drive_service()
-            import eventlet
-            with eventlet.Timeout(4, False):  # 4s max; partial results are OK
-                for fid in to_fetch:
-                    try:
-                        info = svc.files().get(
-                            fileId=fid,
-                            fields="id, md5Checksum, modifiedTime"
-                        ).execute()
-                        ver = info.get("md5Checksum") or info.get("modifiedTime") or ""
-                    except Exception:
-                        # leave as empty string if we fail this round
-                        ver = ""
-                        logger.exception(f"drive_meta_batch: failed for {fid}")
-
-                    versions[fid] = ver
-                    _DRIVE_VER_CACHE[fid] = (ver, now + _DRIVE_VER_TTL)
+            try:
+                info = svc.files().get(
+                    fileId=fid,
+                    fields="id, md5Checksum, modifiedTime"
+                ).execute()
+                ver = info.get("md5Checksum") or info.get("modifiedTime") or ""
+                versions[fid] = ver
+            except Exception:
+                logger.exception(f"drive_meta_batch: failed for {fid}")
+                versions[fid] = ""
 
         return jsonify({"versions": versions}), 200
-
     except Exception as e:
         logger.exception("drive_meta_batch error")
-        # Always return a well-formed object so the client can proceed
         return jsonify({"error": str(e), "versions": {}}), 200
+
 
 @app.route("/api/drive-file-metadata")
 def drive_file_metadata():
