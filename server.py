@@ -407,7 +407,8 @@ except Exception:
     # gzip not available; continue without it
     pass
 
-CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
+from flask_cors import CORS
+CORS(app, resources={r"/api/*": {"origins": ["https://machineschedule.netlify.app", "http://localhost:3000"]}}, supports_credentials=True)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 
 logout_all_ts = int(os.environ.get("LOGOUT_ALL_TS", "0"))
