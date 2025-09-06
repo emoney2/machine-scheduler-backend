@@ -32,9 +32,24 @@ from flask import request, session, jsonify, redirect, url_for, make_response
 from datetime import datetime, timedelta
 
 from flask import g
-import psutil, tracemalloc, gc
+import importlib
+import tracemalloc, gc
 tracemalloc.start()
-_process = psutil.Process(os.getpid())
+psutil = None
+try:
+    spec = importlib.util.find_spec("psutil")
+    if spec:
+        psutil = importlib.import_module("psutil")
+except Exception:
+    psutil = None
+try:
+    _process = psutil.Process(os.getpid()) if psutil else None
+except Exception:
+    _process = None
+# throttle GC: collect only periodically or on large RSS deltas
+_resp_counter = 0
+_gc_every_n = int(os.environ.get("GC_EVERY_N", "25"))  # collect every N responses
+_gc_rss_threshold_mb = float(os.environ.get("GC_RSS_DELTA_MB", "32"))  # or if delta exceeds this
 
 
 
@@ -185,7 +200,7 @@ def _get_thumb_meta(file_id: str, size: str, headers: dict):
         f"https://www.googleapis.com/drive/v3/files/{file_id}"
         f"?fields=thumbnailLink,modifiedTime,md5Checksum"
     )
-    meta = requests.get(meta_url, headers=headers, timeout=20)
+    meta = requests.get(meta_url, headers=headers, timeout=6)
     if meta.status_code != 200:
         return None
 
@@ -731,7 +746,7 @@ def apply_cors(response):
 @app.before_request
 def _mem_before():
     try:
-        g._rss_before = _process.memory_info().rss
+        g._rss_before = _process.memory_info().rss if _process else None
     except Exception:
         g._rss_before = None
 
@@ -739,13 +754,18 @@ def _mem_before():
 @app.after_request
 def _mem_after(resp):
     try:
-        rss_now = _process.memory_info().rss
+        global _resp_counter
+        rss_now = _process.memory_info().rss if _process else None
         rss_before = getattr(g, "_rss_before", None)
-        if rss_before is not None:
+        if rss_before is not None and rss_now is not None:
             delta_mb = (rss_now - rss_before) / (1024 * 1024)
             app.logger.info(f"[MEM] {request.method} {request.path} Δ={delta_mb:.2f}MB rss={rss_now/1024/1024:.2f}MB")
-        # Opportunistic GC to curb fragmentation during bursts
-        gc.collect()
+        # Opportunistic GC: only occasionally or when memory jumps a lot
+        _resp_counter = (_resp_counter + 1) % max(_gc_every_n, 1)
+        if (
+            rss_before is not None and rss_now is not None and (rss_now - rss_before) / (1024 * 1024) >= _gc_rss_threshold_mb
+        ) or _resp_counter == 0:
+            gc.collect()
     except Exception:
         pass
     return resp
@@ -818,24 +838,28 @@ def drive_proxy(file_id):
             return jsonify({"error": "no_creds"}), 502
         headers = {"Authorization": f"Bearer {creds.token}"}
 
-        # Get thumbnailLink (cached metadata reduces chatter)
-        meta_url = (
-            f"https://www.googleapis.com/drive/v3/files/{file_id}"
-            f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
-        )
-        meta = requests.get(meta_url, headers=headers, timeout=6)
-        if meta.status_code != 200:
-            return jsonify({"error": "meta_failed", "code": meta.status_code}), 502
-        info = meta.json() or {}
-        thumb = info.get("thumbnailLink")
-        mime  = (info.get("mimeType") or "").lower()
+        # Try to get thumbnail metadata quickly (optional)
+        info = None
+        thumb = None
+        mime = ""
+        try:
+            meta = requests.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum",
+                headers=headers,
+                timeout=4,
+            )
+            if meta.status_code == 200:
+                info = meta.json() or {}
+                thumb = info.get("thumbnailLink")
+                mime  = (info.get("mimeType") or "").lower()
+        except Exception:
+            info = None
 
         # Prefer native Drive thumbnail if available
         if use_thumb and thumb:
             # Ensure correct size param for Drive thumbnail ("s=<px>")
             px = re.sub(r"[^0-9]", "", size) or "240"
             if "?" in thumb:
-                # normalize size
                 if re.search(r"[?&](sz|s)=", thumb):
                     thumb = re.sub(r"([?&])(sz|s)=\d+", rf"\1s={px}", thumb)
                 else:
@@ -843,7 +867,7 @@ def drive_proxy(file_id):
             else:
                 thumb = f"{thumb}?s={px}"
 
-            img = requests.get(thumb, headers=headers, timeout=20)
+            img = requests.get(thumb, headers=headers, timeout=10)
             if img.status_code == 200 and img.content:
                 if v_param:
                     # Save to disk cache
@@ -2776,6 +2800,12 @@ def save_links():
 @login_required_session
 def get_combined():
     try:
+        # Micro-cache combined payload to flatten load spikes
+        global _orders_cache, _orders_ts
+        now = time.time()
+        if _orders_cache is not None and (now - _orders_ts) < 20:
+            return jsonify(_orders_cache), 200
+
         svc = get_sheets_service().spreadsheets().values()
 
         # 1) Primary fetch: whatever ORDERS_RANGE is set to
@@ -2826,7 +2856,10 @@ def get_combined():
         orders_full = rows_to_dicts(orders_rows)
 
         # 5) Return everything (let the UI pick columns); this avoids empty lists due to header mismatches
-        return jsonify({"orders": orders_full, "links": _links_store}), 200
+        payload = {"orders": orders_full, "links": _links_store}
+        _orders_cache = payload
+        _orders_ts = now
+        return jsonify(payload), 200
 
     except Exception:
         logger.exception("Error building /api/combined")
@@ -2852,6 +2885,10 @@ def get_manual_state():
     """
     global _manual_state_cache, _manual_state_ts
     now = time.time()
+
+    # Micro-cache manual state for 20s to reduce sheet reads
+    if _manual_state_cache is not None and (_manual_state_ts and (now - _manual_state_ts) < 20):
+        return jsonify(_manual_state_cache), 200
 
     try:
         # 1) Read Manual State rows (A2:Z) and parse machine columns (I–Z)
@@ -4211,14 +4248,14 @@ def set_product_specs():
         "N": data.get("volume", ""),          # Volume
     }
 
-    # 3) Write each one cell
+    # 3) Write each one cell (correct range per target column)
     for col, val in updates.items():
         target = f"Table!{col}{row_index}"
         sheet.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"Material Inventory!A{target_row}:P{target_row}",  # <- now includes column P
+            range=target,
             valueInputOption="USER_ENTERED",
-            body={"values": [inventory_row]}
+            body={"values": [[val]]}
         ).execute()
 
     return jsonify({"status": "ok"}), 200
