@@ -2082,8 +2082,8 @@ def update_embroidery_start_time_in_sheet(order_id, new_start_time):
             n = idx0 + 1
             s = ""
             while n:
-                n, rem = divmod(n - 1, 26)
-                s = chr(65 + rem) + s
+                n, r = divmod(n - 1, 26)
+                s = chr(65 + r) + s
             return s
 
         start_col_a1 = col_to_a1(start_idx)
@@ -2412,10 +2412,8 @@ def overview_materials_needed():
         ).execute()
         vals = resp.get("values", [])
         lines = [str(r[0]).strip() for r in vals if r and str(r[0]).strip()]
-
         grouped = {}
         for s in lines:
-            # Split "Item Qty Unit - Vendor"
             vendor = "Misc."
             left = s
             if " - " in s:
@@ -3551,201 +3549,83 @@ def add_materials():
     for it in items:
         name    = it.get("materialName","").strip()
         unit    = it.get("unit","").strip()
-        mininv  = it.get("minInv","").strip()
-        reorder = it.get("reorder","").strip()
-        cost    = it.get("cost","").strip()
+        mininv  = it.get("minInv",  "").strip()
+        reorder = it.get("reorder", "").strip()
+        cost    = it.get("cost",    "").strip()  # not used for threads per request
+        action  = it.get("action",  "").strip()  # "Ordered" / "Received"
+        qty_raw = it.get("quantity","")
 
-        if not name:
+        # must have name and quantity to do anything
+        if not (name and quantity):
             continue
 
-        # rewrite the row references in each formula
-        formulaB = rawB.replace("2", str(next_row))
-        formulaC = rawC.replace("2", str(next_row))
-        formulaH = rawH.replace("2", str(next_row))
+        if type_ == "Material":
+            # === MATERIAL: add to Material Inventory if new, always log to Material Log ===
+            is_new = name.lower() not in existing_mats
+            if is_new:
+                target = first_blank_row(mat_rows)
 
-        inv_rows.append([
-            name,       # A
-            formulaB,   # B: uses rawB but with "2"→next_row
-            formulaC,   # C: same
-            unit,       # D: user entry
-            mininv,     # E
-            reorder,    # F
-            cost,       # G
-            formulaH    # H: uses rawH but with "2"→next_row
-        ])
+                # build formulas for the new target row
+                inv_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_inv_tpl)
+                oo_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_oo_tpl)
+                val_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_val_tpl)
 
-        next_row += 1
-    # end for
+                row_vals = [[
+                    name, inv_f, oo_f, unit,
+                    min_inv, reorder, cost, val_f
+                ]]
 
-    # append the rows you’ve built
-    if inv_rows:
-        sheets.values().append(
+                # write the new inventory row
+                sheet.update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"Material Inventory!A{target}:H{target}",
+                    valueInputOption="USER_INPUT",
+                    body={"values": row_vals}
+                ).execute()
+
+                # keep in-memory sets/rows up to date for subsequent items
+                existing_mats.add(name.lower())
+                while len(mat_rows) < target - 1:
+                    mat_rows.append([])
+                mat_rows.append([name])
+
+            # ALWAYS log the material movement (even if not new)
+            material_log_rows.append([timestamp, "", "", "", "", name, str(qty_raw).strip(), "IN", action])
+
+        else:
+            # === THREAD: DO NOT write to "Thread Inventory"; ONLY log to "Thread Data" ===
+            try:
+                cones = int(str(qty_raw).strip())
+                feet  = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
+            except Exception:
+                feet = ""
+
+            thread_log_rows.append(
+                build_thread_log_row(timestamp, name, feet, action)
+            )
+
+    # 6) Append to logs
+    if material_log_rows:
+        sheet.append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A2:H",
+            range="Material Log!A2:I",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": inv_rows}
-        ).execute(); invalidate_upcoming_cache()
+            body={"values": material_log_rows}
+        ).execute()
 
-    return jsonify({"status":"submitted"}), 200
-
-
-# ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
-@app.route("/api/materialInventory", methods=["OPTIONS"])
-def material_inventory_preflight():
-    return make_response("", 204)
-
-# ─── MATERIAL-LOG POST ────────────────────────────────────────────────────
-@app.route("/api/materialInventory", methods=["POST"])
-@login_required_session
-def submit_material_inventory():
-    """
-    Handles adding new materials to Material Inventory (cols A–H),
-    copying row 2 formulas dynamically, and logging:
-      - Materials -> Material Log
-      - Threads   -> Thread Data (by header name; NO writes to Thread Inventory)
-    """
-    try:
-        # 1) Parse incoming payload
-        items = request.get_json(silent=True) or []
-        items = items if isinstance(items, list) else [items]
-
-        sheet = sheets.values()
-        timestamp = datetime.now(ZoneInfo("America/New_York")) \
-            .strftime("%-m/%-d/%Y %H:%M:%S")
-
-        material_log_rows = []
-        thread_log_rows   = []
-
-        # ========= Material Inventory setup (unchanged behavior) =========
-        # 2) Fetch row 2 formulas for Material Inventory (A2:H2)
-        mat_formula = sheet.get(
+    if thread_log_rows:
+        # Write against a wide range so rows match header width even if columns move
+        sheet.append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A2:H2",
-            valueRenderOption="FORMULA"
-        ).execute().get("values", [[]])[0]
-        mat_inv_tpl  = str(mat_formula[1]) if len(mat_formula) > 1 else ""
-        mat_oo_tpl   = str(mat_formula[2]) if len(mat_formula) > 2 else ""
-        mat_val_tpl  = str(mat_formula[7]) if len(mat_formula) > 7 else ""
+            range="Thread Data!A2:Z",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": thread_log_rows}
+        ).execute()
 
-        # 3) Fetch existing rows for Material Inventory
-        mat_rows = sheet.get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A1:H1000"
-        ).execute().get("values", [])[1:]  # skip header
-        existing_mats = {r[0].strip().lower() for r in mat_rows if r and r[0].strip()}
+    return jsonify({"status": "submitted"}), 200
 
-        # Helper: find first blank row (1-based index + header) in a sheet's col A
-        def first_blank_row(rows):
-            return next((i + 2 for i, r in enumerate(rows)
-                         if not r or not (r[0].strip() if len(r) > 0 else "")),
-                        len(rows) + 2)
-
-        # ========= Thread Data header-based mapping =========
-        # Fetch Thread Data headers so we can place values by name
-        td_rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
-        td_headers = td_rows[0] if td_rows else []
-        td_idx = {h: i for i, h in enumerate(td_headers)}
-
-        def build_thread_log_row(dt, color, feet, action):
-            """Map values into a row aligned to Thread Data headers."""
-            row = [""] * len(td_headers)
-            if "Date" in td_idx:         row[td_idx["Date"]] = dt
-            if "Color" in td_idx:        row[td_idx["Color"]] = color
-            if "Length (ft)" in td_idx:  row[td_idx["Length (ft)"]] = feet
-            if "IN/OUT" in td_idx:       row[td_idx["IN/OUT"]] = "IN"
-            if "O/R" in td_idx:          row[td_idx["O/R"]] = action  # Ordered/Received
-            return row
-
-        # 5) Process each item
-        for it in items:
-            name    = (it.get("materialName") or it.get("value") or "").strip()
-            type_   = (it.get("type") or "").strip() or "Material"
-            unit    = it.get("unit",    "").strip()
-            min_inv = it.get("minInv",  "").strip()
-            reorder = it.get("reorder", "").strip()
-            cost    = it.get("cost",    "").strip()  # not used for threads per request
-            action  = it.get("action",  "").strip()  # "Ordered" / "Received"
-            qty_raw = it.get("quantity","")
-
-            # must have name and quantity to do anything
-            if not (name and str(qty_raw).strip()):
-                continue
-
-            if type_ == "Material":
-                # === MATERIAL: add to Material Inventory if new, always log to Material Log ===
-                is_new = name.lower() not in existing_mats
-                if is_new:
-                    target = first_blank_row(mat_rows)
-
-                    # build formulas for the new target row
-                    inv_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_inv_tpl)
-                    oo_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_oo_tpl)
-                    val_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_val_tpl)
-
-                    row_vals = [[
-                        name, inv_f, oo_f, unit,
-                        min_inv, reorder, cost, val_f
-                    ]]
-
-                    # write the new inventory row
-                    sheet.update(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range=f"Material Inventory!A{target}:H{target}",
-                        valueInputOption="USER_INPUT",
-                        body={"values": row_vals}
-                    ).execute()
-
-                    # keep in-memory sets/rows up to date for subsequent items
-                    existing_mats.add(name.lower())
-                    while len(mat_rows) < target - 1:
-                        mat_rows.append([])
-                    mat_rows.append([name])
-
-                # ALWAYS log the material movement (even if not new)
-                material_log_rows.append([timestamp, "", "", "", "", name, str(qty_raw).strip(), "IN", action])
-
-            else:
-                # === THREAD: DO NOT write to "Thread Inventory"; ONLY log to "Thread Data" ===
-                try:
-                    cones = int(str(qty_raw).strip())
-                    feet  = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
-                except Exception:
-                    feet = ""
-
-                thread_log_rows.append(
-                    build_thread_log_row(timestamp, name, feet, action)
-                )
-
-        # 6) Append to logs
-        if material_log_rows:
-            sheet.append(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Material Log!A2:I",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values": material_log_rows}
-            ).execute()
-
-        if thread_log_rows:
-            # Write against a wide range so rows match header width even if columns move
-            sheet.append(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Thread Data!A2:Z",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values": thread_log_rows}
-            ).execute()
-
-        return jsonify({"status": "submitted"}), 200
-
-    except Exception as e:
-        logging.exception("❌ submit_material_inventory failed")
-        return jsonify({"error": str(e)}), 500
-
-# server.py (or routes file)
-from flask import request, jsonify
-from datetime import datetime
 
 @app.route("/api/directory-row", methods=["GET"])
 @login_required_session
@@ -3929,7 +3809,7 @@ def get_inventory_ordered():
 def mark_inventory_received():
     """
     Expects JSON:
-      { type: "Material"|"Thread", row: <number> }
+      { type: "Material"|"Thread", "row": <number> }
     Updates:
       - Column A (Date) to now
       - O/R column to "Received" (I for Material, H for Thread)
@@ -3942,6 +3822,9 @@ def mark_inventory_received():
         row = int(row)
     except:
         return jsonify({"error":"invalid row"}), 400
+
+    if not sheetType:
+        return jsonify({"error": "Missing type"}), 400
 
     # choose sheet & O/R column
     if sheetType == "Material":
@@ -3971,7 +3854,7 @@ def mark_inventory_received():
         body={"values":[["Received"]]}
     ).execute()
 
-    return jsonify({"status":"ok"}), 200
+    return jsonify({"status": "ok"}), 200
 
 @app.route("/api/inventoryOrdered/quantity", methods=["PATCH"])
 @login_required_session
@@ -4609,8 +4492,6 @@ def qbo_login():
     return redirect(auth_url)
 
 
-logger = logging.getLogger(__name__)
-
 @app.route("/qbo/callback", methods=["GET"])
 def qbo_callback():
     code  = request.args.get("code")
@@ -4805,3 +4686,8 @@ if __name__ == "__main__":
             debug=False,        # Debug off in production
             use_reloader=False  # Avoid double-start on Render
         )
+
+@app.route('/api/test-copilot', methods=['POST'])
+def test_copilot():
+    app.logger.info('Copilot test endpoint hit!')
+    return jsonify({'status': 'success', 'message': 'Copilot test endpoint hit!'})
