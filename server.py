@@ -1750,20 +1750,6 @@ def get_qbo_oauth_credentials(env_override: str = None):
     return QBO_SANDBOX_CLIENT_ID, QBO_SANDBOX_CLIENT_SECRET
 # ─────────────────────────────────────────────────────────────────
 
-# Unified Google auth: always load from GOOGLE_TOKEN_JSON or token.json via _load_google_creds
-# Unified Google auth: always load from GOOGLE_TOKEN_JSON or token.json via _load_google_creds
-creds = _load_google_creds()
-if not creds:
-    raise RuntimeError(
-        "No Google credentials. Set GOOGLE_TOKEN_JSON to your token.json contents, "
-        "or place a valid token.json on disk."
-    )
-
-# Wire clients once, using the creds from _load_google_creds
-sh = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
-service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-sheets  = service.spreadsheets()
-
 def _load_google_creds():
     """
     Load Google OAuth user credentials from:
@@ -1797,8 +1783,7 @@ def _load_google_creds():
 THREAD_IMG_DIR = os.path.join(os.path.dirname(__file__), "static", "thread-images")
 
 @app.route("/thread-images/<int:num>.<ext>", methods=["GET", "OPTIONS"])
-@login_required_session
-def serve_thread_image(num, ext):
+@login_required_sessiondef serve_thread_image(num, ext):
     ext = (ext or "").lower()
     if ext not in ("jpg", "png", "webp"):
         return make_response(("Unsupported extension", 400))
