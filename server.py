@@ -476,9 +476,12 @@ def fetch_sheet(spreadsheet_id: str, sheet_range: str):
         svc = get_sheets_service().spreadsheets().values()
         res = svc.get(spreadsheetId=spreadsheet_id, range=sheet_range).execute()
         return res.get("values", [])
-    except Exception:
+    except Exception as e:
+        if "Google Drive credentials not available" in str(e):
+            logger.error("Google credentials missing! Set GOOGLE_TOKEN_JSON or GOOGLE_TOKEN_JSON_B64 in Render environment.")
+            return {"error": "Google credentials missing. Set GOOGLE_TOKEN_JSON or GOOGLE_TOKEN_JSON_B64 in Render environment."}
         logger.exception("fetch_sheet failed for range %s", sheet_range)
-        return []
+        return {"error": str(e)}
 
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
 raw_frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
@@ -1891,11 +1894,15 @@ def api_combined():
     try:
         # Orders
         orders_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+        if isinstance(orders_rows, dict) and orders_rows.get("error"):
+            return jsonify({"error": orders_rows["error"], "orders": [], "embroideryList": [], "links": {}}), 500
         orders_headers = orders_rows[0] if orders_rows else []
         orders = [dict(zip(orders_headers, r)) for r in orders_rows[1:]] if orders_rows else []
 
         # Embroidery list
         emb_rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
+        if isinstance(emb_rows, dict) and emb_rows.get("error"):
+            return jsonify({"error": emb_rows["error"], "orders": [], "embroideryList": [], "links": {}}), 500
         emb_headers = emb_rows[0] if emb_rows else []
         embroidery_list = [dict(zip(emb_headers, r)) for r in emb_rows[1:]] if emb_rows else []
 
@@ -1907,9 +1914,9 @@ def api_combined():
             "embroideryList": embroidery_list,
             "links": links,
         }), 200
-    except Exception:
+    except Exception as e:
         logger.exception("/api/combined failed")
-        return jsonify({"orders": [], "embroideryList": [], "links": {}}), 200
+        return jsonify({"error": str(e), "orders": [], "embroideryList": [], "links": {}}), 500
 
 
 @app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
@@ -1965,50 +1972,49 @@ def on_connect():
     logger.info(f"Client connected: {request.sid}")
 
 @socketio.on("disconnect")
-def on_disconnect():
-    logger.info(f"Client disconnected: {request.sid}")
+def get_manual_state():
+    global _manual_state_cache, _manual_state_ts
+    now = time.time()
+    if _manual_state_cache is not None and (now - _manual_state_ts) < CACHE_TTL:
+        return jsonify(_manual_state_cache), 200
 
-# ─── Run ────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    # --- Startup banner ---
-    print("🚀 JRCO server.py loaded and running...")
-    print("📡 Available Flask Routes:")
-    for rule in app.url_map.iter_rules():
-        print("✅", rule)
+    try:
+        resp = fetch_sheet(SPREADSHEET_ID, MANUAL_RANGE)
+        if isinstance(resp, dict) and resp.get("error"):
+            return jsonify({"error": resp["error"], "machineColumns": [], "placeholders": []}), 500
+        rows = resp
 
-    # Prefer explicit port from env (Render sets PORT)
-    port = int(os.environ.get("PORT", 10000))
-    logger.info(f"Starting on port {port}")
+        for i in range(len(rows)):
+            while len(rows[i]) < 26:
+                rows[i].append("")
 
-    # Optional one-off Google OAuth token generation
-    if os.environ.get("GENERATE_GOOGLE_TOKEN", "false").lower() == "true":
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        SCOPES = [
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/spreadsheets",
-        ]
-        flow = InstalledAppFlow.from_client_secrets_file("oauth-credentials.json", SCOPES)
-        creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
-        print("✅ token.json created successfully.")
-    else:
-        # IMPORTANT: run via SocketIO so websockets work in production.
-        # Make sure your SocketIO was created with the path you expect, e.g.:
-        # socketio = SocketIO(app, cors_allowed_origins=[FRONTEND_URL], async_mode="eventlet", path="/socket.io")
-        socketio.run(
-            app,
-            host="0.0.0.0",
-            port=port,
-            debug=False,        # Debug off in production
-            use_reloader=False  # Avoid double-start on Render
-        )
+        first = rows[0] if rows else [""] * 26
+        machines = first[8:26]
+        machine_columns = [[s for s in (col or "").split(",") if s] for col in machines]
 
-@app.route('/api/test-copilot', methods=['POST'])
-def test_copilot():
-    app.logger.info('Copilot test endpoint hit!')
-    return jsonify({'status': 'success', 'message': 'Copilot test endpoint hit!'})
+        phs = []
+        for r in rows:
+            if (r[0] or "").strip():
+                phs.append({
+                    "id":          r[0],
+                    "company":     r[1] if len(r) > 1 else "",
+                    "quantity":    r[2] if len(r) > 2 else "",
+                    "stitchCount": r[3] if len(r) > 3 else "",
+                    "inHand":      r[4] if len(r) > 4 else "",
+                    "dueType":     r[5] if len(r) > 5 else "",
+                    "fieldG":      r[6] if len(r) > 6 else "",
+                    "fieldH":      r[7] if len(r) > 7 else "",
+                })
 
+        result = {"machineColumns": machine_columns[:2], "placeholders": phs}
+        _manual_state_cache = result
+        _manual_state_ts = now
+        return jsonify(result), 200
+    except Exception as e:
+        logger.exception("Error reading manual state")
+        if _manual_state_cache:
+            return jsonify(_manual_state_cache), 200
+        return jsonify({"error": str(e), "machineColumns": [], "placeholders": []}), 500
 
 @app.route('/api/sheet-update', methods=['POST'])
 def sheet_update_webhook():
