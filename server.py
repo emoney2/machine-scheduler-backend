@@ -392,6 +392,60 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 
 logout_all_ts = int(os.environ.get("LOGOUT_ALL_TS", "0"))
 
+# === Tiny TTL cache & ETag helper ============================================
+import hashlib, threading
+_cache_lock = threading.Lock()
+_json_cache = {}  # key -> {'ts': float, 'ttl': int, 'etag': str, 'data': bytes}
+
+def _cache_get(key):
+    now = time.time()
+    with _cache_lock:
+        ent = _json_cache.get(key)
+        if ent and (now - ent['ts'] < ent['ttl']):
+            return ent
+        return None
+
+def _cache_set(key, payload_bytes, ttl):
+    etag = 'W/"%s"' % hashlib.sha1(payload_bytes).hexdigest()
+    with _cache_lock:
+        _json_cache[key] = {'ts': time.time(), 'ttl': ttl, 'etag': etag, 'data': payload_bytes}
+    return etag
+
+def _maybe_304(etag):
+    inm = request.headers.get("If-None-Match", "")
+    return (etag and inm and etag in inm)
+
+def send_cached_json(key, ttl, payload_obj_builder):
+    """
+    If cached and fresh, return cached (and 304 on ETag match).
+    Otherwise build payload, cache, and send with ETag.
+    """
+    ent = _cache_get(key)
+    if ent and _maybe_304(ent['etag']):
+        resp = make_response("", 304)
+        resp.headers["ETag"] = ent['etag']
+        resp.headers["Cache-Control"] = f"public, max-age={ttl}"
+        return resp
+
+    if ent:
+        # Serve hot cache quickly
+        resp = Response(ent['data'], mimetype="application/json")
+        resp.headers["ETag"] = ent['etag']
+        resp.headers["Cache-Control"] = f"public, max-age={ttl}"
+        return resp
+
+    # Build fresh payload
+    started = time.time()
+    payload_obj = payload_obj_builder()
+    payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+    etag = _cache_set(key, payload_bytes, ttl)
+    resp = Response(payload_bytes, mimetype="application/json")
+    resp.headers["ETag"] = etag
+    resp.headers["Cache-Control"] = f"public, max-age={ttl}"
+    resp.headers["X-Debug-BuildMs"] = str(int((time.time()-started)*1000))
+    return resp
+
+
 def login_required_session(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -1968,6 +2022,9 @@ _overview_cache     = None
 _overview_ts        = 0
 _jobs_company_cache = {}   # { company_lower: {"ts": <epoch>, "data": {...}} }
 
+# combined: micro-cache + timestamp
+_combined_cache = None
+_combined_ts    = 0.0
 
 # ID-column cache for updateStartTime
 _id_cache           = None
@@ -1989,6 +2046,13 @@ SERVICE_TTL     = 900  # 15 minutes
 # ────────────────────────────────────────────────────────────────────────────
 
 # ---- helpers: clear overview caches ----------------------------------------
+# ─── ETag helper (weak ETag based on JSON bytes) ─────────────────────────────
+def _json_etag(payload_bytes: bytes) -> str:
+    import hashlib as _hashlib
+    return 'W/"%s"' % _hashlib.sha1(payload_bytes).hexdigest()
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def invalidate_materials_needed_cache():
     global _materials_needed_cache, _materials_needed_ts
     _materials_needed_cache = None
@@ -2156,7 +2220,18 @@ def overview_combined():
     global _overview_cache, _overview_ts
     now = time.time()
     if _overview_cache is not None and (now - _overview_ts) < 15:
-        return jsonify(_overview_cache), 200
+        payload_bytes = json.dumps(_overview_cache, separators=(",", ":")).encode("utf-8")
+        etag = _json_etag(payload_bytes)
+        inm = request.headers.get("If-None-Match", "")
+        if etag and inm and etag in inm:
+            resp = make_response("", 304)
+            resp.headers["ETag"] = etag
+            resp.headers["Cache-Control"] = "public, max-age=15"
+            return resp
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "public, max-age=15"
+        return resp
 
     try:
         # Pull both ranges in one locked request
@@ -2279,15 +2354,30 @@ def overview_combined():
         resp_data = {"upcoming": upcoming, "materials": materials}
         _overview_cache = resp_data
         _overview_ts = now
-        return jsonify(resp_data), 200
+        payload_bytes = json.dumps(resp_data, separators=(",", ":")).encode("utf-8")
+        etag = _json_etag(payload_bytes)
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "public, max-age=15"
+        return resp
 
     except Exception:
         # Log and fall back to last good payload if we have one
         app.logger.exception("overview_combined failed")
         if _overview_cache is not None:
-            return jsonify(_overview_cache), 200
-        return jsonify({"upcoming": [], "materials": []}), 200
-
+            payload_bytes = json.dumps(_overview_cache, separators=(",", ":")).encode("utf-8")
+            etag = _json_etag(payload_bytes)
+            resp = Response(payload_bytes, mimetype="application/json")
+            resp.headers["ETag"] = etag
+            resp.headers["Cache-Control"] = "public, max-age=15"
+            return resp
+        fallback = {"upcoming": [], "materials": []}
+        payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
+        etag = _json_etag(payload_bytes)
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "public, max-age=15"
+        return resp
 
 import traceback
 from googleapiclient.errors import HttpError
@@ -2775,8 +2865,26 @@ def save_links():
 @app.route("/api/combined", methods=["GET"])
 @login_required_session
 def get_combined():
+    # 20s micro-cache (+ ETag/304)
+    global _combined_cache, _combined_ts
+    now = time.time()
+    if _combined_cache is not None and (now - _combined_ts) < 20:
+        payload_bytes = json.dumps(_combined_cache, separators=(",", ":")).encode("utf-8")
+        etag = _json_etag(payload_bytes)
+        inm = request.headers.get("If-None-Match", "")
+        if etag and inm and etag in inm:
+            resp = make_response("", 304)
+            resp.headers["ETag"] = etag
+            resp.headers["Cache-Control"] = "public, max-age=20"
+            return resp
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "public, max-age=20"
+        return resp
+
     try:
         svc = get_sheets_service().spreadsheets().values()
+
 
         # 1) Primary fetch: whatever ORDERS_RANGE is set to
         with sheet_lock:
@@ -2826,7 +2934,16 @@ def get_combined():
         orders_full = rows_to_dicts(orders_rows)
 
         # 5) Return everything (let the UI pick columns); this avoids empty lists due to header mismatches
-        return jsonify({"orders": orders_full, "links": _links_store}), 200
+        resp_data = {"orders": orders_full, "links": _links_store}
+        _combined_cache = resp_data
+        _combined_ts = now
+        payload_bytes = json.dumps(resp_data, separators=(",", ":")).encode("utf-8")
+        etag = _json_etag(payload_bytes)
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "public, max-age=20"
+        return resp
+
 
     except Exception:
         logger.exception("Error building /api/combined")
