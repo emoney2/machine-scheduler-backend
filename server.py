@@ -1,4 +1,5 @@
 import eventlet
+ # Simple edit for commit test - Copilot was here
 eventlet.monkey_patch()
 from eventlet import debug
 debug.hub_prevent_multiple_readers(False)
@@ -940,6 +941,7 @@ def serve_label(filename):
         return abort(404)
     # Let browser open in a new tab for printing
     return send_from_directory(tmp, safe, as_attachment=False)
+
 
 def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers, env_override=None):
     """
