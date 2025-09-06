@@ -398,6 +398,7 @@ FRONTEND_URL = raw_frontend.strip()
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins=[FRONTEND_URL], async_mode="eventlet", path="/socket.io")
 # Optional GZIP compression (safe if package missing)
 try:
     from flask_compress import Compress
