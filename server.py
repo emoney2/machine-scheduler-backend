@@ -924,7 +924,11 @@ def drive_proxy(file_id):
 
 @app.route("/api/ping", methods=["GET", "OPTIONS"])
 def api_ping():
-    return jsonify({"ok": True}), 200
+    try:
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        logger.error(f"Error in /api/ping: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 502
 
 @app.route("/labels/<path:filename>")
 def serve_label(filename):
@@ -2888,9 +2892,9 @@ def get_combined():
         _orders_ts = now
         return jsonify(payload), 200
 
-    except Exception:
-        logger.exception("Error building /api/combined")
-        return jsonify({"orders": [], "links": {}}), 200
+    except Exception as e:
+        logger.error(f"Error building /api/combined: {e}", exc_info=True)
+        return jsonify({"error": str(e), "orders": [], "links": {}}), 502
 
 
 @socketio.on("placeholdersUpdated")
