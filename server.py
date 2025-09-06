@@ -1875,7 +1875,7 @@ def drive_make_public():
 # ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
 sheet_lock = Semaphore(1)
 SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
-ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1,B1,C1,D1,E1,F1,G1,H1,I1,J1,K1,L1,M1,N1,O1,P1,Q1,R1,S1,T1,U1,V1,W1,X1,Y1,Z1,AA1,AB1,AC1,AD1,AE1,AF1,AG1,AH1,AI1,AJ1,AK1,AL1,AM1,A2:AM")
+ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
