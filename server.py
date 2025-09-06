@@ -2193,9 +2193,14 @@ def overview_combined():
     """
     # 15s micro-cache
     global _overview_cache, _overview_ts
+
     now = time.time()
+    t0 = time.time()
     if _overview_cache is not None and (now - _overview_ts) < 15:
+        app.logger.info(f"[CACHE] /api/overview cache HIT ({time.time()-t0:.2f}s)")
         return jsonify(_overview_cache), 200
+
+    app.logger.info(f"[CACHE] /api/overview cache MISS ({time.time()-t0:.2f}s), fetching sheet...")
 
     try:
         # Pull both ranges in one locked request
