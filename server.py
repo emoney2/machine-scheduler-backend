@@ -1905,5 +1905,5 @@ def test_copilot():
 @app.route('/api/sheet-update', methods=['POST'])
 def sheet_update_webhook():
     app.logger.info('Received Google Sheet update webhook')
-    socketio.emit('sheet_updated', {'message': 'Sheet data updated'}, broadcast=True)
+    socketio.emit('sheet_updated', {'message': 'Sheet data updated'})
     return jsonify({'status': 'success', 'message': 'Webhook received'})
