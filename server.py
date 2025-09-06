@@ -1783,7 +1783,8 @@ def _load_google_creds():
 THREAD_IMG_DIR = os.path.join(os.path.dirname(__file__), "static", "thread-images")
 
 @app.route("/thread-images/<int:num>.<ext>", methods=["GET", "OPTIONS"])
-@login_required_sessiondef serve_thread_image(num, ext):
+@login_required_session
+def serve_thread_image(num, ext):
     ext = (ext or "").lower()
     if ext not in ("jpg", "png", "webp"):
         return make_response(("Unsupported extension", 400))
