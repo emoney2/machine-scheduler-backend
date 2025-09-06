@@ -2379,7 +2379,7 @@ def prepare_shipment():
             except:
                 ship_qty = 0
 
-            # parse physical dimensions (in inches) from your sheet
+            # parse physical dimensions (inches) from your sheet
             length = float(row_dict.get("Length", 0)   or 0)
             width  = float(row_dict.get("Width",  0)   or 0)
             height = float(row_dict.get("Height", 0)   or 0)
@@ -3100,10 +3100,12 @@ def get_directory():
         rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A")
         # flatten and filter out empty cells
         companies = [r[0] for r in rows if r and r[0].strip()]
-        return jsonify(companies), 200
+        companies.sort()
+
+        return jsonify({"companies": companies})
     except Exception:
         logger.exception("Error fetching directory")
-        return jsonify([]), 200
+        return jsonify({"companies": []})
 
 @app.route("/api/directory", methods=["POST"])
 @login_required_session
@@ -3362,8 +3364,7 @@ def add_materials():
     rawC = get_formula("C")
     rawH = get_formula("H")
 
-    now      = datetime.now(ZoneInfo("America/New_York"))\
-                    .strftime("%-m/%-d/%Y %H:%M:%S")
+    now      = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
     inv_rows = []
     
     # find where row 2 starts, so we can compute new rows dynamically
@@ -4530,6 +4531,7 @@ def sheet_update_webhook():
     except Exception as e:
         app.logger.error(f"SocketIO emit failed: {e}")
     return jsonify({'status': 'success', 'message': 'Webhook received'})
+
 def _load_google_creds():
     """
     Load Google OAuth user credentials from:
