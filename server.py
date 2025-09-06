@@ -2817,9 +2817,14 @@ def get_combined():
     try:
         # Micro-cache combined payload to flatten load spikes
         global _orders_cache, _orders_ts
+
         now = time.time()
+        t0 = time.time()
         if _orders_cache is not None and (now - _orders_ts) < 20:
+            app.logger.info(f"[CACHE] /api/combined cache HIT ({time.time()-t0:.2f}s)")
             return jsonify(_orders_cache), 200
+
+        app.logger.info(f"[CACHE] /api/combined cache MISS ({time.time()-t0:.2f}s), fetching sheet...")
 
         svc = get_sheets_service().spreadsheets().values()
 
@@ -2901,9 +2906,14 @@ def get_manual_state():
     global _manual_state_cache, _manual_state_ts
     now = time.time()
 
+
+    t0 = time.time()
     # Micro-cache manual state for 20s to reduce sheet reads
     if _manual_state_cache is not None and (_manual_state_ts and (now - _manual_state_ts) < 20):
+        app.logger.info(f"[CACHE] /api/manualState cache HIT ({time.time()-t0:.2f}s)")
         return jsonify(_manual_state_cache), 200
+
+    app.logger.info(f"[CACHE] /api/manualState cache MISS ({time.time()-t0:.2f}s), fetching sheet...")
 
     try:
         # 1) Read Manual State rows (A2:Z) and parse machine columns (I–Z)
