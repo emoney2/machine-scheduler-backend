@@ -1,12 +1,8 @@
 import eventlet
- # Simple edit for commit test - Copilot was here
 eventlet.monkey_patch()
 from eventlet import debug
 debug.hub_prevent_multiple_readers(False)
 
-eventlet.monkey_patch()
-from eventlet import debug
-debug.hub_prevent_multiple_readers(False)
 # ─── Imports & Logger Setup ─────────────────────────────────────────────────
 import os
 import json
@@ -36,24 +32,9 @@ from flask import request, session, jsonify, redirect, url_for, make_response
 from datetime import datetime, timedelta
 
 from flask import g
-import importlib
-import tracemalloc, gc
+import psutil, tracemalloc, gc
 tracemalloc.start()
-psutil = None
-try:
-    spec = importlib.util.find_spec("psutil")
-    if spec:
-        psutil = importlib.import_module("psutil")
-except Exception:
-    psutil = None
-try:
-    _process = psutil.Process(os.getpid()) if psutil else None
-except Exception:
-    _process = None
-# throttle GC: collect only periodically or on large RSS deltas
-_resp_counter = 0
-_gc_every_n = int(os.environ.get("GC_EVERY_N", "25"))  # collect every N responses
-_gc_rss_threshold_mb = float(os.environ.get("GC_RSS_DELTA_MB", "32"))  # or if delta exceeds this
+_process = psutil.Process(os.getpid())
 
 
 
@@ -137,14 +118,6 @@ def _hdr_idx(headers):
         d[k] = i
     return d
 
-# ─── Sheet/Drive IDs & Ranges ────────────────────────────────────────────────
-# Define these early so helpers below can reference them
-SPREADSHEET_ID     = os.environ.get("SPREADSHEET_ID", "")
-ORDERS_RANGE       = os.environ.get("ORDERS_RANGE", "Orders!A1:Z")
-EMBROIDERY_RANGE   = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:Z")
-MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:Z")
-MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_CLEAR_RANGE", MANUAL_RANGE)
-
 def get_vendor_directory():
     """Reads Vendors!A1:E → { vendor_name: {method,email,cc,website} }"""
     svc = get_sheets_service().spreadsheets().values()
@@ -212,7 +185,7 @@ def _get_thumb_meta(file_id: str, size: str, headers: dict):
         f"https://www.googleapis.com/drive/v3/files/{file_id}"
         f"?fields=thumbnailLink,modifiedTime,md5Checksum"
     )
-    meta = requests.get(meta_url, headers=headers, timeout=6)
+    meta = requests.get(meta_url, headers=headers, timeout=20)
     if meta.status_code != 200:
         return None
 
@@ -351,43 +324,6 @@ def _ensure_token_json():
     except Exception:
         return False
 
-def _load_google_creds():
-    """
-    Load Google OAuth user credentials from env var or token.json, refresh if needed.
-    Returns a google.oauth2.credentials.Credentials or None.
-    """
-    try:
-        raw = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
-        info = None
-        if raw:
-            try:
-                info = json.loads(raw)
-            except Exception:
-                # raw might be base64
-                try:
-                    info = json.loads(base64.b64decode(raw).decode("utf-8"))
-                except Exception:
-                    info = None
-        creds = None
-        if info:
-            creds = Credentials.from_authorized_user_info(info, SCOPES)
-        elif os.path.exists(GOOGLE_TOKEN_PATH):
-            creds = Credentials.from_authorized_user_file(GOOGLE_TOKEN_PATH, SCOPES)
-        if creds and creds.expired and getattr(creds, "refresh_token", None):
-            try:
-                creds.refresh(GoogleRequest())
-                # persist refreshed token
-                try:
-                    with open(GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
-                        f.write(creds.to_json())
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        return creds
-    except Exception:
-        return None
-
 START_TIME_COL_INDEX = 27
 
 from google.oauth2.credentials import Credentials as OAuthCredentials
@@ -400,31 +336,6 @@ SCOPES = [
 QBO_SCOPE = ["com.intuit.quickbooks.accounting"]
 QBO_AUTH_BASE_URL = "https://appcenter.intuit.com/connect/oauth2"
 
-# ─── QuickBooks helpers and constants (minimal stubs to satisfy references) ───
-QBO_ENV = os.environ.get("QBO_ENV", "production")
-QBO_TOKEN_URL = os.environ.get(
-    "QBO_TOKEN_URL",
-    "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
-)
-
-def get_base_qbo_url(env_override=None):
-    env = (env_override or QBO_ENV or "").lower()
-    is_prod = env in ("prod", "production", "live")
-    return (
-        "https://quickbooks.api.intuit.com" if is_prod else "https://sandbox-quickbooks.api.intuit.com"
-    )
-
-def get_qbo_oauth_credentials(env_override=None):
-    env = (env_override or QBO_ENV or "").lower()
-    is_prod = env in ("prod", "production", "live")
-    if is_prod:
-        client_id = os.environ.get("QBO_PROD_CLIENT_ID") or os.environ.get("QBO_CLIENT_ID")
-        client_secret = os.environ.get("QBO_PROD_CLIENT_SECRET") or os.environ.get("QBO_CLIENT_SECRET")
-    else:
-        client_id = os.environ.get("QBO_SANDBOX_CLIENT_ID") or os.environ.get("QBO_CLIENT_ID")
-        client_secret = os.environ.get("QBO_SANDBOX_CLIENT_SECRET") or os.environ.get("QBO_CLIENT_SECRET")
-    return client_id, client_secret
-
 def get_oauth_credentials():
     # Uses the env-aware loader you added earlier, which checks:
     # 1) GOOGLE_TOKEN_JSON env var, then 2) GOOGLE_TOKEN_PATH (token.json)
@@ -435,31 +346,26 @@ def get_oauth_credentials():
 
 def get_sheets_service():
     import time as _t
-    ttl = int(os.environ.get("SERVICE_TTL", "30"))
-    global _sheets_service, _sheets_ts
-    if '_sheets_service' not in globals():
-        _sheets_service = None
-        _sheets_ts = 0
-    if _sheets_service and (_t.time() - _sheets_ts) < ttl:
+    global _sheets_service, _service_ts
+    if _sheets_service and (_t.time() - _service_ts) < SERVICE_TTL:
         return _sheets_service
     creds = get_oauth_credentials()
     _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    _sheets_ts = _t.time()
+    _service_ts = _t.time()
     return _sheets_service
 
 def get_drive_service():
     import time as _t
-    ttl = int(os.environ.get("SERVICE_TTL", "30"))
-    global _drive_service, _drive_ts
-    if '_drive_service' not in globals():
-        _drive_service = None
-        _drive_ts = 0
-    if _drive_service and (_t.time() - _drive_ts) < ttl:
+    global _drive_service, _service_ts
+    if _drive_service and (_t.time() - _service_ts) < SERVICE_TTL:
         return _drive_service
     creds = get_oauth_credentials()
     _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    _drive_ts = _t.time()
+    _service_ts = _t.time()
     return _drive_service
+
+
+# ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
@@ -467,29 +373,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Caches and Sheet Helpers ───────────────────────────────────────────────
-# Default cache TTL for certain endpoints
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "10"))
-
-def fetch_sheet(spreadsheet_id: str, sheet_range: str):
-    try:
-        svc = get_sheets_service().spreadsheets().values()
-        res = svc.get(spreadsheetId=spreadsheet_id, range=sheet_range).execute()
-        return res.get("values", [])
-    except Exception as e:
-        if "Google Drive credentials not available" in str(e):
-            logger.error("Google credentials missing! Set GOOGLE_TOKEN_JSON or GOOGLE_TOKEN_JSON_B64 in Render environment.")
-            return {"error": "Google credentials missing. Set GOOGLE_TOKEN_JSON or GOOGLE_TOKEN_JSON_B64 in Render environment."}
-        logger.exception("fetch_sheet failed for range %s", sheet_range)
-        return {"error": str(e)}
-
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
 raw_frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
 FRONTEND_URL = raw_frontend.strip()
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins=[FRONTEND_URL], async_mode="eventlet", path="/socket.io")
 # Optional GZIP compression (safe if package missing)
 try:
     from flask_compress import Compress
@@ -498,8 +387,7 @@ except Exception:
     # gzip not available; continue without it
     pass
 
-from flask_cors import CORS
-CORS(app, resources={r"/api/*": {"origins": ["https://machineschedule.netlify.app", "http://localhost:3000"]}}, supports_credentials=True)
+CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 
 logout_all_ts = int(os.environ.get("LOGOUT_ALL_TS", "0"))
@@ -834,8 +722,7 @@ def apply_cors(response):
     }
     if origin in allowed:
         response.headers["Access-Control-Allow-Origin"] = origin
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Vary"] = "Origin"
+        response.headers["Vary"] = "Origin"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
     return response  # short-circuit OPTIONS
@@ -844,7 +731,7 @@ def apply_cors(response):
 @app.before_request
 def _mem_before():
     try:
-        g._rss_before = _process.memory_info().rss if _process else None
+        g._rss_before = _process.memory_info().rss
     except Exception:
         g._rss_before = None
 
@@ -852,18 +739,13 @@ def _mem_before():
 @app.after_request
 def _mem_after(resp):
     try:
-        global _resp_counter
-        rss_now = _process.memory_info().rss if _process else None
+        rss_now = _process.memory_info().rss
         rss_before = getattr(g, "_rss_before", None)
-        if rss_before is not None and rss_now is not None:
+        if rss_before is not None:
             delta_mb = (rss_now - rss_before) / (1024 * 1024)
             app.logger.info(f"[MEM] {request.method} {request.path} Δ={delta_mb:.2f}MB rss={rss_now/1024/1024:.2f}MB")
-        # Opportunistic GC: only occasionally or when memory jumps a lot
-        _resp_counter = (_resp_counter + 1) % max(_gc_every_n, 1)
-        if (
-            rss_before is not None and rss_now is not None and (rss_now - rss_before) / (1024 * 1024) >= _gc_rss_threshold_mb
-        ) or _resp_counter == 0:
-            gc.collect()
+        # Opportunistic GC to curb fragmentation during bursts
+        gc.collect()
     except Exception:
         pass
     return resp
@@ -936,28 +818,24 @@ def drive_proxy(file_id):
             return jsonify({"error": "no_creds"}), 502
         headers = {"Authorization": f"Bearer {creds.token}"}
 
-        # Try to get thumbnail metadata quickly (optional)
-        info = None
-        thumb = None
-        mime = ""
-        try:
-            meta = requests.get(
-                f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum",
-                headers=headers,
-                timeout=4,
-            )
-            if meta.status_code == 200:
-                info = meta.json() or {}
-                thumb = info.get("thumbnailLink")
-                mime  = (info.get("mimeType") or "").lower()
-        except Exception:
-            info = None
+        # Get thumbnailLink (cached metadata reduces chatter)
+        meta_url = (
+            f"https://www.googleapis.com/drive/v3/files/{file_id}"
+            f"?fields=thumbnailLink,mimeType,name,modifiedTime,md5Checksum"
+        )
+        meta = requests.get(meta_url, headers=headers, timeout=6)
+        if meta.status_code != 200:
+            return jsonify({"error": "meta_failed", "code": meta.status_code}), 502
+        info = meta.json() or {}
+        thumb = info.get("thumbnailLink")
+        mime  = (info.get("mimeType") or "").lower()
 
-
-        # Prefer native Drive thumbnail if available, with retry logic
+        # Prefer native Drive thumbnail if available
         if use_thumb and thumb:
+            # Ensure correct size param for Drive thumbnail ("s=<px>")
             px = re.sub(r"[^0-9]", "", size) or "240"
             if "?" in thumb:
+                # normalize size
                 if re.search(r"[?&](sz|s)=", thumb):
                     thumb = re.sub(r"([?&])(sz|s)=\d+", rf"\1s={px}", thumb)
                 else:
@@ -965,51 +843,36 @@ def drive_proxy(file_id):
             else:
                 thumb = f"{thumb}?s={px}"
 
-            last_exc = None
-            for attempt in range(2):
-                try:
-                    img = requests.get(thumb, headers=headers, timeout=10)
-                    if img.status_code == 200 and img.content:
-                        if v_param:
-                            try:
-                                with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
-                                    f.write(img.content)
-                            except Exception:
-                                logger.exception("thumb cache write failed")
-                        resp = Response(img.content, status=200, mimetype="image/jpeg")
-                        resp.headers["Cache-Control"] = cache_control
-                        resp.headers["ETag"] = etag
-                        return resp
-                except Exception as exc:
-                    last_exc = exc
-                    logger.error(f"Drive thumbnail fetch failed for file_id={file_id} url={thumb} attempt={attempt+1}: {exc}")
-            if last_exc:
-                logger.error(f"All thumbnail fetch attempts failed for file_id={file_id} url={thumb}: {last_exc}")
+            img = requests.get(thumb, headers=headers, timeout=20)
+            if img.status_code == 200 and img.content:
+                if v_param:
+                    # Save to disk cache
+                    try:
+                        with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
+                            f.write(img.content)
+                    except Exception:
+                        logger.exception("thumb cache write failed")
 
+                resp = Response(img.content, status=200, mimetype="image/jpeg")
+                resp.headers["Cache-Control"] = cache_control
+                resp.headers["ETag"] = etag
+                return resp
 
-        # Fallback: if original is an image, fetch it and cache, with retry logic
+        # Fallback: if original is an image, fetch it and cache
         if mime.startswith("image/"):
             file_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-            last_exc = None
-            for attempt in range(2):
-                try:
-                    r = requests.get(file_url, headers=headers, timeout=15, stream=False)
-                    if r.status_code == 200 and r.content:
-                        if v_param:
-                            try:
-                                with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
-                                    f.write(r.content)
-                            except Exception:
-                                logger.exception("thumb cache write failed (full-file)")
-                        resp = Response(r.content, status=200, mimetype=mime or "image/jpeg")
-                        resp.headers["Cache-Control"] = cache_control
-                        resp.headers["ETag"] = etag
-                        return resp
-                except Exception as exc:
-                    last_exc = exc
-                    logger.error(f"Drive image fetch failed for file_id={file_id} url={file_url} attempt={attempt+1}: {exc}")
-            if last_exc:
-                logger.error(f"All image fetch attempts failed for file_id={file_id} url={file_url}: {last_exc}")
+            r = requests.get(file_url, headers=headers, timeout=15, stream=False)
+            if r.status_code == 200 and r.content:
+                if v_param:
+                    try:
+                        with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
+                            f.write(r.content)
+                    except Exception:
+                        logger.exception("thumb cache write failed (full-file)")
+                resp = Response(r.content, status=200, mimetype=mime or "image/jpeg")
+                resp.headers["Cache-Control"] = cache_control
+                resp.headers["ETag"] = etag
+                return resp
 
         # No thumbnail and not an image
         return jsonify({"error": "no_thumbnail"}), 404
@@ -1022,11 +885,7 @@ def drive_proxy(file_id):
 
 @app.route("/api/ping", methods=["GET", "OPTIONS"])
 def api_ping():
-    try:
-        return jsonify({"ok": True}), 200
-    except Exception as e:
-        logger.error(f"Error in /api/ping: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 502
+    return jsonify({"ok": True}), 200
 
 @app.route("/labels/<path:filename>")
 def serve_label(filename):
@@ -1038,7 +897,6 @@ def serve_label(filename):
         return abort(404)
     # Let browser open in a new tab for printing
     return send_from_directory(tmp, safe, as_attachment=False)
-
 
 def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers, env_override=None):
     """
@@ -1554,7 +1412,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     base = get_base_qbo_url(env_override)
 
     # Step 1: Get or create customer
-    sheet = get_sheets_service()  # pass service handle as in earlier code
+    sheet = sh
     customer_ref = get_or_create_customer_ref(order_data.get("Company Name", ""), sheet, headers, realm_id)
 
     # Step 2: Get item reference from QBO (look up or create if missing)
@@ -1750,10 +1608,1155 @@ def create_consolidated_invoice_in_quickbooks(
 
 
 
-# In-memory links store
-_links_store = {}
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"status": "ok", "message": "Backend is running"}), 200
+
+@app.before_request
+def _debug_session():
+     logger.info("🔑 Session data for %s → %s", request.path, dict(session))
+# allow cross-site cookies
+app.config.update(
+    SESSION_COOKIE_SAMESITE="None",
+    SESSION_COOKIE_SECURE=True,
+)
+
+# only allow our Netlify front-end on /api/* and support cookies
+CORS(
+    app,
+    resources={
+        r"/":             {"origins": FRONTEND_URL},
+        r"/api/*":        {"origins": FRONTEND_URL},
+        r"/api/threads":  {"origins": FRONTEND_URL},
+        r"/submit":       {"origins": FRONTEND_URL},
+    },
+    supports_credentials=True
+)
+
+
+from flask import session  # (if not already imported)
+
+@app.before_request
+def _debug_session():
+    logger.info("🔑 Session data for %s → %s", request.path, dict(session))
+
+
+
+# ─── Session & Auth Helpers ──────────────────────────────────────────────────
+
+ALLOWED_WS_ORIGINS = list({
+    os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/"),
+    "https://machineschedule.netlify.app",
+    "http://localhost:3000",
+})
+
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=ALLOWED_WS_ORIGINS,
+    async_mode="eventlet",
+    path="/socket.io",
+    ping_interval=25,
+    ping_timeout=20,
+    max_http_buffer_size=1_000_000,
+    logger=False,            # NEW: silence Socket.IO logs
+    engineio_logger=False,   # NEW: silence low-level engine logs
+)
+
+
+
+# ─── Vendor Directory Cache ─────────────────────────────────────────────────
+_vendor_dir_cache = None
+_vendor_dir_ts    = 0
+VENDOR_TTL        = 600  # 10 minutes
+
+def _hdr_index(headers):
+    return {str(h or "").strip().lower(): i for i, h in enumerate(headers or [])}
+
+def read_vendor_directory_from_material_inventory():
+    """Reads Material Inventory!K1:O as: Vendor | Method | Email | CC | Website"""
+    import time as _t
+    global _vendor_dir_cache, _vendor_dir_ts
+    now = _t.time()
+    if _vendor_dir_cache and (now - _vendor_dir_ts) < VENDOR_TTL:
+        return _vendor_dir_cache
+
+    svc = get_sheets_service().spreadsheets().values()
+    vals = svc.get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Material Inventory!K1:O",
+        valueRenderOption="FORMATTED_VALUE"
+    ).execute().get("values", []) or []
+
+    out = {}
+    if vals:
+        idx = _hdr_index(vals[0])
+        for r in vals[1:]:
+            def gv(key):
+                i = idx.get(key)
+                return (r[i].strip() if i is not None and i < len(r) and r[i] is not None else "")
+            vname = gv("vendor").strip()
+            if not vname:
+                continue
+            key = vname.lower()
+            out[key] = {
+                "vendor":  vname,                          # keep original for display if needed
+                "method":  (gv("method") or "").lower(),
+                "email":   gv("email"),
+                "cc":      gv("cc"),
+                "website": gv("website"),
+            }
+
+    _vendor_dir_cache = out
+    _vendor_dir_ts = now
+    return out
+
+
+@app.route("/api/vendors")
+@login_required_session
+def get_vendors():
+    """Returns [{vendor, method, email, cc, website}, ...] from Material Inventory tab (K:O)."""
+    try:
+        m = read_vendor_directory_from_material_inventory()
+        return jsonify({"vendors": [{"vendor": k, **v} for k, v in m.items()]})
+    except Exception:
+        app.logger.exception("vendors failed")
+        return jsonify({"error":"vendors failed"}), 500
+
+
+# ─── Google Drive Token/Scopes Config ──────────────────────────────
+# ─── Google Drive Token/Scopes Config ──────────────────────────────
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive",
+]
+
+# use the same path variable everywhere for Google token
+GOOGLE_TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
+
+def _load_google_creds():
+    """
+    Load Google OAuth user credentials from:
+      1) GOOGLE_TOKEN_JSON env var (preferred, raw token.json contents)
+      2) token.json on disk (GOOGLE_TOKEN_PATH)
+    If the token already contains scopes, do not override them (avoids invalid_scope).
+    Returns an OAuthCredentials object or None.
+    """
+    # 1) ENV first
+    env_val = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
+    if env_val:
+        try:
+            info = json.loads(env_val)
+            token_scopes = info.get("scopes")
+            # If token already has scopes, don't override (prevents invalid_scope)
+            if token_scopes:
+                creds = OAuthCredentials.from_authorized_user_info(info)
+            else:
+                creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            print("🔎 token (env) scopes:", token_scopes)
+            if not creds.valid and creds.refresh_token:
+                from google.auth.transport.requests import Request as GoogleRequest
+                creds.refresh(GoogleRequest())
+            return creds
+        except Exception as e:
+            print("❌ ENV token could not build OAuthCredentials:", repr(e))
+            # fall through to file
+
+    # 2) File next
+    try:
+        if os.path.exists(GOOGLE_TOKEN_PATH):
+            with open(GOOGLE_TOKEN_PATH, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            token_scopes = info.get("scopes")
+            if token_scopes:
+                creds = OAuthCredentials.from_authorized_user_info(info)
+            else:
+                creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            print("🔎 token (file) scopes:", token_scopes)
+            if not creds.valid and creds.refresh_token:
+                from google.auth.transport.requests import Request as GoogleRequest
+                creds.refresh(GoogleRequest())
+            return creds
+    except Exception as e:
+        print("❌ FILE token could not build OAuthCredentials:", repr(e))
+
+    # 3) Nothing worked
+    return None
+
+
+
+
+# --- Drive: make file public (anyone with link → reader) ---------------------
+@app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
+@login_required_session
+def drive_make_public():
+    if request.method == "OPTIONS":
+        # CORS preflight
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+        return resp
+
+    data = request.get_json(silent=True) or {}
+    file_id = (data.get("fileId") or "").strip()
+    if not file_id:
+        return jsonify({"ok": False, "error": "missing fileId"}), 400
+
+    try:
+        drive = get_drive_service()
+        # Check existing permissions for 'anyone'
+        perms = drive.permissions().list(
+            fileId=file_id,
+            fields="permissions(id,type,role)"
+        ).execute()
+        already_public = any(
+            p.get("type") == "anyone" and p.get("role") in ("reader", "commenter", "writer")
+            for p in (perms.get("permissions") or [])
+        )
+
+        if not already_public:
+            # Make it public (view-only)
+            drive.permissions().create(
+                fileId=file_id,
+                body={"type": "anyone", "role": "reader"},
+                fields="id"
+            ).execute()
+
+        return jsonify({"ok": True})
+    except Exception as e:
+        # Don't blow up the UI on permission hiccups
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
+# ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
+sheet_lock = Semaphore(1)
+SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
+ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:ZZ")
+EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
+MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
+MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
+
+# ── Legacy QuickBooks vars (still available if used elsewhere) ────
+QBO_CLIENT_ID     = os.environ.get("QBO_CLIENT_ID")
+QBO_CLIENT_SECRET = os.environ.get("QBO_CLIENT_SECRET")
+QBO_REDIRECT_URI  = (os.environ.get("QBO_REDIRECT_URI") or "").strip()
+QBO_AUTH_URL      = "https://appcenter.intuit.com/connect/oauth2"
+QBO_TOKEN_URL     = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+QBO_SCOPES        = ["com.intuit.quickbooks.accounting"]
+
+# ── QuickBooks environment configuration ────────────────────────
+QBO_SANDBOX_BASE_URL = os.environ.get(
+    "QBO_SANDBOX_BASE_URL",
+    "https://sandbox-quickbooks.api.intuit.com"
+)
+QBO_PROD_BASE_URL = os.environ.get(
+    "QBO_PROD_BASE_URL",
+    "https://quickbooks.api.intuit.com"
+)
+QBO_ENV = os.environ.get("QBO_ENV", "sandbox").lower()  # 'sandbox' or 'production'
+
+def get_base_qbo_url(env_override: str = None) -> str:
+    """
+    Return the correct QuickBooks API base URL based on env_override or QBO_ENV.
+    """
+    env = (env_override or QBO_ENV).lower()
+    return QBO_PROD_BASE_URL if env == "production" else QBO_SANDBOX_BASE_URL
+
+# ── OAuth client credentials for sandbox vs. production ─────────
+QBO_SANDBOX_CLIENT_ID     = os.environ.get("QBO_SANDBOX_CLIENT_ID")
+QBO_SANDBOX_CLIENT_SECRET = os.environ.get("QBO_SANDBOX_CLIENT_SECRET")
+QBO_PROD_CLIENT_ID        = os.environ.get("QBO_PROD_CLIENT_ID")
+QBO_PROD_CLIENT_SECRET    = os.environ.get("QBO_PROD_CLIENT_SECRET")
+
+def get_qbo_oauth_credentials(env_override: str = None):
+    """
+    Return (client_id, client_secret) for the chosen QuickBooks environment.
+    """
+    env = (env_override or QBO_ENV).lower()
+    if env == "production":
+        return QBO_PROD_CLIENT_ID, QBO_PROD_CLIENT_SECRET
+    return QBO_SANDBOX_CLIENT_ID, QBO_SANDBOX_CLIENT_SECRET
+# ─────────────────────────────────────────────────────────────────
+
+# Unified Google auth: always load from GOOGLE_TOKEN_JSON or token.json via _load_google_creds
+# Unified Google auth: always load from GOOGLE_TOKEN_JSON or token.json via _load_google_creds
+creds = _load_google_creds()
+if not creds:
+    raise RuntimeError(
+        "No Google credentials. Set GOOGLE_TOKEN_JSON to your token.json contents, "
+        "or place a valid token.json on disk."
+    )
+
+# Wire clients once, using the creds from _load_google_creds()
+sh = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+sheets  = service.spreadsheets()
+
+
+
+@app.route("/rate", methods=["POST"])
+@login_required_session
+def rate_all_services():
+    """
+    Accepts:
+      { 
+        "to": { "name","phone","addr1","addr2","city","state","zip","country" },
+        "packages": [ { "L":10,"W":10,"H":10,"weight":2 }, ... ]
+      }
+    Returns:
+      [ { code, method, rate, currency, delivery }, ... ]
+    """
+    p = request.get_json(force=True) or {}
+    to = p.get("to", {})
+    pkgs = p.get("packages", [])
+    try:
+        options = ups_get_rate(to, pkgs, ask_all_services=True)
+        return jsonify(options)  # an array that your Ship.jsx already expects
+    except Exception as e:
+        return jsonify([
+            { "method": "Manual Shipping", "rate": "N/A", "delivery": "TBD" }
+        ]), 200
+
+
+@app.route("/api/updateStartTime", methods=["POST"])
+@login_required_session
+def update_start_time():
+    try:
+        data = request.get_json() or {}
+        job_id    = data.get("id")
+        iso_start = clamp_iso_to_next_830_et(data.get("startTime"))  # enforce window server-side
+
+        if not job_id or not iso_start:
+            return jsonify({"error": "Missing job ID or start time"}), 400
+
+        # Write ISO directly to Production Orders
+        update_embroidery_start_time_in_sheet(job_id, iso_start)
+
+        # 🔔 Notify all clients so UIs patch immediately
+        try:
+            socketio.emit("startTimeUpdated", {"orderId": str(job_id), "startTime": iso_start})
+        except Exception:
+            app.logger.exception("socket emit failed for startTimeUpdated")
+
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+# ─── In-memory caches & settings ────────────────────────────────────────────
+# with CACHE_TTL = 0, every GET will hit Sheets directly
+CACHE_TTL           = 30
+
+# orders cache + timestamp
+_orders_cache       = None
+_orders_ts          = 0
+
+# embroidery list cache + timestamp
+_emb_cache          = None
+_emb_ts             = 0
+
+# manualState cache + timestamp (for placeholders & machine assignments)
 _manual_state_cache = None
-_manual_state_ts = 0.0
+_manual_state_ts    = 0
+
+# overview + jobs-for-company micro-caches
+_overview_cache     = None
+_overview_ts        = 0
+_jobs_company_cache = {}   # { company_lower: {"ts": <epoch>, "data": {...}} }
+
+
+# ID-column cache for updateStartTime
+_id_cache           = None
+_id_ts              = 0
+
+# overview: upcoming jobs cache (keyed by days) + timestamp
+_overview_upcoming_cache = {}   # { int(days): {"jobs": [...]} }
+_overview_upcoming_ts    = 0.0
+
+# overview: materials-needed cache + timestamp
+_materials_needed_cache  = None  # {"vendors": [...]}
+_materials_needed_ts     = 0.0
+
+# ─── Google client singletons ───────────────────────────────────────────────
+_sheets_service = None
+_drive_service  = None
+_service_ts     = 0
+SERVICE_TTL     = 900  # 15 minutes
+# ────────────────────────────────────────────────────────────────────────────
+
+# ---- helpers: clear overview caches ----------------------------------------
+def invalidate_materials_needed_cache():
+    global _materials_needed_cache, _materials_needed_ts
+    _materials_needed_cache = None
+    _materials_needed_ts = 0.0
+
+def invalidate_upcoming_cache():
+    global _overview_upcoming_cache, _overview_upcoming_ts
+    _overview_upcoming_cache = {}   # keyed by days
+    _overview_upcoming_ts = 0.0
+# ---------------------------------------------------------------------------
+
+# ✅ You must define or update this function to match your actual Google Sheet logic
+import traceback
+
+def update_embroidery_start_time_in_sheet(order_id, new_start_time):
+    """Write ISO start time into the 'Embroidery Start Time' column for the given Order #."""
+    try:
+        # 1) Read headers & rows
+        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render_option="UNFORMATTED_VALUE")
+        if not rows:
+            raise RuntimeError("orders range returned no rows")
+        headers = [str(h).strip() for h in rows[0]]
+        try:
+            id_idx    = headers.index("Order #")
+            start_idx = headers.index("Embroidery Start Time")
+        except ValueError as e:
+            raise RuntimeError("Missing 'Order #' or 'Embroidery Start Time' header") from e
+
+        # 2) Locate target row
+        row_num = None
+        for i, r in enumerate(rows[1:], start=2):
+            val = "" if id_idx >= len(r) else r[id_idx]
+            if str(val).strip() == str(order_id).strip():
+                row_num = i
+                break
+        if not row_num:
+            raise RuntimeError(f"Order # {order_id} not found in range {ORDERS_RANGE}")
+
+        # 3) Compute A1 for the start cell
+        def col_to_a1(idx0):
+            n = idx0 + 1
+            s = ""
+            while n:
+                n, rem = divmod(n - 1, 26)
+                s = chr(65 + rem) + s
+            return s
+
+        start_col_a1 = col_to_a1(start_idx)
+        target_range = f"Production Orders!{start_col_a1}{row_num}"
+
+        # 4) Write ISO string exactly
+        write_sheet(SPREADSHEET_ID, target_range, [[new_start_time]])
+        return True
+    except Exception as e:
+        app.logger.exception("Failed to update Embroidery Start Time")
+        raise
+
+
+
+def fetch_sheet(spreadsheet_id, sheet_range, value_render_option="UNFORMATTED_VALUE"):
+    svc = get_sheets_service().spreadsheets().values()
+    with sheet_lock:
+        res = svc.get(
+            spreadsheetId=spreadsheet_id,
+            range=sheet_range,
+            valueRenderOption=value_render_option,
+        ).execute()
+    return res.get("values", [])
+
+
+def write_sheet(spreadsheet_id, range_, values):
+    service = get_sheets_service()
+    body = {
+        "range": range_,
+        "majorDimension": "ROWS",
+        "values": values,
+    }
+    return service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=range_,
+        valueInputOption="USER_ENTERED",
+        body=body
+    ).execute()
+
+
+
+def get_sheet_password():
+    try:
+        vals = fetch_sheet(SPREADSHEET_ID, "Manual State!J2:J2")
+        return vals[0][0] if vals and vals[0] else ""
+    except Exception:
+        logger.exception("Failed to fetch sheet password")
+        return ""
+
+
+# ─── Minimal Login Page (HTML) ───────────────────────────────────────────────
+_login_page = """
+<!DOCTYPE html>
+<html>
+<head><title>Login</title></head>
+<body>
+  <h2>Login</h2>
+  {% if error %}
+    <p style="color: red;">{{ error }}</p>
+  {% endif %}
+  <form method="POST">
+    <input type="text" name="username" placeholder="Username" required><br><br>
+    <input type="password" name="password" placeholder="Password" required><br><br>
+    <input type="hidden" name="next" value="{{ next }}">
+    <button type="submit">Login</button>
+  </form>
+</body>
+</html>
+"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    # always default back to your front-end
+    next_url = request.args.get("next") or request.form.get("next") or FRONTEND_URL
+
+    if request.method == "POST":
+        u = request.form["username"]
+        p = request.form["password"]
+        ADMIN_PW    = os.environ.get("ADMIN_PASSWORD", "")
+        ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
+        print("🔑 ADMIN_PASSWORD env is:", repr(ADMIN_PW))
+        if u == "admin":
+            session.clear()
+            session["user"] = u
+            session["token_at_login"] = ADMIN_TOKEN
+            session["last_activity"] = datetime.utcnow().isoformat()
+            session["login_time"]     = time.time()
+            session["login_ts"]      = datetime.utcnow().timestamp()
+            # **new**: stamp when they logged in
+            session["login_time"] = time.time()
+
+            # if they wanted a backend URL, just send them home
+            if next_url.startswith("/"):
+                return redirect(FRONTEND_URL)
+            return redirect(next_url)
+        else:
+            error = "Invalid credentials"
+    
+    return render_template_string(_login_page, error=error, next=next_url)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+@app.route("/api/overview")
+@login_required_session
+def overview_combined():
+    """
+    Fast combined overview:
+      - Upcoming:  Overview!A3:K  (11 columns pre-filtered/sorted in Sheet)
+      - Materials: Overview!M3:M  (single text column: 'Item Qty Unit - Vendor')
+    Returns: { upcoming: [...], materials: [...] }
+    """
+    # 15s micro-cache
+    global _overview_cache, _overview_ts
+    now = time.time()
+    if _overview_cache is not None and (now - _overview_ts) < 15:
+        return jsonify(_overview_cache), 200
+
+    try:
+        # Pull both ranges in one locked request
+        svc = get_sheets_service().spreadsheets().values()
+        with sheet_lock:
+            resp = svc.batchGet(
+                spreadsheetId=SPREADSHEET_ID,
+                ranges=["Overview!A3:K", "Overview!M3:M"],
+                valueRenderOption="UNFORMATTED_VALUE"
+            ).execute()
+        vrs = resp.get("valueRanges", [])
+
+        # ---------- UPCOMING ----------
+        up_vals = (vrs[0].get("values") if len(vrs) > 0 else []) or []
+        TARGET_HEADERS = [
+            "Order #","Preview","Company Name","Design","Quantity",
+            "Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"
+        ]
+
+        # If the first row looks like headers, drop it
+        if up_vals:
+            first_row = [str(x or "").strip() for x in up_vals[0]]
+            if [h.lower() for h in first_row] == [h.lower() for h in TARGET_HEADERS]:
+                up_vals = up_vals[1:]
+
+        headers = TARGET_HEADERS
+
+        def drive_thumb(link, size="w160"):
+            s = str(link or "")
+            fid = ""
+            if "id=" in s:
+                fid = s.split("id=")[-1].split("&")[0]
+            elif "/file/d/" in s:
+                fid = s.split("/file/d/")[-1].split("/")[0]
+            return f"https://drive.google.com/thumbnail?id={fid}&sz={size}" if fid else ""
+
+        # Optional: look up Production Orders "Image" column to prefer its thumbnail
+        order_to_image = {}
+        try:
+            with sheet_lock:
+                po_hdr = (svc.get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range="Production Orders!A1:AM1",
+                    valueRenderOption="UNFORMATTED_VALUE"
+                ).execute().get("values", [[]]) or [[]])[0]
+
+            img_idx = next(
+                (i for i, h in enumerate(po_hdr) if str(h or "").strip().lower() == "image"),
+                -1
+            )
+
+            if img_idx >= 0:
+                def col_letter(idx0):
+                    n = idx0 + 1
+                    s = ""
+                    while n:
+                        n, r = divmod(n - 1, 26)
+                        s = chr(65 + r) + s
+                    return s
+                img_col = col_letter(img_idx)
+
+                with sheet_lock:
+                    pr = svc.batchGet(
+                        spreadsheetId=SPREADSHEET_ID,
+                        ranges=["Production Orders!A2:A", f"Production Orders!{img_col}2:{img_col}"],
+                        valueRenderOption="UNFORMATTED_VALUE"
+                    ).execute().get("valueRanges", [])
+
+                orders_col = (pr[0].get("values") if len(pr) > 0 else []) or []
+                images_col = (pr[1].get("values") if len(pr) > 1 else []) or []
+                max_len = max(len(orders_col), len(images_col))
+                for i in range(max_len):
+                    ord_val = (orders_col[i][0] if i < len(orders_col) and orders_col[i] else "").strip()
+                    img_val = (images_col[i][0] if i < len(images_col) and images_col[i] else "").strip()
+                    if ord_val:
+                        order_to_image[ord_val] = img_val
+        except Exception:
+            # If this enrichment fails, just keep going with Overview data only
+            order_to_image = {}
+
+        def prefer_image(preview, order_no):
+            img = order_to_image.get(str(order_no or "").strip(), "")
+            return drive_thumb(img) or drive_thumb(preview)
+
+        upcoming = []
+        for r in up_vals:
+            if len(r) < len(headers):
+                r = r + [""] * (len(headers) - len(r))
+            row = dict(zip(headers, r))
+            row["image"] = prefer_image(row.get("Preview"), row.get("Order #"))
+            upcoming.append(row)
+
+        # ---------- MATERIALS ----------
+        mat_vals = (vrs[1].get("values") if len(vrs) > 1 else []) or []
+        lines = [str(a[0]).strip() for a in mat_vals if a and str(a[0]).strip()]
+        grouped = {}
+        for s in lines:
+            vendor = "Misc."
+            left = s
+            if " - " in s:
+                left, vendor = s.rsplit(" - ", 1)
+                vendor = (vendor or "Misc.").strip() or "Misc."
+            toks = left.split()
+            name, qty, unit = left, 0, ""
+            if len(toks) >= 3:
+                unit = toks[-1]
+                qty_str = toks[-2]
+                name = " ".join(toks[:-2]).strip()
+                try:
+                    qty = int(round(float(qty_str)))
+                except Exception:
+                    qty = 0
+            typ = "Thread" if unit.lower().startswith("cone") else "Material"
+            if name:
+                grouped.setdefault(vendor, []).append({"name": name, "qty": qty, "unit": unit, "type": typ})
+
+        materials = [{"vendor": v, "items": items} for v, items in grouped.items()]
+
+        # Build response + save micro-cache
+        resp_data = {"upcoming": upcoming, "materials": materials}
+        _overview_cache = resp_data
+        _overview_ts = now
+        return jsonify(resp_data), 200
+
+    except Exception:
+        # Log and fall back to last good payload if we have one
+        app.logger.exception("overview_combined failed")
+        if _overview_cache is not None:
+            return jsonify(_overview_cache), 200
+        return jsonify({"upcoming": [], "materials": []}), 200
+
+
+import traceback
+from googleapiclient.errors import HttpError
+
+@app.route("/api/overview/upcoming")
+@login_required_session
+def overview_upcoming():
+    debug = request.args.get("debug") == "1"
+    try:
+        svc = get_sheets_service().spreadsheets().values()
+        vals = svc.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Overview!A3:K",
+            valueRenderOption="UNFORMATTED_VALUE"
+        ).execute().get("values", [])
+
+        headers = ["Order #","Preview","Company Name","Design","Quantity","Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"]
+        def thumb(link):
+            s = str(link or "")
+            fid = ""
+            if "id=" in s: fid = s.split("id=")[-1].split("&")[0]
+            elif "file/d/" in s: fid = s.split("file/d/")[-1].split("/")[0]
+            return f"https://drive.google.com/thumbnail?id={fid}&sz=w160" if fid else ""
+
+        jobs = []
+        for r in vals:
+            r = r + [""] * (len(headers) - len(r))
+            row = dict(zip(headers, r))
+            row["image"] = thumb(row.get("Preview"))
+            jobs.append(row)
+
+        # optional cache
+        if CACHE_TTL:
+            import time as _t
+            global _overview_upcoming_cache, _overview_upcoming_ts
+            _overview_upcoming_cache[7] = {"jobs": jobs}
+            _overview_upcoming_ts = _t.time()
+            return jsonify(_overview_upcoming_cache[7])
+
+        if debug:
+            return jsonify({"count": len(jobs), "first": jobs[0] if jobs else None})
+        return jsonify({"jobs": jobs})
+
+    except Exception as e:
+        app.logger.exception("overview_upcoming failed")
+        if debug:
+            import traceback
+            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
+        return jsonify({"error": "overview_upcoming failed"}), 500
+
+
+from math import ceil
+import re
+import traceback
+from googleapiclient.errors import HttpError
+
+@app.route("/api/overview/materials-needed")
+@login_required_session
+def overview_materials_needed():
+    debug = request.args.get("debug") == "1"
+    try:
+        svc = get_sheets_service().spreadsheets().values()
+        resp = svc.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Overview!M3:M",
+            valueRenderOption="FORMATTED_VALUE"
+        ).execute()
+        vals = resp.get("values", [])
+        lines = [str(r[0]).strip() for r in vals if r and str(r[0]).strip()]
+
+        grouped = {}
+        for s in lines:
+            # Split "Item Qty Unit - Vendor"
+            vendor = "Misc."
+            left = s
+            if " - " in s:
+                left, vendor = s.rsplit(" - ", 1)
+                vendor = vendor.strip() or "Misc."
+
+            tokens = left.split()
+            # Expect ... <qty> <unit> at the end
+            if len(tokens) >= 3:
+                unit = tokens[-1]
+                qty_str = tokens[-2]
+                name = " ".join(tokens[:-2]).strip()
+                try:
+                    qty = int(round(float(qty_str)))
+                except Exception:
+                    qty = 0
+            else:
+                name, qty, unit = left, 0, ""
+
+            if not name:
+                continue
+            typ = "Thread" if unit.lower().startswith("cone") else "Material"
+            grouped.setdefault(vendor, []).append({
+                "name": name, "qty": qty, "unit": unit, "type": typ
+            })
+
+        vendor_list = [{"vendor": v, "items": items} for v, items in grouped.items()]
+
+        # optional cache
+        if CACHE_TTL:
+            import time as _t
+            global _materials_needed_cache, _materials_needed_ts
+            _materials_needed_cache = {"vendors": vendor_list}
+            _materials_needed_ts = _t.time()
+            return jsonify(_materials_needed_cache)
+
+        if debug:
+            return jsonify({"count_vendors": len(vendor_list), "sample": vendor_list[:1]})
+        return jsonify({"vendors": vendor_list})
+
+    except Exception as e:
+        app.logger.exception("materials-needed failed")
+        if debug:
+            import traceback
+            return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
+        return jsonify({"error": "materials-needed failed"}), 500
+
+# ─── API ENDPOINTS ────────────────────────────────────────────────────────────
+
+@app.route("/api/orders", methods=["GET"])
+@login_required_session
+def get_orders():
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)  # UNFORMATTED_VALUE
+        if not rows:
+            return jsonify([]), 200
+        headers = [str(h).strip() for h in rows[0]]
+
+        data = []
+        for r in rows[1:]:
+            r = r or []
+            if len(r) < len(headers):
+                r = r + ["" for _ in range(len(headers) - len(r))]
+            data.append(dict(zip(headers, r)))
+        return jsonify(data), 200
+    except Exception:
+        logger.exception("Error fetching orders")
+        return jsonify({"error": "orders fetch failed"}), 500
+
+
+
+@app.route("/api/prepare-shipment", methods=["POST"])
+@login_required_session
+def prepare_shipment():
+    data = request.get_json()
+    order_ids = data.get("order_ids", [])
+    if not order_ids:
+        return jsonify({"error": "Missing order_ids"}), 400
+
+    # Fetch both Production Orders and Table tabs
+    prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
+    table_data = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
+
+    prod_headers = prod_data[0]
+    table_headers = table_data[0]
+
+    # ✅ Moved up so it exists before being used
+    shipped_quantities = data.get("shipped_quantities", {})
+
+    # Step 1: Find orders that match the given Order #
+    prod_rows = []
+    all_order_data = []  # ✅ declare this before using it
+
+    for row in prod_data[1:]:
+        row_dict = dict(zip(prod_headers, row))
+        order_id = str(row_dict.get("Order #")).strip()
+
+        if order_id in order_ids:
+            parsed_qty = shipped_quantities.get(order_id, 0)
+            headers = list(row_dict.keys())
+            order_data = {
+                h: (
+                    str(parsed_qty) if h == "Shipped" else
+                    row_dict.get(h, "")
+                )
+                for h in headers
+            }
+            order_data["ShippedQty"] = parsed_qty
+            all_order_data.append(order_data)
+            prod_rows.append(row_dict)
+
+    # Step 2: Create product→volume map
+    table_map = {}
+    for r in table_data[1:]:
+        if len(r) >= 2:
+            product = r[0]
+            volume_str = r[13] if len(r) >= 14 else r[1]  # use column N if available
+            try:
+                volume = float(volume_str)
+                table_map[product.strip().lower()] = volume
+            except:
+                continue
+
+    # Step 3: Check for missing volumes and build job list
+    missing_products = []
+    jobs = []
+
+    for row in prod_rows:
+        order_id = str(row["Order #"])
+        product  = row.get("Product","").strip()
+        # ── IGNORE Back jobs entirely in prepare-shipment ──
+        if re.search(r"\s+Back$", product, flags=re.IGNORECASE):
+            continue
+        key = product.lower()
+        volume = table_map.get(key)
+
+        if volume is None:
+            missing_products.append(product)
+        else:
+            # Use shipQty from frontend if provided, fallback to Quantity column
+            raw_ship_qty = shipped_quantities.get(order_id, row.get("Quantity", 0))
+            try:
+                ship_qty = int(raw_ship_qty)
+            except:
+                ship_qty = 0
+
+            # parse physical dimensions (in inches) from your sheet
+            length = float(row_dict.get("Length", 0)   or 0)
+            width  = float(row_dict.get("Width",  0)   or 0)
+            height = float(row_dict.get("Height", 0)   or 0)
+            jobs.append({
+                "order_id":  order_id,
+                "product":   product,
+                "volume":    volume,
+                "dimensions": (length, width, height),
+                "ship_qty":  ship_qty
+            })
+
+    if missing_products:
+        return jsonify({
+            "error": "Missing volume data",
+            "missing_products": list(set(missing_products))
+        }), 400
+
+    # Step 4: Pack items into as few boxes as possible, respecting both vol & dims
+    BOX_TYPES = [
+        {"size": "Small",  "dims": (10, 10, 10), "vol": 10*10*10},
+        {"size": "Medium", "dims": (15, 15, 15), "vol": 15*15*15},
+        {"size": "Large",  "dims": (20, 20, 20), "vol": 20*20*20},
+    ]
+
+    def can_fit(prod_dims, box_dims):
+        p_sorted = sorted(prod_dims)
+        b_sorted = sorted(box_dims)
+        return all(p <= b for p, b in zip(p_sorted, b_sorted))
+
+    # 4a) Expand each item by its quantity
+    items = []
+    for job in jobs:
+        for _ in range(job["ship_qty"]):
+            items.append({
+                "order_id": job["order_id"],
+                "dims":      job["dimensions"],
+                "volume":    job["volume"]
+            })
+
+    # 4b) Greedily fill boxes
+    boxes = []
+    while items:
+        # start a new box with the first item
+        group     = [items.pop(0)]
+        total_vol = group[0]["volume"]
+        max_dims  = list(group[0]["dims"])
+
+        # try to pack more items into this same box
+        i = 0
+        while i < len(items):
+            it       = items[i]
+            new_dims = (
+                max(max_dims[0], it["dims"][0]),
+                max(max_dims[1], it["dims"][1]),
+                max(max_dims[2], it["dims"][2]),
+            )
+            # check against the largest box capacity and dims
+            largest = BOX_TYPES[-1]
+            if (total_vol + it["volume"] <= largest["vol"]
+                and can_fit(new_dims, largest["dims"])):
+                total_vol += it["volume"]
+                max_dims  = list(new_dims)
+                group.append(it)
+                items.pop(i)
+                continue
+            i += 1
+
+        # 4c) Choose the smallest box that fits this group
+        eligible = [
+            b for b in BOX_TYPES
+            if can_fit(max_dims, b["dims"]) and b["vol"] >= total_vol
+        ]
+        eligible.sort(key=lambda b: b["vol"])
+        chosen = (eligible[0]["size"] if eligible else BOX_TYPES[-1]["size"])
+
+        boxes.append({
+            "size": chosen,
+            "jobs": [g["order_id"] for g in group]
+        })
+
+    return jsonify({
+        "status": "ok",
+        "boxes": boxes
+    })
+@app.route("/api/jobs-for-company")
+@login_required_session
+def jobs_for_company():
+    company = request.args.get("company", "").strip().lower()
+    if not company:
+        return jsonify({"error": "Missing company parameter"}), 400
+
+    # 🔸 15s micro-cache per company
+    global _jobs_company_cache
+    now = time.time()
+    cached = _jobs_company_cache.get(company)
+    if cached and (now - cached["ts"] < 15):
+        return jsonify(cached["data"])
+
+    prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
+
+    headers = prod_data[0]
+    jobs = []
+
+    for row in prod_data[1:]:
+        # ✅ Pad the row so it matches the length of headers
+        while len(row) < len(headers):
+            row.append("")
+
+        row_dict = dict(zip(headers, row))
+        row_company = str(row_dict.get("Company Name", "")).strip().lower()
+        stage = str(row_dict.get("Stage", "")).strip().lower()
+
+        if row_company == company and stage != "complete":
+            # Parse Google Drive file ID from image link
+            image_link = str(row_dict.get("Image", "")).strip()
+            file_id = ""
+            if "id=" in image_link:
+                file_id = image_link.split("id=")[-1].split("&")[0]
+            elif "file/d/" in image_link:
+                file_id = image_link.split("file/d/")[-1].split("/")[0]
+
+            preview_url = (
+                f"https://drive.google.com/thumbnail?id={file_id}"
+                if file_id else ""
+            )
+
+            # Add required fields to job dict
+            row_dict["image"] = preview_url
+            row_dict["orderId"] = str(row_dict.get("Order #", "")).strip()
+            jobs.append(row_dict)
+
+    data = {"jobs": jobs}
+    _jobs_company_cache[company] = {"ts": now, "data": data}
+    return jsonify(data)
+
+
+
+@app.route("/api/set-volume", methods=["POST"])
+def set_volume():
+    global SPREADSHEET_ID
+    data = request.get_json()
+    product = data.get("product")
+    length  = data.get("length")
+    width   = data.get("width")
+    height  = data.get("height")
+
+    if not all([product, length, width, height]):
+        return jsonify({"error": "Missing fields"}), 400
+
+    try:
+        volume = int(length) * int(width) * int(height)
+    except ValueError:
+        return jsonify({"error": "Invalid dimensions"}), 400
+
+    sheets = get_sheets_service().spreadsheets()
+    table_range = "Table!A2:A"
+
+    # ← now correctly using SPREADSHEET_ID
+    result = sheets.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=table_range
+    ).execute()
+    rows = result.get("values", [])
+    products = [row[0] for row in rows if row]
+
+    if product in products:
+        row_index = products.index(product) + 2
+    else:
+        row_index = len(products) + 2
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Table!A2",
+            valueInputOption="RAW",
+            body={"values": [[product]]}
+        ).execute()
+
+    update_range = f"Table!N{row_index}"
+    sheets.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=update_range,
+        valueInputOption="RAW",
+        body={"values": [[volume]]}
+    ).execute()
+
+    return jsonify({"message": "Volume saved", "volume": volume})
+
+@app.route("/api/embroideryList", methods=["GET"])
+@login_required_session
+def get_embroidery_list():
+    try:
+        # ─── Spot A: CACHE CHECK ────────────────────────────────────
+        global _emb_cache, _emb_ts
+        now = time.time()
+        if _emb_cache is not None and (now - _emb_ts) < 10:
+            return jsonify(_emb_cache), 200
+
+        # ─── Fetch the full sheet ──────────────────────────────────
+        rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
+        if not rows:
+            return jsonify([]), 200
+
+        headers = rows[0]
+        data = []
+        for r in rows[1:]:
+            row = dict(zip(headers, r))
+            data.append(row)
+
+        # ─── Spot B: CACHE STORE ───────────────────────────────────
+        _emb_cache = data
+        _emb_ts = now
+
+        return jsonify(data), 200
+
+    except Exception:
+        logger.exception("Error fetching embroidery list")
+        return jsonify([]), 200
+
+# ─── GET A SINGLE ORDER ───────────────────────────────────────────
+@app.route("/api/orders/<order_id>", methods=["GET"])
+@login_required_session
+def get_order(order_id):
+    rows    = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+    headers = rows[0]
+    for row in rows[1:]:
+        if str(row[0]) == str(order_id):
+            return jsonify(dict(zip(headers, row))), 200
+    return jsonify({"error":"order not found"}), 404
+
+
+@app.route("/api/orders/<order_id>", methods=["PUT"])
+@login_required_session
+def update_order(order_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        with sheet_lock:
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!H{order_id}",
+                valueInputOption="RAW",
+                body={"values": [[ data.get("embroidery_start","") ]]}
+            ).execute()
+        socketio.emit("orderUpdated", {"orderId": order_id})
+        return jsonify({"status":"ok"}), 200
+    except Exception:
+        logger.exception("Error updating order")
+        return jsonify({"error":"server error"}), 500
+
+# In-memory links
+_links_store = {}
 
 @app.route("/api/links", methods=["GET"])
 @login_required_session
@@ -1766,205 +2769,1919 @@ def save_links():
     global _links_store
     _links_store = request.get_json() or {}
     socketio.emit("linksUpdated", _links_store)
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status":"ok"}), 200
 
-# Manual State (GET)
+# 🔹 Trim payload: fetch Orders only and project to required fields
+@app.route("/api/combined", methods=["GET"])
+@login_required_session
+def get_combined():
+    try:
+        svc = get_sheets_service().spreadsheets().values()
+
+        # 1) Primary fetch: whatever ORDERS_RANGE is set to
+        with sheet_lock:
+            resp = svc.batchGet(
+                spreadsheetId=SPREADSHEET_ID,
+                ranges=[ORDERS_RANGE],
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        vrs = resp.get("valueRanges", []) or []
+        orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
+
+        # 2) Fallback #1: try a broad A1:Z pull from the "Production Orders" sheet
+        if not orders_rows:
+            app.logger.warning("ORDERS_RANGE returned no rows; falling back to 'Production Orders!A1:Z' (UNFORMATTED_VALUE)")
+            with sheet_lock:
+                resp2 = svc.get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range="Production Orders!A1:Z",
+                    valueRenderOption="UNFORMATTED_VALUE",
+                ).execute()
+            orders_rows = resp2.get("values", []) or []
+
+        # 3) Fallback #2: try FORMATTED_VALUE (sometimes formulas render better)
+        if not orders_rows:
+            app.logger.warning("A1:Z (UNFORMATTED_VALUE) empty; trying FORMATTED_VALUE")
+            with sheet_lock:
+                resp3 = svc.get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range="Production Orders!A1:Z",
+                    valueRenderOption="FORMATTED_VALUE",
+                ).execute()
+            orders_rows = resp3.get("values", []) or []
+
+        # 4) Convert rows to dicts
+        def rows_to_dicts(rows):
+            if not rows:
+                return []
+            headers = [str(h).strip() for h in rows[0]]
+            out = []
+            for r in rows[1:]:
+                r = r or []
+                if len(r) < len(headers):
+                    r += [""] * (len(headers) - len(r))
+                out.append(dict(zip(headers, r)))
+            return out
+
+        orders_full = rows_to_dicts(orders_rows)
+
+        # 5) Return everything (let the UI pick columns); this avoids empty lists due to header mismatches
+        return jsonify({"orders": orders_full, "links": _links_store}), 200
+
+    except Exception:
+        logger.exception("Error building /api/combined")
+        return jsonify({"orders": [], "links": {}}), 200
+
+
+@socketio.on("placeholdersUpdated")
+def handle_placeholders_updated(data):
+    socketio.emit("placeholdersUpdated", data, broadcast=True)
+
+# ─── MANUAL STATE ENDPOINTS (multi-row placeholders) ─────────────────────────
+MANUAL_RANGE       = "Manual State!A2:Z"
+MANUAL_CLEAR_RANGE = "Manual State!A2:Z"
+
+# ─── MANUAL STATE ENDPOINT (GET) ───────────────────────────────────────────────
 @app.route("/api/manualState", methods=["GET"])
 @login_required_session
 def get_manual_state():
+    """
+    Read manual state from the sheet, but PRUNE any order IDs whose Stage is
+    'Sewing' or 'Complete' in Production Orders. If pruning occurs, write the
+    cleaned lists back to Manual State I2:J2 so the sheet self-heals.
+    """
     global _manual_state_cache, _manual_state_ts
     now = time.time()
-    if _manual_state_cache is not None and (now - _manual_state_ts) < CACHE_TTL:
-        return jsonify(_manual_state_cache), 200
 
     try:
-        resp = get_sheets_service().spreadsheets().values().get(
+        # 1) Read Manual State rows (A2:Z) and parse machine columns (I–Z)
+        resp = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE
+            range=MANUAL_RANGE  # e.g., "Manual State!A2:Z"
         ).execute()
-        rows = resp.get("values", [])
+        rows = resp.get("values", []) or []
 
+        # pad each row to 26 columns
         for i in range(len(rows)):
             while len(rows[i]) < 26:
                 rows[i].append("")
 
         first = rows[0] if rows else [""] * 26
-        machines = first[8:26]
-        machine_columns = [[s for s in (col or "").split(",") if s] for col in machines]
+        machines = first[8:26]  # I–Z
+        machine_columns = [[s for s in str(col or "").split(",") if s] for col in machines]
 
+        # 2) Build set of ACTIVE (not Sewing/Complete) order IDs from Production Orders
+        ord_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+        active_ids = set()
+        if ord_rows:
+            hdr = {str(h).strip().lower(): idx for idx, h in enumerate(ord_rows[0])}
+            id_idx = hdr.get("order #", 0)
+            stage_idx = hdr.get("stage", None)
+            for r in ord_rows[1:]:
+                oid = str(r[id_idx] if id_idx < len(r) else "").strip()
+                stage = str(r[stage_idx] if stage_idx is not None and stage_idx < len(r) else "").strip().lower()
+                # keep only if NOT Sewing or Complete
+                if oid and stage not in ("sewing", "complete"):
+                    active_ids.add(oid)
+
+        # 3) Prune completed/sewing/unknown IDs from each machine list
+        cleaned = [[oid for oid in col if oid in active_ids] for col in machine_columns]
+
+        # 4) If cleaned differs, write fixed strings back to I2:J2
+        if cleaned != machine_columns:
+            i2 = ",".join(cleaned[0]) if len(cleaned) > 0 else ""
+            j2 = ",".join(cleaned[1]) if len(cleaned) > 1 else ""
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{MANUAL_RANGE.split('!')[0]}!I2:J2",
+                valueInputOption="RAW",
+                body={"values": [[i2, j2]]}
+            ).execute()
+            machine_columns = cleaned
+
+        # 5) Gather placeholders from A–H (unchanged)
         phs = []
         for r in rows:
-            if (r[0] or "").strip():
+            if str(r[0]).strip():
                 phs.append({
                     "id":          r[0],
-                    "company":     r[1] if len(r) > 1 else "",
-                    "quantity":    r[2] if len(r) > 2 else "",
-                    "stitchCount": r[3] if len(r) > 3 else "",
-                    "inHand":      r[4] if len(r) > 4 else "",
-                    "dueType":     r[5] if len(r) > 5 else "",
-                    "fieldG":      r[6] if len(r) > 6 else "",
-                    "fieldH":      r[7] if len(r) > 7 else "",
+                    "company":     r[1],
+                    "quantity":    r[2],
+                    "stitchCount": r[3],
+                    "inHand":      r[4],
+                    "dueType":     r[5],
+                    "fieldG":      r[6],
+                    "fieldH":      r[7]
                 })
 
-        result = {"machineColumns": machine_columns[:2], "placeholders": phs}
+        result = {
+            "machineColumns": machine_columns,
+            "placeholders":   phs
+        }
         _manual_state_cache = result
-        _manual_state_ts = now
+        _manual_state_ts    = now
         return jsonify(result), 200
+
     except Exception:
         logger.exception("Error reading manual state")
         if _manual_state_cache:
             return jsonify(_manual_state_cache), 200
         return jsonify({"machineColumns": [], "placeholders": []}), 200
 
-# Manual State (POST)
+
+
+
+# ─── MANUAL STATE ENDPOINT (POST) ──────────────────────────────────────────────
 @app.route("/api/manualState", methods=["POST"])
 @login_required_session
 def save_manual_state():
-    global _manual_state_cache, _manual_state_ts
+    """
+    Save manual state (machine1/machine2 order + placeholders), but FIRST
+    prune any order IDs whose Stage is 'Sewing' or 'Complete' in Production Orders.
+    """
     try:
-        data = request.get_json(silent=True) or {}
-        phs  = data.get("placeholders", [])
-        m1   = data.get("machine1", [])
-        m2   = data.get("machine2", [])
+        data = request.get_json(force=True) or {}
+        incoming_m1 = [str(x).strip() for x in data.get("machine1", []) if str(x).strip()]
+        incoming_m2 = [str(x).strip() for x in data.get("machine2", []) if str(x).strip()]
+        placeholders = data.get("placeholders", [])
 
-        # Clear range then write
-        get_sheets_service().spreadsheets().values().clear(
+        # --- Build ACTIVE ID set from Production Orders (exclude Stage == 'sewing' or 'complete') ---
+        active_ids = set()
+        try:
+            ord_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+            if ord_rows:
+                headers = {str(h).strip().lower(): idx for idx, h in enumerate(ord_rows[0])}
+                id_idx = headers.get("order #", 0)
+                stage_idx = headers.get("stage", None)
+                for r in ord_rows[1:]:
+                    oid = str(r[id_idx] if id_idx < len(r) else "").strip()
+                    stage = str(r[stage_idx] if stage_idx is not None and stage_idx < len(r) else "").strip().lower()
+                    # ✅ Keep only if not Sewing or Complete
+                    if oid and stage not in ("sewing", "complete"):
+                        active_ids.add(oid)
+        except Exception:
+            # If orders can't be fetched, fail-open: keep whatever came in
+            logger.exception("Could not fetch Production Orders; skipping prune in POST /api/manualState")
+            active_ids = set(incoming_m1 + incoming_m2)
+
+        # --- Prune off jobs no longer active ---
+        pruned_m1 = [oid for oid in incoming_m1 if oid in active_ids]
+        pruned_m2 = [oid for oid in incoming_m2 if oid in active_ids]
+        removed_ids = (set(incoming_m1 + incoming_m2) - set(pruned_m1 + pruned_m2))
+
+        # --- Write the pruned lists back to Manual State (I2:J2) ---
+        i2 = ",".join(pruned_m1)
+        j2 = ",".join(pruned_m2)
+        sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_CLEAR_RANGE
-        ).execute()
-
-        rows = []
-        first = []
-        if phs:
-            p0 = phs[0]
-            first += [
-                p0.get("id", ""),
-                p0.get("company", ""),
-                str(p0.get("quantity", "")),
-                str(p0.get("stitchCount", "")),
-                p0.get("inHand", ""),
-                p0.get("dueType", ""),
-                p0.get("fieldG", ""),
-                p0.get("fieldH", ""),
-            ]
-        else:
-            first += [""] * 8
-        first.append(",".join(m1))
-        first.append(",".join(m2))
-        first += [""] * (26 - len(first))
-        rows.append(first)
-
-        for p in phs[1:]:
-            row = [
-                p.get("id", ""),
-                p.get("company", ""),
-                str(p.get("quantity", "")),
-                str(p.get("stitchCount", "")),
-                p.get("inHand", ""),
-                p.get("dueType", ""),
-                p.get("fieldG", ""),
-                p.get("fieldH", ""),
-            ]
-            row += [""] * 18
-            rows.append(row)
-
-        num = max(1, len(rows))
-        end_row = 2 + num - 1
-        sheet_name = MANUAL_CLEAR_RANGE.split("!")[0]
-        write_range = f"{sheet_name}!A2:Z{end_row}"
-        get_sheets_service().spreadsheets().values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=write_range,
+            range=f"{MANUAL_RANGE.split('!')[0]}!I2:J2",
             valueInputOption="RAW",
-            body={"values": rows}
+            body={"values": [[i2, j2]]}
         ).execute()
-
-        _manual_state_cache = {"machineColumns": [m1, m2], "placeholders": phs}
-        _manual_state_ts = time.time()
-        socketio.emit("manualStateUpdated", _manual_state_cache)
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        logger.exception("Error in save_manual_state")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-# Combined endpoint: returns orders, embroideryList, links in one payload
-@app.route('/api/combined', methods=['GET'])
-@login_required_session
-def api_combined():
-    try:
-        # Orders
-        orders_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
-        if isinstance(orders_rows, dict) and orders_rows.get("error"):
-            return jsonify({"error": orders_rows["error"], "orders": [], "embroideryList": [], "links": {}}), 500
-        orders_headers = orders_rows[0] if orders_rows else []
-        orders = [dict(zip(orders_headers, r)) for r in orders_rows[1:]] if orders_rows else []
-
-        # Embroidery list
-        emb_rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
-        if isinstance(emb_rows, dict) and emb_rows.get("error"):
-            return jsonify({"error": emb_rows["error"], "orders": [], "embroideryList": [], "links": {}}), 500
-        emb_headers = emb_rows[0] if emb_rows else []
-        embroidery_list = [dict(zip(emb_headers, r)) for r in emb_rows[1:]] if emb_rows else []
-
-        # Links (from in-memory store)
-        links = _links_store
 
         return jsonify({
-            "orders": orders,
-            "embroideryList": embroidery_list,
-            "links": links,
+            "ok": True,
+            "machineColumns": [pruned_m1, pruned_m2],
+            "placeholders": placeholders,
+            "removed": sorted(list(removed_ids))
         }), 200
+
     except Exception as e:
-        logger.exception("/api/combined failed")
-        return jsonify({"error": str(e), "orders": [], "embroideryList": [], "links": {}}), 500
+        logger.exception("Error in POST /api/manualState")
+        return jsonify({"ok": False, "error": str(e)}), 200
 
 
-@app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
-@login_required_session
-def drive_make_public():
+
+# ─────────────────────────────────────────────
+# helper: grant “anyone with link” reader access
+def make_public(file_id, drive_service):
+    drive_service.permissions().create(
+        fileId=file_id,
+        body={"type": "anyone", "role": "reader"},
+        fields="id"
+    ).execute()
+
+@app.route("/submit", methods=["OPTIONS","POST"])
+def submit_order():
     if request.method == "OPTIONS":
-        # CORS preflight (redundant with global handler, but safe)
-        resp = make_response("", 204)
-        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-        allowed = {
-            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-            "https://machineschedule.netlify.app",
-            "http://localhost:3000",
-        }
-        if origin in allowed:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
-        return resp
+        return make_response("", 204)
 
+    try:
+        data               = request.form
+        prod_files         = request.files.getlist("prodFiles")
+        print_files        = request.files.getlist("printFiles")
+
+        # ─── EARLY VALIDATION ────────────────────────────────────────────────
+        materials          = data.getlist("materials")
+        material_percents  = data.getlist("materialPercents")
+        # pad both lists to exactly 5 entries
+        materials[:]         = (materials + [""] * 5)[:5]
+        material_percents[:] = (material_percents + [""] * 5)[:5]
+
+        # 1) Material1 is mandatory
+        if not materials[0].strip():
+            return jsonify({"error": "Material1 is required."}), 400
+
+        # 2) If product contains “full”, backMaterial is mandatory
+        product_lower = (data.get("product") or "").strip().lower()
+        if "full" in product_lower and not data.get("backMaterial","").strip():
+            return jsonify({"error": "Back Material is required for “Full” products."}), 400
+
+        # 3) Every populated material must have its percent
+        for idx, mat in enumerate(materials):
+            if mat.strip():
+                pct = material_percents[idx].strip()
+                if not pct:
+                    return jsonify({
+                        "error": f"Percentage for Material{idx+1} (“{mat}”) is required."
+                    }), 400
+                try:
+                    float(pct)
+                except ValueError:
+                    return jsonify({
+                        "error": f"Material{idx+1} percentage (“{pct}”) must be a number."
+                    }), 400
+
+        # ─── DETERMINE NEXT ROW & ORDER # ────────────────────────────────────
+        col_a      = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Production Orders!A:A"
+        ).execute().get("values", [])
+        next_row   = len(col_a) + 1
+        prev_order = int(col_a[-1][0]) if len(col_a) > 1 else 0
+        new_order  = prev_order + 1
+
+        # ─── TEMPLATE FORMULAS ───────────────────────────────────────────────
+        def tpl_formula(col_letter, target_row):
+            resp = sheets.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!{col_letter}2",
+                valueRenderOption="FORMULA"
+            ).execute()
+            raw = resp.get("values", [[""]])[0][0] or ""
+            return re.sub(r"(\b[A-Z]+)2\b",
+                          lambda m: f"{m.group(1)}{target_row}",
+                          raw)
+
+        ts           = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+        preview      = tpl_formula("C", next_row)
+        stage        = tpl_formula("I", next_row)
+        ship_date    = tpl_formula("V", next_row)
+        stitch_count = tpl_formula("W", next_row)
+        schedule_str = tpl_formula("AC", next_row)
+
+        # ─── DRIVE FOLDER HELPERS ────────────────────────────────────────────
+        drive = get_drive_service()
+
+        def create_folder(name, parent_id=None):
+            query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            if parent_id:
+                query += f" and '{parent_id}' in parents"
+            existing = drive.files().list(q=query, fields="files(id)").execute().get("files", [])
+            for f in existing:
+                drive.files().delete(fileId=f["id"]).execute()
+            meta = {"name": str(name), "mimeType": "application/vnd.google-apps.folder"}
+            if parent_id:
+                meta["parents"] = [parent_id]
+            folder = drive.files().create(body=meta, fields="id").execute()
+            return folder["id"]
+
+        def make_public(file_id):
+            drive.permissions().create(
+                fileId=file_id,
+                body={"role": "reader", "type": "anyone"}
+            ).execute()
+
+        # ─── CREATE ORDER FOLDER & UPLOAD ────────────────────────────────────
+        order_folder_id = create_folder(new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
+        make_public(order_folder_id)
+
+        # if reorderFrom, copy .emb files
+        if data.get("reorderFrom"):
+            copy_emb_files(
+                old_order_num = data["reorderFrom"],
+                new_order_num = new_order,
+                drive_service = drive,
+                new_folder_id = order_folder_id
+            )
+
+        prod_links = []
+        for f in prod_files:
+            m  = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+            up = drive.files().create(
+                body={"name": f.filename, "parents": [order_folder_id]},
+                media_body=m,
+                fields="id,webViewLink"
+            ).execute()
+            make_public(up["id"])
+            prod_links.append(up["webViewLink"])
+
+        print_links = ""
+        if print_files:
+            pf_id = create_folder("Print Files", parent_id=order_folder_id)
+            make_public(pf_id)
+            for f in print_files:
+                m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+                drive.files().create(
+                    body={"name": f.filename, "parents": [pf_id]},
+                    media_body=m,
+                    fields="id"
+                ).execute()
+            print_links = f"https://drive.google.com/drive/folders/{pf_id}"
+
+        # ─── ASSEMBLE & WRITE ROW A→AK ───────────────────────────────────────
+        row = [
+            new_order, ts, preview,
+            data.get("company"), data.get("designName"), data.get("quantity"),
+            "",  # shipped
+            data.get("product"), stage, data.get("price"),
+            data.get("dueDate"), ("PRINT" if prod_links else "NO"),
+            *materials,                  # M–Q
+            data.get("backMaterial"), data.get("furColor"),
+            data.get("embBacking",""), "",  # top stitch blank
+            ship_date, stitch_count,
+            data.get("notes"),
+            ",".join(prod_links),
+            print_links,
+            "",  # AA blank
+            data.get("dateType"),
+            schedule_str,
+            "", "", "",                 # AD, AE, AF – pad so percents start at AG
+            *material_percents           # AG–AK
+        ]
+
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!A{next_row}:AK{next_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [row]}
+        ).execute()
+
+        # ─── COPY AF2 FORMULA DOWN ─────────────────────────────────────────
+        resp = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Production Orders!AF2",
+            valueRenderOption="FORMULA"
+        ).execute()
+        raw_f = resp.get("values",[[""]])[0][0] or ""
+        new_f = raw_f.replace("2", str(next_row))
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!AF{next_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[new_f]]}
+        ).execute(); invalidate_upcoming_cache()
+
+        return jsonify({"status":"ok","order":new_order}), 200
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error("Error in /submit:\n%s", tb)
+        return jsonify({"error": str(e), "trace": tb}), 500
+
+@app.route("/api/reorder", methods=["POST"])
+@login_required_session
+def reorder():
     data = request.get_json(silent=True) or {}
-    file_id = (data.get("fileId") or "").strip()
-    if not file_id:
-        return jsonify({"ok": False, "error": "missing fileId"}), 400
+    prev_id = data.get("previousOrder")
+
+    if not prev_id:
+        return jsonify({"error": "Missing previous order ID"}), 400
+
+    # This endpoint now just acknowledges reorder intent.
+    # Actual reorder is handled via /submit with prefilled data.
+    print(f"↪️ Received reorder request for previous order #{prev_id}. Redirecting to /submit flow.")
+    return jsonify({"status": "ok", "message": f"Reorder initiated for #{prev_id}"}), 200
+
+
+@app.route("/api/directory", methods=["GET"])
+@login_required_session
+def get_directory():
+    """
+    Returns JSON array of company names from the 'Directory' sheet.
+    """
+    try:
+        # read column A (Company Name) from row 2 down
+        rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A")
+        # flatten and filter out empty cells
+        companies = [r[0] for r in rows if r and r[0].strip()]
+        return jsonify(companies), 200
+    except Exception:
+        logger.exception("Error fetching directory")
+        return jsonify([]), 200
+
+@app.route("/api/directory", methods=["POST"])
+@login_required_session
+def add_directory_entry():
+    """
+    Appends a new row to the Directory sheet.
+    Expects JSON with keys:
+      companyName,
+      contactFirstName,
+      contactLastName,
+      contactEmailAddress,
+      streetAddress1,
+      streetAddress2,
+      city,
+      state,
+      zipCode,
+      phoneNumber
+    """
+    try:
+        data = request.get_json(force=True)
+    except Exception as e:
+        print("❌ Failed to parse JSON:", e)
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    print("📥 Incoming /api/reorder payload:", data)
+    try:
+        # build the row in the same order as your sheet columns A→J
+        row = [
+            data.get("companyName", ""),
+            data.get("contactFirstName", ""),
+            data.get("contactLastName", ""),
+            data.get("contactEmailAddress", ""),
+            data.get("streetAddress1", ""),
+            data.get("streetAddress2", ""),
+            data.get("city", ""),
+            data.get("state", ""),
+            data.get("zipCode", ""),
+            data.get("phoneNumber", ""),
+        ]
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Directory!A2:J",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
+        return jsonify({"status": "ok"}), 200
+    except Exception:
+        logger.exception("Error adding new company")
+        return jsonify({"error": "Failed to add company"}), 500
+
+
+
+@app.route("/api/fur-colors", methods=["GET"])
+@login_required_session
+def get_fur_colors():
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!I2:I")
+        colors = [r[0] for r in rows if r and r[0].strip()]
+        return jsonify(colors), 200
+    except Exception:
+        logger.exception("Error fetching fur colors")
+        return jsonify([]), 200
+
+# ─── Add /api/threads endpoint with dynamic formulas ────────────────────────
+@app.route("/api/threads", methods=["POST"])
+@login_required_session
+def add_thread():
+    try:
+        # 1) Parse incoming JSON (single dict or list)
+        raw   = request.get_json(silent=True) or []
+        items = raw if isinstance(raw, list) else [raw]
+
+        # 2) Find next empty row in Material Inventory column I
+        resp     = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!I2:I"
+        ).execute().get("values", [])
+        next_row = len(resp) + 2
+
+        # 3) Helper to fetch raw formula text
+        def tpl(col, src_row):
+            return sheets.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!{col}{src_row}",
+                valueRenderOption="FORMULA"
+            ).execute().get("values", [[""]])[0][0] or ""
+
+        # 4) Copy raw formulas from J4, K4 and O2
+        rawJ = tpl("J", 4)
+        rawK = tpl("K", 4)
+        rawO = tpl("O", 2)
+
+        # 5) Rewrite only the row references:
+        formulaJ = rawJ.replace("I4", f"I{next_row}")
+        formulaK = rawK.replace("I4", f"I{next_row}")
+        formulaO = rawO.replace("2", str(next_row))
+
+        # 6) Loop through each item and write its row I→O
+        added = 0
+        for item in items:
+            threadColor = item.get("threadColor", "").strip()
+            minInv      = item.get("minInv",      "").strip()
+            reorder     = item.get("reorder",     "").strip()
+            cost        = item.get("cost",        "").strip()
+
+            # skip any empty entries
+            if not threadColor:
+                continue
+
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!I{next_row}:O{next_row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[
+                    threadColor,
+                    formulaJ,
+                    formulaK,
+                    minInv,
+                    reorder,
+                    cost,
+                    formulaO
+                ]]}
+            ).execute()
+
+            added    += 1
+            next_row += 1
+
+        return jsonify({"added": added}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/table", methods=["POST"])
+@login_required_session
+def add_table_entry():
+    data = request.get_json(silent=True) or {}
+
+    # 1) Extract your original 11 fields + 3 new ones
+    product_name        = data.get("product", "").strip()        # → A
+    print_time          = data.get("printTime", "")             # → D
+    per_yard            = data.get("perYard", "")               # → F
+    foam_half           = data.get("foamHalf", "")              # → G
+    foam_38             = data.get("foam38", "")                # → H
+    foam_14             = data.get("foam14", "")                # → I
+    foam_18             = data.get("foam18", "")                # → J
+    n_magnets           = data.get("magnetN", "")               # → K
+    s_magnets           = data.get("magnetS", "")               # → L
+    elastic_half_length = data.get("elasticHalf", "")           # → M
+    volume              = data.get("volume", "")                # → N
+
+    # ← New pouch-specific fields:
+    black_grommets      = data.get("blackGrommets", "")         # → O
+    paracord_ft         = data.get("paracordFt", "")            # → P
+    cord_stoppers       = data.get("cordStoppers", "")          # → Q
+
+    if not product_name:
+        return jsonify({"error": "Missing product name"}), 400
+
+    try:
+        # 2) Append into Table!A2:Q2 (now 17 cols A–Q)
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Table!A2:Q2",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={
+                "values": [[
+                    product_name,        # A
+                    "",                  # B
+                    "",                  # C
+                    print_time,          # D
+                    "",                  # E
+                    per_yard,            # F
+                    foam_half,           # G
+                    foam_38,             # H
+                    foam_14,             # I
+                    foam_18,             # J
+                    n_magnets,           # K
+                    s_magnets,           # L
+                    elastic_half_length, # M
+                    volume,              # N
+                    black_grommets,      # O
+                    paracord_ft,         # P
+                    cord_stoppers        # Q
+                ]]
+            }
+        ).execute()
+
+        return jsonify({"status": "ok", "product": product_name}), 200
+
+    except Exception as e:
+        logger.exception("Failed to append new product to Table")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/table", methods=["GET"])
+@login_required_session
+def get_table():
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
+        headers = rows[0]
+        data = [dict(zip(headers, r)) for r in rows[1:]]
+        return jsonify(data), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ─── MATERIALS ENDPOINTS ────────────────────────────────────────────────
+
+from flask import make_response  # if not already imported
+
+# ─── MATERIALS ENDPOINTS ────────────────────────────────────────────────
+
+@app.route("/api/materials", methods=["OPTIONS"])
+def materials_preflight():
+    return make_response("", 204)
+
+# 2) GET list for your typeahead
+@app.route("/api/materials", methods=["GET"])
+@login_required_session
+def get_materials():
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
+        names = [r[0] for r in rows if r and r[0].strip()]
+        return jsonify(names), 200
+    except Exception:
+        logger.exception("Error fetching materials")
+        return jsonify([]), 200
+
+# 3) POST new material(s) into Material Inventory!A–H
+@app.route("/api/materials", methods=["POST"])
+@login_required_session
+def add_materials():
+    raw   = request.get_json(silent=True) or []
+    items = raw if isinstance(raw, list) else [raw]
+
+    # fetch the raw formulas from row 2
+    def get_formula(col):
+        resp = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Material Inventory!{col}2",
+            valueRenderOption="FORMULA"
+        ).execute()
+        return resp.get("values", [[""]])[0][0] or ""
+
+    rawB = get_formula("B")
+    rawC = get_formula("C")
+    rawH = get_formula("H")
+
+    now      = datetime.now(ZoneInfo("America/New_York"))\
+                    .strftime("%-m/%-d/%Y %H:%M:%S")
+    inv_rows = []
+    
+    # find where row 2 starts, so we can compute new rows dynamically
+    existing = sheets.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Material Inventory!A2:A"
+    ).execute().get("values", [])
+    next_row = len(existing) + 2  # because A2 is first data row
+
+    for it in items:
+        name    = it.get("materialName","").strip()
+        unit    = it.get("unit","").strip()
+        mininv  = it.get("minInv","").strip()
+        reorder = it.get("reorder","").strip()
+        cost    = it.get("cost","").strip()
+
+        if not name:
+            continue
+
+        # rewrite the row references in each formula
+        formulaB = rawB.replace("2", str(next_row))
+        formulaC = rawC.replace("2", str(next_row))
+        formulaH = rawH.replace("2", str(next_row))
+
+        inv_rows.append([
+            name,       # A
+            formulaB,   # B: uses rawB but with "2"→next_row
+            formulaC,   # C: same
+            unit,       # D: user entry
+            mininv,     # E
+            reorder,    # F
+            cost,       # G
+            formulaH    # H: uses rawH but with "2"→next_row
+        ])
+
+        next_row += 1
+    # end for
+
+    # append the rows you’ve built
+    if inv_rows:
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!A2:H",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": inv_rows}
+        ).execute(); invalidate_upcoming_cache()
+
+    return jsonify({"status":"submitted"}), 200
+
+
+# ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
+@app.route("/api/materialInventory", methods=["OPTIONS"])
+def material_inventory_preflight():
+    return make_response("", 204)
+
+# ─── MATERIAL-LOG POST ────────────────────────────────────────────────────
+@app.route("/api/materialInventory", methods=["POST"])
+@login_required_session
+def submit_material_inventory():
+    """
+    Handles adding new materials to Material Inventory (cols A–H),
+    copying row 2 formulas dynamically, and logging:
+      - Materials -> Material Log
+      - Threads   -> Thread Data (by header name; NO writes to Thread Inventory)
+    """
+    try:
+        # 1) Parse incoming payload
+        items = request.get_json(silent=True) or []
+        items = items if isinstance(items, list) else [items]
+
+        sheet = sheets.values()
+        timestamp = datetime.now(ZoneInfo("America/New_York")) \
+            .strftime("%-m/%-d/%Y %H:%M:%S")
+
+        material_log_rows = []
+        thread_log_rows   = []
+
+        # ========= Material Inventory setup (unchanged behavior) =========
+        # 2) Fetch row 2 formulas for Material Inventory (A2:H2)
+        mat_formula = sheet.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!A2:H2",
+            valueRenderOption="FORMULA"
+        ).execute().get("values", [[]])[0]
+        mat_inv_tpl  = str(mat_formula[1]) if len(mat_formula) > 1 else ""
+        mat_oo_tpl   = str(mat_formula[2]) if len(mat_formula) > 2 else ""
+        mat_val_tpl  = str(mat_formula[7]) if len(mat_formula) > 7 else ""
+
+        # 3) Fetch existing rows for Material Inventory
+        mat_rows = sheet.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!A1:H1000"
+        ).execute().get("values", [])[1:]  # skip header
+        existing_mats = {r[0].strip().lower() for r in mat_rows if r and r[0].strip()}
+
+        # Helper: find first blank row (1-based index + header) in a sheet's col A
+        def first_blank_row(rows):
+            return next((i + 2 for i, r in enumerate(rows)
+                         if not r or not (r[0].strip() if len(r) > 0 else "")),
+                        len(rows) + 2)
+
+        # ========= Thread Data header-based mapping =========
+        # Fetch Thread Data headers so we can place values by name
+        td_rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
+        td_headers = td_rows[0] if td_rows else []
+        td_idx = {h: i for i, h in enumerate(td_headers)}
+
+        def build_thread_log_row(dt, color, feet, action):
+            """Map values into a row aligned to Thread Data headers."""
+            row = [""] * len(td_headers)
+            if "Date" in td_idx:         row[td_idx["Date"]] = dt
+            if "Color" in td_idx:        row[td_idx["Color"]] = color
+            if "Length (ft)" in td_idx:  row[td_idx["Length (ft)"]] = feet
+            if "IN/OUT" in td_idx:       row[td_idx["IN/OUT"]] = "IN"
+            if "O/R" in td_idx:          row[td_idx["O/R"]] = action  # Ordered/Received
+            return row
+
+        # 5) Process each item
+        for it in items:
+            name    = (it.get("materialName") or it.get("value") or "").strip()
+            type_   = (it.get("type") or "").strip() or "Material"
+            unit    = it.get("unit",    "").strip()
+            min_inv = it.get("minInv",  "").strip()
+            reorder = it.get("reorder", "").strip()
+            cost    = it.get("cost",    "").strip()  # not used for threads per request
+            action  = it.get("action",  "").strip()  # "Ordered" / "Received"
+            qty_raw = it.get("quantity","")
+
+            # must have name and quantity to do anything
+            if not (name and str(qty_raw).strip()):
+                continue
+
+            if type_ == "Material":
+                # === MATERIAL: add to Material Inventory if new, always log to Material Log ===
+                is_new = name.lower() not in existing_mats
+                if is_new:
+                    target = first_blank_row(mat_rows)
+
+                    # build formulas for the new target row
+                    inv_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_inv_tpl)
+                    oo_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_oo_tpl)
+                    val_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_val_tpl)
+
+                    row_vals = [[
+                        name, inv_f, oo_f, unit,
+                        min_inv, reorder, cost, val_f
+                    ]]
+
+                    # write the new inventory row
+                    sheet.update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"Material Inventory!A{target}:H{target}",
+                        valueInputOption="USER_INPUT",
+                        body={"values": row_vals}
+                    ).execute()
+
+                    # keep in-memory sets/rows up to date for subsequent items
+                    existing_mats.add(name.lower())
+                    while len(mat_rows) < target - 1:
+                        mat_rows.append([])
+                    mat_rows.append([name])
+
+                # ALWAYS log the material movement (even if not new)
+                material_log_rows.append([timestamp, "", "", "", "", name, str(qty_raw).strip(), "IN", action])
+
+            else:
+                # === THREAD: DO NOT write to "Thread Inventory"; ONLY log to "Thread Data" ===
+                try:
+                    cones = int(str(qty_raw).strip())
+                    feet  = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
+                except Exception:
+                    feet = ""
+
+                thread_log_rows.append(
+                    build_thread_log_row(timestamp, name, feet, action)
+                )
+
+        # 6) Append to logs
+        if material_log_rows:
+            sheet.append(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Material Log!A2:I",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": material_log_rows}
+            ).execute()
+
+        if thread_log_rows:
+            # Write against a wide range so rows match header width even if columns move
+            sheet.append(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Thread Data!A2:Z",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": thread_log_rows}
+            ).execute()
+
+        return jsonify({"status": "submitted"}), 200
+
+    except Exception as e:
+        logging.exception("❌ submit_material_inventory failed")
+        return jsonify({"error": str(e)}), 500
+
+# server.py (or routes file)
+from flask import request, jsonify
+from datetime import datetime
+
+@app.route("/api/directory-row", methods=["GET"])
+@login_required_session
+def directory_row():
+    company = (request.args.get("company") or "").strip()
+    if not company:
+        return jsonify({"error": "Missing company"}), 400
+
+    # Read your 'Directory' tab (A:K or whatever your full header range is)
+    sheet = sheets.values()
+    resp = sheet.get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Directory!A1:K10000",
+        valueRenderOption="UNFORMATTED_VALUE"
+    ).execute()
+    rows = resp.get("values", [])
+    if not rows:
+        return jsonify({"error": "No Directory data"}), 404
+
+    headers = rows[0]
+    # Find row where 'Company Name' matches (case-insensitive, trimmed)
+    target = None
+    for r in rows[1:]:
+        row = { headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers)) }
+        name = str(row.get("Company Name", "")).strip()
+        if name.lower() == company.lower():
+            target = row
+            break
+
+    if not target:
+        return jsonify({"error": f"Company not found: {company}"}), 404
+
+    return jsonify(target)
+
+
+@app.route("/api/products", methods=["GET"])
+@login_required_session
+def get_products():
+    """
+    Returns JSON array of product names from the 'Table' sheet (column A).
+    """
+    try:
+        # read column A (products) from row 2 down
+        rows = fetch_sheet(SPREADSHEET_ID, "Table!A2:A")
+        products = [r[0] for r in rows if r and r[0].strip()]
+        return jsonify(products), 200
+    except Exception:
+        logger.exception("Error fetching products")
+        return jsonify([]), 200
+
+@app.route("/api/inventory", methods=["GET"])
+@login_required_session
+def get_inventory():
+    # Pull the header row + all data rows from Material Inventory!A1:H
+    rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:H")
+    headers = rows[0] if rows else []
+    data    = [dict(zip(headers, r)) for r in rows[1:]] if rows else []
+    return jsonify({ "headers": headers, "rows": data }), 200
+
+@app.route("/api/threadInventory", methods=["POST"])
+@login_required_session
+def submit_thread_inventory():
+    entries = request.get_json(silent=True) or []
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+
+    # Fetch Thread Data headers so we can place values by name
+    td_rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
+    headers = td_rows[0] if td_rows else []
+    h_idx = {h: i for i, h in enumerate(headers)}
+
+    def build_row(color, feet, action):
+        row = [""] * len(headers)
+        if "Date" in h_idx:         row[h_idx["Date"]] = now
+        if "Color" in h_idx:        row[h_idx["Color"]] = color
+        if "Length (ft)" in h_idx:  row[h_idx["Length (ft)"]] = feet
+        if "IN/OUT" in h_idx:       row[h_idx["IN/OUT"]] = "IN"
+        if "O/R" in h_idx:          row[h_idx["O/R"]] = action  # Ordered / Received
+        return row
+
+    to_log = []
+    for e in (entries if isinstance(entries, list) else [entries]):
+        color     = (e.get("value") or "").strip()      # NOTE: frontend sends "value"
+        action    = (e.get("action") or "").strip()
+        qty_cones = (e.get("quantity") or "").strip()
+        if not (color and action and qty_cones):
+            continue
+
+        try:
+            cones = int(qty_cones)
+            feet  = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
+        except Exception:
+            feet = ""
+
+        to_log.append(build_row(color, feet, action))
+
+    if to_log:
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Thread Data!A2:Z",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": to_log}
+        ).execute()
+
+    # ✅ invalidate materials-needed cache
+    invalidate_materials_needed_cache()
+
+    return jsonify({"added": len(to_log)}), 200
+
+
+
+@app.route("/api/inventoryOrdered", methods=["GET"])
+@login_required_session
+def get_inventory_ordered():
+    orders = []
+
+    # 0) Build Material→Unit and Material→Vendor maps (from Inventory sheet A2:I)
+    inv_rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:I")
+    unit_map = {
+        r[0]: (r[3] if len(r) > 3 else "")
+        for r in inv_rows if r and str(r[0]).strip()
+    }
+    vendor_map = {
+        r[0]: (r[8] if len(r) > 8 else "")
+        for r in inv_rows if r and str(r[0]).strip()
+    }
+
+
+    # 1) Material Log sheet
+    mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
+    if mat:
+        hdr     = mat[0]
+        i_dt    = hdr.index("Date")
+        i_or    = hdr.index("O/R")
+        qty_idx = i_or - 2              # Quantity is one column left of O/R
+        i_mat   = hdr.index("Material")
+
+        for idx, row in enumerate(mat[1:], start=2):
+            if len(row) > i_or and row[i_or].strip().lower() == "ordered":
+                name = row[i_mat] if len(row) > i_mat else ""
+                qty  = row[qty_idx] if len(row) > qty_idx else ""
+                orders.append({
+                    "row":      idx,
+                    "date":     row[i_dt] if len(row) > i_dt else "",
+                    "type":     "Material",
+                    "name":     name,
+                    "quantity": qty,
+                    "unit":     unit_map.get(name, ""),
+                    "vendor":   vendor_map.get(name, "")
+                })
+
+
+    # 2) Thread Data sheet (unchanged)
+    th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
+    if th:
+        hdr    = th[0]
+        i_or   = hdr.index("O/R")
+        i_dt   = hdr.index("Date")
+        i_col  = hdr.index("Color")
+        i_len  = hdr.index("Length (ft)")
+
+        for idx, row in enumerate(th[1:], start=2):
+            if len(row) > i_or and row[i_or].strip().lower() == "ordered":
+                qty = row[i_len] if len(row) > i_len else ""
+                try:
+                    qty = f"{float(qty) / 16500:.2f} cones"
+                except:
+                    pass
+                orders.append({
+                    "row":      idx,
+                    "date":     row[i_dt] if len(row) > i_dt else "",
+                    "type":     "Thread",
+                    "name":     row[i_col] if len(row) > i_col else "",
+                    "quantity": qty
+                })
+
+    return jsonify(orders), 200
+
+@app.route("/api/inventoryOrdered", methods=["PUT"])
+@login_required_session
+def mark_inventory_received():
+    """
+    Expects JSON:
+      { type: "Material"|"Thread", row: <number> }
+    Updates:
+      - Column A (Date) to now
+      - O/R column to "Received" (I for Material, H for Thread)
+    """
+    data      = request.get_json(silent=True) or {}
+    sheetType = data.get("type")
+    row       = data.get("row")
+
+    try:
+        row = int(row)
+    except:
+        return jsonify({"error":"invalid row"}), 400
+
+    # choose sheet & O/R column
+    if sheetType == "Material":
+        sheet   = "Material Log"
+        col_or  = "I"
+    else:
+        sheet   = "Thread Data"
+        col_or  = "H"
+
+    # timestamp in A
+    now = datetime.now(ZoneInfo("America/New_York"))\
+              .strftime("%-m/%-d/%Y %H:%M:%S")
+
+    # 1) Update the Date cell (col A)
+    sheets.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet}!A{row}",
+        valueInputOption="USER_ENTERED",
+        body={"values":[[now]]}
+    ).execute()
+
+    # 2) Update the O/R cell to "Received"
+    sheets.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet}!{col_or}{row}",
+        valueInputOption="USER_ENTERED",
+        body={"values":[["Received"]]}
+    ).execute()
+
+    return jsonify({"status":"ok"}), 200
+
+@app.route("/api/inventoryOrdered/quantity", methods=["PATCH"])
+@login_required_session
+def update_inventory_ordered_quantity():
+    """
+    Update the ordered quantity for an item still in 'Ordered' status.
+
+    JSON:
+      { "type": "Material" | "Thread", "row": <1-based row>, "quantity": <str|num> }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        sheet_type = (data.get("type") or "").strip()
+        row = data.get("row")
+        qty = data.get("quantity")
+
+        try:
+            row = int(row)
+        except Exception:
+            return jsonify({"error": "Invalid 'row'"}), 400
+
+        if not sheet_type or qty is None:
+            return jsonify({"error": "Missing 'type' or 'quantity'"}), 400
+
+        # helper: 0-based index → A1
+        def col_to_a1(idx0: int) -> str:
+            n = idx0 + 1
+            s = ""
+            while n:
+                n, rem = divmod(n - 1, 26)
+                s = chr(65 + rem) + s
+            return s
+
+        if sheet_type.lower() == "material":
+            # Material Log: quantity is 2 columns left of "O/R" (matches your GET)
+            rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
+            if not rows:
+                return jsonify({"error": "Material Log empty"}), 500
+
+            hdr = rows[0]
+            if "O/R" not in hdr:
+                return jsonify({"error": "Could not find 'O/R' in Material Log"}), 500
+            i_or = hdr.index("O/R")
+            idx_qty = i_or - 2
+            if idx_qty < 0:
+                return jsonify({"error": "Invalid Quantity position"}), 500
+
+            colA1 = col_to_a1(idx_qty)
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Log!{colA1}{row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[qty]]}
+            ).execute()
+
+        else:
+            # Threads: update "Length (ft)" in Thread Data
+            rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
+            if not rows:
+                return jsonify({"error": "Thread Data empty"}), 500
+
+            hdr = rows[0]
+            if "Length (ft)" not in hdr:
+                return jsonify({"error": "Could not find 'Length (ft)' in Thread Data"}), 500
+
+            idx_len = hdr.index("Length (ft)")
+            colA1 = col_to_a1(idx_len)
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Thread Data!{colA1}{row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[qty]]}
+            ).execute()
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as e:
+        print("🔥 update_inventory_ordered_quantity error:", str(e))
+        traceback.print_exc()
+        return jsonify({"error": "Internal server error"}), 500
+
+
+
+@app.route("/api/company-list")
+@login_required_session
+def company_list():
+    directory_data = fetch_sheet(SPREADSHEET_ID, "Directory!A1:Z")
+    headers = directory_data[0]
+
+    # Try to find the column with company names
+    col_index = None
+    for idx, col in enumerate(headers):
+        if str(col).strip().lower() in ["company name", "company"]:
+            col_index = idx
+            break
+
+    if col_index is None:
+        return jsonify({"error": "Company name column not found in Directory tab"}), 500
+
+    # Get all non-empty company names and deduplicate
+    companies = list({row[col_index].strip() for row in directory_data[1:] if len(row) > col_index and row[col_index].strip()})
+    companies.sort()
+
+    return jsonify({"companies": companies})
+
+@app.route("/api/process-shipment", methods=["POST"])
+def process_shipment():
+    data = request.get_json()
+    env_override = data.get("qboEnv")  # either "sandbox" or "production"
+    session["qboEnv"] = (env_override or "production")  # ← store desired env
+    print("📥 Reorder API received:", data)
+
+
+    print("📥 Reorder API received:", data)
+
+    # 1) Parse incoming
+    order_ids = [str(oid).strip() for oid in data.get("order_ids", [])]
+    shipped_quantities = {
+        str(k).strip(): v
+        for k, v in data.get("shipped_quantities", {}).items()
+    }
+    boxes = data.get("boxes", [])
+    shipping_method = data.get("shipping_method", "")
+    service_code    = data.get("service_code")   # e.g., "03", "02", "01", etc.
+
+    print("🔍 Received order_ids:", order_ids)
+    print("🔍 Received shipped_quantities:", shipped_quantities)
+    print("🔍 Received shipping_method:", shipping_method)
+
+    if not order_ids:
+        return jsonify({"error": "Missing order_ids"}), 400
+
+    sheet_id = os.environ["SPREADSHEET_ID"]
+    sheet_name = "Production Orders"
+
+    try:
+        service = get_sheets_service()
+        # 2) Read the full sheet
+        result = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{sheet_name}!A1:Z",
+        ).execute()
+        rows = result.get("values", [])
+        headers = rows[0]
+
+        # locate columns
+        id_col      = headers.index("Order #")
+        shipped_col = headers.index("Shipped")
+
+        updates = []
+        all_order_data = []
+
+        # 3) Build update requests & collect data for invoice
+        for i, row in enumerate(rows[1:], start=2):
+            order_id = str(row[id_col]).strip()
+            if order_id in order_ids:
+                raw = shipped_quantities.get(order_id, 0)
+                try:
+                    parsed_qty = int(float(raw))
+                except:
+                    parsed_qty = 0
+
+                # queue sheet update
+                updates.append({
+                    "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
+                    "values": [[str(parsed_qty)]]
+                })
+
+                # build order_data dict for invoice
+                row_dict = dict(zip(headers, row))
+                order_dict = {
+                    h: (
+                        str(parsed_qty) if h in ("Shipped", "ShippedQty")
+                        else row_dict.get(h, "")
+                    )
+                    for h in headers
+                }
+                order_dict["ShippedQty"] = parsed_qty
+                all_order_data.append(order_dict)
+
+        # 4) Push updates
+        if updates:
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"valueInputOption": "USER_ENTERED", "data": updates}
+            ).execute()
+            print("✅ Shipped quantities written to sheet.")
+        else:
+            print("⚠️ No updates to push—check order_ids match sheet.")
+
+        # 5) Create invoice in QBO…
+        headers, realm_id = get_quickbooks_credentials()
+        invoice_url = create_consolidated_invoice_in_quickbooks(
+            all_order_data,
+            shipping_method,
+            tracking_list=[],
+            base_shipping_cost=0.0,
+            sheet=service,
+            env_override=env_override
+        )
+
+        # fetch your company’s info
+        company_info = fetch_company_info(headers, realm_id, env_override)
+
+        # 6) Generate packing‐slip PDF with real company_info
+        pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
+        filename = f"packing_slip_{int(time.time())}.pdf"
+        tmp_path = os.path.join(tempfile.gettempdir(), filename)
+        with open(tmp_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        # 7) Build a public URL for the front-end
+        slip_url = url_for("serve_slip", filename=filename, _external=True)
+
+        # 8) Upload packing slip to Drive for the watcher
+        # Use the first order_id from the request (not the loop variable)
+        order_ids_str = "-".join(order_ids)
+        num_slips     = len(boxes)
+        pdf_filename  = f"{order_ids_str}_copies_{len(boxes)}_packing_slip.pdf"
+        media            = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
+        drive = get_drive_service()
+        drive.files().create(
+            body={
+                "name":    pdf_filename,
+                "parents": [os.environ["PACKING_SLIP_PRINT_FOLDER_ID"]]
+            },
+            media_body=media
+        ).execute()
+
+        # now return just the labels & invoice—no more pop-up slips
+        return jsonify({
+            "labels":  [],
+            "invoice": invoice_url,
+            "slips":   []
+        })
+
+
+    except RedirectException as e:
+        # No valid QuickBooks token → tell client to start OAuth flow
+        print("🔁 Redirecting to OAuth:", e.redirect_url)
+        return jsonify({"redirect": e.redirect_url}), 200
+
+    except Exception as e:
+        # Any other error
+        print("❌ Shipment error:", e)
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    # Log the full stack for debugging
+    logger.exception("Unhandled exception in request:")
+    # Return a JSON error and CORS
+    resp = jsonify(error=str(e))
+    resp.status_code = 500
+    resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
+@app.route("/api/product-specs", methods=["POST"])
+@login_required_session
+def set_product_specs():
+    """
+    Accepts JSON:
+      {
+        "product": "My Product Name",
+        "printTime": 12,
+        "perYard": 3,
+        "foamHalf": 10,
+        "foam38": 8,
+        "foam14": 6,
+        "foam18": 4,
+        "magnetN": 5,
+        "magnetS": 5,
+        "elasticHalf": 100,
+        "volume": 2000
+      }
+    Finds the matching row in the Table sheet by column A, then writes
+    each value into its lettered column.
+    """
+    data = request.get_json() or {}
+    product = data.get("product", "").strip()
+    if not product:
+        return jsonify({"error": "Missing product"}), 400
+
+    # 1) Fetch column A (Products) to find the row
+    sheet = get_sheets_service().spreadsheets()
+    result = sheet.values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Table!A2:Z"
+    ).execute()
+    values = result.get("values", [])
+
+    row_index = None
+    for i, row in enumerate(values, start=2):
+        if str(row[0]).strip().lower() == product.lower():
+            row_index = i
+            break
+
+    if row_index is None:
+        return jsonify({"error": f"Product '{product}' not found"}), 404
+
+    # 2) Map each incoming field to its sheet column
+    updates = {
+        "D": data.get("printTime", ""),       # Print Times (1 Machine)
+        "F": data.get("perYard", ""),         # How Many Products Per Yard
+        "G": data.get("foamHalf", ""),        # 1/2" Foam
+        "H": data.get("foam38", ""),          # 3/8" Foam
+        "I": data.get("foam14", ""),          # 1/4" Foam
+        "J": data.get("foam18", ""),          # 1/8" Foam
+        "K": data.get("magnetN", ""),         # N Magnets
+        "L": data.get("magnetS", ""),         # S Magnets
+        "M": data.get("elasticHalf", ""),     # 1/2" Elastic
+        "N": data.get("volume", ""),          # Volume
+    }
+
+    # 3) Write each one cell
+    for col, val in updates.items():
+        target = f"Table!{col}{row_index}"
+        sheet.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Material Inventory!A{target_row}:P{target_row}",  # <- now includes column P
+            valueInputOption="USER_ENTERED",
+            body={"values": [inventory_row]}
+        ).execute()
+
+    return jsonify({"status": "ok"}), 200
+
+@app.route("/api/logout-all", methods=["POST"])
+@login_required_session
+def logout_all():
+    global logout_all_ts
+    # bump the timestamp so that any calls to login_required_session will now fail
+    logout_all_ts = time.time()
+    # push a socket event to all connected clients
+    socketio.emit("forceLogout")
+    return jsonify({"status": "ok"}), 200
+
+@app.route("/api/rate", methods=["POST"])
+@login_required_session
+def api_rate():
+    """
+    Request body:
+    {
+      "to": { "name","phone","addr1","addr2","city","state","zip","country" },
+      "packages": [ { "L":10,"W":10,"H":10,"weight":2 }, ... ]
+    }
+    Returns list of options: [{code, method, rate, currency, delivery}, ...]
+    """
+    try:
+        payload = request.get_json(force=True)
+        to = payload.get("to", {})
+        packages = payload.get("packages", [])
+        options = ups_get_rate(to, packages, ask_all_services=True)
+        return jsonify({"ok": True, "options": options})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/list-folder-files")
+def list_folder_files():
+    folder_id = request.args.get("folderId")
+    if not folder_id:
+        return jsonify({"error": "Missing folderId"}), 400
 
     try:
         drive = get_drive_service()
-        # Try to grant public read access
-        drive.permissions().create(
-            fileId=file_id,
-            body={"type": "anyone", "role": "reader"},
-            fields="id"
+        results = drive.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields="files(id, name, mimeType)"
         ).execute()
-        return jsonify({"ok": True})
+        return jsonify({"files": results.get("files", [])})
     except Exception as e:
-        # If it already has public access, treat as ok
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/proxy-drive-file")
+def proxy_drive_file():
+    print("🔥 proxy_drive_file hit")
+    file_id = request.args.get("fileId")
+    if not file_id:
+        print("❌ Missing fileId in request")
+        return "Missing fileId", 400
+
+    try:
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        print(f"🔄 Fetching file from: {url}")
+        r = requests.get(url, stream=True)
+        r.raise_for_status()
+
+        content_type = r.headers.get("Content-Type", "application/octet-stream")
+        print(f"✅ File fetched. Content-Type: {content_type}")
+        return Response(r.iter_content(chunk_size=4096), content_type=content_type)
+    except Exception as e:
+        print("❌ Error during proxying file:")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/drive/warmThumbnails", methods=["POST"])
+@login_required_session
+def warm_thumbnails():
+    """
+    Pre-fetch & cache thumbnails on the server so the frontend loads instantly.
+    Body: { "pairs": [ { "id": "<fileId>", "v": "<version>", "sz": "w240" }, ... ] }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        pairs = data.get("pairs") or []
+
+        # De-dup and skip already-cached
+        uniq = {}
+        for p in pairs:
+            fid = str(p.get("id") or "").strip()
+            ver = str(p.get("v") or "").strip()
+            sz  = str(p.get("sz") or "w240").strip()
+            if fid and ver:
+                uniq[(fid, ver, sz)] = 1
+        work = [{"id": fid, "v": ver, "sz": sz} for (fid, ver, sz) in uniq.keys()]
+        work = [p for p in work if not os.path.exists(_thumb_cache_path(p["id"], p["sz"], p["v"]))]
+
+        if not work:
+            return jsonify({"ok": True, "warmed": 0}), 200
+
+        # Auth once
+        creds = _load_google_creds()
+        if not creds or not creds.token:
+            return jsonify({"ok": False, "error": "no_creds"}), 502
+        headers = {"Authorization": f"Bearer {creds.token}"}
+
+        # Worker fn (fetches Drive thumbnail and writes cache)
+        def _warm_one(p):
+            try:
+                fid, ver, sz = p["id"], p["v"], p["sz"]
+                cpath = _thumb_cache_path(fid, sz, ver)
+                if os.path.exists(cpath):
+                    return True
+
+                meta_url = (
+                    f"https://www.googleapis.com/drive/v3/files/{fid}"
+                    f"?fields=thumbnailLink,mimeType"
+                )
+                meta = requests.get(meta_url, headers=headers, timeout=6)
+                if meta.status_code != 200:
+                    return False
+                info = meta.json() or {}
+                thumb = info.get("thumbnailLink")
+                if not thumb:
+                    return False
+
+                px = re.sub(r"[^0-9]", "", sz) or "240"
+                if "?" in thumb:
+                    if re.search(r"[?&](sz|s)=", thumb):
+                        thumb = re.sub(r"([?&])(sz|s)=\d+", rf"\1s={px}", thumb)
+                    else:
+                        thumb = f"{thumb}&s={px}"
+                else:
+                    thumb = f"{thumb}?s={px}"
+
+                img = requests.get(thumb, headers=headers, timeout=10)
+                if img.status_code == 200 and img.content and img.headers.get("Content-Type","").startswith("image/"):
+                    with open(cpath, "wb") as f:
+                        f.write(img.content)
+                    return True
+            except Exception:
+                logger.exception("warm one failed")
+            return False
+
+        # Fetch in parallel to speed up warm-up
+        warmed = 0
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futures = [ex.submit(_warm_one, p) for p in work]
+            for fut in as_completed(futures):
+                if fut.result():
+                    warmed += 1
+
+        return jsonify({"ok": True, "warmed": warmed}), 200
+
+    except Exception as e:
+        logger.exception("warm_thumbnails error")
+        return jsonify({"ok": False, "error": str(e)}), 200
+
+
+@app.route("/api/drive/metaBatch", methods=["POST"])
+@login_required_session
+def drive_meta_batch():
+    """
+    Return a version token per Drive file ID so the frontend can cache-bust only when artwork changes.
+    Version = md5Checksum if present, else modifiedTime, else "".
+    Request body: {"ids": ["<fileId1>", "<fileId2>", ...]}
+    Response:     {"versions": {"<id>": "<ver>", ...}}
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        ids = [str(x).strip() for x in (data.get("ids") or []) if str(x).strip()]
+        versions = {}
+        if not ids:
+            return jsonify({"versions": versions}), 200
+
+        svc = get_drive_service()
+        for fid in ids:
+            try:
+                info = svc.files().get(
+                    fileId=fid,
+                    fields="id, md5Checksum, modifiedTime"
+                ).execute()
+                ver = info.get("md5Checksum") or info.get("modifiedTime") or ""
+                versions[fid] = ver
+            except Exception:
+                logger.exception(f"drive_meta_batch: failed for {fid}")
+                versions[fid] = ""
+
+        return jsonify({"versions": versions}), 200
+    except Exception as e:
+        logger.exception("drive_meta_batch error")
+        return jsonify({"error": str(e), "versions": {}}), 200
+
+
+@app.route("/api/drive-file-metadata")
+def drive_file_metadata():
+    file_id = request.args.get("fileId")
+    if not file_id:
+        return jsonify({"error": "Missing fileId"}), 400
+
+    try:
+        print(f"🔍 Fetching metadata for file ID: {file_id}")
+        service = get_drive_service()
+        metadata = service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
+        print(f"✅ Metadata retrieved: {metadata}")
+        return jsonify(metadata)
+    except Exception as e:
+        app.logger.error(f"❌ Error fetching metadata for file {file_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+def get_column_index(sheet, header_name):
+    headers = sheet.row_values(1)
+    for idx, col in enumerate(headers, start=1):
+        if col.strip().lower() == header_name.strip().lower():
+            return idx
+    raise ValueError(f"Column '{header_name}' not found.")
+
+@app.route("/api/resetStartTime", methods=["POST"])
+@login_required_session
+def reset_start_time():
+    try:
+        data = request.get_json()
+        job_id = str(data.get("id", "")).strip()
+        timestamp = data.get("timestamp", "")
+
+        if not job_id or not timestamp:
+            return jsonify({"error": "Missing job ID or timestamp"}), 400
+
+        sheet = sh.worksheet("Production Orders")
+        header = [h.strip() for h in sheet.row_values(1)]
+
         try:
-            perms = drive.permissions().list(
-                fileId=file_id,
-                fields="permissions(id,type,role)"
-            ).execute().get("permissions", [])
-            if any(p.get("type") == "anyone" and p.get("role") in ("reader", "commenter", "writer") for p in perms):
-                return jsonify({"ok": True, "note": "already_public"})
-        except Exception:
-            pass
-        logger.exception("drive_make_public error")
-        return jsonify({"ok": False, "error": str(e)}), 500
+            emb_start_col = header.index("Embroidery Start Time") + 1
+        except ValueError:
+            return jsonify({"error": "Missing 'Embroidery Start Time' column"}), 500
+
+        rows = sheet.get_all_records()
+        for i, row in enumerate(rows, start=2):
+            if str(row.get("ID", "")).strip() == job_id:
+                sheet.update_cell(i, emb_start_col, timestamp)
+                print(f"✅ Reset start time for row {i} (Job ID {job_id}) → {timestamp}")
+                return jsonify({"status": "ok"}), 200
+
+        return jsonify({"error": "Job not found"}), 404
+
+    except Exception as e:
+        print("🔥 Server error:", str(e))
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
+
+def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
+    try:
+        # Step 1: Look up the old folder
+        query = f"name = '{old_order_num}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        folders = drive_service.files().list(q=query, fields="files(id)").execute().get("files", [])
+        if not folders:
+            print(f"❌ No folder found for order #{old_order_num}")
+            return
+
+        old_folder_id = folders[0]["id"]
+
+        # Step 2: List files inside old folder
+        query = f"'{old_folder_id}' in parents and trashed = false"
+        files = drive_service.files().list(q=query, fields="files(id, name)").execute().get("files", [])
+
+        for file in files:
+            if file["name"].lower().endswith(".emb"):
+                print(f"📤 Copying {file['name']} from order {old_order_num} → {new_order_num}")
+                drive_service.files().copy(
+                    fileId=file["id"],
+                    body={"name": f"{new_order_num}.emb", "parents": [new_folder_id]}
+                ).execute()
+    except Exception as e:
+        print("❌ Error copying .emb files:", e)
+
+from flask import request, session, redirect
+from requests_oauthlib import OAuth2Session
+
+@app.route("/qbo/login")
+def qbo_login():
+    print("🚀 Entered /qbo/login route")
+
+    # ── 0) Determine sandbox vs prod from query or session ───────
+    env_override = request.args.get("env") or session.get("qboEnv")
+    session["qboEnv"] = env_override or QBO_ENV
+
+    # ── 1) Pick the correct OAuth client ID/secret ───────────────
+    client_id, client_secret = get_qbo_oauth_credentials(env_override)
+
+    # Log what we’re sending so you can confirm in Render logs
+    print(f"QBO env: {session.get('qboEnv', QBO_ENV)} | redirect_uri={QBO_REDIRECT_URI!r}")
+    print(f"QBO client id (first 6): {str(client_id)[:6]}…")
+
+    # ── 2) Build the OAuth2Session with the chosen client_id ─────
+    qbo = OAuth2Session(
+     client_id=client_id,
+     redirect_uri=QBO_REDIRECT_URI,
+     scope=QBO_SCOPES,
+     state=session.get("qbo_oauth_state")
+    )
+
+
+    # ── 3) Generate the authorization URL ─────────────────────────
+    auth_url, state = qbo.authorization_url(QBO_AUTH_URL)
+
+    # ── 4) Persist state and redirect the user ────────────────────
+    session["qbo_oauth_state"] = state
+    print("🔗 QuickBooks redirect URL:", auth_url)
+    return redirect(auth_url)
+
+
+logger = logging.getLogger(__name__)
+
+@app.route("/qbo/callback", methods=["GET"])
+def qbo_callback():
+    code  = request.args.get("code")
+    state = request.args.get("state")
+    realm = request.args.get("realmId")
+
+    if state != session.get("qbo_oauth_state"):
+        return "⚠️ Invalid state", 400
+
+    # ── 0) Determine sandbox vs production from session ──────────
+    env_override = session.get("qboEnv", QBO_ENV)
+
+    # ── 1) Pick the correct OAuth client credentials ─────────────
+    client_id, client_secret = get_qbo_oauth_credentials(env_override)
+
+    # ── 2) Rebuild OAuth2Session with that client_id & state ─────
+    qbo = OAuth2Session(
+        client_id,
+        redirect_uri=QBO_REDIRECT_URI,
+        state=state
+    )
+
+    # ── 3) Exchange code for token using the matching client_secret ─
+    token = qbo.fetch_token(
+        QBO_TOKEN_URL,
+        client_secret=client_secret,
+        code=code
+    )
+
+    # ── 4) Persist token & realmId to disk for reuse ─────────────
+    disk_data = { **token, "realmId": realm }
+    with open(TOKEN_PATH, "w") as f:
+        json.dump(disk_data, f, indent=2)
+    logger.info("✅ Wrote QBO token to disk at %s", TOKEN_PATH)
+
+    # ── 5) Store in session for your API calls ────────────────────
+    session["qbo_token"] = {
+        "access_token":  token["access_token"],
+        "refresh_token": token["refresh_token"],
+        "expires_at":    time.time() + int(token["expires_in"]),
+        "realmId":       realm
+    }
+    session["qboEnv"] = env_override
+    logger.info("✅ Stored QBO token in session, environment: %s", env_override)
+
+    # ── 6) Redirect back into your Ship UI ────────────────────────
+    frontend = FRONTEND_URL.rstrip("/")
+    resume_url = f"{frontend}/ship"
+    logger.info("🔁 OAuth callback complete — redirecting to Ship page: %s", resume_url)
+    return redirect(resume_url)
+
+@app.route("/authorize-quickbooks")
+def authorize_quickbooks():
+    from requests_oauthlib import OAuth2Session
+
+    qbo = OAuth2Session(
+        client_id=QBO_CLIENT_ID,
+        redirect_uri=QBO_REDIRECT_URI,
+        scope=QBO_SCOPE
+    )
+
+    authorization_url, state = qbo.authorization_url(QBO_AUTH_BASE_URL)
+
+    # Save the state in session to protect against CSRF
+    session["qbo_oauth_state"] = state
+
+    print("🔗 Redirecting to QuickBooks auth URL:", authorization_url)
+    return redirect(authorization_url)
+
+@app.route("/quickbooks/login")
+def quickbooks_login_redirect():
+    # grab desired post-OAuth path (e.g. /ship)
+    next_path = request.args.get("next", "/ship")
+    # must match exactly what Intuit expects
+    redirect_uri = os.environ["QBO_REDIRECT_URI"]
+    # pass that as state so we can come back here
+    auth_url = get_quickbooks_auth_url(redirect_uri, state=next_path)
+    return redirect(auth_url)
+
+# --- Protected thread images (behind login) ---
+THREAD_IMG_DIR = os.path.join(os.path.dirname(__file__), "static", "thread-images")
+
+@app.route("/thread-images/<int:num>.<ext>", methods=["GET", "OPTIONS"])
+@login_required_session
+def serve_thread_image(num, ext):
+    ext = (ext or "").lower()
+    if ext not in ("jpg", "png", "webp"):
+        return make_response(("Unsupported extension", 400))
+    filename = f"{num}.{ext}"
+    full_path = os.path.join(THREAD_IMG_DIR, filename)
+    if not os.path.exists(full_path):
+        return make_response(("Not found", 404))
+    resp = make_response(send_from_directory(THREAD_IMG_DIR, filename, conditional=True))
+    resp.headers["Cache-Control"] = "private, max-age=2592000, immutable"
+    return resp
+
+
+
+@app.route("/api/thread-colors", methods=["GET"])
+@login_required_session
+def get_thread_colors():
+    try:
+        sheet = sh.worksheet("Thread Inventory")
+        data = sheet.get_all_values()
+
+        if not data or len(data) < 2:
+            return jsonify([]), 200
+
+        headers = data[0]
+        rows = data[1:]
+
+        # Find the index of the "Thread Colors" column
+        try:
+            col_idx = headers.index("Thread Colors")
+        except ValueError:
+            raise Exception("🧵 'Thread Colors' column not found in header row.")
+
+        # Collect all unique numeric thread codes
+        thread_colors = set()
+        for row in rows:
+            if len(row) > col_idx:
+                val = str(row[col_idx]).strip()
+                if val and val.isdigit():  # Only include values like 1800, 1801, etc.
+                    thread_colors.add(val)
+
+        return jsonify(sorted(thread_colors)), 200
+
+    except Exception as e:
+        print("❌ Failed to fetch thread colors:", e)
+        return jsonify([]), 500
+
+@app.route("/order/madeira", methods=["POST"])
+@login_required_session
+def order_madeira():
+    data = request.get_json(silent=True) or {}
+    items = data.get("items") or []
+
+    # Optional: resolve from Thread Inventory if `threads` is provided (unchanged if you already added)
+    # ... keep your existing resolving code here ...
+
+    if not items:
+        return jsonify({"error": "No items provided"}), 400
+
+    try:
+        result = asyncio.run(madeira_login_and_cart(items))
+        return jsonify({"status": "ok", "count": len(items), **(result or {})}), 200
+    except Exception as e:
+        print("🔥 madeira order error:", str(e))
+        return jsonify({"error": "Failed to add to cart", "details": str(e)}), 500
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
@@ -1972,52 +4689,41 @@ def on_connect():
     logger.info(f"Client connected: {request.sid}")
 
 @socketio.on("disconnect")
-def get_manual_state():
-    global _manual_state_cache, _manual_state_ts
-    now = time.time()
-    if _manual_state_cache is not None and (now - _manual_state_ts) < CACHE_TTL:
-        return jsonify(_manual_state_cache), 200
+def on_disconnect():
+    logger.info(f"Client disconnected: {request.sid}")
 
-    try:
-        resp = fetch_sheet(SPREADSHEET_ID, MANUAL_RANGE)
-        if isinstance(resp, dict) and resp.get("error"):
-            return jsonify({"error": resp["error"], "machineColumns": [], "placeholders": []}), 500
-        rows = resp
+# ─── Run ────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # --- Startup banner ---
+    print("🚀 JRCO server.py loaded and running...")
+    print("📡 Available Flask Routes:")
+    for rule in app.url_map.iter_rules():
+        print("✅", rule)
 
-        for i in range(len(rows)):
-            while len(rows[i]) < 26:
-                rows[i].append("")
+    # Prefer explicit port from env (Render sets PORT)
+    port = int(os.environ.get("PORT", 10000))
+    logger.info(f"Starting on port {port}")
 
-        first = rows[0] if rows else [""] * 26
-        machines = first[8:26]
-        machine_columns = [[s for s in (col or "").split(",") if s] for col in machines]
-
-        phs = []
-        for r in rows:
-            if (r[0] or "").strip():
-                phs.append({
-                    "id":          r[0],
-                    "company":     r[1] if len(r) > 1 else "",
-                    "quantity":    r[2] if len(r) > 2 else "",
-                    "stitchCount": r[3] if len(r) > 3 else "",
-                    "inHand":      r[4] if len(r) > 4 else "",
-                    "dueType":     r[5] if len(r) > 5 else "",
-                    "fieldG":      r[6] if len(r) > 6 else "",
-                    "fieldH":      r[7] if len(r) > 7 else "",
-                })
-
-        result = {"machineColumns": machine_columns[:2], "placeholders": phs}
-        _manual_state_cache = result
-        _manual_state_ts = now
-        return jsonify(result), 200
-    except Exception as e:
-        logger.exception("Error reading manual state")
-        if _manual_state_cache:
-            return jsonify(_manual_state_cache), 200
-        return jsonify({"error": str(e), "machineColumns": [], "placeholders": []}), 500
-
-@app.route('/api/sheet-update', methods=['POST'])
-def sheet_update_webhook():
-    app.logger.info('Received Google Sheet update webhook')
-    socketio.emit('sheet_updated', {'message': 'Sheet data updated'})
-    return jsonify({'status': 'success', 'message': 'Webhook received'})
+    # Optional one-off Google OAuth token generation
+    if os.environ.get("GENERATE_GOOGLE_TOKEN", "false").lower() == "true":
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        SCOPES = [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/spreadsheets",
+        ]
+        flow = InstalledAppFlow.from_client_secrets_file("oauth-credentials.json", SCOPES)
+        creds = flow.run_local_server(port=0)
+        with open("token.json", "w") as token:
+            token.write(creds.to_json())
+        print("✅ token.json created successfully.")
+    else:
+        # IMPORTANT: run via SocketIO so websockets work in production.
+        # Make sure your SocketIO was created with the path you expect, e.g.:
+        # socketio = SocketIO(app, cors_allowed_origins=[FRONTEND_URL], async_mode="eventlet", path="/socket.io")
+        socketio.run(
+            app,
+            host="0.0.0.0",
+            port=port,
+            debug=False,        # Debug off in production
+            use_reloader=False  # Avoid double-start on Render
+        )
