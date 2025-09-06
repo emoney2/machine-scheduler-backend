@@ -1754,8 +1754,10 @@ def read_vendor_directory_from_material_inventory():
 @login_required_session
 def get_vendors():
     """Returns [{vendor, method, email, cc, website}, ...] from Material Inventory tab (K:O)."""
+    t0 = time.time()
     try:
         m = read_vendor_directory_from_material_inventory()
+        app.logger.info(f"[CACHE] /api/vendors served in {time.time()-t0:.2f}s")
         return jsonify({"vendors": [{"vendor": k, **v} for k, v in m.items()]})
     except Exception:
         app.logger.exception("vendors failed")
