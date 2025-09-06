@@ -3308,7 +3308,13 @@ def get_table():
     try:
         rows = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
         headers = rows[0] if rows else []
-        data    = [dict(zip(headers, r)) for r in rows[1:]] if rows else []
+        data    = [dict(zip(headers, r)) for r in rows[1:]]
+
+        # Decode any HTML entities in the "Product" column (A)
+        for row in data:
+            if "Product" in row:
+                row["Product"] = html.unescape(row["Product"])
+
         return jsonify(data), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -4524,3 +4530,31 @@ def sheet_update_webhook():
     except Exception as e:
         app.logger.error(f"SocketIO emit failed: {e}")
     return jsonify({'status': 'success', 'message': 'Webhook received'})
+def _load_google_creds():
+    """
+    Load Google OAuth user credentials from:
+      1) GOOGLE_TOKEN_JSON env var (preferred, raw token.json contents)
+      2) token.json on disk (GOOGLE_TOKEN_PATH)
+    Returns an OAuthCredentials object or None.
+    """
+    env_val = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
+    if env_val:
+        try:
+            info = json.loads(env_val)
+            creds = OAuthCredentials.from_authorized_user_info(info, SCOPES)
+            if not creds.valid and creds.refresh_token:
+                creds.refresh(GoogleRequest())
+            return creds
+        except Exception as e:
+            print("❌ ENV token could not build OAuthCredentials:", repr(e))
+    try:
+        if os.path.exists(GOOGLE_TOKEN_PATH):
+            with open(GOOGLE_TOKEN_PATH, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            creds = OAuthCredentials.from_authorized_user_info(info, SCOPES)
+            if not creds.valid and creds.refresh_token:
+                creds.refresh(GoogleRequest())
+            return creds
+    except Exception as e:
+        print("❌ FILE token could not build OAuthCredentials:", repr(e))
+    return None
