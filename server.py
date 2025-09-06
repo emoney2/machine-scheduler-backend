@@ -1905,11 +1905,5 @@ def test_copilot():
 @app.route('/api/sheet-update', methods=['POST'])
 def sheet_update_webhook():
     app.logger.info('Received Google Sheet update webhook')
-    # Emit Socket.IO event to all clients
-    from flask_socketio import SocketIO
-    # Use the global socketio instance if available
-    try:
-        socketio.emit('sheet_updated', {'message': 'Sheet data updated'}, broadcast=True)
-    except Exception as e:
-        app.logger.error(f"SocketIO emit failed: {e}")
+    socketio.emit('sheet_updated', {'message': 'Sheet data updated'}, broadcast=True)
     return jsonify({'status': 'success', 'message': 'Webhook received'})
