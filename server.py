@@ -1657,6 +1657,17 @@ def create_consolidated_invoice_in_quickbooks(
 
 
 
+@app.route('/api/combined', methods=['GET'])
+def api_combined():
+    # TODO: Replace with actual combined data logic
+    return jsonify({"status": "ok", "data": "Combined endpoint placeholder"})
+
+@app.route('/api/manualState', methods=['GET'])
+def api_manual_state():
+    # TODO: Replace with actual manual state logic
+    return jsonify({"status": "ok", "data": "ManualState endpoint placeholder"})
+
+
 @app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
 @login_required_session
 def drive_make_public():
