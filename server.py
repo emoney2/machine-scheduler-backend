@@ -855,9 +855,9 @@ def drive_proxy(file_id):
         except Exception:
             info = None
 
-        # Prefer native Drive thumbnail if available
+
+        # Prefer native Drive thumbnail if available, with retry logic
         if use_thumb and thumb:
-            # Ensure correct size param for Drive thumbnail ("s=<px>")
             px = re.sub(r"[^0-9]", "", size) or "240"
             if "?" in thumb:
                 if re.search(r"[?&](sz|s)=", thumb):
@@ -867,36 +867,51 @@ def drive_proxy(file_id):
             else:
                 thumb = f"{thumb}?s={px}"
 
-            img = requests.get(thumb, headers=headers, timeout=10)
-            if img.status_code == 200 and img.content:
-                if v_param:
-                    # Save to disk cache
-                    try:
-                        with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
-                            f.write(img.content)
-                    except Exception:
-                        logger.exception("thumb cache write failed")
+            last_exc = None
+            for attempt in range(2):
+                try:
+                    img = requests.get(thumb, headers=headers, timeout=10)
+                    if img.status_code == 200 and img.content:
+                        if v_param:
+                            try:
+                                with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
+                                    f.write(img.content)
+                            except Exception:
+                                logger.exception("thumb cache write failed")
+                        resp = Response(img.content, status=200, mimetype="image/jpeg")
+                        resp.headers["Cache-Control"] = cache_control
+                        resp.headers["ETag"] = etag
+                        return resp
+                except Exception as exc:
+                    last_exc = exc
+                    logger.error(f"Drive thumbnail fetch failed for file_id={file_id} url={thumb} attempt={attempt+1}: {exc}")
+            if last_exc:
+                logger.error(f"All thumbnail fetch attempts failed for file_id={file_id} url={thumb}: {last_exc}")
 
-                resp = Response(img.content, status=200, mimetype="image/jpeg")
-                resp.headers["Cache-Control"] = cache_control
-                resp.headers["ETag"] = etag
-                return resp
 
-        # Fallback: if original is an image, fetch it and cache
+        # Fallback: if original is an image, fetch it and cache, with retry logic
         if mime.startswith("image/"):
             file_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-            r = requests.get(file_url, headers=headers, timeout=15, stream=False)
-            if r.status_code == 200 and r.content:
-                if v_param:
-                    try:
-                        with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
-                            f.write(r.content)
-                    except Exception:
-                        logger.exception("thumb cache write failed (full-file)")
-                resp = Response(r.content, status=200, mimetype=mime or "image/jpeg")
-                resp.headers["Cache-Control"] = cache_control
-                resp.headers["ETag"] = etag
-                return resp
+            last_exc = None
+            for attempt in range(2):
+                try:
+                    r = requests.get(file_url, headers=headers, timeout=15, stream=False)
+                    if r.status_code == 200 and r.content:
+                        if v_param:
+                            try:
+                                with open(_thumb_cache_path(file_id, size, v_param), "wb") as f:
+                                    f.write(r.content)
+                            except Exception:
+                                logger.exception("thumb cache write failed (full-file)")
+                        resp = Response(r.content, status=200, mimetype=mime or "image/jpeg")
+                        resp.headers["Cache-Control"] = cache_control
+                        resp.headers["ETag"] = etag
+                        return resp
+                except Exception as exc:
+                    last_exc = exc
+                    logger.error(f"Drive image fetch failed for file_id={file_id} url={file_url} attempt={attempt+1}: {exc}")
+            if last_exc:
+                logger.error(f"All image fetch attempts failed for file_id={file_id} url={file_url}: {last_exc}")
 
         # No thumbnail and not an image
         return jsonify({"error": "no_thumbnail"}), 404
