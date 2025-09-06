@@ -4,6 +4,9 @@ eventlet.monkey_patch()
 from eventlet import debug
 debug.hub_prevent_multiple_readers(False)
 
+eventlet.monkey_patch()
+from eventlet import debug
+debug.hub_prevent_multiple_readers(False)
 # ─── Imports & Logger Setup ─────────────────────────────────────────────────
 import os
 import json
