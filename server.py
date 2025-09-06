@@ -137,6 +137,14 @@ def _hdr_idx(headers):
         d[k] = i
     return d
 
+# ─── Sheet/Drive IDs & Ranges ────────────────────────────────────────────────
+# Define these early so helpers below can reference them
+SPREADSHEET_ID     = os.environ.get("SPREADSHEET_ID", "")
+ORDERS_RANGE       = os.environ.get("ORDERS_RANGE", "Orders!A1:Z")
+EMBROIDERY_RANGE   = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:Z")
+MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:Z")
+MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_CLEAR_RANGE", MANUAL_RANGE)
+
 def get_vendor_directory():
     """Reads Vendors!A1:E → { vendor_name: {method,email,cc,website} }"""
     svc = get_sheets_service().spreadsheets().values()
@@ -343,6 +351,43 @@ def _ensure_token_json():
     except Exception:
         return False
 
+def _load_google_creds():
+    """
+    Load Google OAuth user credentials from env var or token.json, refresh if needed.
+    Returns a google.oauth2.credentials.Credentials or None.
+    """
+    try:
+        raw = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
+        info = None
+        if raw:
+            try:
+                info = json.loads(raw)
+            except Exception:
+                # raw might be base64
+                try:
+                    info = json.loads(base64.b64decode(raw).decode("utf-8"))
+                except Exception:
+                    info = None
+        creds = None
+        if info:
+            creds = Credentials.from_authorized_user_info(info, SCOPES)
+        elif os.path.exists(GOOGLE_TOKEN_PATH):
+            creds = Credentials.from_authorized_user_file(GOOGLE_TOKEN_PATH, SCOPES)
+        if creds and creds.expired and getattr(creds, "refresh_token", None):
+            try:
+                creds.refresh(GoogleRequest())
+                # persist refreshed token
+                try:
+                    with open(GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
+                        f.write(creds.to_json())
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return creds
+    except Exception:
+        return None
+
 START_TIME_COL_INDEX = 27
 
 from google.oauth2.credentials import Credentials as OAuthCredentials
@@ -355,6 +400,31 @@ SCOPES = [
 QBO_SCOPE = ["com.intuit.quickbooks.accounting"]
 QBO_AUTH_BASE_URL = "https://appcenter.intuit.com/connect/oauth2"
 
+# ─── QuickBooks helpers and constants (minimal stubs to satisfy references) ───
+QBO_ENV = os.environ.get("QBO_ENV", "production")
+QBO_TOKEN_URL = os.environ.get(
+    "QBO_TOKEN_URL",
+    "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+)
+
+def get_base_qbo_url(env_override=None):
+    env = (env_override or QBO_ENV or "").lower()
+    is_prod = env in ("prod", "production", "live")
+    return (
+        "https://quickbooks.api.intuit.com" if is_prod else "https://sandbox-quickbooks.api.intuit.com"
+    )
+
+def get_qbo_oauth_credentials(env_override=None):
+    env = (env_override or QBO_ENV or "").lower()
+    is_prod = env in ("prod", "production", "live")
+    if is_prod:
+        client_id = os.environ.get("QBO_PROD_CLIENT_ID") or os.environ.get("QBO_CLIENT_ID")
+        client_secret = os.environ.get("QBO_PROD_CLIENT_SECRET") or os.environ.get("QBO_CLIENT_SECRET")
+    else:
+        client_id = os.environ.get("QBO_SANDBOX_CLIENT_ID") or os.environ.get("QBO_CLIENT_ID")
+        client_secret = os.environ.get("QBO_SANDBOX_CLIENT_SECRET") or os.environ.get("QBO_CLIENT_SECRET")
+    return client_id, client_secret
+
 def get_oauth_credentials():
     # Uses the env-aware loader you added earlier, which checks:
     # 1) GOOGLE_TOKEN_JSON env var, then 2) GOOGLE_TOKEN_PATH (token.json)
@@ -365,32 +435,50 @@ def get_oauth_credentials():
 
 def get_sheets_service():
     import time as _t
-    global _sheets_service, _service_ts
-    if _sheets_service and (_t.time() - _service_ts) < SERVICE_TTL:
+    ttl = int(os.environ.get("SERVICE_TTL", "30"))
+    global _sheets_service, _sheets_ts
+    if '_sheets_service' not in globals():
+        _sheets_service = None
+        _sheets_ts = 0
+    if _sheets_service and (_t.time() - _sheets_ts) < ttl:
         return _sheets_service
     creds = get_oauth_credentials()
     _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    _service_ts = _t.time()
+    _sheets_ts = _t.time()
     return _sheets_service
 
 def get_drive_service():
     import time as _t
-    global _drive_service, _service_ts
-    if _drive_service and (_t.time() - _service_ts) < SERVICE_TTL:
+    ttl = int(os.environ.get("SERVICE_TTL", "30"))
+    global _drive_service, _drive_ts
+    if '_drive_service' not in globals():
+        _drive_service = None
+        _drive_ts = 0
+    if _drive_service and (_t.time() - _drive_ts) < ttl:
         return _drive_service
     creds = get_oauth_credentials()
     _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    _service_ts = _t.time()
+    _drive_ts = _t.time()
     return _drive_service
-
-
-# ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ─── Caches and Sheet Helpers ───────────────────────────────────────────────
+# Default cache TTL for certain endpoints
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "10"))
+
+def fetch_sheet(spreadsheet_id: str, sheet_range: str):
+    try:
+        svc = get_sheets_service().spreadsheets().values()
+        res = svc.get(spreadsheetId=spreadsheet_id, range=sheet_range).execute()
+        return res.get("values", [])
+    except Exception:
+        logger.exception("fetch_sheet failed for range %s", sheet_range)
+        return []
 
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
 raw_frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
@@ -743,7 +831,8 @@ def apply_cors(response):
     }
     if origin in allowed:
         response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Vary"] = "Origin"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
     return response  # short-circuit OPTIONS
@@ -1462,7 +1551,7 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     base = get_base_qbo_url(env_override)
 
     # Step 1: Get or create customer
-    sheet = sh
+    sheet = get_sheets_service()  # pass service handle as in earlier code
     customer_ref = get_or_create_customer_ref(order_data.get("Company Name", ""), sheet, headers, realm_id)
 
     # Step 2: Get item reference from QBO (look up or create if missing)
@@ -1658,27 +1747,188 @@ def create_consolidated_invoice_in_quickbooks(
 
 
 
-@app.route('/api/combined', methods=['GET'])
-def api_combined():
-    # TODO: Replace with actual combined data logic
-    return jsonify({"status": "ok", "data": "Combined endpoint placeholder"})
+# In-memory links store
+_links_store = {}
+_manual_state_cache = None
+_manual_state_ts = 0.0
 
-@app.route('/api/manualState', methods=['GET'])
-def api_manual_state():
-    # TODO: Replace with actual manual state logic
-    return jsonify({"status": "ok", "data": "ManualState endpoint placeholder"})
+@app.route("/api/links", methods=["GET"])
+@login_required_session
+def get_links():
+    return jsonify(_links_store), 200
+
+@app.route("/api/links", methods=["POST"])
+@login_required_session
+def save_links():
+    global _links_store
+    _links_store = request.get_json() or {}
+    socketio.emit("linksUpdated", _links_store)
+    return jsonify({"status": "ok"}), 200
+
+# Manual State (GET)
+@app.route("/api/manualState", methods=["GET"])
+@login_required_session
+def get_manual_state():
+    global _manual_state_cache, _manual_state_ts
+    now = time.time()
+    if _manual_state_cache is not None and (now - _manual_state_ts) < CACHE_TTL:
+        return jsonify(_manual_state_cache), 200
+
+    try:
+        resp = get_sheets_service().spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=MANUAL_RANGE
+        ).execute()
+        rows = resp.get("values", [])
+
+        for i in range(len(rows)):
+            while len(rows[i]) < 26:
+                rows[i].append("")
+
+        first = rows[0] if rows else [""] * 26
+        machines = first[8:26]
+        machine_columns = [[s for s in (col or "").split(",") if s] for col in machines]
+
+        phs = []
+        for r in rows:
+            if (r[0] or "").strip():
+                phs.append({
+                    "id":          r[0],
+                    "company":     r[1] if len(r) > 1 else "",
+                    "quantity":    r[2] if len(r) > 2 else "",
+                    "stitchCount": r[3] if len(r) > 3 else "",
+                    "inHand":      r[4] if len(r) > 4 else "",
+                    "dueType":     r[5] if len(r) > 5 else "",
+                    "fieldG":      r[6] if len(r) > 6 else "",
+                    "fieldH":      r[7] if len(r) > 7 else "",
+                })
+
+        result = {"machineColumns": machine_columns[:2], "placeholders": phs}
+        _manual_state_cache = result
+        _manual_state_ts = now
+        return jsonify(result), 200
+    except Exception:
+        logger.exception("Error reading manual state")
+        if _manual_state_cache:
+            return jsonify(_manual_state_cache), 200
+        return jsonify({"machineColumns": [], "placeholders": []}), 200
+
+# Manual State (POST)
+@app.route("/api/manualState", methods=["POST"])
+@login_required_session
+def save_manual_state():
+    global _manual_state_cache, _manual_state_ts
+    try:
+        data = request.get_json(silent=True) or {}
+        phs  = data.get("placeholders", [])
+        m1   = data.get("machine1", [])
+        m2   = data.get("machine2", [])
+
+        # Clear range then write
+        get_sheets_service().spreadsheets().values().clear(
+            spreadsheetId=SPREADSHEET_ID,
+            range=MANUAL_CLEAR_RANGE
+        ).execute()
+
+        rows = []
+        first = []
+        if phs:
+            p0 = phs[0]
+            first += [
+                p0.get("id", ""),
+                p0.get("company", ""),
+                str(p0.get("quantity", "")),
+                str(p0.get("stitchCount", "")),
+                p0.get("inHand", ""),
+                p0.get("dueType", ""),
+                p0.get("fieldG", ""),
+                p0.get("fieldH", ""),
+            ]
+        else:
+            first += [""] * 8
+        first.append(",".join(m1))
+        first.append(",".join(m2))
+        first += [""] * (26 - len(first))
+        rows.append(first)
+
+        for p in phs[1:]:
+            row = [
+                p.get("id", ""),
+                p.get("company", ""),
+                str(p.get("quantity", "")),
+                str(p.get("stitchCount", "")),
+                p.get("inHand", ""),
+                p.get("dueType", ""),
+                p.get("fieldG", ""),
+                p.get("fieldH", ""),
+            ]
+            row += [""] * 18
+            rows.append(row)
+
+        num = max(1, len(rows))
+        end_row = 2 + num - 1
+        sheet_name = MANUAL_CLEAR_RANGE.split("!")[0]
+        write_range = f"{sheet_name}!A2:Z{end_row}"
+        get_sheets_service().spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=write_range,
+            valueInputOption="RAW",
+            body={"values": rows}
+        ).execute()
+
+        _manual_state_cache = {"machineColumns": [m1, m2], "placeholders": phs}
+        _manual_state_ts = time.time()
+        socketio.emit("manualStateUpdated", _manual_state_cache)
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        logger.exception("Error in save_manual_state")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# Combined endpoint: returns orders, embroideryList, links in one payload
+@app.route('/api/combined', methods=['GET'])
+@login_required_session
+def api_combined():
+    try:
+        # Orders
+        orders_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+        orders_headers = orders_rows[0] if orders_rows else []
+        orders = [dict(zip(orders_headers, r)) for r in orders_rows[1:]] if orders_rows else []
+
+        # Embroidery list
+        emb_rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE)
+        emb_headers = emb_rows[0] if emb_rows else []
+        embroidery_list = [dict(zip(emb_headers, r)) for r in emb_rows[1:]] if emb_rows else []
+
+        # Links (from in-memory store)
+        links = _links_store
+
+        return jsonify({
+            "orders": orders,
+            "embroideryList": embroidery_list,
+            "links": links,
+        }), 200
+    except Exception:
+        logger.exception("/api/combined failed")
+        return jsonify({"orders": [], "embroideryList": [], "links": {}}), 200
 
 
 @app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
 @login_required_session
 def drive_make_public():
     if request.method == "OPTIONS":
-        # CORS preflight
+        # CORS preflight (redundant with global handler, but safe)
         resp = make_response("", 204)
-        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed = {
+            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+        }
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
         return resp
 
     data = request.get_json(silent=True) or {}
@@ -1688,180 +1938,26 @@ def drive_make_public():
 
     try:
         drive = get_drive_service()
-        # Check existing permissions for 'anyone'
-        perms = drive.permissions().list(
+        # Try to grant public read access
+        drive.permissions().create(
             fileId=file_id,
-            fields="permissions(id,type,role)"
+            body={"type": "anyone", "role": "reader"},
+            fields="id"
         ).execute()
-        already_public = any(
-            p.get("type") == "anyone" and p.get("role") in ("reader", "commenter", "writer")
-            for p in (perms.get("permissions") or [])
-        )
-
-        if not already_public:
-            # Make it public (view-only)
-            drive.permissions().create(
-                fileId=file_id,
-                body={"type": "anyone", "role": "reader"},
-                fields="id"
-            ).execute()
-
         return jsonify({"ok": True})
     except Exception as e:
-        # Don't blow up the UI on permission hiccups
+        # If it already has public access, treat as ok
+        try:
+            perms = drive.permissions().list(
+                fileId=file_id,
+                fields="permissions(id,type,role)"
+            ).execute().get("permissions", [])
+            if any(p.get("type") == "anyone" and p.get("role") in ("reader", "commenter", "writer") for p in perms):
+                return jsonify({"ok": True, "note": "already_public"})
+        except Exception:
+            pass
+        logger.exception("drive_make_public error")
         return jsonify({"ok": False, "error": str(e)}), 500
-
-
-
-# ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
-sheet_lock = Semaphore(1)
-SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
-ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
-EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
-MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
-MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
-
-# ── Legacy QuickBooks vars (still available if used elsewhere) ────
-QBO_CLIENT_ID     = os.environ.get("QBO_CLIENT_ID")
-QBO_CLIENT_SECRET = os.environ.get("QBO_CLIENT_SECRET")
-QBO_REDIRECT_URI  = (os.environ.get("QBO_REDIRECT_URI") or "").strip()
-QBO_AUTH_URL      = "https://appcenter.intuit.com/connect/oauth2"
-QBO_TOKEN_URL     = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
-QBO_SCOPES        = ["com.intuit.quickbooks.accounting"]
-
-# ── QuickBooks environment configuration ────────────────────────
-QBO_SANDBOX_BASE_URL = os.environ.get(
-    "QBO_SANDBOX_BASE_URL",
-    "https://sandbox-quickbooks.api.intuit.com"
-)
-QBO_PROD_BASE_URL = os.environ.get(
-    "QBO_PROD_BASE_URL",
-    "https://quickbooks.api.intuit.com"
-)
-QBO_ENV = os.environ.get("QBO_ENV", "sandbox").lower()  # 'sandbox' or 'production'
-
-def get_base_qbo_url(env_override: str = None) -> str:
-    """
-    Return the correct QuickBooks API base URL based on env_override or QBO_ENV.
-    """
-    env = (env_override or QBO_ENV).lower()
-    return QBO_PROD_BASE_URL if env == "production" else QBO_SANDBOX_BASE_URL
-
-# ── OAuth client credentials for sandbox vs. production ─────────
-QBO_SANDBOX_CLIENT_ID     = os.environ.get("QBO_SANDBOX_CLIENT_ID")
-QBO_SANDBOX_CLIENT_SECRET = os.environ.get("QBO_SANDBOX_CLIENT_SECRET")
-QBO_PROD_CLIENT_ID        = os.environ.get("QBO_PROD_CLIENT_ID")
-QBO_PROD_CLIENT_SECRET    = os.environ.get("QBO_PROD_CLIENT_SECRET")
-
-def get_qbo_oauth_credentials(env_override: str = None):
-    """
-    Return (client_id, client_secret) for the chosen QuickBooks environment.
-    """
-    env = (env_override or QBO_ENV).lower()
-    if env == "production":
-        return QBO_PROD_CLIENT_ID, QBO_PROD_CLIENT_SECRET
-    return QBO_SANDBOX_CLIENT_ID, QBO_SANDBOX_CLIENT_SECRET
-# ─────────────────────────────────────────────────────────────────
-
-def _load_google_creds():
-    """
-    Load Google OAuth user credentials from:
-      1) GOOGLE_TOKEN_JSON env var (preferred, raw token.json contents)
-      2) token.json on disk (GOOGLE_TOKEN_PATH)
-    Returns an OAuthCredentials object or None.
-    """
-    env_val = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
-    if env_val:
-        try:
-            info = json.loads(env_val)
-            creds = OAuthCredentials.from_authorized_user_info(info, SCOPES)
-            if not creds.valid and creds.refresh_token:
-                creds.refresh(GoogleRequest())
-            return creds
-        except Exception as e:
-            print("❌ ENV token could not build OAuthCredentials:", repr(e))
-    try:
-        if os.path.exists(GOOGLE_TOKEN_PATH):
-            with open(GOOGLE_TOKEN_PATH, "r", encoding="utf-8") as f:
-                info = json.load(f)
-            creds = OAuthCredentials.from_authorized_user_info(info, SCOPES)
-            if not creds.valid and creds.refresh_token:
-                creds.refresh(GoogleRequest())
-            return creds
-    except Exception as e:
-        print("❌ FILE token could not build OAuthCredentials:", repr(e))
-    return None
-
-# --- Protected thread images (behind login) ---
-THREAD_IMG_DIR = os.path.join(os.path.dirname(__file__), "static", "thread-images")
-
-@app.route("/thread-images/<int:num>.<ext>", methods=["GET", "OPTIONS"])
-@login_required_session
-def serve_thread_image(num, ext):
-    ext = (ext or "").lower()
-    if ext not in ("jpg", "png", "webp"):
-        return make_response(("Unsupported extension", 400))
-    filename = f"{num}.{ext}"
-    full_path = os.path.join(THREAD_IMG_DIR, filename)
-    if not os.path.exists(full_path):
-        return make_response(("Not found", 404))
-    resp = make_response(send_from_directory(THREAD_IMG_DIR, filename, conditional=True))
-    resp.headers["Cache-Control"] = "private, max-age=2592000, immutable"
-    return resp
-
-
-
-@app.route("/api/thread-colors", methods=["GET"])
-@login_required_session
-def get_thread_colors():
-    try:
-        sheet = sh.worksheet("Thread Inventory")
-        data = sheet.get_all_values()
-
-        if not data or len(data) < 2:
-            return jsonify([]), 200
-
-        headers = data[0]
-        rows = data[1:]
-
-        # Find the index of the "Thread Colors" column
-        try:
-            col_idx = headers.index("Thread Colors")
-        except ValueError:
-            raise Exception("🧵 'Thread Colors' column not found in header row.")
-
-        # Collect all unique numeric thread codes
-        thread_colors = set()
-        for row in rows:
-            if len(row) > col_idx:
-                val = str(row[col_idx]).strip()
-                if val and val.isdigit():  # Only include values like 1800, 1801, etc.
-                    thread_colors.add(val)
-
-        return jsonify(sorted(thread_colors)), 200
-
-    except Exception as e:
-        print("❌ Failed to fetch thread colors:", e)
-        return jsonify([]), 500
-
-@app.route("/order/madeira", methods=["POST"])
-@login_required_session
-def order_madeira():
-    data = request.get_json(silent=True) or {}
-    items = data.get("items") or []
-
-    # Optional: resolve from Thread Inventory if `threads` is provided (unchanged if you already added)
-    # ... keep your existing resolving code here ...
-
-    if not items:
-        return jsonify({"error": "No items provided"}), 400
-
-    try:
-        result = asyncio.run(madeira_login_and_cart(items))
-        return jsonify({"status": "ok", "count": len(items), **(result or {})}), 200
-    except Exception as e:
-        print("🔥 madeira order error:", str(e))
-        return jsonify({"error": "Failed to add to cart", "details": str(e)}), 500
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
