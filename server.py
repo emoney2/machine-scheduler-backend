@@ -1656,187 +1656,6 @@ def create_consolidated_invoice_in_quickbooks(
 
 
 
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({"status": "ok", "message": "Backend is running"}), 200
-
-@app.before_request
-def _debug_session():
-     logger.info("🔑 Session data for %s → %s", request.path, dict(session))
-# allow cross-site cookies
-app.config.update(
-    SESSION_COOKIE_SAMESITE="None",
-    SESSION_COOKIE_SECURE=True,
-)
-
-# only allow our Netlify front-end on /api/* and support cookies
-CORS(
-    app,
-    resources={
-        r"/":             {"origins": FRONTEND_URL},
-        r"/api/*":        {"origins": FRONTEND_URL},
-        r"/api/threads":  {"origins": FRONTEND_URL},
-        r"/submit":       {"origins": FRONTEND_URL},
-    },
-    supports_credentials=True
-)
-
-
-from flask import session  # (if not already imported)
-
-@app.before_request
-def _debug_session():
-    logger.info("🔑 Session data for %s → %s", request.path, dict(session))
-
-
-
-# ─── Session & Auth Helpers ──────────────────────────────────────────────────
-
-ALLOWED_WS_ORIGINS = list({
-    os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/"),
-    "https://machineschedule.netlify.app",
-    "http://localhost:3000",
-})
-
-socketio = SocketIO(
-    app,
-    cors_allowed_origins=ALLOWED_WS_ORIGINS,
-    async_mode="eventlet",
-    path="/socket.io",
-    ping_interval=25,
-    ping_timeout=20,
-    max_http_buffer_size=1_000_000,
-    logger=False,            # NEW: silence Socket.IO logs
-    engineio_logger=False,   # NEW: silence low-level engine logs
-)
-
-
-
-# ─── Vendor Directory Cache ─────────────────────────────────────────────────
-_vendor_dir_cache = None
-_vendor_dir_ts    = 0
-VENDOR_TTL        = 600  # 10 minutes
-
-def _hdr_index(headers):
-    return {str(h or "").strip().lower(): i for i, h in enumerate(headers or [])}
-
-def read_vendor_directory_from_material_inventory():
-    """Reads Material Inventory!K1:O as: Vendor | Method | Email | CC | Website"""
-    import time as _t
-    global _vendor_dir_cache, _vendor_dir_ts
-    now = _t.time()
-    if _vendor_dir_cache and (now - _vendor_dir_ts) < VENDOR_TTL:
-        return _vendor_dir_cache
-
-    svc = get_sheets_service().spreadsheets().values()
-    vals = svc.get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Material Inventory!K1:O",
-        valueRenderOption="FORMATTED_VALUE"
-    ).execute().get("values", []) or []
-
-    out = {}
-    if vals:
-        idx = _hdr_index(vals[0])
-        for r in vals[1:]:
-            def gv(key):
-                i = idx.get(key)
-                return (r[i].strip() if i is not None and i < len(r) and r[i] is not None else "")
-            vname = gv("vendor").strip()
-            if not vname:
-                continue
-            key = vname.lower()
-            out[key] = {
-                "vendor":  vname,                          # keep original for display if needed
-                "method":  (gv("method") or "").lower(),
-                "email":   gv("email"),
-                "cc":      gv("cc"),
-                "website": gv("website"),
-            }
-
-    _vendor_dir_cache = out
-    _vendor_dir_ts = now
-    return out
-
-
-@app.route("/api/vendors")
-@login_required_session
-def get_vendors():
-    """Returns [{vendor, method, email, cc, website}, ...] from Material Inventory tab (K:O)."""
-    t0 = time.time()
-    try:
-        m = read_vendor_directory_from_material_inventory()
-        app.logger.info(f"[CACHE] /api/vendors served in {time.time()-t0:.2f}s")
-        return jsonify({"vendors": [{"vendor": k, **v} for k, v in m.items()]})
-    except Exception:
-        app.logger.exception("vendors failed")
-        return jsonify({"error":"vendors failed"}), 500
-
-
-# ─── Google Drive Token/Scopes Config ──────────────────────────────
-# ─── Google Drive Token/Scopes Config ──────────────────────────────
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive",
-]
-
-# use the same path variable everywhere for Google token
-GOOGLE_TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
-
-def _load_google_creds():
-    """
-    Load Google OAuth user credentials from:
-      1) GOOGLE_TOKEN_JSON env var (preferred, raw token.json contents)
-      2) token.json on disk (GOOGLE_TOKEN_PATH)
-    If the token already contains scopes, do not override them (avoids invalid_scope).
-    Returns an OAuthCredentials object or None.
-    """
-    # 1) ENV first
-    env_val = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
-    if env_val:
-        try:
-            info = json.loads(env_val)
-            token_scopes = info.get("scopes")
-            # If token already has scopes, don't override (prevents invalid_scope)
-            if token_scopes:
-                creds = OAuthCredentials.from_authorized_user_info(info)
-            else:
-                creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
-            print("🔎 token (env) scopes:", token_scopes)
-            if not creds.valid and creds.refresh_token:
-                from google.auth.transport.requests import Request as GoogleRequest
-                creds.refresh(GoogleRequest())
-            return creds
-        except Exception as e:
-            print("❌ ENV token could not build OAuthCredentials:", repr(e))
-            # fall through to file
-
-    # 2) File next
-    try:
-        if os.path.exists(GOOGLE_TOKEN_PATH):
-            with open(GOOGLE_TOKEN_PATH, "r", encoding="utf-8") as f:
-                info = json.load(f)
-            token_scopes = info.get("scopes")
-            if token_scopes:
-                creds = OAuthCredentials.from_authorized_user_info(info)
-            else:
-                creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
-            print("🔎 token (file) scopes:", token_scopes)
-            if not creds.valid and creds.refresh_token:
-                from google.auth.transport.requests import Request as GoogleRequest
-                creds.refresh(GoogleRequest())
-            return creds
-    except Exception as e:
-        print("❌ FILE token could not build OAuthCredentials:", repr(e))
-
-    # 3) Nothing worked
-    return None
-
-
-
-
-# --- Drive: make file public (anyone with link → reader) ---------------------
 @app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
 @login_required_session
 def drive_make_public():
@@ -1940,7 +1759,7 @@ if not creds:
         "or place a valid token.json on disk."
     )
 
-# Wire clients once, using the creds from _load_google_creds()
+# Wire clients once, using the creds from _load_google_creds
 sh = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
 service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 sheets  = service.spreadsheets()
@@ -2233,7 +2052,7 @@ def overview_combined():
 
         # If the first row looks like headers, drop it
         if up_vals:
-            first_row = [str(x or "").strip() for x in up_vals[0]]
+            first_row = [h for h in up_vals[0]]
             if [h.lower() for h in first_row] == [h.lower() for h in TARGET_HEADERS]:
                 up_vals = up_vals[1:]
 
@@ -3389,7 +3208,9 @@ def add_thread():
             threadColor = item.get("threadColor", "").strip()
             minInv      = item.get("minInv",      "").strip()
             reorder     = item.get("reorder",     "").strip()
-            cost        = item.get("cost",        "").strip()
+            cost        = item.get("cost",        "").strip()  # not used for threads per request
+            action      = item.get("action",      "").strip()  # "Ordered" / "Received"
+            qty_raw     = item.get("quantity",    "")
 
             # skip any empty entries
             if not threadColor:
@@ -3486,8 +3307,8 @@ def add_table_entry():
 def get_table():
     try:
         rows = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
-        headers = rows[0]
-        data = [dict(zip(headers, r)) for r in rows[1:]]
+        headers = rows[0] if rows else []
+        data    = [dict(zip(headers, r)) for r in rows[1:]] if rows else []
         return jsonify(data), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -4456,8 +4277,7 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
     except Exception as e:
         print("❌ Error copying .emb files:", e)
 
-from flask import request, session, redirect
-from requests_oauthlib import OAuth2Session
+from flask_oauthlib.client import OAuth
 
 @app.route("/qbo/login")
 def qbo_login():
@@ -4691,3 +4511,16 @@ if __name__ == "__main__":
 def test_copilot():
     app.logger.info('Copilot test endpoint hit!')
     return jsonify({'status': 'success', 'message': 'Copilot test endpoint hit!'})
+
+
+@app.route('/api/sheet-update', methods=['POST'])
+def sheet_update_webhook():
+    app.logger.info('Received Google Sheet update webhook')
+    # Emit Socket.IO event to all clients
+    from flask_socketio import SocketIO
+    # Use the global socketio instance if available
+    try:
+        socketio.emit('sheet_updated', {'message': 'Sheet data updated'}, broadcast=True)
+    except Exception as e:
+        app.logger.error(f"SocketIO emit failed: {e}")
+    return jsonify({'status': 'success', 'message': 'Webhook received'})
