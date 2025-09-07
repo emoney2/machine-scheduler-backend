@@ -31,6 +31,10 @@ from functools import wraps
 from flask import request, session, jsonify, redirect, url_for, make_response
 from datetime import datetime, timedelta
 
+import socket
+from requests.exceptions import ConnectionError as ReqConnError, Timeout as ReqTimeout, RequestException
+
+
 from flask import g
 import psutil, tracemalloc, gc
 tracemalloc.start()
@@ -839,58 +843,35 @@ from urllib3.exceptions import NameResolutionError as UrlNameResError
 @login_required_session
 def drive_proxy(file_id):
     """
-    Download-or-proxy a Drive thumbnail for <file_id>.
-    - Tries existing 'lh3...' URL if provided
-    - Falls back to drive.google.com/thumbnail?id=<id>&sz=<sz>
-    - On DNS failures, issues a 302 redirect to the drive.google.com URL
+    Robust Drive thumbnail proxy for <file_id>.
+    Tries Google thumbnail directly; if backend DNS has a hiccup, redirect the browser.
     """
-    sz = request.args.get("sz", "w240")  # "w160", "w240", etc.
-    use_thumb = request.args.get("thumb")  # "1" if you passed a full thumb URL upstream
-
-    # Candidate URLs to try (in order)
-    candidates = []
-
-    # 1) Whatever upstream computed (e.g., lh3.googleusercontent.com/...); only if present
-    if use_thumb:
-        # Your upstream probably passed ?thumb=1 and built the URL internally;
-        # if you actually pass the URL in another param, grab it here.
-        pass
-
-    # 2) Drive's standard thumbnail endpoint (more reliable host)
+    sz = request.args.get("sz", "w240")  # w160/w240/...
     google_thumb = f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
-    candidates.append(google_thumb)
-
-    # 3) Optional: try a direct lh3 pattern (some files only show there)
-    # Note: not all IDs work directly with this, but harmless to try.
-    # lh3_s = sz.replace("w", "s") if sz.startswith("w") else "s240"
-    # candidates.append(f"https://lh3.googleusercontent.com/d/{file_id}={lh3_s}")
 
     headers = {
         "Accept": "image/*",
         "User-Agent": "Mozilla/5.0",
     }
 
-    # Try each candidate; if DNS blows up, try the next
-    for url in candidates:
-        try:
-            r = _http.get(url, headers=headers, timeout=10, stream=True)
-            if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image/"):
-                content = r.raw.read(decode_content=True)
-                resp = Response(content, mimetype=r.headers.get("Content-Type", "image/jpeg"))
-                # Cache on client for a while; adjust to taste
-                resp.headers["Cache-Control"] = "public, max-age=86400"
-                return resp
-            # Handle 3xx/4xx by skipping to next candidate
-        except (ReqConnError, UrlNameResError, socket.gaierror, TimeoutError):
-            # DNS lookup failed or connection issue — try next candidate
-            continue
-        except Exception:
-            app.logger.exception("drive_proxy fetch failed for %s via %s", file_id, url)
-            continue
+    # Try to fetch on the server first (fast path, enables server-side caching/CDN).
+    try:
+        r = requests.get(google_thumb, headers=headers, timeout=10, stream=True)
+        if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image/"):
+            content = r.raw.read(decode_content=True)
+            resp = Response(content, mimetype=r.headers.get("Content-Type", "image/jpeg"))
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+            return resp
+        # If not 200, fall through to redirect below.
+    except (ReqConnError, ReqTimeout, socket.gaierror, RequestException):
+        # DNS/connection trouble on the server — fall through to redirect.
+        pass
+    except Exception:
+        app.logger.exception("drive_proxy fetch failed for %s", file_id)
 
-    # If all fetches failed server-side, let the browser fetch it directly
+    # Let the browser fetch it directly if server fetch didn’t work.
     return redirect(google_thumb, code=302)
-# ─────────────────────────────────────────────────────────────────────────────
+
 @app.route("/api/ping", methods=["GET", "OPTIONS"])
 def api_ping():
     return jsonify({"ok": True}), 200
