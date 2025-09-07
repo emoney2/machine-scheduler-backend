@@ -2767,7 +2767,7 @@ def save_links():
     return jsonify({"status":"ok"}), 200
 
 # 🔹 Trim payload: fetch Orders only and project to required fields
-@app.route("/api/combined", methods=["GET"])
+@app.route("/api/combined", methods=["GET"], endpoint="api_combined")
 @login_required_session
 def get_combined():
     # 20s micro-cache (+ ETag/304)
