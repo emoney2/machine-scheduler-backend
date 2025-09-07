@@ -4823,6 +4823,58 @@ def order_madeira():
         print("🔥 madeira order error:", str(e))
         return jsonify({"error": "Failed to add to cart", "details": str(e)}), 500
 
+# ── Material Images: serve by vendor + name ──────────────────────────────────
+# Expects files under backend/static/material-images/<vendor>/<filename>
+# Tries extensions in order: .webp, .jpg, .jpeg, .png
+
+from flask import send_from_directory
+import unicodedata
+import re
+
+def _slug(s):
+    s = str(s or "").strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^A-Za-z0-9._\- ]+", "", s)
+    s = s.replace(" ", "_")
+    return s
+
+@app.route("/material-image", methods=["GET"])
+@login_required_session
+def material_image():
+    vendor = request.args.get("vendor", "").strip()
+    name   = request.args.get("name", "").strip()
+    if not vendor or not name:
+        return "", 404
+
+    base_dir = os.path.join(BASE_DIR, "static", "material-images")
+    safe_vendor = _slug(vendor)
+    # Try name as-is first, then a slug, then lowercased
+    candidates = []
+    stem_candidates = [
+        name,
+        _slug(name),
+        _slug(name).lower(),
+        name.lower(),
+    ]
+    exts = [".webp", ".jpg", ".jpeg", ".png"]
+    for stem in stem_candidates:
+        for ext in exts:
+            candidates.append(stem + ext)
+
+    vendor_dir = os.path.join(base_dir, safe_vendor)
+    for filename in candidates:
+        full = os.path.join(vendor_dir, filename)
+        if os.path.isfile(full):
+            # Cache publicly; change max-age if you like
+            resp = send_from_directory(vendor_dir, filename)
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+            return resp
+
+    # Not found
+    return "", 404
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
