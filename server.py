@@ -1,4 +1,6 @@
 import eventlet
+import os, eventlet
+os.environ.setdefault("EVENTLET_NO_GREENDNS", "yes")
 eventlet.monkey_patch()
 from eventlet import debug
 debug.hub_prevent_multiple_readers(False)
@@ -349,14 +351,16 @@ def get_oauth_credentials():
     raise Exception("🔑 Google Drive credentials not available. Set GOOGLE_TOKEN_JSON or provide token.json.")
 
 def get_sheets_service():
-    import time as _t
-    global _sheets_service, _service_ts
-    if _sheets_service and (_t.time() - _service_ts) < SERVICE_TTL:
-        return _sheets_service
-    creds = get_oauth_credentials()
-    _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    _service_ts = _t.time()
-    return _sheets_service
+    # Use an HTTP client with a hard timeout so Eventlet can't hang forever
+    import httplib2
+    from googleapiclient.discovery import build
+    from google_auth_httplib2 import AuthorizedHttp
+
+    creds = get_google_credentials()
+    http = httplib2.Http(timeout=10)  # 10s per request
+    authed = AuthorizedHttp(creds, http=http)
+    return build("sheets", "v4", http=authed, cache_discovery=False)
+
 
 def get_drive_service():
     import time as _t
@@ -2249,13 +2253,25 @@ def overview_combined():
     try:
         # ---- Read both ranges from the Overview sheet ----------------------
         svc = get_sheets_service().spreadsheets().values()
-        with sheet_lock:
-            resp = svc.batchGet(
-                spreadsheetId=SPREADSHEET_ID,
-                ranges=["Overview!A3:K", "Overview!M3:M"],
-                valueRenderOption="UNFORMATTED_VALUE"
-            ).execute()
-        vrs = resp.get("valueRanges", [])
+
+        # 2 quick attempts to ride out transient network hiccups
+        resp = None
+        for attempt in (1, 2):
+            try:
+                with sheet_lock:
+                    resp = svc.batchGet(
+                        spreadsheetId=SPREADSHEET_ID,
+                        ranges=["Overview!A3:K", "Overview!M3:M"],
+                        valueRenderOption="UNFORMATTED_VALUE",
+                    ).execute()
+                break  # success → leave the loop
+            except Exception as e:
+                app.logger.warning("Sheets batchGet failed (attempt %d): %s", attempt, e)
+                if attempt == 2:
+                    raise
+                time.sleep(0.6)  # tiny backoff before final try
+
+        vrs = resp.get("valueRanges", []) if resp else []
 
         # ---------- UPCOMING ----------
         TARGET_HEADERS = [
