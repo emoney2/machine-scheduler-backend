@@ -83,6 +83,10 @@ from flask import send_file  # ADD if not present
 THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_cache")
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
+def _json_etag(payload_bytes: bytes) -> str:
+    import hashlib as _hashlib
+    return 'W/"%s"' % _hashlib.sha1(payload_bytes).hexdigest()
+
 def _thumb_cache_path(file_id: str, size: str, version: str) -> str:
     safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f"{file_id}_{size}_{version or 'nov'}.jpg")
     return os.path.join(THUMB_CACHE_DIR, safe)
@@ -2207,176 +2211,77 @@ def logout():
     session.clear()
     return redirect("/login")
 
-@app.route("/api/overview")
+@app.route("/api/combined", methods=["GET"])
 @login_required_session
-def overview_combined():
-    """
-    Fast combined overview:
-      - Upcoming:  Overview!A3:K  (11 columns pre-filtered/sorted in Sheet)
-      - Materials: Overview!M3:M  (single text column: 'Item Qty Unit - Vendor')
-    Returns: { upcoming: [...], materials: [...] }
-    """
-    # 15s micro-cache
-    global _overview_cache, _overview_ts
+def get_combined():
+    # 20s micro-cache + ETag/304
+    global _combined_cache, _combined_ts
     now = time.time()
-    if _overview_cache is not None and (now - _overview_ts) < 15:
-        payload_bytes = json.dumps(_overview_cache, separators=(",", ":")).encode("utf-8")
+    if _combined_cache is not None and (now - _combined_ts) < 20:
+        payload_bytes = json.dumps(_combined_cache, separators=(",", ":")).encode("utf-8")
         etag = _json_etag(payload_bytes)
         inm = request.headers.get("If-None-Match", "")
         if etag and inm and etag in inm:
             resp = make_response("", 304)
             resp.headers["ETag"] = etag
-            resp.headers["Cache-Control"] = "public, max-age=15"
+            resp.headers["Cache-Control"] = "public, max-age=20"
             return resp
         resp = Response(payload_bytes, mimetype="application/json")
         resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "public, max-age=15"
+        resp.headers["Cache-Control"] = "public, max-age=20"
         return resp
 
     try:
-        # Pull both ranges in one locked request
         svc = get_sheets_service().spreadsheets().values()
+
+        # 1) Primary fetch: whatever ORDERS_RANGE is set to
         with sheet_lock:
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
-                ranges=["Overview!A3:K", "Overview!M3:M"],
-                valueRenderOption="UNFORMATTED_VALUE"
+                ranges=[ORDERS_RANGE],
+                valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
         vrs = resp.get("valueRanges", [])
+        orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
 
-        # ---------- UPCOMING ----------
-        up_vals = (vrs[0].get("values") if len(vrs) > 0 else []) or []
-        TARGET_HEADERS = [
-            "Order #","Preview","Company Name","Design","Quantity",
-            "Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"
-        ]
+        # 2) If we need fallback headers or links, fetch those here (your existing logic)
+        # (… keep your current 2/3 fetches …)
 
-        # If the first row looks like headers, drop it
-        if up_vals:
-            first_row = [str(x or "").strip() for x in up_vals[0]]
-            if [h.lower() for h in first_row] == [h.lower() for h in TARGET_HEADERS]:
-                up_vals = up_vals[1:]
+        # 4) Convert rows to dicts
+        def rows_to_dicts(rows):
+            if not rows:
+                return []
+            headers = [str(h).strip() for h in rows[0]]
+            out = []
+            for r in rows[1:]:
+                r = r or []
+                if len(r) < len(headers):
+                    r += [""] * (len(headers) - len(r))
+                out.append(dict(zip(headers, r)))
+            return out
 
-        headers = TARGET_HEADERS
+        orders_full = rows_to_dicts(orders_rows)
 
-        def drive_thumb(link, size="w160"):
-            s = str(link or "")
-            fid = ""
-            if "id=" in s:
-                fid = s.split("id=")[-1].split("&")[0]
-            elif "/file/d/" in s:
-                fid = s.split("/file/d/")[-1].split("/")[0]
-            return f"https://drive.google.com/thumbnail?id={fid}&sz={size}" if fid else ""
-
-        # Optional: look up Production Orders "Image" column to prefer its thumbnail
-        order_to_image = {}
-        try:
-            with sheet_lock:
-                po_hdr = (svc.get(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range="Production Orders!A1:AM1",
-                    valueRenderOption="UNFORMATTED_VALUE"
-                ).execute().get("values", [[]]) or [[]])[0]
-
-            img_idx = next(
-                (i for i, h in enumerate(po_hdr) if str(h or "").strip().lower() == "image"),
-                -1
-            )
-
-            if img_idx >= 0:
-                def col_letter(idx0):
-                    n = idx0 + 1
-                    s = ""
-                    while n:
-                        n, r = divmod(n - 1, 26)
-                        s = chr(65 + r) + s
-                    return s
-                img_col = col_letter(img_idx)
-
-                with sheet_lock:
-                    pr = svc.batchGet(
-                        spreadsheetId=SPREADSHEET_ID,
-                        ranges=["Production Orders!A2:A", f"Production Orders!{img_col}2:{img_col}"],
-                        valueRenderOption="UNFORMATTED_VALUE"
-                    ).execute().get("valueRanges", [])
-
-                orders_col = (pr[0].get("values") if len(pr) > 0 else []) or []
-                images_col = (pr[1].get("values") if len(pr) > 1 else []) or []
-                max_len = max(len(orders_col), len(images_col))
-                for i in range(max_len):
-                    ord_val = (orders_col[i][0] if i < len(orders_col) and orders_col[i] else "").strip()
-                    img_val = (images_col[i][0] if i < len(images_col) and images_col[i] else "").strip()
-                    if ord_val:
-                        order_to_image[ord_val] = img_val
-        except Exception:
-            # If this enrichment fails, just keep going with Overview data only
-            order_to_image = {}
-
-        def prefer_image(preview, order_no):
-            img = order_to_image.get(str(order_no or "").strip(), "")
-            return drive_thumb(img) or drive_thumb(preview)
-
-        upcoming = []
-        for r in up_vals:
-            if len(r) < len(headers):
-                r = r + [""] * (len(headers) - len(r))
-            row = dict(zip(headers, r))
-            row["image"] = prefer_image(row.get("Preview"), row.get("Order #"))
-            upcoming.append(row)
-
-        # ---------- MATERIALS ----------
-        mat_vals = (vrs[1].get("values") if len(vrs) > 1 else []) or []
-        lines = [str(a[0]).strip() for a in mat_vals if a and str(a[0]).strip()]
-        grouped = {}
-        for s in lines:
-            vendor = "Misc."
-            left = s
-            if " - " in s:
-                left, vendor = s.rsplit(" - ", 1)
-                vendor = (vendor or "Misc.").strip() or "Misc."
-            toks = left.split()
-            name, qty, unit = left, 0, ""
-            if len(toks) >= 3:
-                unit = toks[-1]
-                qty_str = toks[-2]
-                name = " ".join(toks[:-2]).strip()
-                try:
-                    qty = int(round(float(qty_str)))
-                except Exception:
-                    qty = 0
-            typ = "Thread" if unit.lower().startswith("cone") else "Material"
-            if name:
-                grouped.setdefault(vendor, []).append({"name": name, "qty": qty, "unit": unit, "type": typ})
-
-        materials = [{"vendor": v, "items": items} for v, items in grouped.items()]
-
-        # Build response + save micro-cache
-        resp_data = {"upcoming": upcoming, "materials": materials}
-        _overview_cache = resp_data
-        _overview_ts = now
+        # 5) Build + cache + return
+        resp_data = {"orders": orders_full, "links": _links_store}
+        _combined_cache = resp_data
+        _combined_ts = now
         payload_bytes = json.dumps(resp_data, separators=(",", ":")).encode("utf-8")
         etag = _json_etag(payload_bytes)
         resp = Response(payload_bytes, mimetype="application/json")
         resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "public, max-age=15"
+        resp.headers["Cache-Control"] = "public, max-age=20"
         return resp
 
     except Exception:
-        # Log and fall back to last good payload if we have one
-        app.logger.exception("overview_combined failed")
-        if _overview_cache is not None:
-            payload_bytes = json.dumps(_overview_cache, separators=(",", ":")).encode("utf-8")
-            etag = _json_etag(payload_bytes)
-            resp = Response(payload_bytes, mimetype="application/json")
-            resp.headers["ETag"] = etag
-            resp.headers["Cache-Control"] = "public, max-age=15"
-            return resp
-        fallback = {"upcoming": [], "materials": []}
+        logger.exception("Error building /api/combined")
+        # Even error path returns JSON (no 5xx to the client)
+        fallback = {"orders": [], "links": {}}
         payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
         etag = _json_etag(payload_bytes)
         resp = Response(payload_bytes, mimetype="application/json")
         resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "public, max-age=15"
+        resp.headers["Cache-Control"] = "public, max-age=20"
         return resp
 
 import traceback
