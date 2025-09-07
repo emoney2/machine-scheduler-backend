@@ -2884,64 +2884,29 @@ def save_links():
     socketio.emit("linksUpdated", _links_store)
     return jsonify({"status":"ok"}), 200
 
-# 🔹 Trim payload: fetch Orders only and project to required fields
 @app.route("/api/combined", methods=["GET"], endpoint="api_combined")
 @login_required_session
 def get_combined():
-    # 20s micro-cache (+ ETag/304)
-    global _combined_cache, _combined_ts
-    now = time.time()
-    if _combined_cache is not None and (now - _combined_ts) < 20:
-        payload_bytes = json.dumps(_combined_cache, separators=(",", ":")).encode("utf-8")
-        etag = _json_etag(payload_bytes)
-        inm = request.headers.get("If-None-Match", "")
-        if etag and inm and etag in inm:
-            resp = make_response("", 304)
-            resp.headers["ETag"] = etag
-            resp.headers["Cache-Control"] = "public, max-age=20"
-            return resp
-        resp = Response(payload_bytes, mimetype="application/json")
-        resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "public, max-age=20"
-        return resp
+    """
+    Returns: { orders: [...], links: {...} }
+    Uses 20s micro-cache and ETag/304 to avoid long hangs under load.
+    """
+    TTL = 20
 
-    try:
+    def build_payload():
         svc = get_sheets_service().spreadsheets().values()
 
-
-        # 1) Primary fetch: whatever ORDERS_RANGE is set to
+        # 1) Primary fetch
         with sheet_lock:
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
                 ranges=[ORDERS_RANGE],
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
-        vrs = resp.get("valueRanges", []) or []
+        vrs = resp.get("valueRanges", [])
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
 
-        # 2) Fallback #1: try a broad A1:Z pull from the "Production Orders" sheet
-        if not orders_rows:
-            app.logger.warning("ORDERS_RANGE returned no rows; falling back to 'Production Orders!A1:Z' (UNFORMATTED_VALUE)")
-            with sheet_lock:
-                resp2 = svc.get(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range="Production Orders!A1:Z",
-                    valueRenderOption="UNFORMATTED_VALUE",
-                ).execute()
-            orders_rows = resp2.get("values", []) or []
-
-        # 3) Fallback #2: try FORMATTED_VALUE (sometimes formulas render better)
-        if not orders_rows:
-            app.logger.warning("A1:Z (UNFORMATTED_VALUE) empty; trying FORMATTED_VALUE")
-            with sheet_lock:
-                resp3 = svc.get(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range="Production Orders!A1:Z",
-                    valueRenderOption="FORMATTED_VALUE",
-                ).execute()
-            orders_rows = resp3.get("values", []) or []
-
-        # 4) Convert rows to dicts
+        # 2) Convert rows to dicts
         def rows_to_dicts(rows):
             if not rows:
                 return []
@@ -2956,21 +2921,10 @@ def get_combined():
 
         orders_full = rows_to_dicts(orders_rows)
 
-        # 5) Return everything (let the UI pick columns); this avoids empty lists due to header mismatches
-        resp_data = {"orders": orders_full, "links": _links_store}
-        _combined_cache = resp_data
-        _combined_ts = now
-        payload_bytes = json.dumps(resp_data, separators=(",", ":")).encode("utf-8")
-        etag = _json_etag(payload_bytes)
-        resp = Response(payload_bytes, mimetype="application/json")
-        resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "public, max-age=20"
-        return resp
+        # 3) Use your existing _links_store (or however you populate links)
+        return {"orders": orders_full, "links": _links_store}
 
-
-    except Exception:
-        logger.exception("Error building /api/combined")
-        return jsonify({"orders": [], "links": {}}), 200
+    return send_cached_json("combined", TTL, build_payload)
 
 
 @socketio.on("placeholdersUpdated")
