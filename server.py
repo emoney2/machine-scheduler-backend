@@ -89,6 +89,8 @@ from flask import send_file  # ADD if not present
 THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_cache")
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
+
+
 def _thumb_cache_path(file_id: str, size: str, version: str) -> str:
     safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f"{file_id}_{size}_{version or 'nov'}.jpg")
     return os.path.join(THUMB_CACHE_DIR, safe)
@@ -275,6 +277,35 @@ GOOGLE_SCOPES = [
 # Google token file path (your choice)
 GOOGLE_TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
 
+# --- Google auth: unify credential loading for Sheets/Drive -------------------
+from google.oauth2.credentials import Credentials as OAuthCredentials
+from google.auth.transport.requests import Request as GoogleRequest
+
+def get_google_credentials():
+    """
+    Returns OAuthCredentials using:
+      1) GOOGLE_TOKEN_JSON env (your boot writes token.json from env on startup)
+      2) token.json file (GOOGLE_TOKEN_PATH)
+    Will auto-refresh if expired and refresh_token is present.
+    """
+    # Prefer the same loader your Drive code uses
+    creds = _load_google_creds()
+    if not creds:
+        raise RuntimeError("No Google OAuth credentials found. Set GOOGLE_TOKEN_JSON or provide token.json")
+
+    # If token is expired but refresh_token exists, google-auth refreshes on first request;
+    # we can optionally preemptively refresh:
+    try:
+        if not creds.valid and getattr(creds, "refresh_token", None):
+            creds.refresh(GoogleRequest())
+    except Exception:
+        # Ignore refresh hiccups here; the API client will retry/raise cleanly.
+        pass
+
+    return creds
+# -----------------------------------------------------------------------------
+
+
 def _bootstrap_token_from_env():
     """
     Accept GOOGLE_TOKEN_JSON_B64 (base64 of token.json) or GOOGLE_TOKEN_JSON (raw JSON),
@@ -360,6 +391,7 @@ def get_sheets_service():
     http = httplib2.Http(timeout=10)  # 10s per request
     authed = AuthorizedHttp(creds, http=http)
     return build("sheets", "v4", http=authed, cache_discovery=False)
+
 
 
 def get_drive_service():
