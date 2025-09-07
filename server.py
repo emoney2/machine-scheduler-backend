@@ -4903,6 +4903,104 @@ def material_image():
     return resp
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Set Preview formula for an order (writes to Production Orders sheet) ─────
+from flask import request, jsonify
+
+def _col_letter(idx0: int) -> str:
+    # 0-based index → A1 letter
+    n = idx0 + 1
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+@app.route("/api/orders/<order_number>/preview", methods=["POST"], endpoint="api_set_order_preview")
+@login_required_session
+def set_order_preview(order_number):
+    """
+    JSON body: { "previewFormula": "=IFNA(IMAGE(\"https://...\"), \"No preview available\")" }
+    Writes the formula into the 'Preview' column for the row whose 'Order #' equals <order_number>.
+    """
+    try:
+        payload = request.get_json(silent=True, force=True) or {}
+        formula = str(payload.get("previewFormula", "")).strip()
+        if not formula:
+            return jsonify(error="previewFormula required"), 400
+
+        # Sheets service
+        svc_vals = get_sheets_service().spreadsheets().values()
+
+        # 1) Read header to find columns
+        header_resp = svc_vals.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Production Orders!1:1",
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+        header = (header_resp.get("values") or [[]])[0]
+        header_norm = [str(h or "").strip().lower() for h in header]
+
+        def col_idx(name):
+            try:
+                return header_norm.index(name.lower())
+            except ValueError:
+                return -1
+
+        order_idx = col_idx("order #")
+        preview_idx = col_idx("preview")
+        if order_idx < 0:
+            return jsonify(error="Header 'Order #' not found in Production Orders"), 400
+        if preview_idx < 0:
+            return jsonify(error="Header 'Preview' not found in Production Orders"), 400
+
+        # 2) Find row for this order number
+        ord_col = _col_letter(order_idx)
+        ord_range = f"Production Orders!{ord_col}2:{ord_col}"
+        ord_resp = svc_vals.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=ord_range,
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+        ord_vals = ord_resp.get("values") or []
+        ord_str = str(order_number).strip()
+
+        row_offset = None
+        for i, r in enumerate(ord_vals):
+            val = str((r[0] if r else "")).strip()
+            if val == ord_str:
+                row_offset = i  # 0-based from row 2
+                break
+
+        if row_offset is None:
+            return jsonify(error=f"Order # {ord_str} not found"), 404
+
+        row_num = 2 + row_offset
+        prev_col = _col_letter(preview_idx)
+        target_a1 = f"Production Orders!{prev_col}{row_num}"
+
+        # 3) Write formula (USER_ENTERED so Sheets evaluates IMAGE())
+        svc_vals.update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=target_a1,
+            valueInputOption="USER_ENTERED",
+            body={"values": [[formula]]},
+        ).execute()
+
+        # 4) Nudge any overview cache if present
+        try:
+            invalidate_overview_cache()  # no-op if you didn't define it
+        except Exception:
+            pass
+
+        return jsonify(ok=True, cell=target_a1), 200
+
+    except Exception as e:
+        app.logger.exception("set_order_preview failed for order=%s", order_number)
+        # Don't blow up the client — report a clean error
+        return jsonify(error=str(e)), 500
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
