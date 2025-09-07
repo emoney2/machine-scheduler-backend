@@ -4731,57 +4731,80 @@ def order_madeira():
         print("🔥 madeira order error:", str(e))
         return jsonify({"error": "Failed to add to cart", "details": str(e)}), 500
 
-# ── Material Images: serve by vendor + name ──────────────────────────────────
-# Expects files under backend/static/material-images/<vendor>/<filename>
-# Tries extensions in order: .webp, .jpg, .jpeg, .png
-
+# ── Material Images: serve by vendor + name (works at /api/material-image AND /material-image) ──
 from flask import send_from_directory
-import unicodedata
-import re
+import os, unicodedata, re
+from urllib.parse import unquote
 
-def _slug(s):
+# Ensure BASE_DIR exists once at module scope (adjust if you already define it)
+if "BASE_DIR" not in globals():
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _slug(s: str) -> str:
     s = str(s or "").strip()
     s = unicodedata.normalize("NFKD", s)
     s = s.encode("ascii", "ignore").decode("ascii")
-    s = re.sub(r"[^A-Za-z0-9._\- ]+", "", s)
+    s = re.sub(r"[^A-Za-z0-9._\- /]+", "", s)   # allow basic filename chars + spaces + slash
+    s = s.replace('"', "").replace("'", "")     # drop quotes
+    s = s.replace("/", "_")                     # convert pathy names like 1/2" to 1_2
+    s = s.strip()
     s = s.replace(" ", "_")
     return s
 
-@app.route("/material-image", methods=["GET"])
+@app.route("/api/material-image", methods=["GET"], endpoint="api_material_image")
+@app.route("/material-image", methods=["GET"], endpoint="plain_material_image")
 @login_required_session
 def material_image():
-    vendor = request.args.get("vendor", "").strip()
-    name   = request.args.get("name", "").strip()
+    # Read & decode inputs
+    vendor_raw = request.args.get("vendor", "")
+    name_raw   = request.args.get("name", "")
+    vendor = unquote(vendor_raw or "").strip()
+    name   = unquote(name_raw or "").strip()
     if not vendor or not name:
         return "", 404
 
     base_dir = os.path.join(BASE_DIR, "static", "material-images")
-    safe_vendor = _slug(vendor)
-    # Try name as-is first, then a slug, then lowercased
-    candidates = []
+
+    # Try vendor directory variants to tolerate folder naming
+    vendor_candidates = [
+        vendor,
+        _slug(vendor),
+        vendor.lower(),
+        _slug(vendor).lower(),
+    ]
+    # Deduplicate while preserving order
+    seen = set()
+    vendor_candidates = [v for v in vendor_candidates if not (v in seen or seen.add(v))]
+
+    # Filename stems to try (original, slug, lower)
     stem_candidates = [
         name,
         _slug(name),
-        _slug(name).lower(),
         name.lower(),
+        _slug(name).lower(),
     ]
+    seen = set()
+    stem_candidates = [s for s in stem_candidates if not (s in seen or seen.add(s))]
+
     exts = [".webp", ".jpg", ".jpeg", ".png"]
-    for stem in stem_candidates:
-        for ext in exts:
-            candidates.append(stem + ext)
 
-    vendor_dir = os.path.join(base_dir, safe_vendor)
-    for filename in candidates:
-        full = os.path.join(vendor_dir, filename)
-        if os.path.isfile(full):
-            # Cache publicly; change max-age if you like
-            resp = send_from_directory(vendor_dir, filename)
-            resp.headers["Cache-Control"] = "public, max-age=86400"
-            return resp
+    for vdir in vendor_candidates:
+        vendor_dir = os.path.join(base_dir, vdir)
+        if not os.path.isdir(vendor_dir):
+            continue
+        for stem in stem_candidates:
+            for ext in exts:
+                filename = stem + ext
+                full = os.path.join(vendor_dir, filename)
+                if os.path.isfile(full):
+                    resp = send_from_directory(vendor_dir, filename)
+                    resp.headers["Cache-Control"] = "public, max-age=86400"
+                    return resp
 
-    # Not found
+    # Not found — return clean 404 (no 500s)
     return "", 404
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
