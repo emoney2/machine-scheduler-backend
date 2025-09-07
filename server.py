@@ -4760,78 +4760,147 @@ def order_madeira():
         print("🔥 madeira order error:", str(e))
         return jsonify({"error": "Failed to add to cart", "details": str(e)}), 500
 
-# ── Material Images: serve by vendor + name (works at /api/material-image AND /material-image) ──
-from flask import send_from_directory
-import os, unicodedata, re
+# ── Material Images: robust fuzzy match (both /api/material-image and /material-image) ──
+from flask import send_from_directory, redirect
+import os, re, unicodedata
 from urllib.parse import unquote
 
-# Ensure BASE_DIR exists once at module scope (adjust if you already define it)
 if "BASE_DIR" not in globals():
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def _slug(s: str) -> str:
-    s = str(s or "").strip()
-    s = unicodedata.normalize("NFKD", s)
-    s = s.encode("ascii", "ignore").decode("ascii")
-    s = re.sub(r"[^A-Za-z0-9._\- /]+", "", s)   # allow basic filename chars + spaces + slash
-    s = s.replace('"', "").replace("'", "")     # drop quotes
-    s = s.replace("/", "_")                     # convert pathy names like 1/2" to 1_2
-    s = s.strip()
-    s = s.replace(" ", "_")
+MATERIAL_BASE = os.path.join(BASE_DIR, "static", "material-images")
+# Map common vendor aliases → actual folder names you committed
+VENDOR_ALIASES = {
+    # Add aliases as needed; left side is what the sheet might say,
+    # right side is the folder you created under static/material-images
+    "leatherwks": "LeatherWks",
+    "leather wks": "LeatherWks",
+    "leatherworks": "LeatherWks",
+    "carroll leathers": "Carroll Leathers",
+    "upholstery supplies": "Upholstery Supplies",
+}
+
+def _clean(s: str) -> str:
+    """Loose normalizer for filenames & queries: lowercase, strip accents, remove punctuation, collapse spaces."""
+    s = unquote(str(s or ""))
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = s.replace('"', "").replace("'", "")
+    s = s.replace("/", "_").replace("\\", "_")  # 1/2" => 1_2
+    s = s.replace("&", "and")                   # belts & buckles -> belts and buckles
+    s = re.sub(r"[^a-zA-Z0-9._\- ]+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
+
+def _norm_key(s: str) -> str:
+    """Aggressive key for fuzzy compare: lowercase and drop spaces/_/-/dots."""
+    s = _clean(s).lower()
+    return re.sub(r"[ \-_.]+", "", s)
+
+def _pick_vendor_dir(vendor_raw: str) -> str | None:
+    """Choose a vendor directory: try exact, alias, and case-insensitive."""
+    if not os.path.isdir(MATERIAL_BASE):
+        return None
+    vendor_clean = _clean(vendor_raw)
+    alias = VENDOR_ALIASES.get(vendor_clean.lower())
+    candidates = []
+    if alias:
+        candidates.append(alias)
+    candidates.extend([vendor_clean, vendor_clean.lower(), vendor_clean.title(), vendor_clean.replace(" ", "_")])
+    # existing folders
+    try:
+        folders = [d for d in os.listdir(MATERIAL_BASE) if os.path.isdir(os.path.join(MATERIAL_BASE, d))]
+    except Exception:
+        folders = []
+    # exact/alias first
+    for c in candidates:
+        if c in folders:
+            return os.path.join(MATERIAL_BASE, c)
+    # fall back to case-insensitive match
+    vc = vendor_clean.lower().replace(" ", "")
+    for f in folders:
+        if f.lower().replace(" ", "") == vc:
+            return os.path.join(MATERIAL_BASE, f)
+    return None
+
+def _find_best_file(vendor_dir: str, name_raw: str) -> tuple[str, str] | None:
+    """
+    Fuzzy match a file in vendor_dir to name_raw.
+    Tries exact stems with common extensions, then scans directory for best normalized match.
+    Returns (dir, filename) or None.
+    """
+    if not vendor_dir or not os.path.isdir(vendor_dir):
+        return None
+
+    name_clean = _clean(name_raw)
+    # quick exact tries for common extensions on cleaned stems
+    stems = list(dict.fromkeys([name_clean,
+                                name_clean.replace(" ", "_"),
+                                name_clean.replace(" ", "-"),
+                                name_clean.lower(),
+                                name_clean.lower().replace(" ", "_"),
+                                name_clean.lower().replace(" ", "-")]))
+    exts = [".webp", ".jpg", ".jpeg", ".png"]
+    for stem in stems:
+        for ext in exts:
+            fn = stem + ext
+            full = os.path.join(vendor_dir, fn)
+            if os.path.isfile(full):
+                return vendor_dir, fn
+
+    # Fuzzy scan: normalize both requested name and file stems
+    target = _norm_key(name_clean)
+    try:
+        files = [f for f in os.listdir(vendor_dir) if os.path.isfile(os.path.join(vendor_dir, f))]
+    except Exception:
+        files = []
+
+    best = None
+    best_score = -1
+    for fn in files:
+        stem, ext = os.path.splitext(fn)
+        if ext.lower() not in (".webp", ".jpg", ".jpeg", ".png"):
+            continue
+        fk = _norm_key(stem)
+        # scoring: exact => 100, startswith/endswith => 80, contains => 60, partial overlap len
+        score = 0
+        if fk == target:
+            score = 100
+        elif fk.startswith(target) or fk.endswith(target):
+            score = 80
+        elif target in fk or fk in target:
+            score = 60
+        else:
+            # overlap score: length of common subsequence of characters
+            common = len(os.path.commonprefix([fk, target]))
+            score = common
+        if score > best_score:
+            best_score = score
+            best = fn
+
+    if best and best_score >= 60:  # require decent similarity for safety
+        return vendor_dir, best
+    return None
 
 @app.route("/api/material-image", methods=["GET"], endpoint="api_material_image")
 @app.route("/material-image", methods=["GET"], endpoint="plain_material_image")
 @login_required_session
 def material_image():
-    # Read & decode inputs
     vendor_raw = request.args.get("vendor", "")
     name_raw   = request.args.get("name", "")
-    vendor = unquote(vendor_raw or "").strip()
-    name   = unquote(name_raw or "").strip()
-    if not vendor or not name:
+    if not vendor_raw or not name_raw:
         return "", 404
 
-    base_dir = os.path.join(BASE_DIR, "static", "material-images")
+    vendor_dir = _pick_vendor_dir(vendor_raw)
+    hit = _find_best_file(vendor_dir, name_raw) if vendor_dir else None
+    if not hit:
+        # Helpful log once in a while; return clean 404
+        app.logger.info("material-image miss vendor=%r name=%r dir=%r", vendor_raw, name_raw, vendor_dir)
+        return "", 404
 
-    # Try vendor directory variants to tolerate folder naming
-    vendor_candidates = [
-        vendor,
-        _slug(vendor),
-        vendor.lower(),
-        _slug(vendor).lower(),
-    ]
-    # Deduplicate while preserving order
-    seen = set()
-    vendor_candidates = [v for v in vendor_candidates if not (v in seen or seen.add(v))]
-
-    # Filename stems to try (original, slug, lower)
-    stem_candidates = [
-        name,
-        _slug(name),
-        name.lower(),
-        _slug(name).lower(),
-    ]
-    seen = set()
-    stem_candidates = [s for s in stem_candidates if not (s in seen or seen.add(s))]
-
-    exts = [".webp", ".jpg", ".jpeg", ".png"]
-
-    for vdir in vendor_candidates:
-        vendor_dir = os.path.join(base_dir, vdir)
-        if not os.path.isdir(vendor_dir):
-            continue
-        for stem in stem_candidates:
-            for ext in exts:
-                filename = stem + ext
-                full = os.path.join(vendor_dir, filename)
-                if os.path.isfile(full):
-                    resp = send_from_directory(vendor_dir, filename)
-                    resp.headers["Cache-Control"] = "public, max-age=86400"
-                    return resp
-
-    # Not found — return clean 404 (no 500s)
-    return "", 404
+    vdir, filename = hit
+    resp = send_from_directory(vdir, filename)
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
 # ─────────────────────────────────────────────────────────────────────────────
 
 
