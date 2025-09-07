@@ -83,10 +83,6 @@ from flask import send_file  # ADD if not present
 THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_cache")
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
-def _json_etag(payload_bytes: bytes) -> str:
-    import hashlib as _hashlib
-    return 'W/"%s"' % _hashlib.sha1(payload_bytes).hexdigest()
-
 def _thumb_cache_path(file_id: str, size: str, version: str) -> str:
     safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f"{file_id}_{size}_{version or 'nov'}.jpg")
     return os.path.join(THUMB_CACHE_DIR, safe)
@@ -2286,6 +2282,128 @@ def get_combined():
 
 import traceback
 from googleapiclient.errors import HttpError
+
+# ── OVERVIEW endpoint available at /overview AND /api/overview ──────────────
+@app.route("/overview", methods=["GET"], endpoint="overview_plain")
+@app.route("/api/overview", methods=["GET"], endpoint="overview_api")
+@login_required_session
+def overview_combined():
+    """
+    Returns: { upcoming: [...], materials: [...] }
+    - 15s micro-cache + ETag/304
+    - On error: logs and returns last-good or empty payload (never 500s)
+    Requires your existing: get_sheets_service(), sheet_lock, SPREADSHEET_ID
+    """
+    # 15s micro-cache + ETag/304
+    global _overview_cache, _overview_ts
+    now = time.time()
+    if _overview_cache is not None and (now - _overview_ts) < 15:
+        payload_bytes = json.dumps(_overview_cache, separators=(",", ":")).encode("utf-8")
+        etag = _json_etag(payload_bytes)
+        inm = request.headers.get("If-None-Match", "")
+        if etag and inm and etag in inm:
+            resp = make_response("", 304)
+            resp.headers["ETag"] = etag
+            resp.headers["Cache-Control"] = "public, max-age=15"
+            return resp
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "public, max-age=15"
+        return resp
+
+    try:
+        # ---- Read both ranges from the Overview sheet ----------------------
+        svc = get_sheets_service().spreadsheets().values()
+        with sheet_lock:
+            resp = svc.batchGet(
+                spreadsheetId=SPREADSHEET_ID,
+                ranges=["Overview!A3:K", "Overview!M3:M"],
+                valueRenderOption="UNFORMATTED_VALUE"
+            ).execute()
+        vrs = resp.get("valueRanges", [])
+
+        # ---------- UPCOMING ----------
+        TARGET_HEADERS = [
+            "Order #","Preview","Company Name","Design","Quantity",
+            "Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"
+        ]
+        up_vals = (vrs[0].get("values") if len(vrs) > 0 and isinstance(vrs[0].get("values"), list) else []) or []
+        # Drop header row if present
+        if up_vals:
+            first_row = [str(x or "").strip() for x in up_vals[0]]
+            if [h.lower() for h in first_row] == [h.lower() for h in TARGET_HEADERS]:
+                up_vals = up_vals[1:]
+
+        upcoming = []
+        for r in up_vals:
+            r = (r or []) + [""] * (len(TARGET_HEADERS) - len(r))
+            upcoming.append(dict(zip(TARGET_HEADERS, r)))
+
+        # ---------- MATERIALS ----------
+        mat_vals = (vrs[1].get("values") if len(vrs) > 1 and isinstance(vrs[1].get("values"), list) else []) or []
+        grouped = {}
+        for row in mat_vals:
+            s = str((row[0] if row else "") or "").strip()
+            if not s:
+                continue
+            # Split: "... Qty Unit - Vendor"
+            vendor = "Misc."
+            left = s
+            if " - " in s:
+                left, vendor = s.rsplit(" - ", 1)
+                vendor = (vendor or "Misc.").strip() or "Misc."
+
+            toks = left.split()
+            name, qty, unit = left, 0, ""
+            if len(toks) >= 3:
+                unit = toks[-1]
+                qty_str = toks[-2]
+                name = " ".join(toks[:-2]).strip()
+                try:
+                    qty = int(round(float(qty_str)))
+                except Exception:
+                    qty = 0
+
+            typ = "Thread" if unit.lower().startswith("cone") else "Material"
+            if name:
+                grouped.setdefault(vendor, []).append({
+                    "name": name, "qty": qty, "unit": unit, "type": typ
+                })
+
+        materials = [{"vendor": v, "items": items} for v, items in grouped.items()]
+
+        # ---- Cache + respond -----------------------------------------------
+        resp_data = {"upcoming": upcoming, "materials": materials}
+        _overview_cache = resp_data
+        _overview_ts = now
+
+        payload_bytes = json.dumps(resp_data, separators=(",", ":")).encode("utf-8")
+        etag = _json_etag(payload_bytes)
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "public, max-age=15"
+        return resp
+
+    except Exception:
+        app.logger.exception("overview_combined failed")
+        # Serve last-good if we have it
+        if _overview_cache is not None:
+            payload_bytes = json.dumps(_overview_cache, separators=(",", ":")).encode("utf-8")
+            etag = _json_etag(payload_bytes)
+            resp = Response(payload_bytes, mimetype="application/json")
+            resp.headers["ETag"] = etag
+            resp.headers["Cache-Control"] = "public, max-age=15"
+            return resp
+        # Otherwise serve empty payload (200)
+        fallback = {"upcoming": [], "materials": []}
+        payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
+        etag = _json_etag(payload_bytes)
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "public, max-age=15"
+        return resp
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 @app.route("/api/overview/upcoming")
 @login_required_session
