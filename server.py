@@ -2285,7 +2285,7 @@ from googleapiclient.errors import HttpError
 @login_required_session
 def overview_combined():
     """
-    Returns: { upcoming: [...], materials: [...] }
+    Returns: { upcoming: [...], materials: [...], daysWindow: "7" }
     - 15s micro-cache + ETag/304
     - On error: logs and returns last-good or empty payload (never 500s)
     Requires your existing: get_sheets_service(), sheet_lock, SPREADSHEET_ID
@@ -2308,7 +2308,7 @@ def overview_combined():
         return resp
 
     try:
-        # ---- Read both ranges from the Overview sheet ----------------------
+        # ---- Read ranges from the Overview sheet ----------------------------
         svc = get_sheets_service().spreadsheets().values()
 
         # 2 quick attempts to ride out transient network hiccups
@@ -2318,11 +2318,10 @@ def overview_combined():
                 with sheet_lock:
                     resp = svc.batchGet(
                         spreadsheetId=SPREADSHEET_ID,
-                        ranges=["Overview!A3:K", "Overview!M3:M"],
+                        ranges=["Overview!A3:K", "Overview!M3:M", "Overview!B1"],
                         valueRenderOption="UNFORMATTED_VALUE",
                         fields="valueRanges(values)"
                     ).execute()
-
                 break  # success → leave the loop
             except Exception as e:
                 app.logger.warning("Sheets batchGet failed (attempt %d): %s", attempt, e)
@@ -2382,8 +2381,17 @@ def overview_combined():
 
         materials = [{"vendor": v, "items": items} for v, items in grouped.items()]
 
+        # ---- Read B1 for days window ---------------------------------------
+        days_window = "7"
+        try:
+            b1_vals = (vrs[2].get("values") if len(vrs) > 2 and isinstance(vrs[2].get("values"), list) else []) or []
+            if b1_vals and b1_vals[0] and b1_vals[0][0] is not None:
+                days_window = str(b1_vals[0][0]).strip() or "7"
+        except Exception:
+            pass
+
         # ---- Cache + respond -----------------------------------------------
-        resp_data = {"upcoming": upcoming, "materials": materials}
+        resp_data = {"upcoming": upcoming, "materials": materials, "daysWindow": days_window}
         _overview_cache = resp_data
         _overview_ts = now
 
@@ -2412,6 +2420,7 @@ def overview_combined():
         resp.headers["ETag"] = etag
         resp.headers["Cache-Control"] = "public, max-age=15"
         return resp
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
