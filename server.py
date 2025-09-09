@@ -451,6 +451,10 @@ def _cache_set(key, payload_bytes, ttl):
         _json_cache[key] = {'ts': time.time(), 'ttl': ttl, 'etag': etag, 'data': payload_bytes}
     return etag
 
+def _cache_peek(key):
+    with _cache_lock:
+        return _json_cache.get(key)
+
 def _maybe_304(etag):
     inm = request.headers.get("If-None-Match", "")
     return (etag and inm and etag in inm)
@@ -458,20 +462,41 @@ def _maybe_304(etag):
 def send_cached_json(key, ttl, payload_obj_builder):
     """
     If cached and fresh, return cached (and 304 on ETag match).
+    If cached but stale, return stale immediately and refresh in background.
     Otherwise build payload, cache, and send with ETag.
     """
     ent = _cache_get(key)
     if ent and _maybe_304(ent['etag']):
         resp = make_response("", 304)
         resp.headers["ETag"] = ent['etag']
-        resp.headers["Cache-Control"] = f"public, max-age={ttl}"
+        resp.headers["Cache-Control"] = f"public, max-age={ttl}, stale-while-revalidate=300"
         return resp
 
     if ent:
         # Serve hot cache quickly
         resp = Response(ent['data'], mimetype="application/json")
         resp.headers["ETag"] = ent['etag']
-        resp.headers["Cache-Control"] = f"public, max-age={ttl}"
+        resp.headers["Cache-Control"] = f"public, max-age={ttl}, stale-while-revalidate=300"
+        return resp
+
+    # If we have a stale cache entry, serve it immediately and refresh in background
+    stale = _cache_peek(key)
+    if stale:
+        # Kick off a background refresh (Eventlet green thread)
+        def _bg_refresh():
+            try:
+                payload_obj = payload_obj_builder()
+                payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+                _cache_set(key, payload_bytes, ttl)
+            except Exception as e:
+                app.logger.warning("Background refresh failed for %s: %s", key, e)
+        eventlet.spawn_n(_bg_refresh)
+
+        # Serve stale immediately
+        resp = Response(stale['data'], mimetype="application/json")
+        resp.headers["ETag"] = stale['etag']
+        resp.headers["Cache-Control"] = f"public, max-age=5, stale-while-revalidate=300"
+        resp.headers["Warning"] = '110 - "stale response served while refreshing"'
         return resp
 
     # Build fresh payload
@@ -481,7 +506,7 @@ def send_cached_json(key, ttl, payload_obj_builder):
     etag = _cache_set(key, payload_bytes, ttl)
     resp = Response(payload_bytes, mimetype="application/json")
     resp.headers["ETag"] = etag
-    resp.headers["Cache-Control"] = f"public, max-age={ttl}"
+    resp.headers["Cache-Control"] = f"public, max-age={ttl}, stale-while-revalidate=300"
     resp.headers["X-Debug-BuildMs"] = str(int((time.time()-started)*1000))
     return resp
 
