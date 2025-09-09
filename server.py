@@ -2207,6 +2207,7 @@ def get_combined():
                 spreadsheetId=SPREADSHEET_ID,
                 ranges=[ORDERS_RANGE],
                 valueRenderOption="UNFORMATTED_VALUE",
+                fields="valueRanges(values)"
             ).execute()
         vrs = resp.get("valueRanges", [])
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
@@ -2295,7 +2296,9 @@ def overview_combined():
                         spreadsheetId=SPREADSHEET_ID,
                         ranges=["Overview!A3:K", "Overview!M3:M"],
                         valueRenderOption="UNFORMATTED_VALUE",
+                        fields="valueRanges(values)"
                     ).execute()
+
                 break  # success → leave the loop
             except Exception as e:
                 app.logger.warning("Sheets batchGet failed (attempt %d): %s", attempt, e)
