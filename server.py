@@ -2168,34 +2168,33 @@ _login_page = """
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
-    # always default back to your front-end
     next_url = request.args.get("next") or request.form.get("next") or FRONTEND_URL
 
     if request.method == "POST":
-        u = request.form["username"]
-        p = request.form["password"]
-        ADMIN_PW    = os.environ.get("ADMIN_PASSWORD", "")
+        # We only care about the password. Username can be anything.
+        p = (request.form.get("password") or "").strip()
+        ADMIN_PW = (os.environ.get("ADMIN_PASSWORD") or "").strip()
         ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-        print("🔑 ADMIN_PASSWORD env is:", repr(ADMIN_PW))
-        if u == "admin":
+        if not ADMIN_PW:
+            error = "Server is missing ADMIN_PASSWORD. Ask the admin to set it."
+        elif p == ADMIN_PW:
             session.clear()
-            session["user"] = u
+            session["user"] = "admin"  # single-user auth
             session["token_at_login"] = ADMIN_TOKEN
             session["last_activity"] = datetime.utcnow().isoformat()
-            session["login_time"]     = time.time()
-            session["login_ts"]      = datetime.utcnow().timestamp()
-            # **new**: stamp when they logged in
             session["login_time"] = time.time()
+            session["login_ts"] = datetime.utcnow().timestamp()
 
-            # if they wanted a backend URL, just send them home
+            # If they posted a backend path, still send them to the frontend root
             if next_url.startswith("/"):
                 return redirect(FRONTEND_URL)
             return redirect(next_url)
         else:
             error = "Invalid credentials"
-    
+
     return render_template_string(_login_page, error=error, next=next_url)
+
 
 
 @app.route("/logout")
