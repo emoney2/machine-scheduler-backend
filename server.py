@@ -2279,6 +2279,16 @@ def get_combined():
 import traceback
 from googleapiclient.errors import HttpError
 
+def _drive_id_from_link(s: str) -> str:
+    s = str(s or "")
+    m = re.search(r'[?&]id=([A-Za-z0-9_-]+)', s)
+    if m:
+        return m.group(1)
+    m = re.search(r'/file/d/([A-Za-z0-9_-]+)', s)
+    if m:
+        return m.group(1)
+    return ""
+
 # ── OVERVIEW endpoint available at /overview AND /api/overview ──────────────
 @app.route("/overview", methods=["GET"], endpoint="overview_plain")
 @app.route("/api/overview", methods=["GET"], endpoint="overview_api")
@@ -2318,7 +2328,7 @@ def overview_combined():
                 with sheet_lock:
                     resp = svc.batchGet(
                         spreadsheetId=SPREADSHEET_ID,
-                        ranges=["Overview!A3:K", "Overview!M3:M", "Overview!B1"],
+                        ranges=["Overview!A3:K", "Overview!M3:M", "Overview!B1", "Overview!Y3:Y"],
                         valueRenderOption="UNFORMATTED_VALUE",
                         fields="valueRanges(values)"
                     ).execute()
@@ -2343,11 +2353,24 @@ def overview_combined():
             if [h.lower() for h in first_row] == [h.lower() for h in TARGET_HEADERS]:
                 up_vals = up_vals[1:]
 
-        upcoming = []
-        for r in up_vals:
-            r = (r or []) + [""] * (len(TARGET_HEADERS) - len(r))
-            upcoming.append(dict(zip(TARGET_HEADERS, r)))
+        # Y column values (raw Drive links)
+        y_vals = (vrs[3].get("values") if len(vrs) > 3 and isinstance(vrs[3].get("values"), list) else []) or []
 
+        upcoming = []
+        for i, r in enumerate(up_vals):
+            r = (r or []) + [""] * (len(TARGET_HEADERS) - len(r))
+            row = dict(zip(TARGET_HEADERS, r))
+
+            # derive imageUrl from the raw link in column Y for the same row index
+            link = ""
+            if i < len(y_vals) and y_vals[i]:
+                link = y_vals[i][0] if len(y_vals[i]) else ""
+            fid = _drive_id_from_link(link)
+            if fid:
+                backend_root = request.url_root.rstrip("/")
+                row["imageUrl"] = f"{backend_root}/drive/proxy/{fid}?sz=w160"
+
+            upcoming.append(row)
         # ---------- MATERIALS ----------
         mat_vals = (vrs[1].get("values") if len(vrs) > 1 and isinstance(vrs[1].get("values"), list) else []) or []
         grouped = {}
