@@ -2367,8 +2367,9 @@ def overview_combined():
                 link = y_vals[i][0] if len(y_vals[i]) else ""
             fid = _drive_id_from_link(link)
             if fid:
-       backend_root = request.url_root.rstrip("/")
-       row["imageUrl"] = f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
+                backend_root = request.url_root.rstrip("/")
+                row["imageUrl"] = f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
+
 
             upcoming.append(row)
         # ---------- MATERIALS ----------
