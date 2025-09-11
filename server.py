@@ -904,34 +904,50 @@ from urllib3.exceptions import NameResolutionError as UrlNameResError
 @login_required_session
 def drive_proxy(file_id):
     """
-    Robust Drive thumbnail proxy for <file_id>.
-    Tries Google thumbnail directly; if backend DNS has a hiccup, redirect the browser.
+    Drive thumbnail proxy with on-disk cache.
+    Query params:
+      - sz: size token, e.g. w160/w240
+      - v:  version key (stable per order, e.g. the Order #)
     """
-    sz = request.args.get("sz", "w240")  # w160/w240/...
+    sz = request.args.get("sz", "w240")
+    ver = request.args.get("v", "").strip()
+
+    # 1) Serve from cache if we have it and a version was provided
+    if ver:
+      try:
+        cpath = _thumb_cache_path(file_id, sz, ver)
+        if os.path.exists(cpath):
+          resp = send_file(cpath, mimetype="image/jpeg", as_attachment=False, conditional=True)
+          resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+          return resp
+      except Exception:
+        app.logger.exception("drive_proxy cache read failed for %s", file_id)
+
+    # 2) Fetch from Google (and write cache if v provided)
     google_thumb = f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
+    headers = { "Accept": "image/*", "User-Agent": "Mozilla/5.0" }
 
-    headers = {
-        "Accept": "image/*",
-        "User-Agent": "Mozilla/5.0",
-    }
-
-    # Try to fetch on the server first (fast path, enables server-side caching/CDN).
     try:
-        r = requests.get(google_thumb, headers=headers, timeout=10, stream=True)
-        if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image/"):
-            content = r.raw.read(decode_content=True)
-            resp = Response(content, mimetype=r.headers.get("Content-Type", "image/jpeg"))
-            resp.headers["Cache-Control"] = "public, max-age=86400"
-            return resp
-        # If not 200, fall through to redirect below.
-    except (ReqConnError, ReqTimeout, socket.gaierror, RequestException):
-        # DNS/connection trouble on the server — fall through to redirect.
-        pass
+      r = requests.get(google_thumb, headers=headers, timeout=10, stream=True)
+      if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image/"):
+        content = r.raw.read(decode_content=True)
+        # write cache
+        if ver:
+          try:
+            os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
+            with open(_thumb_cache_path(file_id, sz, ver), "wb") as f:
+              f.write(content)
+          except Exception:
+            app.logger.exception("drive_proxy cache write failed for %s", file_id)
+        resp = Response(content, mimetype=r.headers.get("Content-Type", "image/jpeg"))
+        resp.headers["Cache-Control"] = "public, max-age=86400"
+        return resp
     except Exception:
-        app.logger.exception("drive_proxy fetch failed for %s", file_id)
+      app.logger.exception("drive_proxy fetch failed for %s", file_id)
 
-    # Let the browser fetch it directly if server fetch didn’t work.
+    # 3) Fallback: let the browser fetch it (rare)
     return redirect(google_thumb, code=302)
+
 
 @app.route("/api/ping", methods=["GET", "OPTIONS"])
 def api_ping():
