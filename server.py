@@ -2289,6 +2289,8 @@ def _drive_id_from_link(s: str) -> str:
         return m.group(1)
     return ""
 
+
+
 # ── OVERVIEW endpoint available at /overview AND /api/overview ──────────────
 @app.route("/overview", methods=["GET"], endpoint="overview_plain")
 @app.route("/api/overview", methods=["GET"], endpoint="overview_api")
@@ -2565,6 +2567,75 @@ def overview_materials_needed():
         return jsonify({"error": "materials-needed failed"}), 500
 
 # ─── API ENDPOINTS ────────────────────────────────────────────────────────────
+# ─── Fur: mark complete (write Quantity Made in "Fur List") ───────────────────
+@app.route("/api/fur/complete", methods=["POST", "OPTIONS"])
+@login_required_session
+def api_fur_complete():
+    try:
+        data = request.get_json(silent=True) or {}
+        order_id = str(data.get("orderId") or data.get("order_id") or "").strip()
+        quantity = data.get("quantity")
+
+        if not order_id:
+            return jsonify({"error": "Missing 'orderId'"}), 400
+        try:
+            qty_int = int(quantity)
+        except Exception:
+            return jsonify({"error": "Invalid 'quantity'"}), 400
+
+        # Read Fur List to locate the row for this Order #
+        svc = get_sheets_service().spreadsheets().values()
+        resp = svc.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Fur List!A1:ZZ",
+            valueRenderOption="FORMATTED_VALUE"
+        ).execute()
+        rows = resp.get("values", []) or []
+        if not rows:
+            return jsonify({"error": "Fur List tab is empty"}), 500
+
+        headers = [str(h or "").strip() for h in rows[0]]
+        def idx_of(name):
+            try:
+                return headers.index(name)
+            except ValueError:
+                return -1
+
+        order_idx = idx_of("Order #")
+        qty_idx   = idx_of("Quantity Made")
+        if order_idx < 0 or qty_idx < 0:
+            return jsonify({"error": "Missing 'Order #' or 'Quantity Made' header in Fur List"}), 500
+
+        # find row where Order # matches
+        row_num = None
+        for i, r in enumerate(rows[1:], start=2):
+            val = r[order_idx] if order_idx < len(r) else ""
+            if str(val).strip() == order_id:
+                row_num = i
+                break
+
+        if not row_num:
+            return jsonify({"error": f"Order # {order_id} not found in Fur List"}), 404
+
+        # small helper: 0-based column index → A1 letter(s)
+        def col_to_a1(idx0):
+            n = idx0 + 1
+            s = ""
+            while n:
+                n, rem = divmod(n - 1, 26)
+                s = chr(65 + rem) + s
+            return s
+
+        target_cell = f"Fur List!{col_to_a1(qty_idx)}{row_num}"
+        write_sheet(SPREADSHEET_ID, target_cell, [[qty_int]])
+
+        # (Optional) we could emit a socket event here; UI already removes the card.
+        return jsonify({"ok": True, "orderId": order_id, "wrote": qty_int})
+
+    except Exception:
+        logger.exception("Error in /api/fur/complete")
+        return jsonify({"error": "Internal error"}), 500
+
 
 @app.route("/api/orders", methods=["GET"])
 @login_required_session
