@@ -1908,6 +1908,7 @@ sheet_lock = Semaphore(1)
 SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
 ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
 FUR_RANGE        = os.environ.get("FUR_RANGE",        "Fur List!A1:Z")
+CUT_RANGE    = os.environ.get("CUT_RANGE",    "Cut List!A1:Z")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
@@ -2585,6 +2586,93 @@ def api_fur_complete():
         logger.exception("Error in /api/fur/complete")
         return jsonify({"error": "Internal error"}), 500
 
+@app.route("/api/cut/complete", methods=["POST"])
+@login_required_session
+def cut_complete():
+    """
+    Body: { orderId: "<Order #>", quantity: <number> }
+    For the matching row in "Cut List":
+      For each source column in H..R (inclusive), if that cell has text,
+      write the quantity into the cell to its right (I..S).
+    """
+    data = request.get_json(silent=True) or {}
+    order_id = str(data.get("orderId", "")).strip()
+    quantity = data.get("quantity", 0)
+
+    if not order_id:
+      return jsonify(ok=False, error="Missing orderId"), 400
+
+    try:
+        svc = get_sheets_service().spreadsheets().values()
+        with sheet_lock:
+            # Find the row by Order #
+            find_resp = svc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Cut List!A1:ZZ",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        rows = find_resp.get("values", []) or []
+        if not rows:
+            return jsonify(ok=False, error="Cut List is empty"), 404
+
+        headers = [str(h).strip() for h in rows[0]]
+        order_idx = headers.index("Order #") if "Order #" in headers else None
+        if order_idx is None:
+            return jsonify(ok=False, error="Order # column not found in Cut List"), 400
+
+        row_num = None  # 1-based
+        for i in range(1, len(rows)):
+            r = rows[i] or []
+            val = str(r[order_idx] if order_idx < len(r) else "").strip()
+            if val == order_id:
+                row_num = i + 1
+                break
+
+        if not row_num:
+            return jsonify(ok=False, error=f"Order {order_id} not found in Cut List"), 404
+
+        # Get H..R for that row (sources)
+        with sheet_lock:
+            src_resp = svc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Cut List!H{row_num}:R{row_num}",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        src_vals = (src_resp.get("values") or [[]])[0]
+        # Pad to 11 cells (H..R)
+        while len(src_vals) < 11:
+            src_vals.append("")
+
+        # Build writes to I..S where source has text
+        updates = []
+        for idx in range(11):  # 0..10 for H..R
+            src_val = str(src_vals[idx]).strip()
+            if src_val != "":
+                # destination column is next to the right: (H+idx)+1
+                dest_col_letter = chr(ord('H') + idx + 1)  # I..S
+                updates.append({
+                    "range": f"Cut List!{dest_col_letter}{row_num}",
+                    "values": [[quantity]],
+                })
+
+        if not updates:
+            return jsonify(ok=True, wrote=0)  # nothing to write
+
+        # Batch update
+        body = {
+            "valueInputOption": "USER_ENTERED",
+            "data": updates
+        }
+        with sheet_lock:
+            svc.batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body=body
+            ).execute()
+
+        return jsonify(ok=True, wrote=len(updates))
+    except Exception as e:
+        app.logger.exception("cut_complete failed")
+        return jsonify(ok=False, error=str(e)), 500
 
 @app.route("/api/orders", methods=["GET"])
 @login_required_session
@@ -2952,7 +3040,7 @@ def save_links():
 @login_required_session
 def get_combined():
     """
-    Returns: { orders: [...], links: {...] }
+    Returns: { orders: [...], links: {...} }
     Uses 20s micro-cache and ETag/304.
     """
     TTL = 20
@@ -2962,13 +3050,14 @@ def get_combined():
         with sheet_lock:
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
-                ranges=[ORDERS_RANGE, FUR_RANGE],  # pull both tabs
+                ranges=[ORDERS_RANGE, FUR_RANGE, CUT_RANGE],  # add Cut
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
 
         vrs = resp.get("valueRanges", [])
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
         fur_rows    = (vrs[1].get("values") if len(vrs) > 1 else []) or []
+        cut_rows    = (vrs[2].get("values") if len(vrs) > 2 else []) or []
 
         def rows_to_dicts(rows):
             if not rows:
@@ -2984,20 +3073,30 @@ def get_combined():
 
         orders_full = rows_to_dicts(orders_rows)
         fur_full    = rows_to_dicts(fur_rows)
+        cut_full    = rows_to_dicts(cut_rows)
 
-        # Map Fur List by Order #
-        fur_map = {}
-        for fr in fur_full:
-            oid = str(fr.get("Order #", "")).strip()
-            if oid:
-                fur_map[oid] = fr
+        # Build lookups by Order #
+        fur_map = { str(r.get("Order #", "")).strip(): r
+                    for r in fur_full if str(r.get("Order #", "")).strip() }
+        cut_map = { str(r.get("Order #", "")).strip(): r
+                    for r in cut_full if str(r.get("Order #", "")).strip() }
 
-        # Merge Status from Fur List into Production Orders rows
+        # Merge statuses into the Production Orders objects
         for o in orders_full:
             oid = str(o.get("Order #", "")).strip()
-            fr  = fur_map.get(oid)
+            if not oid:
+                continue
+
+            fr = fur_map.get(oid)
             if fr and "Status" in fr:
+                # keep generic Status (used by Fur tab) and also label it explicitly
                 o["Status"] = fr.get("Status", "")
+                o["Fur Status"] = fr.get("Status", "")
+
+            cr = cut_map.get(oid)
+            if cr and "Status" in cr:
+                # used by Cut tab filtering
+                o["Cut Status"] = cr.get("Status", "")
 
         return {"orders": orders_full, "links": _links_store}
 
@@ -3013,11 +3112,6 @@ def get_combined():
         return resp
 
     return send_cached_json("combined", TTL, build_payload)
-
-
-
-
-
 
 @socketio.on("placeholdersUpdated")
 def handle_placeholders_updated(data):
