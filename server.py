@@ -2677,6 +2677,115 @@ def cut_complete():
         app.logger.exception("cut_complete failed")
         return jsonify(ok=False, error=str(e)), 500
 
+@app.route("/api/cut/completeBatch", methods=["POST"])
+@login_required_session
+def cut_complete_batch():
+    """
+    Body: { items: [ {orderId: "<Order #>", quantity: <number>}, ... ] }
+    For each item, in the Cut List row:
+      Look at H..R (inclusive). For each cell that has text, write 'quantity' into the cell to its right (I..S).
+    All rows are handled in one Sheets batchUpdate to avoid timeouts.
+    """
+    data = request.get_json(silent=True) or {}
+    items = data.get("items") or []
+    if not isinstance(items, list) or not items:
+        return jsonify(ok=False, error="No items to complete"), 400
+
+    # Initialize Sheets client (fail fast if creds missing)
+    try:
+        vsvc = get_sheets_service().spreadsheets().values()
+    except RuntimeError as e:
+        app.logger.error("cut_complete_batch: Google credentials missing: %s", e)
+        return jsonify(ok=False, error="Server is not connected to Google. Add GOOGLE_TOKEN_JSON or token.json."), 503
+    except Exception:
+        app.logger.exception("cut_complete_batch: unable to init Google Sheets client")
+        return jsonify(ok=False, error="Could not initialize Google Sheets client."), 503
+
+    # Helper: 0-based column index → A1 letter(s)
+    def col_letter(idx0: int) -> str:
+        n = idx0 + 1
+        s = ""
+        while n:
+            n, rem = divmod(n - 1, 26)
+            s = chr(65 + rem) + s
+        return s
+
+    try:
+        # Load entire Cut List once
+        with sheet_lock:
+            resp = vsvc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Cut List!A1:ZZ",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+
+        rows = resp.get("values", []) or []
+        if not rows:
+            return jsonify(ok=False, error="Cut List is empty"), 404
+
+        headers = [str(h).strip() for h in rows[0]]
+        if "Order #" not in headers:
+            return jsonify(ok=False, error="Order # column not found in Cut List"), 400
+        order_ix = headers.index("Order #")
+
+        # Map Order # → 1-based row number
+        row_index = {}
+        for i in range(1, len(rows)):
+            r = rows[i] or []
+            key = str(r[order_ix] if order_ix < len(r) else "").strip()
+            if key:
+                row_index[key] = i + 1
+
+        updates = []
+        missing = []
+        wrote_cells = 0
+
+        for it in items:
+            oid = str(it.get("orderId", "")).strip()
+            qty = it.get("quantity", 0)
+            if not oid:
+                continue
+
+            row_num = row_index.get(oid)
+            if not row_num:
+                missing.append(oid)
+                continue
+
+            # Pull the whole row from the cached 'rows'
+            row = rows[row_num - 1] or []
+
+            # Ensure row has at least up to column S (index 18)
+            while len(row) <= 18:
+                row.append("")
+
+            # H..R are indices 7..17 inclusive (0-based). If cell has text, write qty to next col (I..S → 8..18)
+            for src_ix in range(7, 18):
+                has_text = str(row[src_ix]).strip() != ""
+                if has_text:
+                    dest_ix = src_ix + 1
+                    dest_letter = col_letter(dest_ix)
+                    updates.append({
+                        "range": f"Cut List!{dest_letter}{row_num}",
+                        "values": [[qty]],
+                    })
+                    wrote_cells += 1
+
+        if not updates:
+            return jsonify(ok=True, wrote=0, updated=0, missing=missing)
+
+        body = {"valueInputOption": "USER_ENTERED", "data": updates}
+        with sheet_lock:
+            vsvc.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+
+        app.logger.info("cut_complete_batch: updated orders=%d wrote cells=%d missing=%d",
+                        len(items) - len(missing), wrote_cells, len(missing))
+        return jsonify(ok=True, wrote=wrote_cells, updated=len(items) - len(missing), missing=missing)
+
+    except Exception as e:
+        app.logger.exception("cut_complete_batch failed")
+        return jsonify(ok=False, error=str(e)), 500
+
+
 @app.route("/api/orders", methods=["GET"])
 @login_required_session
 def get_orders():
