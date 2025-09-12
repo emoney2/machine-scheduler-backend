@@ -896,9 +896,31 @@ def token_status():
     return jsonify(info)
 
 
-# ── Robust Drive thumbnail proxy ─────────────────────────────────────────────
-from requests.exceptions import ConnectionError as ReqConnError
-from urllib3.exceptions import NameResolutionError as UrlNameResError
+# --- replace your /api/drive/proxy handler with this ---
+from threading import Thread
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def _warm_thumb_async(file_id: str, sz: str, ver: str):
+    """Background cache warm with retries; never raises to the request thread."""
+    try:
+        google_thumb = f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
+        sess = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+        sess.mount("https://", HTTPAdapter(max_retries=retry))
+        r = sess.get(google_thumb, headers={"Accept": "image/*", "User-Agent": "Mozilla/5.0"}, timeout=10)
+        if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image/"):
+            os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
+            with open(_thumb_cache_path(file_id, sz, ver or "1"), "wb") as f:
+                f.write(r.content)
+    except Exception:
+        app.logger.exception("thumb warm failed for %s", file_id)
 
 @app.route("/api/drive/proxy/<file_id>")
 @login_required_session
@@ -906,48 +928,30 @@ def drive_proxy(file_id):
     """
     Disk-cached Drive thumbnail proxy.
 
-    Query params:
-      - sz: size token, e.g. w160/w240 (defaults to w240)
-      - v:  version key to separate caches (use Order # or a constant if image never changes)
+    Behavior:
+      * If cached: serve from disk (immutable, instant).
+      * If not cached: spawn background warm + 302 redirect to Google immediately.
     """
-    sz = request.args.get("sz", "w240").strip()
-    ver = (request.args.get("v") or "").strip()
+    sz  = (request.args.get("sz") or "w240").strip()
+    ver = (request.args.get("v") or "").strip() or "1"
 
-    # 1) Serve from cache if available and we have a version key
+    # 1) Cache hit → serve immediately
     try:
-        if ver:
-            cpath = _thumb_cache_path(file_id, sz, ver)
-            if os.path.exists(cpath):
-                resp = send_file(cpath, mimetype="image/jpeg", as_attachment=False, conditional=True)
-                resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-                return resp
+        cpath = _thumb_cache_path(file_id, sz, ver)
+        if os.path.exists(cpath):
+            resp = send_file(cpath, mimetype="image/jpeg", as_attachment=False, conditional=True)
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            return resp
     except Exception:
         app.logger.exception("drive_proxy cache read failed for %s", file_id)
 
-    # 2) Not cached → fetch from Google and write cache (if version provided)
-    google_thumb = f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
-    headers = { "Accept": "image/*", "User-Agent": "Mozilla/5.0" }
-
+    # 2) Cache miss → warm in background, redirect client so the UI still gets an image now
     try:
-        r = requests.get(google_thumb, headers=headers, timeout=10)
-        if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image/"):
-            content = r.content
-            # write cache for future hits
-            if ver:
-                try:
-                    os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
-                    with open(_thumb_cache_path(file_id, sz, ver), "wb") as f:
-                        f.write(content)
-                except Exception:
-                    app.logger.exception("drive_proxy cache write failed for %s", file_id)
-
-            resp = Response(content, mimetype=r.headers.get("Content-Type", "image/jpeg"))
-            resp.headers["Cache-Control"] = "public, max-age=86400"
-            return resp
+        Thread(target=_warm_thumb_async, args=(file_id, sz, ver), daemon=True).start()
     except Exception:
-        app.logger.exception("drive_proxy fetch failed for %s", file_id)
+        app.logger.exception("drive_proxy warm spawn failed for %s", file_id)
 
-    # 3) Fallback: let the browser try directly
+    google_thumb = f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
     return redirect(google_thumb, code=302)
 
 
