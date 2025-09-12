@@ -2948,8 +2948,8 @@ def save_links():
 @login_required_session
 def get_combined():
     """
-    Returns: { orders: [...], links: {...} }
-    Uses 20s micro-cache and ETag/304 to avoid long hangs under load.
+    Returns: { orders: [...], links: {...] }
+    Uses 20s micro-cache and ETag/304.
     """
     TTL = 20
 
@@ -2958,11 +2958,13 @@ def get_combined():
         with sheet_lock:
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
-                ranges=[ORDERS_RANGE],
+                ranges=[ORDERS_RANGE, FUR_RANGE],  # pull both tabs
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
+
         vrs = resp.get("valueRanges", [])
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
+        fur_rows    = (vrs[1].get("values") if len(vrs) > 1 else []) or []
 
         def rows_to_dicts(rows):
             if not rows:
@@ -2977,10 +2979,38 @@ def get_combined():
             return out
 
         orders_full = rows_to_dicts(orders_rows)
+        fur_full    = rows_to_dicts(fur_rows)
+
+        # Map Fur List by Order #
+        fur_map = {}
+        for fr in fur_full:
+            oid = str(fr.get("Order #", "")).strip()
+            if oid:
+                fur_map[oid] = fr
+
+        # Merge Status from Fur List into Production Orders rows
+        for o in orders_full:
+            oid = str(o.get("Order #", "")).strip()
+            fr  = fur_map.get(oid)
+            if fr and "Status" in fr:
+                o["Status"] = fr.get("Status", "")
+
         return {"orders": orders_full, "links": _links_store}
 
-    # (In your file this version uses the shared caching helper)
+    # Allow client to force rebuild right after writes
+    if request.args.get("refresh") == "1":
+        payload_obj   = build_payload()
+        payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+        etag          = _json_etag(payload_bytes)
+        _cache_set("combined", payload_bytes, TTL)
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = f"public, max-age={TTL}, stale-while-revalidate=300"
+        return resp
+
     return send_cached_json("combined", TTL, build_payload)
+
+
 
 
 
