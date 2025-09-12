@@ -2589,26 +2589,29 @@ def api_fur_complete():
 @app.route("/api/cut/complete", methods=["POST"])
 @login_required_session
 def cut_complete():
-    """
-    Body: { orderId: "<Order #>", quantity: <number> }
-    For the matching row in "Cut List":
-      For each source column in H..R (inclusive), if that cell has text,
-      write the quantity into the cell to its right (I..S).
-    """
     data = request.get_json(silent=True) or {}
     order_id = str(data.get("orderId", "")).strip()
     quantity = data.get("quantity", 0)
 
     if not order_id:
-      return jsonify(ok=False, error="Missing orderId"), 400
+        return jsonify(ok=False, error="Missing orderId"), 400
 
     try:
-        svc = get_sheets_service().spreadsheets().values()
+        # Try to init Sheets client; fail fast with a clear error
+        try:
+            svc = get_sheets_service().spreadsheets().values()
+        except RuntimeError as e:
+            app.logger.error("cut_complete: Google credentials missing: %s", e)
+            return jsonify(ok=False, error="Server is not connected to Google. Add GOOGLE_TOKEN_JSON or token.json."), 503
+        except Exception as e:
+            app.logger.exception("cut_complete: unable to init Google Sheets client")
+            return jsonify(ok=False, error="Could not initialize Google Sheets client."), 503
+
+        # 1) Load the whole Cut List to find the row by "Order #"
         with sheet_lock:
-            # Find the row by Order #
             find_resp = svc.get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"Cut List!A1:ZZ",
+                range="Cut List!A1:ZZ",
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
         rows = find_resp.get("values", []) or []
