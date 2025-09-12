@@ -1902,7 +1902,8 @@ def drive_make_public():
 # ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
 sheet_lock = Semaphore(1)
 SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
-ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:ZZ")
+ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
+FUR_RANGE        = os.environ.get("FUR_RANGE",        "Fur List!A1:Z")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
@@ -2219,80 +2220,6 @@ def login():
 def logout():
     session.clear()
     return redirect("/login")
-
-@app.route("/api/combined", methods=["GET"])
-@login_required_session
-def get_combined():
-    # 20s micro-cache + ETag/304
-    global _combined_cache, _combined_ts
-    now = time.time()
-    if _combined_cache is not None and (now - _combined_ts) < 20:
-        payload_bytes = json.dumps(_combined_cache, separators=(",", ":")).encode("utf-8")
-        etag = _json_etag(payload_bytes)
-        inm = request.headers.get("If-None-Match", "")
-        if etag and inm and etag in inm:
-            resp = make_response("", 304)
-            resp.headers["ETag"] = etag
-            resp.headers["Cache-Control"] = "public, max-age=20"
-            return resp
-        resp = Response(payload_bytes, mimetype="application/json")
-        resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "public, max-age=20"
-        return resp
-
-    try:
-        svc = get_sheets_service().spreadsheets().values()
-
-        # 1) Primary fetch: whatever ORDERS_RANGE is set to
-        with sheet_lock:
-            resp = svc.batchGet(
-                spreadsheetId=SPREADSHEET_ID,
-                ranges=[ORDERS_RANGE],
-                valueRenderOption="UNFORMATTED_VALUE",
-                fields="valueRanges(values)"
-            ).execute()
-        vrs = resp.get("valueRanges", [])
-        orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
-
-        # 2) If we need fallback headers or links, fetch those here (your existing logic)
-        # (… keep your current 2/3 fetches …)
-
-        # 4) Convert rows to dicts
-        def rows_to_dicts(rows):
-            if not rows:
-                return []
-            headers = [str(h).strip() for h in rows[0]]
-            out = []
-            for r in rows[1:]:
-                r = r or []
-                if len(r) < len(headers):
-                    r += [""] * (len(headers) - len(r))
-                out.append(dict(zip(headers, r)))
-            return out
-
-        orders_full = rows_to_dicts(orders_rows)
-
-        # 5) Build + cache + return
-        resp_data = {"orders": orders_full, "links": _links_store}
-        _combined_cache = resp_data
-        _combined_ts = now
-        payload_bytes = json.dumps(resp_data, separators=(",", ":")).encode("utf-8")
-        etag = _json_etag(payload_bytes)
-        resp = Response(payload_bytes, mimetype="application/json")
-        resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "public, max-age=20"
-        return resp
-
-    except Exception:
-        logger.exception("Error building /api/combined")
-        # Even error path returns JSON (no 5xx to the client)
-        fallback = {"orders": [], "links": {}}
-        payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
-        etag = _json_etag(payload_bytes)
-        resp = Response(payload_bytes, mimetype="application/json")
-        resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "public, max-age=20"
-        return resp
 
 import traceback
 from googleapiclient.errors import HttpError
@@ -3016,6 +2943,7 @@ def save_links():
     socketio.emit("linksUpdated", _links_store)
     return jsonify({"status":"ok"}), 200
 
+# KEEP this handler
 @app.route("/api/combined", methods=["GET"], endpoint="api_combined")
 @login_required_session
 def get_combined():
@@ -3027,8 +2955,6 @@ def get_combined():
 
     def build_payload():
         svc = get_sheets_service().spreadsheets().values()
-
-        # 1) Primary fetch
         with sheet_lock:
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
@@ -3038,7 +2964,6 @@ def get_combined():
         vrs = resp.get("valueRanges", [])
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
 
-        # 2) Convert rows to dicts
         def rows_to_dicts(rows):
             if not rows:
                 return []
@@ -3052,11 +2977,12 @@ def get_combined():
             return out
 
         orders_full = rows_to_dicts(orders_rows)
-
-        # 3) Use your existing _links_store (or however you populate links)
         return {"orders": orders_full, "links": _links_store}
 
+    # (In your file this version uses the shared caching helper)
     return send_cached_json("combined", TTL, build_payload)
+
+
 
 
 @socketio.on("placeholdersUpdated")
