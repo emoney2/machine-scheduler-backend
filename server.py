@@ -126,6 +126,83 @@ def _hdr_idx(headers):
         d[k] = i
     return d
 
+def _find_col(headers, name):
+hi = _hdr_idx(hdr)
+out = {}
+for r in rows[1:]:
+name = (r[hi.get("materials", -1)] if hi.get("materials") is not None and hi.get("materials") < len(r) else "").strip()
+unit = (r[hi.get("unit", -1)] if hi.get("unit") is not None and hi.get("unit") < len(r) else "").strip()
+if name:
+out[name] = unit # case-sensitive strings: "Yards" or "Sqft"
+return out
+
+
+def _get_ppy_lookup():
+table = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
+hdr = table[0]
+h = _hdr_idx(hdr)
+p_col = h.get("product") or 0
+ppy_col = h.get("ppy")
+if ppy_col is None:
+# Fallback to the 6th column (Apps Script uses index 5)
+ppy_col = 5 if len(hdr) > 5 else 1
+out = {}
+for r in table[1:]:
+if not r or p_col >= len(r):
+continue
+prod = str(r[p_col]).strip()
+if not prod:
+continue
+val = r[ppy_col] if ppy_col < len(r) else ""
+try:
+out[prod.lower()] = float(val)
+except:
+continue
+return out
+
+
+def _compute_usage_units(material_name, unit_str, product, width_in, length_in, qty, ppy_lookup):
+"""
+Mirrors your Apps Script rules (54" fabric width, 13.5 sqft/yd):
+- If Unit == "Yards":
+• Product present → usage = qty / PPY
+• Else (W×L) → usage = (area_in² × qty) / (36×54)
+- If Unit == "Sqft":
+• Product present → usage = (qty / PPY) × 13.5
+• Else (W×L) → usage = (area_in² / 144) × qty
+Returns a float.
+"""
+unit = (unit_str or "").strip() # case-sensitive per your instruction
+ppy = None
+if product:
+ppy = ppy_lookup.get(product.lower())
+area_in2 = None
+if width_in and length_in:
+try:
+area_in2 = float(width_in) * float(length_in)
+except:
+area_in2 = None
+
+
+if unit == "Yards":
+if product and ppy and ppy > 0:
+return float(qty) / float(ppy)
+if area_in2:
+return (area_in2 * float(qty)) / (36.0 * 54.0)
+return 0.0
+
+
+if unit == "Sqft":
+if product and ppy and ppy > 0:
+return (float(qty) / float(ppy)) * 13.5
+if area_in2:
+return (area_in2 / 144.0) * float(qty)
+return 0.0
+
+
+# Unknown unit → block upstream; return 0 here for safety
+return 0.0
+
 def get_vendor_directory():
     """Reads Vendors!A1:E → { vendor_name: {method,email,cc,website} }"""
     svc = get_sheets_service().spreadsheets().values()
@@ -2805,6 +2882,83 @@ def get_orders():
     except Exception:
         logger.exception("Error fetching orders")
         return jsonify({"error": "orders fetch failed"}), 500
+
+@app.route("/api/material-log/original-usage", methods=["GET"]) # ?order=123
+return jsonify({"added": len(to_append)}), 200
+
+
+@app.route("/api/material-log/rd-append", methods=["POST"])
+@login_required_session
+def material_log_rd_append():
+data = request.get_json(silent=True) or {}
+items = data.get("items") or []
+if not isinstance(items, list) or not items:
+return jsonify({"error": "Missing items"}), 400
+
+
+# lookups
+units = _get_material_units_lookup()
+ppy = _get_ppy_lookup()
+
+
+# Validate and compute
+to_append = []
+now_str = datetime.datetime.now().isoformat()
+
+
+for it in items:
+mat = (it.get("material") or "").strip()
+prod = (it.get("product") or "").strip()
+w_in = it.get("widthIn")
+l_in = it.get("lengthIn")
+qty = it.get("quantity")
+if not mat:
+return jsonify({"error": "Select the correct material"}), 400
+# whole numbers only
+if not isinstance(qty, (int, float)) or int(qty) != qty or qty <= 0:
+return jsonify({"error": "Quantity must be a whole number"}), 400
+qty = int(qty)
+
+
+# One of product or W×L is required; if both present, Product wins
+if not prod and not (w_in and l_in):
+return jsonify({"error": "Provide Product or W×L"}), 400
+if prod:
+w_in = None; l_in = None
+
+
+unit_str = units.get(mat, None)
+if not unit_str:
+return jsonify({"error": f"Material '{mat}' not found in Material Inventory"}), 400
+if unit_str not in ("Yards", "Sqft"):
+return jsonify({"error": f"Unsupported unit '{unit_str}' for material '{mat}'"}), 400
+
+
+used = _compute_usage_units(mat, unit_str, prod, w_in, l_in, qty, ppy)
+shape = prod or (f"{int(w_in)}x{int(l_in)}" if (w_in and l_in) else "")
+row = [ now_str, "R&D", "", qty, shape, mat, used, "OUT", "", "" ]
+to_append.append(row)
+
+
+svc = get_sheets_service().spreadsheets().values()
+with sheet_lock:
+svc.append(
+spreadsheetId=SPREADSHEET_ID,
+range="Material Log!A1:Z",
+valueInputOption="USER_ENTERED",
+insertDataOption="INSERT_ROWS",
+body={"values": to_append}
+).execute()
+
+
+# optional: invalidate materials-needed cache if you cache it
+try:
+invalidate_materials_needed_cache()
+except Exception:
+pass
+
+
+return jsonify({"added": len(to_append)}), 200
 
 
 
