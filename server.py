@@ -127,81 +127,97 @@ def _hdr_idx(headers):
     return d
 
 def _find_col(headers, name):
-hi = _hdr_idx(hdr)
-out = {}
-for r in rows[1:]:
-name = (r[hi.get("materials", -1)] if hi.get("materials") is not None and hi.get("materials") < len(r) else "").strip()
-unit = (r[hi.get("unit", -1)] if hi.get("unit") is not None and hi.get("unit") < len(r) else "").strip()
-if name:
-out[name] = unit # case-sensitive strings: "Yards" or "Sqft"
-return out
+    name = (name or "").strip().lower()
+    for i, h in enumerate(headers or []):
+        if str(h or "").strip().lower() == name:
+            return i
+    return None
 
+def _get_material_units_lookup():
+    """Material Inventory → { MaterialName (exact): Unit (case-sensitive 'Yards'|'Sqft') }."""
+    rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:Z")
+    if not rows:
+        return {}
+    hdr = rows[0]
+    hi = _hdr_idx(hdr)  # lower-cased header→index
+
+    m_ix = hi.get("materials")
+    u_ix = hi.get("unit")
+    out = {}
+    for r in rows[1:]:
+        mat = (r[m_ix] if m_ix is not None and m_ix < len(r) else "")
+        unit = (r[u_ix] if u_ix is not None and u_ix < len(r) else "")
+        mat = str(mat).strip()
+        unit = str(unit).strip()
+        if mat:
+            out[mat] = unit  # keep exact case: "Yards" or "Sqft"
+    return out
 
 def _get_ppy_lookup():
-table = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
-hdr = table[0]
-h = _hdr_idx(hdr)
-p_col = h.get("product") or 0
-ppy_col = h.get("ppy")
-if ppy_col is None:
-# Fallback to the 6th column (Apps Script uses index 5)
-ppy_col = 5 if len(hdr) > 5 else 1
-out = {}
-for r in table[1:]:
-if not r or p_col >= len(r):
-continue
-prod = str(r[p_col]).strip()
-if not prod:
-continue
-val = r[ppy_col] if ppy_col < len(r) else ""
-try:
-out[prod.lower()] = float(val)
-except:
-continue
-return out
+    """Table sheet → { product.lower(): PPY } matching your Apps Script (column A product, col 6 PPY)."""
+    rows = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
+    if not rows:
+        return {}
+    hdr = rows[0]
+    hi = _hdr_idx(hdr)
+    p_col = hi.get("product", 0)
+    ppy_col = hi.get("ppy")
+    if ppy_col is None:
+        # Fallback to the 6th column (Apps Script uses index 5)
+        ppy_col = 5 if len(hdr) > 5 else 1
 
+    out = {}
+    for r in rows[1:]:
+        if not r or p_col >= len(r):
+            continue
+        prod = str(r[p_col]).strip()
+        if not prod:
+            continue
+        val = r[ppy_col] if ppy_col < len(r) else ""
+        try:
+            out[prod.lower()] = float(val)
+        except Exception:
+            pass
+    return out
 
 def _compute_usage_units(material_name, unit_str, product, width_in, length_in, qty, ppy_lookup):
-"""
-Mirrors your Apps Script rules (54" fabric width, 13.5 sqft/yd):
-- If Unit == "Yards":
-• Product present → usage = qty / PPY
-• Else (W×L) → usage = (area_in² × qty) / (36×54)
-- If Unit == "Sqft":
-• Product present → usage = (qty / PPY) × 13.5
-• Else (W×L) → usage = (area_in² / 144) × qty
-Returns a float.
-"""
-unit = (unit_str or "").strip() # case-sensitive per your instruction
-ppy = None
-if product:
-ppy = ppy_lookup.get(product.lower())
-area_in2 = None
-if width_in and length_in:
-try:
-area_in2 = float(width_in) * float(length_in)
-except:
-area_in2 = None
+    """
+    Mirrors your Apps Script rules (36×54 for a yard → 13.5 sqft/yd), using existing 54" width.
 
+    Yards:
+      - if Product present: usage = qty / PPY
+      - else if W×L:       usage = (W×L in² × qty) / (36×54)
 
-if unit == "Yards":
-if product and ppy and ppy > 0:
-return float(qty) / float(ppy)
-if area_in2:
-return (area_in2 * float(qty)) / (36.0 * 54.0)
-return 0.0
+    Sqft:
+      - if Product present: usage = (qty / PPY) × 13.5
+      - else if W×L:        usage = (W×L in² / 144) × qty
+    """
+    unit = (unit_str or "").strip()  # upstream enforces case-sensitive "Yards"|"Sqft"
+    ppy = ppy_lookup.get((product or "").lower()) if product else None
 
+    area_in2 = None
+    if width_in and length_in:
+        try:
+            area_in2 = float(width_in) * float(length_in)
+        except Exception:
+            area_in2 = None
 
-if unit == "Sqft":
-if product and ppy and ppy > 0:
-return (float(qty) / float(ppy)) * 13.5
-if area_in2:
-return (area_in2 / 144.0) * float(qty)
-return 0.0
+    if unit == "Yards":
+        if product and ppy and ppy > 0:
+            return float(qty) / float(ppy)
+        if area_in2:
+            return (area_in2 * float(qty)) / (36.0 * 54.0)
+        return 0.0
 
+    if unit == "Sqft":
+        if product and ppy and ppy > 0:
+            return (float(qty) / float(ppy)) * 13.5
+        if area_in2:
+            return (area_in2 / 144.0) * float(qty)
+        return 0.0
 
-# Unknown unit → block upstream; return 0 here for safety
-return 0.0
+    # Unknown unit (blocked upstream)
+    return 0.0
 
 def get_vendor_directory():
     """Reads Vendors!A1:E → { vendor_name: {method,email,cc,website} }"""
@@ -2883,83 +2899,165 @@ def get_orders():
         logger.exception("Error fetching orders")
         return jsonify({"error": "orders fetch failed"}), 500
 
-@app.route("/api/material-log/original-usage", methods=["GET"]) # ?order=123
-return jsonify({"added": len(to_append)}), 200
+@app.route("/api/material-log/original-usage", methods=["GET"])  # ?order=123
+@login_required_session
+def material_log_original_usage():
+    order = (request.args.get("order") or "").strip()
+    if not order:
+        return jsonify({"error": "Missing order"}), 400
+
+    rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
+    if not rows:
+        return jsonify({"items": []}), 200
+
+    hdr = rows[0]
+    hi = _hdr_idx(hdr)
+
+    items = []
+    for idx, r in enumerate(rows[1:], start=2):  # 1-based row in sheet
+        order_val = str(r[hi.get("order #", -1)] if hi.get("order #") is not None and hi.get("order #") < len(r) else "").strip()
+        recut_val = str(r[hi.get("recut", -1)] if hi.get("recut") is not None and hi.get("recut") < len(r) else "").strip()
+        if order_val != order:
+            continue
+        if recut_val.lower() == "recut":  # exclude existing recut rows
+            continue
+
+        def gv(key):
+            i = hi.get(key)
+            return r[i] if i is not None and i < len(r) else ""
+
+        # parse numeric fields safely
+        try:
+            qty_pieces = int(float(gv("quantity")))
+        except Exception:
+            qty_pieces = 0
+        try:
+            qty_units = float(gv("qty"))
+        except Exception:
+            qty_units = 0.0
+
+        items.append({
+            "id": idx,  # sheet row number for reference
+            "date": str(gv("date")),
+            "order": order_val,
+            "companyName": str(gv("company name")),
+            "quantity": qty_pieces,
+            "shape": str(gv("shape")),
+            "material": str(gv("material")),
+            "qtyUnits": qty_units,
+            "inOut": str(gv("in/out")),
+        })
+
+    return jsonify({"items": items}), 200
 
 
 @app.route("/api/material-log/rd-append", methods=["POST"])
 @login_required_session
 def material_log_rd_append():
-data = request.get_json(silent=True) or {}
-items = data.get("items") or []
-if not isinstance(items, list) or not items:
-return jsonify({"error": "Missing items"}), 400
+    data = request.get_json(silent=True) or {}
+    items = data.get("items") or []
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "Missing items"}), 400
 
+    # lookups (Material→Unit, Product→PPY)
+    units = _get_material_units_lookup()
+    ppy   = _get_ppy_lookup()
 
-# lookups
-units = _get_material_units_lookup()
-ppy = _get_ppy_lookup()
+    to_append = []
+    now_iso = datetime.utcnow().isoformat()
 
+    for it in items:
+        mat = (it.get("material") or "").strip()
+        prod = (it.get("product") or "").strip()
+        w_in = it.get("widthIn")
+        l_in = it.get("lengthIn")
+        qty  = it.get("quantity")
 
-# Validate and compute
-to_append = []
-now_str = datetime.datetime.now().isoformat()
+        # 1) material required
+        if not mat:
+            return jsonify({"error": "Select the correct material"}), 400
 
+        # 2) whole numbers only
+        if not isinstance(qty, (int, float)) or int(qty) != qty or qty <= 0:
+            return jsonify({"error": "Quantity must be a whole number"}), 400
+        qty = int(qty)
 
-for it in items:
-mat = (it.get("material") or "").strip()
-prod = (it.get("product") or "").strip()
-w_in = it.get("widthIn")
-l_in = it.get("lengthIn")
-qty = it.get("quantity")
-if not mat:
-return jsonify({"error": "Select the correct material"}), 400
-# whole numbers only
-if not isinstance(qty, (int, float)) or int(qty) != qty or qty <= 0:
-return jsonify({"error": "Quantity must be a whole number"}), 400
-qty = int(qty)
+        # 3) one of Product or W×L; if both present, Product wins
+        if not prod and not (w_in and l_in):
+            return jsonify({"error": "Provide Product or W×L"}), 400
+        if prod:
+            w_in = None
+            l_in = None
 
+        # 4) units must be present & be exactly "Yards" or "Sqft"
+        unit_str = units.get(mat)
+        if not unit_str:
+            return jsonify({"error": f"Material '{mat}' not found in Material Inventory"}), 400
+        if unit_str not in ("Yards", "Sqft"):
+            return jsonify({"error": f"Unsupported unit '{unit_str}' for material '{mat}'"}), 400
 
-# One of product or W×L is required; if both present, Product wins
-if not prod and not (w_in and l_in):
-return jsonify({"error": "Provide Product or W×L"}), 400
-if prod:
-w_in = None; l_in = None
+        used = _compute_usage_units(mat, unit_str, prod, w_in, l_in, qty, ppy)
+        shape = prod or (f"{int(w_in)}x{int(l_in)}" if (w_in and l_in) else "")
 
+        # Date | Order # | Company Name | Quantity | Shape | Material | QTY | IN/OUT | O/R | Recut
+        to_append.append([now_iso, "R&D", "", qty, shape, mat, used, "OUT", "", ""])
 
-unit_str = units.get(mat, None)
-if not unit_str:
-return jsonify({"error": f"Material '{mat}' not found in Material Inventory"}), 400
-if unit_str not in ("Yards", "Sqft"):
-return jsonify({"error": f"Unsupported unit '{unit_str}' for material '{mat}'"}), 400
+    svc = get_sheets_service().spreadsheets().values()
+    with sheet_lock:
+        svc.append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Log!A1:Z",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": to_append}
+        ).execute()
 
+    return jsonify({"added": len(to_append)}), 200
 
-used = _compute_usage_units(mat, unit_str, prod, w_in, l_in, qty, ppy)
-shape = prod or (f"{int(w_in)}x{int(l_in)}" if (w_in and l_in) else "")
-row = [ now_str, "R&D", "", qty, shape, mat, used, "OUT", "", "" ]
-to_append.append(row)
+@app.route("/api/material-log/recut-append", methods=["POST"])
+@login_required_session
+def material_log_recut_append():
+    data = request.get_json(silent=True) or {}
+    order = (data.get("orderNumber") or "").strip()
+    recut_qty = data.get("recutQty")
+    items = data.get("items") or []  # [{ material, shape, companyName, originalQuantity, originalUnits }, ...]
 
+    if not order:
+        return jsonify({"error": "Missing orderNumber"}), 400
+    if not isinstance(recut_qty, (int, float)) or int(recut_qty) != recut_qty or recut_qty <= 0:
+        return jsonify({"error": "Recut quantity must be a whole number"}), 400
+    recut_qty = int(recut_qty)
+    if not items:
+        return jsonify({"error": "No items selected"}), 400
 
-svc = get_sheets_service().spreadsheets().values()
-with sheet_lock:
-svc.append(
-spreadsheetId=SPREADSHEET_ID,
-range="Material Log!A1:Z",
-valueInputOption="USER_ENTERED",
-insertDataOption="INSERT_ROWS",
-body={"values": to_append}
-).execute()
+    now_iso = datetime.utcnow().isoformat()
+    rows = []
+    for it in items:
+        company = (it.get("companyName") or "").strip()
+        shape   = (it.get("shape") or "").strip()
+        mat     = (it.get("material") or "").strip()
+        orig_q  = it.get("originalQuantity") or 0
+        orig_u  = it.get("originalUnits") or 0.0
 
+        try:
+            per_piece = float(orig_u) / max(1, int(float(orig_q)))
+        except Exception:
+            per_piece = 0.0
 
-# optional: invalidate materials-needed cache if you cache it
-try:
-invalidate_materials_needed_cache()
-except Exception:
-pass
+        used = per_piece * recut_qty
+        rows.append([now_iso, order, company, recut_qty, shape, mat, used, "OUT", "", "Recut"])
 
+    svc = get_sheets_service().spreadsheets().values()
+    with sheet_lock:
+        svc.append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Log!A1:Z",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows}
+        ).execute()
 
-return jsonify({"added": len(to_append)}), 200
-
+    return jsonify({"added": len(rows)}), 200
 
 
 @app.route("/api/prepare-shipment", methods=["POST"])
