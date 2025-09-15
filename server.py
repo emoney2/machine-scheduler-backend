@@ -611,19 +611,22 @@ def login_required_session(f):
     def decorated(*args, **kwargs):
         # 1) OPTIONS are always allowed (CORS preflight)
         if request.method == "OPTIONS":
-            origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-            allowed = {
-                (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-                "https://machineschedule.netlify.app",
-                "http://localhost:3000",
-            }
-            response = make_response("", 204)
-            if origin in allowed:
-                response.headers["Access-Control-Allow-Origin"] = origin
-                response.headers["Access-Control-Allow-Credentials"] = "true"
-                response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-                response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,OPTIONS"
-            return response
+                    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+                    # Env-driven allow-list + safe defaults
+                    allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
+                    allowed = {o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()}
+                    allowed.update({
+                        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+                        "https://machineschedule.netlify.app",
+                        "http://localhost:3000",
+                    })
+                    response = make_response("", 204)
+                    if origin in allowed:
+                        response.headers["Access-Control-Allow-Origin"] = origin
+                        response.headers["Access-Control-Allow-Credentials"] = "true"
+                        response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+                        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,OPTIONS"
+                    return response
 
         # 2) Must be logged in at all
         if not session.get("user"):
@@ -929,11 +932,14 @@ def handle_preflight():
 @app.after_request
 def apply_cors(response):
     origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-    allowed = {
+    # Env-driven allow-list + safe defaults
+    allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
+    allowed = {o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()}
+    allowed.update({
         (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
         "https://machineschedule.netlify.app",
         "http://localhost:3000",
-    }
+    })
     if origin in allowed:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Vary"] = "Origin"
@@ -971,21 +977,44 @@ def drive_thumbnail():
     if not file_id:
         return jsonify({"error": "Missing fileId"}), 400
     try:
+        # Use your existing Drive service + OAuth creds
         drive = get_drive_service()
-        # Optional: get mime/type and name
-        meta = drive.files().get(fileId=file_id, fields="mimeType,name").execute()
-        mime = meta.get("mimeType", "image/jpeg")
-        # Download file bytes
-        buf = io.BytesIO()
-        request_media = drive.files().get_media(fileId=file_id)
-        downloader = MediaIoBaseDownload(buf, request_media, chunksize=1024*1024)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        buf.seek(0)
-        return send_file(buf, mimetype=mime, as_attachment=False,
-                         download_name=meta.get("name", "preview"))
-    except Exception as e:
+        creds = get_oauth_credentials()  # same creds mechanism you use elsewhere
+        if hasattr(creds, "expired") and creds.expired and hasattr(creds, "refresh_token"):
+            # Refresh if needed
+            creds.refresh(Request())
+
+        # Ask Drive for its lightweight thumbnail URL (much faster than full download)
+        meta = drive.files().get(
+            fileId=file_id,
+            fields="thumbnailLink,hasThumbnail,name,mimeType,modifiedTime,md5Checksum"
+        ).execute()
+
+        thumb_url = meta.get("thumbnailLink")
+        has_thumb = meta.get("hasThumbnail")
+        if not has_thumb or not thumb_url:
+            # No thumbnail available → fail quietly so the <img> hides
+            return Response(status=204)
+
+        # Fetch the thumbnail bytes with an authorized session (no httplib2)
+        session = AuthorizedSession(creds)
+        r = session.get(thumb_url, timeout=10)
+        if r.status_code != 200 or not r.content:
+            return Response(status=204)
+
+        # Set caching so browsers don’t re-fetch on every view
+        headers = {
+            "Cache-Control": "public, max-age=86400",  # 1 day
+        }
+        if meta.get("modifiedTime"):
+            headers["Last-Modified"] = meta["modifiedTime"]
+        if meta.get("md5Checksum"):
+            headers["ETag"] = meta["md5Checksum"]
+
+        # Drive thumbs are jpeg/png; send as generic image type
+        return Response(r.content, mimetype="image/jpeg", headers=headers)
+
+    except Exception:
         app.logger.exception("drive_thumbnail error")
         # Let the <img> fail silently; UI hides it onError
         return Response(status=204)
