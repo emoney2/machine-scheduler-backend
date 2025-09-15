@@ -500,21 +500,6 @@ def get_drive_service():
     _service_ts = _t.time()
     return _drive_service
 
-# --- ADD near your existing Google API helpers (below get_sheets_service) ---
-_drive_service = None
-
-def get_drive_service():
-    """Build a Google Drive v3 client using the same creds mechanism you use for Sheets."""
-    global _drive_service
-    if _drive_service is not None:
-        return _drive_service
-    # Reuse your existing credential loader; ensure Drive readonly scope is allowed
-    creds = get_google_credentials(scopes=[
-        "https://www.googleapis.com/auth/drive.readonly"
-    ])
-    _drive_service = gbuild("drive", "v3", credentials=creds, cache_discovery=False)
-    return _drive_service
-
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
 logging.basicConfig(
