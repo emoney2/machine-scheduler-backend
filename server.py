@@ -32,6 +32,9 @@ from playwright.async_api import async_playwright
 from functools import wraps
 from flask import request, session, jsonify, redirect, url_for, make_response
 from datetime import datetime, timedelta
+from flask import send_file, Response
+from googleapiclient.discovery import build as gbuild
+from googleapiclient.http import MediaIoBaseDownload
 
 import socket
 from requests.exceptions import ConnectionError as ReqConnError, Timeout as ReqTimeout, RequestException
@@ -497,6 +500,20 @@ def get_drive_service():
     _service_ts = _t.time()
     return _drive_service
 
+# --- ADD near your existing Google API helpers (below get_sheets_service) ---
+_drive_service = None
+
+def get_drive_service():
+    """Build a Google Drive v3 client using the same creds mechanism you use for Sheets."""
+    global _drive_service
+    if _drive_service is not None:
+        return _drive_service
+    # Reuse your existing credential loader; ensure Drive readonly scope is allowed
+    creds = get_google_credentials(scopes=[
+        "https://www.googleapis.com/auth/drive.readonly"
+    ])
+    _drive_service = gbuild("drive", "v3", credentials=creds, cache_discovery=False)
+    return _drive_service
 
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
@@ -961,6 +978,32 @@ def _mem_after(resp):
     except Exception:
         pass
     return resp
+# --- ADD alongside your other routes ---
+@app.route("/api/drive/thumbnail", methods=["GET"])
+@login_required_session
+def drive_thumbnail():
+    file_id = (request.args.get("fileId") or "").strip()
+    if not file_id:
+        return jsonify({"error": "Missing fileId"}), 400
+    try:
+        drive = get_drive_service()
+        # Optional: get mime/type and name
+        meta = drive.files().get(fileId=file_id, fields="mimeType,name").execute()
+        mime = meta.get("mimeType", "image/jpeg")
+        # Download file bytes
+        buf = io.BytesIO()
+        request_media = drive.files().get_media(fileId=file_id)
+        downloader = MediaIoBaseDownload(buf, request_media, chunksize=1024*1024)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        buf.seek(0)
+        return send_file(buf, mimetype=mime, as_attachment=False,
+                         download_name=meta.get("name", "preview"))
+    except Exception as e:
+        app.logger.exception("drive_thumbnail error")
+        # Let the <img> fail silently; UI hides it onError
+        return Response(status=204)
 
 
 @app.route("/api/drive/token-status", methods=["GET"])
@@ -2913,7 +2956,7 @@ def material_log_original_usage():
     hdr = rows[0]
     hi = _hdr_idx(hdr)
 
-    # NEW: lookup material → unit so UI can label Yards/Sqft
+    # NEW: lookup material → unit for labeling Yards/Sqft
     units_lookup = _get_material_units_lookup()
 
     items = []
@@ -2950,11 +2993,12 @@ def material_log_original_usage():
             "shape": str(gv("shape")),
             "material": material_name,
             "qtyUnits": qty_units,
-            "unit": unit,                     # ← NEW
+            "unit": unit,                     # ← added
             "inOut": str(gv("in/out")),
         })
 
     return jsonify({"items": items}), 200
+
 
 
 @app.route("/api/material-log/rd-append", methods=["POST"])
@@ -3041,10 +3085,10 @@ def material_log_recut_append():
         orig_q  = it.get("originalQuantity") or 0
         orig_u  = it.get("originalUnits") or 0.0
 
-        # NEW: per-material recut qty
+        # Per-material recut qty (must be whole number > 0)
         rq = it.get("recutQty")
         if not isinstance(rq, (int, float)) or int(rq) != rq or rq <= 0:
-            continue  # skip lines without a valid whole-number qty
+            continue
         rq = int(rq)
 
         try:
@@ -3070,7 +3114,6 @@ def material_log_recut_append():
         ).execute()
 
     return jsonify({"added": len(rows)}), 200
-
 
 
 @app.route("/api/prepare-shipment", methods=["POST"])
