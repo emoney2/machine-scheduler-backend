@@ -1600,6 +1600,82 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
     else:
         raise Exception(f"❌ Failed to create item '{product_name}' in QBO: {res.text}")
 
+def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
+    """
+    Ensure a ShipMethod (e.g., 'UPS') exists in QBO and return {"value": Id, "name": Name}.
+    """
+    import requests
+    base = get_base_qbo_url(env_override)
+    query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
+    create_url = f"{base}/v3/company/{realm_id}/shipmethod?minorversion=65"
+
+    # 1) Try to find it
+    escaped = name.replace("'", "''")
+    query = f"SELECT * FROM ShipMethod WHERE Name = '{escaped}'"
+    r = requests.get(query_url, headers=headers, params={"query": query})
+    if r.status_code == 200:
+        items = r.json().get("QueryResponse", {}).get("ShipMethod", [])
+        if items:
+            sm = items[0]
+            return {"value": sm["Id"], "name": sm["Name"]}
+
+    # 2) Create if missing
+    payload = {"Name": name}
+    r2 = requests.post(create_url, headers={**headers, "Content-Type": "application/json"}, json=payload)
+    if r2.status_code in (200, 201):
+        sm = r2.json().get("ShipMethod", {})
+        return {"value": sm["Id"], "name": sm["Name"]}
+
+    # 3) Fallback (name only) — QBO usually needs an Id, but we'll return name if creation fails
+    logging.warning("⚠️ Could not create/find ShipMethod '%s' (%s / %s). Falling back to name only.", name, r.status_code, r2.status_code if 'r2' in locals() else None)
+    return {"name": name}
+
+
+def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start=1001):
+    """
+    Query the latest invoice DocNumber and return +1 (as string).
+    If none found or non-numeric, start at fallback_start.
+    """
+    import requests
+    base = get_base_qbo_url(env_override)
+    query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
+    query = "SELECT DocNumber FROM Invoice ORDER BY MetaData.CreateTime DESC MAXRESULTS 1"
+    r = requests.get(query_url, headers=headers, params={"query": query})
+    if r.status_code == 200:
+        resp = r.json().get("QueryResponse", {})
+        invs = resp.get("Invoice", [])
+        if invs:
+            last = (invs[0].get("DocNumber") or "").strip()
+            if last.isdigit():
+                return str(int(last) + 1)
+    return str(fallback_start)
+
+
+def fetch_customer_email_from_directory(sheet_service, company_name):
+    """
+    Read the 'Directory' sheet and return the Contact Email Address for the company.
+    """
+    SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+    if not SPREADSHEET_ID:
+        logging.warning("⚠️ Missing SPREADSHEET_ID; cannot read Directory for email.")
+        return ""
+    resp = sheet_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Directory!A1:Z"
+    ).execute()
+    rows = resp.get("values", []) or []
+    if len(rows) < 2:
+        return ""
+    headers = rows[0]
+    try:
+        idx_company = headers.index("Company Name")
+        idx_email   = headers.index("Contact Email Address")
+    except ValueError:
+        return ""
+    for row in rows[1:]:
+        if len(row) > idx_company and row[idx_company].strip() == (company_name or "").strip():
+            return row[idx_email] if len(row) > idx_email else ""
+    return ""
 
 
 def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=None, base_shipping_cost=0.0, env_override=None):
@@ -1650,6 +1726,16 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     unit_price = float(order_data.get("Price", 0))
     amount = round(qty * unit_price, 2)
 
+    # ── Build invoice fields we’re adding ──────────────────────────
+    txn_date_str = datetime.now().strftime("%Y-%m-%d")
+    # Directory email for this customer
+    sheet_service = get_sheets_service()
+    bill_email = fetch_customer_email_from_directory(sheet_service, order_data.get("Company Name", "")) or ""
+    # Force Ship Via = UPS
+    ship_method_ref = get_or_create_ship_method_ref("UPS", headers, realm_id, env_override)
+    # Next DocNumber (+1)
+    doc_number = get_next_invoice_number(headers, realm_id, env_override)
+
     invoice_payload = {
         "CustomerRef": customer_ref,
         "Line": [
@@ -1664,10 +1750,17 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
                 }
             }
         ],
-        "TxnDate":      datetime.now().strftime("%Y-%m-%d"),
-        "TotalAmt":     float(round(amount, 2)),
-        "SalesTermRef": { "value": "3" },
+        "TxnDate":       txn_date_str,
+        "ShipDate":      txn_date_str,
+        "DocNumber":     doc_number,
+        "TotalAmt":      float(round(amount, 2)),
+        "SalesTermRef":  { "value": "3" },
+        "BillEmail":     {"Address": bill_email} if bill_email else None,
+        "ShipMethodRef": ship_method_ref
     }
+    # Remove any None values QBO might reject (e.g., missing BillEmail)
+    invoice_payload = {k: v for k, v in invoice_payload.items() if v is not None}
+
 
     invoice_url = f"{base}/v3/company/{realm_id}/invoice"
     logging.info("📦 Invoice payload about to send to QuickBooks:")
@@ -1792,14 +1885,34 @@ def create_consolidated_invoice_in_quickbooks(
         raise Exception("❌ No valid line items to invoice.")
 
     # ── 4) Build the invoice payload ────────────────────────────────
+    txn_date_str = datetime.now().strftime("%Y-%m-%d")
+
+    # Directory email for this customer
+    sheet_service = get_sheets_service()
+    bill_email = fetch_customer_email_from_directory(
+        sheet_service,
+        first_order.get("Company Name", "")
+    ) or ""
+
+    # Force Ship Via = UPS
+    ship_method_ref = get_or_create_ship_method_ref("UPS", headers, realm_id, env_override)
+
+    # Next DocNumber (+1 from last)
+    doc_number = get_next_invoice_number(headers, realm_id, env_override)
+
     invoice_payload = {
         "CustomerRef":  customer_ref,
         "Line":         line_items,
-        "TxnDate":      datetime.now().strftime("%Y-%m-%d"),
+        "TxnDate":      txn_date_str,
+        "ShipDate":     txn_date_str,
+        "DocNumber":    doc_number,
         "TotalAmt":     round(sum(item["Amount"] for item in line_items), 2),
         "SalesTermRef": {"value": "3"},
-        "BillEmail":    {"Address": "sandbox@sample.com"}
+        "BillEmail":    {"Address": bill_email} if bill_email else None,
+        "ShipMethodRef": ship_method_ref,
     }
+    # Drop any None values QBO might reject (e.g., missing BillEmail)
+    invoice_payload = {k: v for k, v in invoice_payload.items() if v is not None}
 
     # ── 5) Send to QuickBooks ───────────────────────────────────────
     url = f"{base}/v3/company/{realm_id}/invoice"
@@ -4841,7 +4954,7 @@ def process_shipment():
         return jsonify({
             "labels":  [],
             "invoice": invoice_url,
-            "slips":   []
+            "slips":   [slip_url]
         })
 
 
