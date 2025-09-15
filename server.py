@@ -3052,10 +3052,12 @@ def cut_complete_batch():
 @app.route("/api/orders", methods=["GET"])
 @login_required_session
 def get_orders():
-    try:
+    TTL = 15  # seconds
+
+    def build_payload():
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)  # UNFORMATTED_VALUE
         if not rows:
-            return jsonify([]), 200
+            return []
         headers = [str(h).strip() for h in rows[0]]
 
         data = []
@@ -3064,10 +3066,10 @@ def get_orders():
             if len(r) < len(headers):
                 r = r + ["" for _ in range(len(headers) - len(r))]
             data.append(dict(zip(headers, r)))
-        return jsonify(data), 200
-    except Exception:
-        logger.exception("Error fetching orders")
-        return jsonify({"error": "orders fetch failed"}), 500
+        return data
+
+    return send_cached_json("orders", TTL, build_payload)
+
 
 @app.route("/api/material-log/original-usage", methods=["GET"])  # ?order=123
 @login_required_session
@@ -3076,56 +3078,59 @@ def material_log_original_usage():
     if not order:
         return jsonify({"error": "Missing order"}), 400
 
-    rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
-    if not rows:
-        return jsonify({"items": []}), 200
+    TTL = 30
+    key = f"orig-usage:{order}"
 
-    hdr = rows[0]
-    hi = _hdr_idx(hdr)
+    def build_payload():
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
+        if not rows:
+            return {"items": []}
 
-    # NEW: lookup material → unit for labeling Yards/Sqft
-    units_lookup = _get_material_units_lookup()
+        hdr = rows[0]
+        hi = _hdr_idx(hdr)
 
-    items = []
-    for idx, r in enumerate(rows[1:], start=2):
-        order_val = str(r[hi.get("order #", -1)] if hi.get("order #") is not None and hi.get("order #") < len(r) else "").strip()
-        recut_val = str(r[hi.get("recut", -1)] if hi.get("recut") is not None and hi.get("recut") < len(r) else "").strip()
-        if order_val != order:
-            continue
-        if recut_val.lower() == "recut":
-            continue
+        # lookup material → unit for labeling Yards/Sqft
+        units_lookup = _get_material_units_lookup()
 
-        def gv(key):
-            i = hi.get(key)
-            return r[i] if i is not None and i < len(r) else ""
+        items = []
+        for idx, r in enumerate(rows[1:], start=2):
+            order_val = str(r[hi.get("order #", -1)] if hi.get("order #") is not None and hi.get("order #") < len(r) else "").strip()
+            recut_val = str(r[hi.get("recut", -1)] if hi.get("recut") is not None and hi.get("recut") < len(r) else "").strip()
+            if order_val != order or recut_val.lower() == "recut":
+                continue
 
-        try:
-            qty_pieces = int(float(gv("quantity")))
-        except Exception:
-            qty_pieces = 0
-        try:
-            qty_units = float(gv("qty"))
-        except Exception:
-            qty_units = 0.0
+            def gv(key):
+                i = hi.get(key)
+                return r[i] if i is not None and i < len(r) else ""
 
-        material_name = str(gv("material"))
-        unit = units_lookup.get(material_name, "")  # "Yards" | "Sqft" (case-sensitive)
+            try:
+                qty_pieces = int(float(gv("quantity")))
+            except Exception:
+                qty_pieces = 0
+            try:
+                qty_units = float(gv("qty"))
+            except Exception:
+                qty_units = 0.0
 
-        items.append({
-            "id": idx,
-            "date": str(gv("date")),
-            "order": order_val,
-            "companyName": str(gv("company name")),
-            "quantity": qty_pieces,
-            "shape": str(gv("shape")),
-            "material": material_name,
-            "qtyUnits": qty_units,
-            "unit": unit,                     # ← added
-            "inOut": str(gv("in/out")),
-        })
+            material_name = str(gv("material"))
+            unit = units_lookup.get(material_name, "")
 
-    return jsonify({"items": items}), 200
+            items.append({
+                "id": idx,
+                "date": str(gv("date")),
+                "order": order_val,
+                "companyName": str(gv("company name")),
+                "quantity": qty_pieces,
+                "shape": str(gv("shape")),
+                "material": material_name,
+                "qtyUnits": qty_units,
+                "unit": unit,
+                "inOut": str(gv("in/out")),
+            })
 
+        return {"items": items}
+
+    return send_cached_json(key, TTL, build_payload)
 
 
 @app.route("/api/material-log/rd-append", methods=["POST"])
@@ -3679,6 +3684,13 @@ def get_manual_state():
     """
     global _manual_state_cache, _manual_state_ts
     now = time.time()
+
+    global _manual_state_cache, _manual_state_ts
+    now = time.time()
+
+    # >>> ADDED: 10s fast-path from in-memory cache
+    if _manual_state_cache and (now - _manual_state_ts) < 10:
+        return jsonify(_manual_state_cache), 200
 
     try:
         # 1) Read Manual State rows (A2:Z) and parse machine columns (I–Z)
