@@ -2913,20 +2913,22 @@ def material_log_original_usage():
     hdr = rows[0]
     hi = _hdr_idx(hdr)
 
+    # NEW: lookup material → unit so UI can label Yards/Sqft
+    units_lookup = _get_material_units_lookup()
+
     items = []
-    for idx, r in enumerate(rows[1:], start=2):  # 1-based row in sheet
+    for idx, r in enumerate(rows[1:], start=2):
         order_val = str(r[hi.get("order #", -1)] if hi.get("order #") is not None and hi.get("order #") < len(r) else "").strip()
         recut_val = str(r[hi.get("recut", -1)] if hi.get("recut") is not None and hi.get("recut") < len(r) else "").strip()
         if order_val != order:
             continue
-        if recut_val.lower() == "recut":  # exclude existing recut rows
+        if recut_val.lower() == "recut":
             continue
 
         def gv(key):
             i = hi.get(key)
             return r[i] if i is not None and i < len(r) else ""
 
-        # parse numeric fields safely
         try:
             qty_pieces = int(float(gv("quantity")))
         except Exception:
@@ -2936,15 +2938,19 @@ def material_log_original_usage():
         except Exception:
             qty_units = 0.0
 
+        material_name = str(gv("material"))
+        unit = units_lookup.get(material_name, "")  # "Yards" | "Sqft" (case-sensitive)
+
         items.append({
-            "id": idx,  # sheet row number for reference
+            "id": idx,
             "date": str(gv("date")),
             "order": order_val,
             "companyName": str(gv("company name")),
             "quantity": qty_pieces,
             "shape": str(gv("shape")),
-            "material": str(gv("material")),
+            "material": material_name,
             "qtyUnits": qty_units,
+            "unit": unit,                     # ← NEW
             "inOut": str(gv("in/out")),
         })
 
@@ -3018,34 +3024,40 @@ def material_log_rd_append():
 @login_required_session
 def material_log_recut_append():
     data = request.get_json(silent=True) or {}
-    order = (data.get("orderNumber") or "").strip()
-    recut_qty = data.get("recutQty")
-    items = data.get("items") or []  # [{ material, shape, companyName, originalQuantity, originalUnits }, ...]
+    order_number = str(data.get("orderNumber") or "").strip()
+    items        = data.get("items") or []  # each has per-item recutQty (whole number)
 
-    if not order:
+    if not order_number:
         return jsonify({"error": "Missing orderNumber"}), 400
-    if not isinstance(recut_qty, (int, float)) or int(recut_qty) != recut_qty or recut_qty <= 0:
-        return jsonify({"error": "Recut quantity must be a whole number"}), 400
-    recut_qty = int(recut_qty)
     if not items:
         return jsonify({"error": "No items selected"}), 400
 
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.datetime.utcnow().isoformat()
     rows = []
     for it in items:
-        company = (it.get("companyName") or "").strip()
-        shape   = (it.get("shape") or "").strip()
-        mat     = (it.get("material") or "").strip()
+        company = str(it.get("companyName") or "").strip()
+        shape   = str(it.get("shape") or "").strip()
+        mat     = str(it.get("material") or "").strip()
         orig_q  = it.get("originalQuantity") or 0
         orig_u  = it.get("originalUnits") or 0.0
+
+        # NEW: per-material recut qty
+        rq = it.get("recutQty")
+        if not isinstance(rq, (int, float)) or int(rq) != rq or rq <= 0:
+            continue  # skip lines without a valid whole-number qty
+        rq = int(rq)
 
         try:
             per_piece = float(orig_u) / max(1, int(float(orig_q)))
         except Exception:
             per_piece = 0.0
 
-        used = per_piece * recut_qty
-        rows.append([now_iso, order, company, recut_qty, shape, mat, used, "OUT", "", "Recut"])
+        used = per_piece * rq
+        # Date | Order # | Company Name | Quantity | Shape | Material | QTY | IN/OUT | O/R | Recut
+        rows.append([now_iso, order_number, company, rq, shape, mat, used, "OUT", "", "Recut"])
+
+    if not rows:
+        return jsonify({"error": "No valid recut quantities provided"}), 400
 
     svc = get_sheets_service().spreadsheets().values()
     with sheet_lock:
@@ -3058,6 +3070,7 @@ def material_log_recut_append():
         ).execute()
 
     return jsonify({"added": len(rows)}), 200
+
 
 
 @app.route("/api/prepare-shipment", methods=["POST"])
