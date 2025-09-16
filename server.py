@@ -3720,7 +3720,7 @@ def get_manual_state():
         # 1) Read Manual State rows (A2:Z) and parse machine columns (I–Z)
         resp = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE  # e.g., "Manual State!I2:J2"
+            range=MANUAL_RANGE,  # e.g., "Manual State!I2:J2"
             valueRenderOption="UNFORMATTED_VALUE"
         ).execute()
         rows = resp.get("values", []) or []
