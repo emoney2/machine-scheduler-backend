@@ -92,6 +92,9 @@ from flask import send_file  # ADD if not present
 THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_cache")
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
+_matlog_cache = None          # {"by_order": {"123": [items...]}, "ts": float}
+_matlog_cache_ttl = 60.0      # seconds
+
 
 
 def _thumb_cache_path(file_id: str, size: str, version: str) -> str:
@@ -3054,83 +3057,100 @@ def cut_complete_batch():
 def get_orders():
     TTL = 15  # seconds
 
+    # Only fields MaterialLog needs
+    KEEP = {"Order #", "Company Name", "Design", "Product", "Stage", "Due Date"}
+
     def build_payload():
-        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)  # UNFORMATTED_VALUE
+        # Pull unformatted to keep payload lean
+        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render="UNFORMATTED_VALUE") or []
         if not rows:
             return []
-        headers = [str(h).strip() for h in rows[0]]
 
-        data = []
+        headers = [str(h or "").strip() for h in rows[0]]
+        hi = {h: i for i, h in enumerate(headers) if h}
+
+        out = []
         for r in rows[1:]:
-            r = r or []
-            if len(r) < len(headers):
-                r = r + ["" for _ in range(len(headers) - len(r))]
-            data.append(dict(zip(headers, r)))
-        return data
+            if not r:
+                continue
+            o = {}
+            for k in KEEP:
+                i = hi.get(k)
+                o[k] = r[i] if (i is not None and i < len(r)) else ""
+            out.append(o)
+        return out
 
     return send_cached_json("orders", TTL, build_payload)
+
 
 
 @app.route("/api/material-log/original-usage", methods=["GET"])  # ?order=123
 @login_required_session
 def material_log_original_usage():
+    global _matlog_cache
     order = (request.args.get("order") or "").strip()
     if not order:
         return jsonify({"error": "Missing order"}), 400
 
-    TTL = 30
-    key = f"orig-usage:{order}"
+    now = time.time()
+    fresh = (_matlog_cache and (now - _matlog_cache["ts"] < _matlog_cache_ttl))
 
-    def build_payload():
-        rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
+    if not fresh:
+        # Rebuild cache once per TTL
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z") or []
         if not rows:
-            return {"items": []}
+            _matlog_cache = {"by_order": {}, "ts": now}
+        else:
+            hdr = rows[0]
+            hi = _hdr_idx(hdr)
+            units_lookup = _get_material_units_lookup()
 
-        hdr = rows[0]
-        hi = _hdr_idx(hdr)
+            by_order = {}
+            for idx, r in enumerate(rows[1:], start=2):
+                def gv(key):
+                    i = hi.get(key)
+                    return r[i] if i is not None and i < len(r) else ""
 
-        # lookup material → unit for labeling Yards/Sqft
-        units_lookup = _get_material_units_lookup()
+                order_val = str(gv("order #")).strip()
+                if not order_val:
+                    continue
 
-        items = []
-        for idx, r in enumerate(rows[1:], start=2):
-            order_val = str(r[hi.get("order #", -1)] if hi.get("order #") is not None and hi.get("order #") < len(r) else "").strip()
-            recut_val = str(r[hi.get("recut", -1)] if hi.get("recut") is not None and hi.get("recut") < len(r) else "").strip()
-            if order_val != order or recut_val.lower() == "recut":
-                continue
+                recut_val = str(gv("recut")).strip().lower()
+                if recut_val == "recut":
+                    continue
 
-            def gv(key):
-                i = hi.get(key)
-                return r[i] if i is not None and i < len(r) else ""
+                try:
+                    qty_pieces = int(float(gv("quantity")))
+                except Exception:
+                    qty_pieces = 0
+                try:
+                    qty_units = float(gv("qty"))
+                except Exception:
+                    qty_units = 0.0
 
-            try:
-                qty_pieces = int(float(gv("quantity")))
-            except Exception:
-                qty_pieces = 0
-            try:
-                qty_units = float(gv("qty"))
-            except Exception:
-                qty_units = 0.0
+                material_name = str(gv("material"))
+                unit = units_lookup.get(material_name, "")
 
-            material_name = str(gv("material"))
-            unit = units_lookup.get(material_name, "")
+                item = {
+                    "id": idx,
+                    "date": str(gv("date")),
+                    "order": order_val,
+                    "companyName": str(gv("company name")),
+                    "quantity": qty_pieces,
+                    "shape": str(gv("shape")),
+                    "material": material_name,
+                    "qtyUnits": qty_units,
+                    "unit": unit,
+                    "inOut": str(gv("in/out")),
+                }
+                by_order.setdefault(order_val, []).append(item)
 
-            items.append({
-                "id": idx,
-                "date": str(gv("date")),
-                "order": order_val,
-                "companyName": str(gv("company name")),
-                "quantity": qty_pieces,
-                "shape": str(gv("shape")),
-                "material": material_name,
-                "qtyUnits": qty_units,
-                "unit": unit,
-                "inOut": str(gv("in/out")),
-            })
+            _matlog_cache = {"by_order": by_order, "ts": now}
 
-        return {"items": items}
+    # Serve from cache
+    items = (_matlog_cache["by_order"].get(order) if _matlog_cache else None) or []
+    return jsonify({"items": items}), 200
 
-    return send_cached_json(key, TTL, build_payload)
 
 
 @app.route("/api/material-log/rd-append", methods=["POST"])
@@ -3688,8 +3708,9 @@ def get_manual_state():
     global _manual_state_cache, _manual_state_ts
     now = time.time()
 
-    if _manual_state_cache and (now - _manual_state_ts) < 10:
+    if _manual_state_cache and (now - _manual_state_ts) < 30:
         return jsonify(_manual_state_cache), 200
+
 
     # >>> ADDED: 10s fast-path from in-memory cache
     if _manual_state_cache and (now - _manual_state_ts) < 10:
@@ -3700,6 +3721,7 @@ def get_manual_state():
         resp = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
             range=MANUAL_RANGE  # e.g., "Manual State!I2:J2"
+            valueRenderOption="UNFORMATTED_VALUE"
         ).execute()
         rows = resp.get("values", []) or []
 
