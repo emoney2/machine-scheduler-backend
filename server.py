@@ -3096,7 +3096,8 @@ def get_orders():
     TTL = 15  # seconds
 
     # Only fields MaterialLog needs
-    KEEP = {"Order #", "Company Name", "Design", "Product", "Stage", "Due Date"}
+    KEEP = {"Order #", "Company Name", "Design", "Product", "Stage", "Due Date", "Quantity"}
+
 
     def build_payload():
         # Pull unformatted to keep payload lean
