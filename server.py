@@ -5783,29 +5783,15 @@ def thread_relog():
         if c_order is None or c_lenft is None:
             return jsonify({"error": "Thread Data headers missing 'Order Number' or 'Length (ft)'. Check tab."}), 400
 
-        # 2) Find original order quantity in Production Orders
-        po_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render="UNFORMATTED_VALUE") or []
-        if not po_rows:
-            return jsonify({"error": "Production Orders sheet empty"}), 400
-
-        po_hdr = [str(h or "").strip() for h in po_rows[0]]
-        poi = {h.lower(): i for i, h in enumerate(po_hdr)}
-        # 2) If the client sent originalQuantity, prefer it first
-        orig_qty = None
+        # 2) Get original quantity from client body (no Production Orders lookup)
         try:
-            rq_oq = body.get("originalQuantity")
-            if rq_oq is not None:
-                rq_oq = float(rq_oq)
-                if rq_oq > 0:
-                    orig_qty = rq_oq
+            orig_qty = float(body.get("originalQuantity"))
         except Exception:
             orig_qty = None
 
-        if orig_qty is None:
-            # Fallback: find original qty from the Production Orders sheet with flexible headers
-            po_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render="UNFORMATTED_VALUE") or []
-            if not po_rows:
-                return jsonify({"error": "Production Orders sheet empty"}), 400
+        if not orig_qty or orig_qty <= 0:
+            return jsonify({"error": "originalQuantity is required and must be > 0 to re-log thread."}), 400
+
 
             po_hdr = [str(h or "").strip() for h in po_rows[0]]
             poi = {h.lower(): i for i, h in enumerate(po_hdr)}
