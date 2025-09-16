@@ -5855,7 +5855,7 @@ def thread_relog():
             if c_stitch is not None and c_stitch < len(r): new_row[c_stitch] = r[c_stitch]
             if c_inout  is not None: new_row[c_inout]  = "OUT"
             if c_or     is not None: new_row[c_or]     = ""
-     if c_recut is not None: new_row[c_recut] = "Recut"
+            if c_recut is not None: new_row[c_recut] = "Recut"
 
             append_values.append(new_row)
 
