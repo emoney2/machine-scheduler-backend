@@ -5765,13 +5765,20 @@ def thread_relog():
         hdr = [str(h or "").strip() for h in td_rows[0]]
         idx = {h.lower(): i for i, h in enumerate(hdr)}
 
-        # Required columns we expect (align with your Python update_sheet)
-        # date, order number, color, color name, length (ft), stitch count, in/out, o/r
+        # Exact columns in your sheet:
+        # Date | Order Number | Color | Color Name | Length (ft) | Stitch Count | IN/OUT | O/R
+        c_date   = idx.get("date")
         c_order  = idx.get("order number")
         c_color  = idx.get("color")
         c_name   = idx.get("color name")
         c_lenft  = idx.get("length (ft)")
         c_stitch = idx.get("stitch count")
+        c_inout  = idx.get("in/out")
+        c_or     = idx.get("o/r")
+
+        if c_order is None or c_lenft is None:
+            return jsonify({"error": "Thread Data headers missing 'Order Number' or 'Length (ft)'. Check tab."}), 400
+
 
         if c_order is None or c_lenft is None:
             return jsonify({"error": "Thread Data headers missing 'Order Number' or 'Length (ft)'. Check tab."}), 400
@@ -5813,38 +5820,29 @@ def thread_relog():
         append_values = []
         now_iso = datetime.utcnow().strftime("%m/%d/%Y %H:%M:%S")
 
-        # locate optional columns safely
-        c_inout = idx.get("in/out")
-        c_or    = idx.get("o/r")
-
         for r in matches:
             try:
-                total_ft = float(r[c_lenft]) if c_lenft < len(r) else 0.0
+                total_ft = float(r[c_lenft]) if c_lenft is not None and c_lenft < len(r) else 0.0
             except Exception:
                 total_ft = 0.0
-            per_piece = total_ft / float(orig_qty)
+
+            per_piece = (total_ft / float(orig_qty)) if float(orig_qty) > 0 else 0.0
             new_total = round(per_piece * float(qty), 4)
 
-            # Construct a new row matching your headers (fill missing cells as "")
+            # Build a row exactly aligned to your header array
             new_row = [""] * len(hdr)
-            # date
-            if "date" in idx:
-                new_row[idx["date"]] = now_iso
-            # order number
-            new_row[c_order] = order
-            # color, color name
-            if c_color is not None and c_color < len(r): new_row[c_color] = r[c_color]
-            if c_name  is not None and c_name  < len(r): new_row[c_name]  = r[c_name]
-            # length (ft)
-            new_row[c_lenft] = new_total
-            # stitch count (copy, if present)
+
+            if c_date   is not None: new_row[c_date]   = now_iso
+            if c_order  is not None: new_row[c_order]  = order
+            if c_color  is not None and c_color  < len(r): new_row[c_color]  = r[c_color]
+            if c_name   is not None and c_name   < len(r): new_row[c_name]   = r[c_name]
+            if c_lenft  is not None: new_row[c_lenft]  = new_total
             if c_stitch is not None and c_stitch < len(r): new_row[c_stitch] = r[c_stitch]
-            # in/out
-            if c_inout is not None: new_row[c_inout] = "OUT"
-            # o/r
-            if c_or is not None: new_row[c_or] = ""
+            if c_inout  is not None: new_row[c_inout]  = "OUT"
+            if c_or     is not None: new_row[c_or]     = ""
 
             append_values.append(new_row)
+
 
         # 5) Append to Thread Data
         body = {
@@ -5855,8 +5853,9 @@ def thread_relog():
             range="Thread Data!A1",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body=body
+            body={"values": append_values}
         ).execute()
+
 
         return jsonify({"ok": True, "appended": len(append_values)}), 200
 
