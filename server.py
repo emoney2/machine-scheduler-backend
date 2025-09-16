@@ -5790,21 +5790,48 @@ def thread_relog():
 
         po_hdr = [str(h or "").strip() for h in po_rows[0]]
         poi = {h.lower(): i for i, h in enumerate(po_hdr)}
-        po_order_col = poi.get("order #") or poi.get("order number")
-        po_qty_col   = poi.get("quantity")
-        if po_order_col is None or po_qty_col is None:
-            return jsonify({"error": "Production Orders missing 'Order #' or 'Quantity' header"}), 400
-
+        # 2) If the client sent originalQuantity, prefer it first
         orig_qty = None
-        for r in po_rows[1:]:
-            if po_order_col < len(r) and str(r[po_order_col]).strip() == order:
-                try:
-                    orig_qty = float(r[po_qty_col]) if po_qty_col < len(r) else None
-                except Exception:
-                    orig_qty = None
-                break
-        if not orig_qty or orig_qty <= 0:
-            return jsonify({"error": f"Original Quantity not found for order {order}"}), 400
+        try:
+            rq_oq = body.get("originalQuantity")
+            if rq_oq is not None:
+                rq_oq = float(rq_oq)
+                if rq_oq > 0:
+                    orig_qty = rq_oq
+        except Exception:
+            orig_qty = None
+
+        if orig_qty is None:
+            # Fallback: find original qty from the Production Orders sheet with flexible headers
+            po_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render="UNFORMATTED_VALUE") or []
+            if not po_rows:
+                return jsonify({"error": "Production Orders sheet empty"}), 400
+
+            po_hdr = [str(h or "").strip() for h in po_rows[0]]
+            poi = {h.lower(): i for i, h in enumerate(po_hdr)}
+
+            # Accept multiple aliases
+            po_order_col = (poi.get("order #") or
+                            poi.get("order number") or
+                            poi.get("order"))
+            po_qty_col   = (poi.get("quantity") or
+                            poi.get("qty") or
+                            poi.get("qty pieces"))
+
+            if po_order_col is None or po_qty_col is None:
+                return jsonify({"error": "Production Orders missing an order id ('Order #','Order Number','Order') or quantity ('Quantity','Qty','Qty Pieces') header"}), 400
+
+            for r in po_rows[1:]:
+                if po_order_col < len(r) and str(r[po_order_col]).strip() == order:
+                    try:
+                        orig_qty = float(r[po_qty_col]) if po_qty_col < len(r) else None
+                    except Exception:
+                        orig_qty = None
+                    break
+
+            if not orig_qty or orig_qty <= 0:
+                return jsonify({"error": f"Original Quantity not found for order {order}"}), 400
+
 
         # 3) Gather thread rows for this order
         matches = []
