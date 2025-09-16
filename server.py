@@ -3688,6 +3688,9 @@ def get_manual_state():
     global _manual_state_cache, _manual_state_ts
     now = time.time()
 
+    if _manual_state_cache and (now - _manual_state_ts) < 10:
+        return jsonify(_manual_state_cache), 200
+
     # >>> ADDED: 10s fast-path from in-memory cache
     if _manual_state_cache and (now - _manual_state_ts) < 10:
         return jsonify(_manual_state_cache), 200
@@ -3696,7 +3699,7 @@ def get_manual_state():
         # 1) Read Manual State rows (A2:Z) and parse machine columns (I–Z)
         resp = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE  # e.g., "Manual State!A2:Z"
+            range=MANUAL_RANGE  # e.g., "Manual State!I2:J2"
         ).execute()
         rows = resp.get("values", []) or []
 
