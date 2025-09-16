@@ -92,6 +92,10 @@ from flask import send_file  # ADD if not present
 THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_cache")
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
+# --- Tiny in-process cache for Drive thumbnails ---
+_drive_thumb_cache = {}  # key: f"{file_id}:{modified_time}" -> bytes
+_drive_thumb_ttl   = 600  # seconds (10 min)
+
 _matlog_cache = None          # {"by_order": {"123": [items...]}, "ts": float}
 _matlog_cache_ttl = 60.0      # seconds
 
@@ -995,26 +999,42 @@ def drive_thumbnail():
 
         thumb_url = meta.get("thumbnailLink")
         has_thumb = meta.get("hasThumbnail")
+        modified  = meta.get("modifiedTime") or ""
+        etag      = meta.get("md5Checksum") or ""
         if not has_thumb or not thumb_url:
-            # No thumbnail available → fail quietly so the <img> hides
             return Response(status=204)
 
-        # Fetch the thumbnail bytes with an authorized session (no httplib2)
+        # --- In-process cache lookup ---
+        cache_key = f"{file_id}:{modified}"
+        now = time.time()
+        cached = _drive_thumb_cache.get(cache_key)
+        if cached and (now - cached["ts"] < _drive_thumb_ttl):
+            return Response(
+                cached["bytes"],
+                mimetype="image/jpeg",
+                headers={
+                    "Cache-Control": "public, max-age=86400",
+                    **({"Last-Modified": modified} if modified else {}),
+                    **({"ETag": etag} if etag else {}),
+                },
+            )
+
+        # Miss → fetch from Drive once
         session = AuthorizedSession(creds)
-        r = session.get(thumb_url, timeout=10)
+        r = session.get(thumb_url, timeout=8)
         if r.status_code != 200 or not r.content:
             return Response(status=204)
 
-        # Set caching so browsers don’t re-fetch on every view
-        headers = {
-            "Cache-Control": "public, max-age=86400",  # 1 day
-        }
-        if meta.get("modifiedTime"):
-            headers["Last-Modified"] = meta["modifiedTime"]
-        if meta.get("md5Checksum"):
-            headers["ETag"] = meta["md5Checksum"]
+        # Save to cache
+        _drive_thumb_cache[cache_key] = {"bytes": r.content, "ts": now}
 
-        # Drive thumbs are jpeg/png; send as generic image type
+        # Respond with strong cache headers for browsers/CDNs
+        headers = {"Cache-Control": "public, max-age=86400"}
+        if modified:
+            headers["Last-Modified"] = modified
+        if etag:
+            headers["ETag"] = etag
+
         return Response(r.content, mimetype="image/jpeg", headers=headers)
 
     except Exception:
@@ -3231,7 +3251,7 @@ def material_log_recut_append():
     if not items:
         return jsonify({"error": "No items selected"}), 400
 
-    now_iso = datetime.datetime.utcnow().isoformat()
+    now_iso = datetime.utcnow().isoformat()
     rows = []
     for it in items:
         company = str(it.get("companyName") or "").strip()
