@@ -1001,8 +1001,23 @@ def drive_thumbnail():
         has_thumb = meta.get("hasThumbnail")
         modified  = meta.get("modifiedTime") or ""
         etag      = meta.get("md5Checksum") or ""
+
+        # Fallback: if no Drive thumbnail, try direct media for image/* files
         if not has_thumb or not thumb_url:
+            mime = meta.get("mimeType", "")
+            if mime.startswith("image/"):
+                session = AuthorizedSession(creds)
+                r = session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=8)
+                if r.status_code == 200 and r.content:
+                    headers = {"Cache-Control": "public, max-age=86400"}
+                    if modified:
+                        headers["Last-Modified"] = modified
+                    if etag:
+                        headers["ETag"] = etag
+                    return Response(r.content, mimetype=mime, headers=headers)
+            # otherwise, no image we can stream → no content
             return Response(status=204)
+
 
         # --- In-process cache lookup ---
         cache_key = f"{file_id}:{modified}"
