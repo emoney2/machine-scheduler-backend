@@ -3728,99 +3728,72 @@ def get_combined():
 def handle_placeholders_updated(data):
     socketio.emit("placeholdersUpdated", data, broadcast=True)
 
-# ─── MANUAL STATE ENDPOINTS (multi-row placeholders) ─────────────────────────
-MANUAL_RANGE       = "Manual State!A2:Z"
-MANUAL_CLEAR_RANGE = "Manual State!A2:Z"
+# Replace the single MANUAL_RANGE and single get() call with this:
 
-# ─── MANUAL STATE ENDPOINT (GET) ───────────────────────────────────────────────
+MANUAL_PLACEHOLDERS_RANGE = "Manual State!A2:H"
+MANUAL_MACHINES_RANGE     = "Manual State!I2:J2"
+
 @app.route("/api/manualState", methods=["GET"])
 @login_required_session
 def get_manual_state():
-    """
-    Read manual state from the sheet, but PRUNE any order IDs whose Stage is
-    'Sewing' or 'Complete' in Production Orders. If pruning occurs, write the
-    cleaned lists back to Manual State I2:J2 so the sheet self-heals.
-    """
-    global _manual_state_cache, _manual_state_ts
-    now = time.time()
-
     global _manual_state_cache, _manual_state_ts
     now = time.time()
 
     if _manual_state_cache and (now - _manual_state_ts) < 30:
         return jsonify(_manual_state_cache), 200
 
-
-    # >>> ADDED: 10s fast-path from in-memory cache
-    if _manual_state_cache and (now - _manual_state_ts) < 10:
-        return jsonify(_manual_state_cache), 200
-
     try:
-        # 1) Read Manual State rows (A2:Z) and parse machine columns (I–Z)
-        resp = sheets.values().get(
+        svc = get_sheets_service().spreadsheets().values()
+        resp = svc.batchGet(
             spreadsheetId=SPREADSHEET_ID,
-            range=MANUAL_RANGE,  # e.g., "Manual State!I2:J2"
-            valueRenderOption="UNFORMATTED_VALUE"
+            ranges=[MANUAL_PLACEHOLDERS_RANGE, MANUAL_MACHINES_RANGE],
+            valueRenderOption="UNFORMATTED_VALUE",
         ).execute()
-        rows = resp.get("values", []) or []
 
-        # pad each row to 26 columns
-        for i in range(len(rows)):
-            while len(rows[i]) < 26:
-                rows[i].append("")
+        ph_rows = (resp.get("valueRanges", [{}])[0].get("values") or [])
+        m_rows  = (resp.get("valueRanges", [{}, {}])[1].get("values") or [])
 
-        first = rows[0] if rows else [""] * 26
-        machines = first[8:26]  # I–Z
-        machine_columns = [[s for s in str(col or "").split(",") if s] for col in machines]
+        # Parse machines (I–J from first row)
+        first   = (m_rows[0] if m_rows else ["",""])
+        machine1_ids = [s for s in str(first[0] or "").split(",") if s]
+        machine2_ids = [s for s in str(first[1] or "").split(",") if s]
 
-        # 2) Build set of ACTIVE (not Sewing/Complete) order IDs from Production Orders
+        # Build set of ACTIVE IDs (exclude Sewing/Complete) from Production Orders as before...
         ord_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
         active_ids = set()
         if ord_rows:
-            hdr = {str(h).strip().lower(): idx for idx, h in enumerate(ord_rows[0])}
+            hdr = {str(h).strip().lower(): i for i, h in enumerate(ord_rows[0])}
             id_idx = hdr.get("order #", 0)
             stage_idx = hdr.get("stage", None)
             for r in ord_rows[1:]:
                 oid = str(r[id_idx] if id_idx < len(r) else "").strip()
                 stage = str(r[stage_idx] if stage_idx is not None and stage_idx < len(r) else "").strip().lower()
-                # keep only if NOT Sewing or Complete
                 if oid and stage not in ("sewing", "complete"):
                     active_ids.add(oid)
 
-        # 3) Prune completed/sewing/unknown IDs from each machine list
-        cleaned = [[oid for oid in col if oid in active_ids] for col in machine_columns]
+        # Prune machine lists
+        m1_clean = [oid for oid in machine1_ids if oid in active_ids]
+        m2_clean = [oid for oid in machine2_ids if oid in active_ids]
 
-        # 4) If cleaned differs, write fixed strings back to I2:J2
-        if cleaned != machine_columns:
-            i2 = ",".join(cleaned[0]) if len(cleaned) > 0 else ""
-            j2 = ",".join(cleaned[1]) if len(cleaned) > 1 else ""
-            sheets.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"{MANUAL_RANGE.split('!')[0]}!I2:J2",
-                valueInputOption="RAW",
-                body={"values": [[i2, j2]]}
-            ).execute()
-            machine_columns = cleaned
-
-        # 5) Gather placeholders from A–H (unchanged)
+        # Collect placeholders from A–H, stop when A is blank
         phs = []
-        for r in rows:
-            if str(r[0]).strip():
-                phs.append({
-                    "id":          r[0],
-                    "company":     r[1],
-                    "quantity":    r[2],
-                    "stitchCount": r[3],
-                    "inHand":      r[4],
-                    "dueType":     r[5],
-                    "fieldG":      r[6],
-                    "fieldH":      r[7]
-                })
+        for r in ph_rows:
+            if not str(r[0] if len(r) > 0 else "").strip():
+                break
+            # Make sure indexes exist; pad to 8
+            r = (r + [""] * (8 - len(r)))[:8]
+            phs.append({
+                "id":          str(r[0]),
+                "company":     r[1],
+                "quantity":    r[2],
+                "stitchCount": r[3],
+                "inHand":      r[4],
+                "dueType":     r[5],
+                "fieldG":      r[6],
+                "fieldH":      r[7],
+            })
 
-        result = {
-            "machineColumns": machine_columns,
-            "placeholders":   phs
-        }
+        result = {"machineColumns": [m1_clean, m2_clean], "placeholders": phs}
         _manual_state_cache = result
         _manual_state_ts    = now
         return jsonify(result), 200
@@ -3830,9 +3803,6 @@ def get_manual_state():
         if _manual_state_cache:
             return jsonify(_manual_state_cache), 200
         return jsonify({"machineColumns": [], "placeholders": []}), 200
-
-
-
 
 # ─── MANUAL STATE ENDPOINT (POST) ──────────────────────────────────────────────
 @app.route("/api/manualState", methods=["POST"])
