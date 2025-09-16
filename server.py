@@ -5725,6 +5725,131 @@ def _col_letter(idx0: int) -> str:
         s = chr(65 + r) + s
     return s
 
+@app.route("/api/thread/relog", methods=["POST"])
+@login_required_session
+def thread_relog():
+    """
+    Body: { orderNumber: str, embroideryQty: int }
+    Behavior:
+      - Reads 'Thread Data' tab for rows matching this Order Number
+      - Finds original order qty from 'Production Orders'
+      - For each matching thread row, computes per-piece length and appends a scaled row
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        order = str(body.get("orderNumber") or "").strip()
+        qty   = int(body.get("embroideryQty") or 0)
+        if not order or qty <= 0:
+            return jsonify({"error": "orderNumber and positive embroideryQty required"}), 400
+
+        # 1) Load Thread Data
+        td_rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z", value_render="UNFORMATTED_VALUE") or []
+        if not td_rows:
+            return jsonify({"error": "Thread Data tab empty"}), 400
+
+        hdr = [str(h or "").strip() for h in td_rows[0]]
+        idx = {h.lower(): i for i, h in enumerate(hdr)}
+
+        # Required columns we expect (align with your Python update_sheet)
+        # date, order number, color, color name, length (ft), stitch count, in/out, o/r
+        c_order  = idx.get("order number")
+        c_color  = idx.get("color")
+        c_name   = idx.get("color name")
+        c_lenft  = idx.get("length (ft)")
+        c_stitch = idx.get("stitch count")
+
+        if c_order is None or c_lenft is None:
+            return jsonify({"error": "Thread Data headers missing 'Order Number' or 'Length (ft)'. Check tab."}), 400
+
+        # 2) Find original order quantity in Production Orders
+        po_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render="UNFORMATTED_VALUE") or []
+        if not po_rows:
+            return jsonify({"error": "Production Orders sheet empty"}), 400
+
+        po_hdr = [str(h or "").strip() for h in po_rows[0]]
+        poi = {h.lower(): i for i, h in enumerate(po_hdr)}
+        po_order_col = poi.get("order #") or poi.get("order number")
+        po_qty_col   = poi.get("quantity")
+        if po_order_col is None or po_qty_col is None:
+            return jsonify({"error": "Production Orders missing 'Order #' or 'Quantity' header"}), 400
+
+        orig_qty = None
+        for r in po_rows[1:]:
+            if po_order_col < len(r) and str(r[po_order_col]).strip() == order:
+                try:
+                    orig_qty = float(r[po_qty_col]) if po_qty_col < len(r) else None
+                except Exception:
+                    orig_qty = None
+                break
+        if not orig_qty or orig_qty <= 0:
+            return jsonify({"error": f"Original Quantity not found for order {order}"}), 400
+
+        # 3) Gather thread rows for this order
+        matches = []
+        for r in td_rows[1:]:
+            if c_order < len(r) and str(r[c_order]).strip() == order:
+                matches.append(r)
+
+        if not matches:
+            return jsonify({"error": f"No thread rows found for order {order} in Thread Data"}), 404
+
+        # 4) Build append rows scaled to 'qty'
+        #    Per-piece ft = (logged_length_ft / orig_qty); new total = per_piece_ft * qty
+        append_values = []
+        now_iso = datetime.utcnow().strftime("%m/%d/%Y %H:%M:%S")
+
+        # locate optional columns safely
+        c_inout = idx.get("in/out")
+        c_or    = idx.get("o/r")
+
+        for r in matches:
+            try:
+                total_ft = float(r[c_lenft]) if c_lenft < len(r) else 0.0
+            except Exception:
+                total_ft = 0.0
+            per_piece = total_ft / float(orig_qty)
+            new_total = round(per_piece * float(qty), 4)
+
+            # Construct a new row matching your headers (fill missing cells as "")
+            new_row = [""] * len(hdr)
+            # date
+            if "date" in idx:
+                new_row[idx["date"]] = now_iso
+            # order number
+            new_row[c_order] = order
+            # color, color name
+            if c_color is not None and c_color < len(r): new_row[c_color] = r[c_color]
+            if c_name  is not None and c_name  < len(r): new_row[c_name]  = r[c_name]
+            # length (ft)
+            new_row[c_lenft] = new_total
+            # stitch count (copy, if present)
+            if c_stitch is not None and c_stitch < len(r): new_row[c_stitch] = r[c_stitch]
+            # in/out
+            if c_inout is not None: new_row[c_inout] = "OUT"
+            # o/r
+            if c_or is not None: new_row[c_or] = ""
+
+            append_values.append(new_row)
+
+        # 5) Append to Thread Data
+        body = {
+            "values": append_values
+        }
+        sheets.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Thread Data!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body
+        ).execute()
+
+        return jsonify({"ok": True, "appended": len(append_values)}), 200
+
+    except Exception as e:
+        logger.exception("thread_relog failed")
+        return jsonify({"error": f"thread_relog failed: {e}"}), 500
+
+
 @app.route("/api/orders/<order_number>/preview", methods=["POST"], endpoint="api_set_order_preview")
 @login_required_session
 def set_order_preview(order_number):
