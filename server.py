@@ -2398,15 +2398,18 @@ def update_embroidery_start_time_in_sheet(order_id, new_start_time):
 
 
 
-def fetch_sheet(spreadsheet_id, sheet_range, value_render_option="UNFORMATTED_VALUE"):
-    svc = get_sheets_service().spreadsheets().values()
-    with sheet_lock:
-        res = svc.get(
-            spreadsheetId=spreadsheet_id,
-            range=sheet_range,
-            valueRenderOption=value_render_option,
-        ).execute()
-    return res.get("values", [])
+def fetch_sheet(spreadsheet_id, rng, value_render=None):
+    kwargs = {}
+    if value_render:  # e.g., "UNFORMATTED_VALUE"
+        kwargs["valueRenderOption"] = value_render
+
+    resp = sheets.values().get(
+        spreadsheetId=spreadsheet_id,
+        range=rng,
+        **kwargs
+    ).execute()
+    return resp.get("values", [])
+
 
 
 def write_sheet(spreadsheet_id, range_, values):
