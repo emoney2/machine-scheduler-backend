@@ -4146,10 +4146,22 @@ def reorder():
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
 def get_directory():
+    # 5 min TTL; cap rows to avoid giant scans on heavy sheets
     def build():
-        rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A")
-        return [r[0] for r in rows if r and str(r[0]).strip()]
+        try:
+            rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A1000") or []
+            companies = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
+            # optional: de-dupe + alpha sort for stable UI
+            seen = set(); out = []
+            for c in companies:
+                if c not in seen:
+                    seen.add(c); out.append(c)
+            return sorted(out, key=str.lower)
+        except Exception:
+            logger.exception("Error fetching directory")
+            return []
     return send_cached_json("directory:list", 300, build)
+
 
 
 @app.route("/api/directory", methods=["POST"])
@@ -4644,10 +4656,22 @@ def directory_row():
 @app.route("/api/products", methods=["GET"])
 @login_required_session
 def get_products():
+    # 5 min TTL; cap rows because 'Table' can be large/expensive
     def build():
-        rows = fetch_sheet(SPREADSHEET_ID, "Table!A2:A")
-        return [r[0] for r in rows if r and str(r[0]).strip()]
+        try:
+            rows = fetch_sheet(SPREADSHEET_ID, "Table!A2:A500") or []
+            products = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
+            # optional: de-dupe + alpha sort for stable UI
+            seen = set(); out = []
+            for p in products:
+                if p not in seen:
+                    seen.add(p); out.append(p)
+            return sorted(out, key=str.lower)
+        except Exception:
+            logger.exception("Error fetching products")
+            return []
     return send_cached_json("products:list", 300, build)
+
 
 @app.route("/api/inventory", methods=["GET"])
 @login_required_session
