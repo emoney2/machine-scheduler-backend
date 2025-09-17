@@ -626,7 +626,11 @@ def login_required_session(f):
                         (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
                         "https://machineschedule.netlify.app",
                         "http://localhost:3000",
+                        "http://127.0.0.1:3000",
+                        "http://localhost:5173",
+                        "http://127.0.0.1:5173",
                     })
+
                     response = make_response("", 204)
                     if origin in allowed:
                         response.headers["Access-Control-Allow-Origin"] = origin
@@ -927,7 +931,11 @@ def handle_preflight():
             (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
             "https://machineschedule.netlify.app",
             "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
         }
+
         resp = make_response("", 204)
         if origin in allowed:
             resp.headers["Access-Control-Allow-Origin"] = origin
@@ -946,7 +954,11 @@ def apply_cors(response):
         (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
         "https://machineschedule.netlify.app",
         "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
     })
+
     if origin in allowed:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Vary"] = "Origin"
