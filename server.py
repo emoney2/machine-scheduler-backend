@@ -4151,7 +4151,6 @@ def get_directory():
         try:
             rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A") or []
             companies = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
-            # optional: de-dupe + alpha sort for stable UI
             seen = set(); out = []
             for c in companies:
                 if c not in seen:
@@ -4160,7 +4159,9 @@ def get_directory():
         except Exception:
             logger.exception("Error fetching directory")
             return []
-    return send_cached_json("directory:list", 300, build)
+
+    return jsonify(build()), 200
+
 
 
 
@@ -4384,9 +4385,9 @@ def materials_preflight():
 @login_required_session
 def get_materials():
     def build():
-        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A") or []
         return [r[0] for r in rows if r and str(r[0]).strip()]
-    return send_cached_json("materials:list", 300, build)
+    return jsonify(build()), 200
 
 
 # 3) POST new material(s) into Material Inventory!A–H
@@ -4670,7 +4671,7 @@ def get_products():
         except Exception:
             logger.exception("Error fetching products")
             return []
-    return send_cached_json("products:list", 300, build)
+    return jsonify(build()), 200
 
 
 @app.route("/api/inventory", methods=["GET"])
