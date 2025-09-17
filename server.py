@@ -3838,9 +3838,15 @@ def get_manual_state():
         m_rows  = (resp.get("valueRanges", [{}, {}])[1].get("values") or [])
 
         # Parse machines (I–J from first row)
-        first   = (m_rows[0] if m_rows else ["",""])
-        machine1_ids = [s for s in str(first[0] or "").split(",") if s]
-        machine2_ids = [s for s in str(first[1] or "").split(",") if s]
+        # Parse machines (I–J from first row) — tolerate single-cell rows
+        first = (m_rows[0] if m_rows else [])
+        c0 = str(first[0]).strip() if len(first) > 0 and first[0] is not None else ""
+        c1 = str(first[1]).strip() if len(first) > 1 and first[1] is not None else ""
+
+        # Split, strip, and drop empties
+        machine1_ids = [s.strip() for s in c0.split(",") if s and s.strip()]
+        machine2_ids = [s.strip() for s in c1.split(",") if s and s.strip()]
+
 
         # Build set of ACTIVE IDs (exclude Sewing/Complete) from Production Orders as before...
         # Just return raw IDs from I2:J2 and placeholders; pruning happens client-side.
@@ -3893,29 +3899,24 @@ def save_manual_state():
         incoming_m2 = [str(x).strip() for x in data.get("machine2", []) if str(x).strip()]
         placeholders = data.get("placeholders", [])
 
-        # --- Build ACTIVE ID set from Production Orders (exclude Stage == 'sewing' or 'complete') ---
-        active_ids = set()
-        try:
-            ord_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
-            if ord_rows:
-                headers = {str(h).strip().lower(): idx for idx, h in enumerate(ord_rows[0])}
-                id_idx = headers.get("order #", 0)
-                stage_idx = headers.get("stage", None)
-                for r in ord_rows[1:]:
-                    oid = str(r[id_idx] if id_idx < len(r) else "").strip()
-                    stage = str(r[stage_idx] if stage_idx is not None and stage_idx < len(r) else "").strip().lower()
-                    # ✅ Keep only if not Sewing or Complete
-                    if oid and stage not in ("sewing", "complete"):
-                        active_ids.add(oid)
-        except Exception:
-            # If orders can't be fetched, fail-open: keep whatever came in
-            logger.exception("Could not fetch Production Orders; skipping prune in POST /api/manualState")
-            active_ids = set(incoming_m1 + incoming_m2)
+        # --- Fast path: trust incoming machine lists; client will reconcile against active jobs ---
+        # We skip scanning Production Orders entirely (latency reduction).
+        def _uniq_preserve(seq):
+            seen = set()
+            out = []
+            for s in seq:
+                s = (s or "").strip()
+                if s and s not in seen:
+                    seen.add(s)
+                    out.append(s)
+            return out
 
-        # --- Prune off jobs no longer active ---
-        pruned_m1 = [oid for oid in incoming_m1 if oid in active_ids]
-        pruned_m2 = [oid for oid in incoming_m2 if oid in active_ids]
-        removed_ids = (set(incoming_m1 + incoming_m2) - set(pruned_m1 + pruned_m2))
+        pruned_m1 = _uniq_preserve(incoming_m1)
+        pruned_m2 = _uniq_preserve(incoming_m2)
+
+        # Nothing pruned on the server; client will ignore unknown/complete/sewing IDs
+        removed_ids = set()
+
 
         # --- Write the pruned lists back to Manual State (I2:J2) ---
         i2 = ",".join(pruned_m1)
