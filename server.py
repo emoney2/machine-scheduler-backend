@@ -1127,33 +1127,52 @@ def _warm_thumb_async(file_id: str, sz: str, ver: str):
 @login_required_session
 def drive_proxy(file_id):
     """
-    Disk-cached Drive thumbnail proxy.
-
-    Behavior:
-      * If cached: serve from disk (immutable, instant).
-      * If not cached: spawn background warm + 302 redirect to Google immediately.
+    Stream a Drive thumbnail back as image bytes with correct CORS.
+    Never 302 to Google (avoids CORS issues in fetch/img).
     """
-    sz  = (request.args.get("sz") or "w240").strip()
-    ver = (request.args.get("v") or "").strip() or "1"
+    from flask import Response
+    import requests
+    import mimetypes
 
-    # 1) Cache hit → serve immediately
+    size = request.args.get("sz", "w240")
+    size = size if isinstance(size, str) else "w240"
+
+    # Build Google thumb URL (works for images/PDF previews)
+    g_url = f"https://drive.google.com/thumbnail?id={file_id}&sz={size}"
+
     try:
-        cpath = _thumb_cache_path(file_id, sz, ver)
-        if os.path.exists(cpath):
-            resp = send_file(cpath, mimetype="image/jpeg", as_attachment=False, conditional=True)
-            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-            return resp
-    except Exception:
-        app.logger.exception("drive_proxy cache read failed for %s", file_id)
+      # Fetch from Google server-side
+      r = requests.get(g_url, stream=True, timeout=10)
+    except Exception as e:
+      return jsonify({"error": f"fetch-failed: {e}"}), 502
 
-    # 2) Cache miss → warm in background, redirect client so the UI still gets an image now
-    try:
-        Thread(target=_warm_thumb_async, args=(file_id, sz, ver), daemon=True).start()
-    except Exception:
-        app.logger.exception("drive_proxy warm spawn failed for %s", file_id)
+    # Google returns 200 + image/* for thumbs; handle fallbacks
+    status = r.status_code
+    if status != 200:
+      # Pass through a simple not found to keep frontend clean
+      return "", 404
 
-    google_thumb = f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
-    return redirect(google_thumb, code=302)
+    # Guess content type; default to jpeg if unknown
+    ctype = r.headers.get("Content-Type", "")
+    if not ctype or not ctype.startswith("image/"):
+      ctype = "image/jpeg"
+
+    def generate():
+      for chunk in r.iter_content(chunk_size=8192):
+        if chunk:
+          yield chunk
+
+    resp = Response(generate(), status=200, mimetype=ctype)
+    # Helpful cache headers (tweak to your taste)
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    # CORS: your app likely has Flask-CORS globally; this is just extra safety
+    origin = request.headers.get("Origin", "")
+    allowed = os.environ.get("ALLOWED_ORIGINS", "")
+    if origin and (origin == os.environ.get("FRONTEND_URL") or (allowed and origin in allowed.split(","))):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
 
 
 @app.route("/api/ping", methods=["GET", "OPTIONS"])
