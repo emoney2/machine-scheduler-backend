@@ -408,6 +408,11 @@ def get_google_credentials():
         pass
 
     return creds
+
+# ✅ Back-compat alias: some endpoints still call the old name
+def get_google_creds():
+    return get_google_credentials()
+
 # -----------------------------------------------------------------------------
 
 
