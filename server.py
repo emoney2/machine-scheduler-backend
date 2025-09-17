@@ -3109,12 +3109,18 @@ def get_orders():
     TTL = 15  # seconds
 
     # Only fields MaterialLog needs
-    KEEP = {"Order #", "Company Name", "Design", "Product", "Stage", "Due Date", "Quantity"}
-
+    KEEP = {
+        "Order #", "Company Name", "Design", "Product", "Stage",
+        "Due Date", "Quantity",
+        # image-ish fields the UI knows how to use:
+        "Preview", "Image", "Thumbnail", "Image URL", "Image Link",
+        "Photo", "Img", "Mockup", "Front Image", "Mockup Link",
+        "Artwork", "Art", "Picture", "Picture URL", "Artwork Link"
+    }
 
     def build_payload():
         # Pull unformatted to keep payload lean
-        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render="UNFORMATTED_VALUE") or []
+        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render="FORMULA") or []
         if not rows:
             return []
 
