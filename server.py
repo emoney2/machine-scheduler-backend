@@ -4146,18 +4146,11 @@ def reorder():
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
 def get_directory():
-    """
-    Returns JSON array of company names from the 'Directory' sheet.
-    """
-    try:
-        # read column A (Company Name) from row 2 down
+    def build():
         rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A")
-        # flatten and filter out empty cells
-        companies = [r[0] for r in rows if r and r[0].strip()]
-        return jsonify(companies), 200
-    except Exception:
-        logger.exception("Error fetching directory")
-        return jsonify([]), 200
+        return [r[0] for r in rows if r and str(r[0]).strip()]
+    return send_cached_json("directory:list", 300, build)
+
 
 @app.route("/api/directory", methods=["POST"])
 @login_required_session
@@ -4214,13 +4207,11 @@ def add_directory_entry():
 @app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
 def get_fur_colors():
-    try:
+    def build():
         rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!I2:I")
-        colors = [r[0] for r in rows if r and r[0].strip()]
-        return jsonify(colors), 200
-    except Exception:
-        logger.exception("Error fetching fur colors")
-        return jsonify([]), 200
+        return [r[0] for r in rows if r and str(r[0]).strip()]
+    return send_cached_json("furcolors:list", 300, build)
+
 
 # ─── Add /api/threads endpoint with dynamic formulas ────────────────────────
 @app.route("/api/threads", methods=["POST"])
@@ -4380,13 +4371,11 @@ def materials_preflight():
 @app.route("/api/materials", methods=["GET"])
 @login_required_session
 def get_materials():
-    try:
+    def build():
         rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A")
-        names = [r[0] for r in rows if r and r[0].strip()]
-        return jsonify(names), 200
-    except Exception:
-        logger.exception("Error fetching materials")
-        return jsonify([]), 200
+        return [r[0] for r in rows if r and str(r[0]).strip()]
+    return send_cached_json("materials:list", 300, build)
+
 
 # 3) POST new material(s) into Material Inventory!A–H
 @app.route("/api/materials", methods=["POST"])
@@ -4655,17 +4644,10 @@ def directory_row():
 @app.route("/api/products", methods=["GET"])
 @login_required_session
 def get_products():
-    """
-    Returns JSON array of product names from the 'Table' sheet (column A).
-    """
-    try:
-        # read column A (products) from row 2 down
+    def build():
         rows = fetch_sheet(SPREADSHEET_ID, "Table!A2:A")
-        products = [r[0] for r in rows if r and r[0].strip()]
-        return jsonify(products), 200
-    except Exception:
-        logger.exception("Error fetching products")
-        return jsonify([]), 200
+        return [r[0] for r in rows if r and str(r[0]).strip()]
+    return send_cached_json("products:list", 300, build)
 
 @app.route("/api/inventory", methods=["GET"])
 @login_required_session
