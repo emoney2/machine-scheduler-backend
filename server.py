@@ -3114,9 +3114,16 @@ def get_orders():
         "Due Date", "Quantity", "Image", "Preview"
     }
 
+    # Columns that might carry preview links (match what MaterialLog.jsx checks)
+    IMG_KEYS = {
+        "Preview", "Image", "Thumbnail", "Image URL", "Image Link",
+        "Photo", "Img", "Mockup", "Front Image", "Mockup Link",
+        "Artwork", "Art", "Picture", "Picture URL", "Artwork Link",
+    }
+    KEEP = KEEP_BASE | IMG_KEYS  # <-- include all image-ish fields
 
     def build_payload():
-        # 1) Pull unformatted values for everything (fast + stable for dates/numbers)
+        # 1) Pull unformatted values for everything (stable for dates/numbers)
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render="UNFORMATTED_VALUE") or []
         if not rows:
             return []
@@ -3124,35 +3131,26 @@ def get_orders():
         headers = [str(h or "").strip() for h in rows[0]]
         hi = {h: i for i, h in enumerate(headers) if h}
 
-        # 2) Identify “image-ish” headers that the frontend can use for thumbnails
-        #    These match what MaterialLog.jsx already checks in getPreviewUrl()
-        IMG_KEYS = {
-            "Preview", "Image", "Thumbnail", "Image URL", "Image Link",
-            "Photo", "Img", "Mockup", "Front Image", "Mockup Link",
-            "Artwork", "Art", "Picture", "Picture URL", "Artwork Link",
-        }
+        # 2) Figure out which image-ish headers are actually present
         present_img_cols = [(h, i) for h, i in hi.items() if h in IMG_KEYS]
 
-        # 3) For those columns only, fetch the FORMULAs (so the UI can parse =IMAGE()/=HYPERLINK())
+        # 3) For those columns only, fetch FORMULA text (=IMAGE/ =HYPERLINK)
+        #    so the frontend can extract the actual URL when unformatted is empty.
         formula_by_col = {}
         if present_img_cols:
-            # Derive sheet name from ORDERS_RANGE like "Production Orders!A1:AM"
             sheet_name = ORDERS_RANGE.split("!", 1)[0]
 
-            def col_to_a1(idx0):
-                # 0 -> A, 25 -> Z, 26 -> AA ...
+            def col_to_a1(idx0: int) -> str:
+                # 0->A, 25->Z, 26->AA
+                n = idx0 + 1
                 s = ""
-                n = idx0
-                while True:
-                    n, r = divmod(n, 26)
-                    s = chr(65 + r) + s
-                    if n == 0:
-                        break
-                    n -= 1
+                while n:
+                    n, rem = divmod(n - 1, 26)
+                    s = chr(65 + rem) + s
                 return s
 
-            ranges = [f"{sheet_name}!{col_to_a1(i)}2:{col_to_a1(i)}"
-                      for (_, i) in present_img_cols]
+            # Build one A1 range per column, starting at row 2 to align with rows[1:]
+            ranges = [f"{sheet_name}!{col_to_a1(i)}2:{col_to_a1(i)}" for (_, i) in present_img_cols]
 
             svc = get_sheets_service().spreadsheets().values()
             resp = svc.batchGet(
@@ -3164,14 +3162,14 @@ def get_orders():
             value_ranges = resp.get("valueRanges", [])
             for (hdr, _), vr in zip(present_img_cols, value_ranges):
                 vals = vr.get("values", [])
-                # Flatten and pad to align with rows[1:]
                 flat = [(row[0] if row else "") for row in vals]
-                needed = max(0, len(rows) - 1 - len(flat))
+                # Pad to match number of data rows
+                needed = max(0, (len(rows) - 1) - len(flat))
                 flat.extend([""] * needed)
                 formula_by_col[hdr] = flat
 
-        # 4) Build output rows. For image-ish keys, if the unformatted value is empty,
-        #    fill from the formula string (so the frontend can extract the URL).
+        # 4) Build output rows; if an image-ish field is empty in unformatted,
+        #    fill it from the formula text so the UI can parse =IMAGE/=HYPERLINK.
         out = []
         for r_idx, r in enumerate(rows[1:]):
             if not r:
@@ -3181,14 +3179,15 @@ def get_orders():
                 i = hi.get(k)
                 val = r[i] if (i is not None and i < len(r)) else ""
                 if (not val) and (k in formula_by_col):
-                    # Merge formula text (e.g., '=IMAGE("https://...")')
                     col_vals = formula_by_col.get(k) or []
                     if r_idx < len(col_vals):
                         val = col_vals[r_idx]
                 o[k] = val
             out.append(o)
         return out
+
     return send_cached_json("orders", TTL, build_payload)
+
 
 @app.route("/api/material-log/original-usage", methods=["GET"])  # ?order=123
 @login_required_session
