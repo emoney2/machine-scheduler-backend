@@ -1127,45 +1127,49 @@ def _warm_thumb_async(file_id: str, sz: str, ver: str):
 @login_required_session
 def drive_proxy(file_id):
     """
-    Stream a Drive thumbnail back as image bytes with correct CORS.
+    Stream a Drive thumbnail back as image bytes, with debug logging.
     Never 302 to Google (avoids CORS issues in fetch/img).
     """
     from flask import Response
-    import requests
+    import requests, sys
     import mimetypes
 
     size = request.args.get("sz", "w240")
     size = size if isinstance(size, str) else "w240"
 
-    # Build Google thumb URL (works for images/PDF previews)
     g_url = f"https://drive.google.com/thumbnail?id={file_id}&sz={size}"
+    print(f"[drive_proxy] file_id={file_id} sz={size}", file=sys.stderr)
+    print(f"[drive_proxy] GET {g_url}", file=sys.stderr)
 
     try:
-      # Fetch from Google server-side
-      r = requests.get(g_url, stream=True, timeout=10)
+        r = requests.get(g_url, stream=True, timeout=10)
+        print(f"[drive_proxy] Google status={r.status_code} ctype={r.headers.get('Content-Type')}", file=sys.stderr)
     except Exception as e:
-      return jsonify({"error": f"fetch-failed: {e}"}), 502
+        print(f"[drive_proxy] ERROR fetch-failed: {e}", file=sys.stderr)
+        return jsonify({"error": f"fetch-failed: {e}"}), 502
 
-    # Google returns 200 + image/* for thumbs; handle fallbacks
-    status = r.status_code
-    if status != 200:
-      # Pass through a simple not found to keep frontend clean
-      return "", 404
+    if r.status_code != 200:
+        body_preview = ""
+        try:
+            body_preview = next(r.iter_content(chunk_size=256)).decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        print(f"[drive_proxy] Non-200 -> {r.status_code}; body[:256]={body_preview!r}", file=sys.stderr)
+        return "", 404
 
-    # Guess content type; default to jpeg if unknown
     ctype = r.headers.get("Content-Type", "")
     if not ctype or not ctype.startswith("image/"):
-      ctype = "image/jpeg"
+        print(f"[drive_proxy] Unexpected ctype={ctype!r}; forcing image/jpeg", file=sys.stderr)
+        ctype = "image/jpeg"
 
     def generate():
-      for chunk in r.iter_content(chunk_size=8192):
-        if chunk:
-          yield chunk
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                yield chunk
 
     resp = Response(generate(), status=200, mimetype=ctype)
-    # Helpful cache headers (tweak to your taste)
     resp.headers["Cache-Control"] = "public, max-age=3600"
-    # CORS: your app likely has Flask-CORS globally; this is just extra safety
+
     origin = request.headers.get("Origin", "")
     allowed = os.environ.get("ALLOWED_ORIGINS", "")
     if origin and (origin == os.environ.get("FRONTEND_URL") or (allowed and origin in allowed.split(","))):
