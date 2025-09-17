@@ -4146,24 +4146,25 @@ def reorder():
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
 def get_directory():
-    # 5 min TTL; cap rows to avoid giant scans on heavy sheets
+    from flask import make_response
     def build():
         try:
             rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A") or []
             companies = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
+            # de-dupe + sort
             seen = set(); out = []
             for c in companies:
                 if c not in seen:
                     seen.add(c); out.append(c)
             return sorted(out, key=str.lower)
         except Exception:
-            logger.exception("Error fetching directory")
+            logging.exception("Error fetching directory")
             return []
-
-    return jsonify(build()), 200
-
-
-
+    payload = build()
+    resp = make_response(jsonify(payload), 200)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 @app.route("/api/directory", methods=["POST"])
 @login_required_session
@@ -4380,15 +4381,22 @@ from flask import make_response  # if not already imported
 def materials_preflight():
     return make_response("", 204)
 
-# 2) GET list for your typeahead
 @app.route("/api/materials", methods=["GET"])
 @login_required_session
 def get_materials():
+    from flask import make_response
     def build():
-        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A") or []
-        return [r[0] for r in rows if r and str(r[0]).strip()]
-    return jsonify(build()), 200
-
+        try:
+            rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A") or []
+            return [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
+        except Exception:
+            logging.exception("Error fetching materials")
+            return []
+    payload = build()
+    resp = make_response(jsonify(payload), 200)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 # 3) POST new material(s) into Material Inventory!A–H
 @app.route("/api/materials", methods=["POST"])
@@ -4653,26 +4661,28 @@ def directory_row():
 
     return jsonify(target)
 
-
 @app.route("/api/products", methods=["GET"])
 @login_required_session
 def get_products():
-    # 5 min TTL; cap rows because 'Table' can be large/expensive
+    from flask import make_response
     def build():
         try:
             rows = fetch_sheet(SPREADSHEET_ID, "Table!A2:A500") or []
             products = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
-            # optional: de-dupe + alpha sort for stable UI
+            # de-dupe + sort (optional — remove if your sheet is already curated)
             seen = set(); out = []
             for p in products:
                 if p not in seen:
                     seen.add(p); out.append(p)
             return sorted(out, key=str.lower)
         except Exception:
-            logger.exception("Error fetching products")
+            logging.exception("Error fetching products")
             return []
-    return jsonify(build()), 200
-
+    payload = build()
+    resp = make_response(jsonify(payload), 200)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 @app.route("/api/inventory", methods=["GET"])
 @login_required_session
