@@ -6054,34 +6054,52 @@ def set_order_preview(order_number):
         # Don't blow up the client — report a clean error
         return jsonify(error=str(e)), 500
 
+# --- Order Summary (for Scan.jsx) -------------------------------------------
 @app.route("/api/order-summary", methods=["GET"])
 @login_required_session
 def order_summary():
     """
-    Query params: ?dept=fur&order=6  (dept is ignored for lookup but included for future rules)
-    Looks up the order in Production Orders and returns a compact summary for Material.jsx.
+    Returns a compact order summary for the scanner page.
+    Query params:
+      - dept  : "fur", "cut", etc. (not required for lookup, but included for future rules)
+      - order : the order number (digits)
+    Response:
+      {
+        "order": "43",
+        "company": "Acme GC",
+        "title": "Quilted Black Driver",
+        "product": "Driver",
+        "stage": "Embroidery",
+        "dueDate": "09/22/2025",
+        "furColor": "Black",
+        "quantity": 24,
+        "thumbnailUrl": "https://.../api/drive/proxy/<fileId>?sz=w640",
+        "images": ["...thumb...", "...bom1...", "...bom2...", "...bom3..."]  # optional
+      }
     """
     try:
         dept  = (request.args.get("dept") or "").strip().lower()
         order = (request.args.get("order") or "").strip()
-
         if not order:
             return jsonify({"error": "missing order"}), 400
 
-        # Pull the Production Orders sheet (same logic you already use elsewhere)
+        # Pull Production Orders
+        # Adjust range if you store more columns (AF was mentioned in your headers)
+        ORDERS_RANGE = "Production Orders!A1:AF"
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE) or []
         if not rows:
             return jsonify({"error": "no data"}), 404
 
         headers = [str(h or "").strip() for h in rows[0]]
+
         def gv(row, name, default=""):
             try:
                 i = headers.index(name)
-                return row[i] if i < len(row) else default
             except ValueError:
                 return default
+            return row[i] if i < len(row) else default
 
-        # Find the row where "Order #" matches
+        # Find matching order row (compare text)
         hit = None
         for r in rows[1:]:
             if str(gv(r, "Order #")).strip() == str(order):
@@ -6091,40 +6109,61 @@ def order_summary():
         if not hit:
             return jsonify({"error": "order not found"}), 404
 
-        company = str(gv(hit, "Company Name", "")).strip() or "—"
-        design  = str(gv(hit, "Design", "")).strip()
-        product = str(gv(hit, "Product", "")).strip()
-        qty     = gv(hit, "Quantity", "")
-        try:
-            qty = int(qty)
-        except Exception:
-            pass
+        # Map fields from your sheet
+        company   = str(gv(hit, "Company Name", "") or "").strip()
+        design    = str(gv(hit, "Design", "") or "").strip()
+        product   = str(gv(hit, "Product", "") or "").strip()
+        stage     = str(gv(hit, "Stage", "") or "").strip()
+        due_raw   = str(gv(hit, "Due Date", "") or "").strip()
+        fur_color = str(gv(hit, "Fur Color", "") or "").strip()
+        qty_raw   = gv(hit, "Quantity", "")  # may be str or number
 
-        # Compose a nice title (Design first; fall back to Product)
+        # Pretty title: prefer Design, then Product, else "Order <#>"
         title = design or product or f"Order {order}"
 
-        # Try common image-ish columns in your sheet
-        img_candidates = [
-            "Preview","Image","Thumbnail","Image URL","Image Link","Photo",
-            "Img","Mockup","Front Image","Mockup Link","Artwork","Art","Picture","Picture URL","Artwork Link",
-        ]
-        link_val = ""
-        for key in img_candidates:
-            v = str(gv(hit, key, "")).strip()
-            if v:
-                link_val = v
-                break
+        # Quantity
+        try:
+            quantity = int(float(qty_raw))  # sheets sometimes deliver as float string
+        except Exception:
+            quantity = str(qty_raw) if str(qty_raw).strip() else "—"
 
-        # Reuse your Drive-id extractor and /api/drive/proxy handler
-        file_id = _drive_id_from_link(link_val) if link_val else ""
-        thumb = f"{request.host_url.rstrip('/')}/api/drive/proxy/{file_id}?sz=w640" if file_id else None
+        # Format due date (leave as-is if we can't parse)
+        due_date = _fmt_date_mdy(due_raw)
+
+        # Collect potential image columns (first will be treated as thumbnail)
+        img_cols = [
+            "Preview", "Image", "Thumbnail", "Image URL", "Image Link", "Photo",
+            "Img", "Front Image", "Mockup", "Mockup Link", "Artwork", "Art",
+            "Picture", "Picture URL", "Artwork Link",
+        ]
+        links = []
+        for c in img_cols:
+            v = str(gv(hit, c, "") or "").strip()
+            if v and v not in links:
+                links.append(v)
+
+        # Convert links -> drive file IDs -> proxy URLs
+        def to_thumb(url, size="w640"):
+            fid = _safe_drive_id(url)
+            return f"{request.host_url.rstrip('/')}/api/drive/proxy/{fid}?sz={size}" if fid else None
+
+        thumbs = [u for u in (to_thumb(x) for x in links) if u]
+        thumbnail_url = thumbs[0] if thumbs else None
+
+        # If you later add BOM images server-side, push them into `images`.
+        images = thumbs[:4] if thumbs else ( [thumbnail_url] if thumbnail_url else [] )
 
         payload = {
             "order": str(order),
-            "company": company,
+            "company": company or "—",
             "title": title,
-            "quantity": qty if qty != "" else "—",
-            "thumbnailUrl": thumb,
+            "product": product or "",
+            "stage": stage or "",
+            "dueDate": due_date or "",
+            "furColor": fur_color or "",
+            "quantity": quantity,
+            "thumbnailUrl": thumbnail_url,
+            "images": images,
         }
         return jsonify(payload), 200
 
@@ -6132,10 +6171,62 @@ def order_summary():
         app.logger.exception("order_summary failed")
         return jsonify({"error": "server error"}), 500
 
-# ─────────────────────────────────────────────────────────────────────────────
 
+# Helpers ---------------------------------------------------------------------
 
+def _fmt_date_mdy(s):
+    """Try to normalize sheet date-like strings to MM/DD/YYYY; else return original."""
+    if not s:
+        return ""
+    try:
+        # Try common forms from Sheets (serials may already be formatted upstream)
+        from datetime import datetime
+        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%m/%d"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                # If year missing, keep as MM/DD
+                if fmt == "%m/%d":
+                    return dt.strftime("%m/%d")
+                return dt.strftime("%m/%d/%Y")
+            except Exception:
+                pass
+        return s
+    except Exception:
+        return s
 
+def _safe_drive_id(link_or_id):
+    """
+    Use your existing _drive_id_from_link if present; otherwise accept raw id.
+    Supports:
+      - https://drive.google.com/file/d/<id>/view?usp=...
+      - https://drive.google.com/open?id=<id>
+      - https://drive.google.com/uc?id=<id>
+      - raw <id>
+    """
+    try:
+        # Prefer existing helper if defined
+        if "_drive_id_from_link" in globals():
+            fid = _drive_id_from_link(link_or_id)
+            if fid:
+                return fid
+    except Exception:
+        pass
+
+    s = str(link_or_id or "").strip()
+    if not s:
+        return ""
+    # Common patterns
+    import re
+    m = re.search(r"/d/([a-zA-Z0-9_-]{20,})", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]{20,})", s)
+    if m:
+        return m.group(1)
+    # If it already looks like an id, return as-is
+    if re.fullmatch(r"[a-zA-Z0-9_-]{20,}", s):
+        return s
+    return ""
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
