@@ -495,10 +495,10 @@ import httplib2
 from googleapiclient.discovery import build
 
 def get_sheets_service():
-    creds = get_google_creds()
-    # Increase low-level socket timeout to 60s
-    http = creds.authorize(httplib2.Http(timeout=60))
-    return build("sheets", "v4", http=http, cache_discovery=False)
+    from googleapiclient.discovery import build
+    creds = get_google_credentials()
+    # Pass credentials directly; no httplib2/authorize dance needed
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 def get_drive_service():
     import time as _t
