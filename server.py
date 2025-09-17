@@ -99,6 +99,8 @@ _drive_thumb_ttl   = 600  # seconds (10 min)
 _matlog_cache = None          # {"by_order": {"123": [items...]}, "ts": float}
 _matlog_cache_ttl = 60.0      # seconds
 
+_last_directory = {"data": [], "ts": 0}
+_last_products  = {"data": [], "ts": 0}
 
 
 def _thumb_cache_path(file_id: str, size: str, version: str) -> str:
@@ -4147,24 +4149,29 @@ def reorder():
 @login_required_session
 def get_directory():
     from flask import make_response
+    global _last_directory
+
     def build():
-        try:
-            rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A") or []
-            companies = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
-            # de-dupe + sort
-            seen = set(); out = []
-            for c in companies:
-                if c not in seen:
-                    seen.add(c); out.append(c)
-            return sorted(out, key=str.lower)
-        except Exception:
-            logging.exception("Error fetching directory")
-            return []
-    payload = build()
+        rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A") or []
+        companies = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
+        seen = set(); out = []
+        for c in companies:
+            if c not in seen:
+                seen.add(c); out.append(c)
+        return sorted(out, key=str.lower)
+
+    try:
+        payload = build()
+        _last_directory = {"data": payload, "ts": time.time()}
+    except Exception:
+        logging.exception("Error fetching directory; serving last known good")
+        payload = _last_directory["data"]
+
     resp = make_response(jsonify(payload), 200)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     return resp
+
 
 @app.route("/api/directory", methods=["POST"])
 @login_required_session
@@ -4665,24 +4672,29 @@ def directory_row():
 @login_required_session
 def get_products():
     from flask import make_response
+    global _last_products
+
     def build():
-        try:
-            rows = fetch_sheet(SPREADSHEET_ID, "Table!A2:A500") or []
-            products = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
-            # de-dupe + sort (optional — remove if your sheet is already curated)
-            seen = set(); out = []
-            for p in products:
-                if p not in seen:
-                    seen.add(p); out.append(p)
-            return sorted(out, key=str.lower)
-        except Exception:
-            logging.exception("Error fetching products")
-            return []
-    payload = build()
+        rows = fetch_sheet(SPREADSHEET_ID, "Table!A2:A") or []  # remove hard cap
+        products = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
+        seen = set(); out = []
+        for p in products:
+            if p not in seen:
+                seen.add(p); out.append(p)
+        return sorted(out, key=str.lower)
+
+    try:
+        payload = build()
+        _last_products = {"data": payload, "ts": time.time()}
+    except Exception:
+        logging.exception("Error fetching products; serving last known good")
+        payload = _last_products["data"]
+
     resp = make_response(jsonify(payload), 200)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     return resp
+
 
 @app.route("/api/inventory", methods=["GET"])
 @login_required_session
