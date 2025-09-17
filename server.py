@@ -3843,21 +3843,12 @@ def get_manual_state():
         machine2_ids = [s for s in str(first[1] or "").split(",") if s]
 
         # Build set of ACTIVE IDs (exclude Sewing/Complete) from Production Orders as before...
-        ord_rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
-        active_ids = set()
-        if ord_rows:
-            hdr = {str(h).strip().lower(): i for i, h in enumerate(ord_rows[0])}
-            id_idx = hdr.get("order #", 0)
-            stage_idx = hdr.get("stage", None)
-            for r in ord_rows[1:]:
-                oid = str(r[id_idx] if id_idx < len(r) else "").strip()
-                stage = str(r[stage_idx] if stage_idx is not None and stage_idx < len(r) else "").strip().lower()
-                if oid and stage not in ("sewing", "complete"):
-                    active_ids.add(oid)
+        # Just return raw IDs from I2:J2 and placeholders; pruning happens client-side.
+        m1_clean = machine1_ids
+        m2_clean = machine2_ids
+        result = {"machineColumns": [m1_clean, m2_clean], "placeholders": phs}
+        return jsonify(result), 200
 
-        # Prune machine lists
-        m1_clean = [oid for oid in machine1_ids if oid in active_ids]
-        m2_clean = [oid for oid in machine2_ids if oid in active_ids]
 
         # Collect placeholders from A–H, stop when A is blank
         phs = []
