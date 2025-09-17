@@ -486,18 +486,14 @@ def get_oauth_credentials():
         return creds
     raise Exception("🔑 Google Drive credentials not available. Set GOOGLE_TOKEN_JSON or provide token.json.")
 
+import httplib2
+from googleapiclient.discovery import build
+
 def get_sheets_service():
-    # Use an HTTP client with a hard timeout so Eventlet can't hang forever
-    import httplib2
-    from googleapiclient.discovery import build
-    from google_auth_httplib2 import AuthorizedHttp
-
-    creds = get_google_credentials()
-    http = httplib2.Http(timeout=10)  # 10s per request
-    authed = AuthorizedHttp(creds, http=http)
-    return build("sheets", "v4", http=authed, cache_discovery=False)
-
-
+    creds = get_google_creds()
+    # Increase low-level socket timeout to 60s
+    http = creds.authorize(httplib2.Http(timeout=60))
+    return build("sheets", "v4", http=http, cache_discovery=False)
 
 def get_drive_service():
     import time as _t
@@ -2471,18 +2467,27 @@ def update_embroidery_start_time_in_sheet(order_id, new_start_time):
 
 
 
-def fetch_sheet(spreadsheet_id, rng, value_render=None):
-    kwargs = {}
-    if value_render:  # e.g., "UNFORMATTED_VALUE"
-        kwargs["valueRenderOption"] = value_render
+import time
 
-    resp = sheets.values().get(
-        spreadsheetId=spreadsheet_id,
-        range=rng,
-        **kwargs
-    ).execute()
-    return resp.get("values", [])
-
+def fetch_sheet(spreadsheet_id, range_a1):
+    service = get_sheets_service()
+    for attempt in range(1, 4):  # up to 3 tries: ~60s*3 worst-case
+        try:
+            resp = service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=range_a1,
+                majorDimension="ROWS"
+            ).execute()
+            return resp.get("values", []) or []
+        except Exception as e:
+            # Only retry on timeouts / transient transport errors
+            msg = str(e)
+            if "timed out" in msg.lower() or "transport" in msg.lower() or "unavailable" in msg.lower():
+                if attempt < 3:
+                    time.sleep(1 * attempt)  # 1s, 2s
+                    continue
+            # Non-retryable or final failure
+            raise
 
 
 def write_sheet(spreadsheet_id, range_, values):
