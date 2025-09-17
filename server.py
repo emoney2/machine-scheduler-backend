@@ -26,7 +26,7 @@ from flask import current_app
 from flask import request, jsonify
 from flask import request, make_response, jsonify, Response
 from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request as GoogleRequest
+from google.auth.transport.requests import Request as GoogleRequest, AuthorizedSession
 from math import ceil
 from playwright.async_api import async_playwright
 from functools import wraps
@@ -1001,7 +1001,8 @@ def drive_thumbnail():
         creds = get_oauth_credentials()  # same creds mechanism you use elsewhere
         if hasattr(creds, "expired") and creds.expired and hasattr(creds, "refresh_token"):
             # Refresh if needed
-            creds.refresh(Request())
+            creds.refresh(GoogleRequest())
+
 
         # Ask Drive for its lightweight thumbnail URL (much faster than full download)
         meta = drive.files().get(
