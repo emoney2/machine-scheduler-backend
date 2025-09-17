@@ -3862,12 +3862,6 @@ def get_manual_state():
 
         # Build set of ACTIVE IDs (exclude Sewing/Complete) from Production Orders as before...
         # Just return raw IDs from I2:J2 and placeholders; pruning happens client-side.
-        m1_clean = machine1_ids
-        m2_clean = machine2_ids
-        result = {"machineColumns": [m1_clean, m2_clean], "placeholders": phs}
-        return jsonify(result), 200
-
-
         # Collect placeholders from A–H, stop when A is blank
         phs = []
         for r in ph_rows:
@@ -3886,10 +3880,14 @@ def get_manual_state():
                 "fieldH":      r[7],
             })
 
+        # Return raw IDs from I2:J2 and placeholders; pruning happens client-side.
+        m1_clean = machine1_ids
+        m2_clean = machine2_ids
         result = {"machineColumns": [m1_clean, m2_clean], "placeholders": phs}
         _manual_state_cache = result
         _manual_state_ts    = now
         return jsonify(result), 200
+
 
     except Exception:
         logger.exception("Error reading manual state")
@@ -3933,12 +3931,19 @@ def save_manual_state():
         # --- Write the pruned lists back to Manual State (I2:J2) ---
         i2 = ",".join(pruned_m1)
         j2 = ",".join(pruned_m2)
-        sheets.values().update(
+
+        # Local Sheets client
+        sheets = get_sheets_service().spreadsheets().values()
+
+        # Derive the sheet name from MANUAL_MACHINES_RANGE and write to I2:J2
+        _sheet_name = MANUAL_MACHINES_RANGE.split('!')[0]
+        sheets.update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{MANUAL_RANGE.split('!')[0]}!I2:J2",
+            range=f"{_sheet_name}!I2:J2",
             valueInputOption="RAW",
             body={"values": [[i2, j2]]}
         ).execute()
+
 
         return jsonify({
             "ok": True,
