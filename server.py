@@ -4149,7 +4149,7 @@ def get_directory():
     # 5 min TTL; cap rows to avoid giant scans on heavy sheets
     def build():
         try:
-            rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A1000") or []
+            rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A") or []
             companies = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
             # optional: de-dupe + alpha sort for stable UI
             seen = set(); out = []
