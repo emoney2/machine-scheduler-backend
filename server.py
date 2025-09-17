@@ -3108,10 +3108,10 @@ def cut_complete_batch():
 def get_orders():
     TTL = 15  # seconds
 
-    # Only fields MaterialLog needs
-    KEEP = {
+    # Base fields MaterialLog needs
+    KEEP_BASE = {
         "Order #", "Company Name", "Design", "Product", "Stage",
-        "Due Date", "Quantity", "Image", "Preview"
+        "Due Date", "Quantity", "Preview", "Image"
     }
 
     # Columns that might carry preview links (match what MaterialLog.jsx checks)
@@ -3120,7 +3120,9 @@ def get_orders():
         "Photo", "Img", "Mockup", "Front Image", "Mockup Link",
         "Artwork", "Art", "Picture", "Picture URL", "Artwork Link",
     }
-    KEEP = KEEP_BASE | IMG_KEYS  # <-- include all image-ish fields
+
+    # Union of base + image-ish keys
+    KEEP = KEEP_BASE | IMG_KEYS
 
     def build_payload():
         # 1) Pull unformatted values for everything (stable for dates/numbers)
@@ -3134,14 +3136,12 @@ def get_orders():
         # 2) Figure out which image-ish headers are actually present
         present_img_cols = [(h, i) for h, i in hi.items() if h in IMG_KEYS]
 
-        # 3) For those columns only, fetch FORMULA text (=IMAGE/ =HYPERLINK)
-        #    so the frontend can extract the actual URL when unformatted is empty.
+        # 3) For those columns only, fetch FORMULA text (=IMAGE/=HYPERLINK)
         formula_by_col = {}
         if present_img_cols:
             sheet_name = ORDERS_RANGE.split("!", 1)[0]
 
             def col_to_a1(idx0: int) -> str:
-                # 0->A, 25->Z, 26->AA
                 n = idx0 + 1
                 s = ""
                 while n:
@@ -3149,7 +3149,6 @@ def get_orders():
                     s = chr(65 + rem) + s
                 return s
 
-            # Build one A1 range per column, starting at row 2 to align with rows[1:]
             ranges = [f"{sheet_name}!{col_to_a1(i)}2:{col_to_a1(i)}" for (_, i) in present_img_cols]
 
             svc = get_sheets_service().spreadsheets().values()
@@ -3163,7 +3162,6 @@ def get_orders():
             for (hdr, _), vr in zip(present_img_cols, value_ranges):
                 vals = vr.get("values", [])
                 flat = [(row[0] if row else "") for row in vals]
-                # Pad to match number of data rows
                 needed = max(0, (len(rows) - 1) - len(flat))
                 flat.extend([""] * needed)
                 formula_by_col[hdr] = flat
@@ -3171,22 +3169,19 @@ def get_orders():
         # 4) Build output rows; if an image-ish field is empty in unformatted,
         #    fill it from the formula text so the UI can parse =IMAGE/=HYPERLINK.
         out = []
-        for r_idx, r in enumerate(rows[1:]):
-            if not r:
-                continue
-            o = {}
+        for r_idx, r in enumerate(rows[1:], start=1):
+            obj = {}
             for k in KEEP:
                 i = hi.get(k)
-                val = r[i] if (i is not None and i < len(r)) else ""
-                if (not val) and (k in formula_by_col):
-                    col_vals = formula_by_col.get(k) or []
-                    if r_idx < len(col_vals):
-                        val = col_vals[r_idx]
-                o[k] = val
-            out.append(o)
+                val = r[i] if i is not None and i < len(r) else ""
+                if (not val) and (k in IMG_KEYS):
+                    val = formula_by_col.get(k, [""] * len(rows))[r_idx - 1]
+                obj[k] = val
+            out.append(obj)
         return out
 
     return send_cached_json("orders", TTL, build_payload)
+
 
 
 @app.route("/api/material-log/original-usage", methods=["GET"])  # ?order=123
