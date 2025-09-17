@@ -6053,6 +6053,85 @@ def set_order_preview(order_number):
         app.logger.exception("set_order_preview failed for order=%s", order_number)
         # Don't blow up the client — report a clean error
         return jsonify(error=str(e)), 500
+
+@app.route("/api/order-summary", methods=["GET"])
+@login_required_session
+def order_summary():
+    """
+    Query params: ?dept=fur&order=6  (dept is ignored for lookup but included for future rules)
+    Looks up the order in Production Orders and returns a compact summary for Material.jsx.
+    """
+    try:
+        dept  = (request.args.get("dept") or "").strip().lower()
+        order = (request.args.get("order") or "").strip()
+
+        if not order:
+            return jsonify({"error": "missing order"}), 400
+
+        # Pull the Production Orders sheet (same logic you already use elsewhere)
+        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE) or []
+        if not rows:
+            return jsonify({"error": "no data"}), 404
+
+        headers = [str(h or "").strip() for h in rows[0]]
+        def gv(row, name, default=""):
+            try:
+                i = headers.index(name)
+                return row[i] if i < len(row) else default
+            except ValueError:
+                return default
+
+        # Find the row where "Order #" matches
+        hit = None
+        for r in rows[1:]:
+            if str(gv(r, "Order #")).strip() == str(order):
+                hit = r
+                break
+
+        if not hit:
+            return jsonify({"error": "order not found"}), 404
+
+        company = str(gv(hit, "Company Name", "")).strip() or "—"
+        design  = str(gv(hit, "Design", "")).strip()
+        product = str(gv(hit, "Product", "")).strip()
+        qty     = gv(hit, "Quantity", "")
+        try:
+            qty = int(qty)
+        except Exception:
+            pass
+
+        # Compose a nice title (Design first; fall back to Product)
+        title = design or product or f"Order {order}"
+
+        # Try common image-ish columns in your sheet
+        img_candidates = [
+            "Preview","Image","Thumbnail","Image URL","Image Link","Photo",
+            "Img","Mockup","Front Image","Mockup Link","Artwork","Art","Picture","Picture URL","Artwork Link",
+        ]
+        link_val = ""
+        for key in img_candidates:
+            v = str(gv(hit, key, "")).strip()
+            if v:
+                link_val = v
+                break
+
+        # Reuse your Drive-id extractor and /api/drive/proxy handler
+        file_id = _drive_id_from_link(link_val) if link_val else ""
+        thumb = f"{request.host_url.rstrip('/')}/api/drive/proxy/{file_id}?sz=w640" if file_id else None
+
+        payload = {
+            "order": str(order),
+            "company": company,
+            "title": title,
+            "quantity": qty if qty != "" else "—",
+            "thumbnailUrl": thumb,
+        }
+        return jsonify(payload), 200
+
+    except Exception:
+        app.logger.exception("order_summary failed")
+        return jsonify({"error": "server error"}), 500
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
