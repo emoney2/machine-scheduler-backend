@@ -102,6 +102,18 @@ _matlog_cache_ttl = 60.0      # seconds
 _last_directory = {"data": [], "ts": 0}
 _last_products  = {"data": [], "ts": 0}
 
+def _norm_key(s: str) -> str:
+    """Normalize header/label for matching (lowercase, trim, unify quotes, collapse spaces)."""
+    if s is None:
+        return ""
+    s = str(s)
+    # unify curly quotes to straight quotes
+    s = s.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    # lowercase + collapse whitespace
+    s = " ".join(s.strip().lower().split())
+    return s
+
+
 def _resize_thumbnail_link(link: str, sz: str) -> str:
     """
     Drive's thumbnailLink usually ends with '=s220' or '=w###'.
@@ -6303,6 +6315,8 @@ def order_summary():
                         return t_hdr.index(name)
                     except ValueError:
                         return None
+                hdr_idx_map = { _norm_key(h): i for i, h in enumerate(t_hdr) }
+
 
                 # Key column in Table sheet: "Products" (your header)
                 key_ix = idx("Products")
@@ -6334,14 +6348,31 @@ def order_summary():
                         for name, label in bom_pairs:
                             if not name:
                                 continue
-                            # If user pasted a link or raw id, accept it; else look up by name in the folder
+
+                            # Resolve file id (name can be a raw ID, link, or a filename in the BOM folder)
                             fid = _safe_drive_id(name)
                             if not fid and BOM_FOLDER_ID:
                                 f = _drive_find_first_in_folder_by_name(BOM_FOLDER_ID, name)
                                 fid = f.get("id") if f else ""
-                            if fid:
-                                src = f"{request.host_url.rstrip('/')}/api/drive/proxy/{fid}?sz=w640"
-                                bom_items.append({"src": src, "label": label or ""})
+
+                            if not fid:
+                                continue
+
+                            # Look up quantity from the Table row using the BOM label as a header key
+                            qty_prefix = ""
+                            if label:
+                                hdr_ix = hdr_idx_map.get(_norm_key(label))
+                                if hdr_ix is not None and hdr_ix < len(hit):
+                                    qty_val = str(hit[hdr_ix]).strip()
+                                    # show only if non-empty and not zero
+                                    if qty_val and qty_val not in ("0", "0.0"):
+                                        qty_prefix = qty_val
+
+                            final_label = f"{qty_prefix} - {label}" if qty_prefix else (label or "")
+
+                            src = f"{request.host_url.rstrip('/')}/api/drive/proxy/{fid}?sz=w640"
+                            bom_items.append({"src": src, "label": final_label})
+
 
                         # Merge: main images first (keep original order), then BOMs (max 3). Cap total at 4.
                         imagesLabeled = [{"src": u, "label": ""} for u in (images or [])]
