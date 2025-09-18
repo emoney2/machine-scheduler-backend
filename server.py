@@ -2406,6 +2406,82 @@ SERVICE_TTL     = 900  # 15 minutes
 # ────────────────────────────────────────────────────────────────────────────
 
 # ---- helpers: clear overview caches ----------------------------------------
+# --- BOM lookup config --------------------------------------------------------
+BOM_TABLE_RANGE = os.environ.get("BOM_TABLE_RANGE", "Table!A1:Z")
+# Set this in your backend env (Render) to the folder ID you gave me:
+# 1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu
+BOM_FOLDER_ID   = os.environ.get("BOM_FOLDER_ID", "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu")
+
+def _safe_drive_id(link_or_id: str) -> str:
+    """Accept a Drive link or a raw file ID; return just the file ID or ''."""
+    try:
+        if "_drive_id_from_link" in globals():
+            fid = _drive_id_from_link(link_or_id)
+            if fid:
+                return fid
+    except Exception:
+        pass
+    s = str(link_or_id or "").strip()
+    if not s:
+        return ""
+    import re
+    m = re.search(r"/d/([A-Za-z0-9_-]{20,})", s) or re.search(r"[?&]id=([A-Za-z0-9_-]{20,})", s)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{20,}", s):
+        return s
+    return ""
+
+def _get_drive_service():
+    """Drive v3 client using your existing Google creds helper."""
+    from googleapiclient.discovery import build
+    creds = get_google_credentials()
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def _drive_find_first_in_folder_by_name(folder_id: str, name: str):
+    """
+    Find a file by name inside a specific folder. Tries exact match, then .pdf,
+    then case-insensitive scan of up to 100 files.
+    """
+    if not folder_id or not name:
+        return None
+    from googleapiclient.errors import HttpError
+    svc = _get_drive_service()
+
+    def _try_name(nm: str):
+        q = f"'{folder_id}' in parents and name = '{nm}' and trashed = false"
+        return svc.files().list(q=q, fields="files(id,name,mimeType)", pageSize=5).execute().get("files", [])
+
+    try:
+        files = _try_name(name)
+        if files:
+            return files[0]
+    except HttpError:
+        pass
+
+    base = name
+    alt = base if base.lower().endswith(".pdf") else f"{base}.pdf"
+    try:
+        files = _try_name(alt)
+        if files:
+            return files[0]
+    except HttpError:
+        pass
+
+    # Last resort: fetch a page and check case-insensitively
+    try:
+        q = f"'{folder_id}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
+        files = svc.files().list(q=q, fields="files(id,name,mimeType)", pageSize=100).execute().get("files", [])
+        lname = base.lower()
+        lname_pdf = lname if lname.endswith(".pdf") else lname + ".pdf"
+        for f in files:
+            fn = (f.get("name") or "").lower()
+            if fn == lname or fn == lname_pdf:
+                return f
+    except HttpError:
+        pass
+    return None
+
 # ─── ETag helper (weak ETag based on JSON bytes) ─────────────────────────────
 def _json_etag(payload_bytes: bytes) -> str:
     import hashlib as _hashlib
@@ -6148,8 +6224,67 @@ def order_summary():
         thumbs = [u for u in (to_thumb(x) for x in links) if u]
         thumbnail_url = thumbs[0] if thumbs else None
 
-        # Up to 4 images total (thumbnail + BOMs later)
-        images = thumbs[:4] if thumbs else ([thumbnail_url] if thumbnail_url else [])
+        # --- BOM lookup from Table tab (based on Products) ---------------------------
+        imagesLabeled = [{"src": u, "label": ""} for u in (images or [])]  # start with current images
+
+        try:
+            table_rows = fetch_sheet(SPREADSHEET_ID, BOM_TABLE_RANGE) or []
+            if table_rows:
+                t_hdr = [str(h or "").strip() for h in table_rows[0]]
+                def idx(name):
+                    try:
+                        return t_hdr.index(name)
+                    except ValueError:
+                        return None
+
+                # Key column in Table sheet: "Products" (your header)
+                key_ix = idx("Products")
+                bom1_ix, bom1l_ix = idx("BOM1"), idx("BOM1 Label")
+                bom2_ix, bom2l_ix = idx("BOM2"), idx("BOM2 Label")
+                bom3_ix, bom3l_ix = idx("BOM3"), idx("BOM3 Label")
+
+                # We matched the order row earlier and have the product string already
+                prod_key = (product or "").strip().lower()
+                if key_ix is not None and prod_key:
+                    hit = None
+                    for r in table_rows[1:]:
+                        val = str(r[key_ix] if key_ix < len(r) else "").strip().lower()
+                        if val == prod_key:
+                            hit = r
+                            break
+
+                    if hit:
+                        def gv(rw, ix):
+                            return (rw[ix] if ix is not None and ix < len(rw) else "")
+
+                        bom_pairs = [
+                            (str(gv(hit, bom1_ix)).strip(), str(gv(hit, bom1l_ix)).strip()),
+                            (str(gv(hit, bom2_ix)).strip(), str(gv(hit, bom2l_ix)).strip()),
+                            (str(gv(hit, bom3_ix)).strip(), str(gv(hit, bom3l_ix)).strip()),
+                        ]
+
+                        bom_items = []
+                        for name, label in bom_pairs:
+                            if not name:
+                                continue
+                            # If user pasted a link or raw id, accept it; else look up by name in the folder
+                            fid = _safe_drive_id(name)
+                            if not fid and BOM_FOLDER_ID:
+                                f = _drive_find_first_in_folder_by_name(BOM_FOLDER_ID, name)
+                                fid = f.get("id") if f else ""
+                            if fid:
+                                src = f"{request.host_url.rstrip('/')}/api/drive/proxy/{fid}?sz=w640"
+                                bom_items.append({"src": src, "label": label or ""})
+
+                        # Merge: main images first (keep original order), then BOMs (max 3). Cap total at 4.
+                        imagesLabeled = [{"src": u, "label": ""} for u in (images or [])]
+                        imagesLabeled.extend(bom_items[:3])
+                        images = [x["src"] for x in imagesLabeled][:4]
+                        imagesLabeled = imagesLabeled[:4]
+        except Exception:
+            app.logger.exception("BOM lookup failed; continuing without BOMs")
+            imagesLabeled = [{"src": u, "label": ""} for u in (images or [])][:4]
+
 
         payload = {
             "order": str(order),
@@ -6161,9 +6296,11 @@ def order_summary():
             "furColor": fur_color or "",
             "quantity": quantity,
             "thumbnailUrl": thumbnail_url,
-            "images": images,
+            "images": images,                  # keeps backward compat
+            "imagesLabeled": imagesLabeled,    # NEW: each item {src, label}
         }
         return jsonify(payload), 200
+
 
     except Exception:
         app.logger.exception("order_summary failed")
