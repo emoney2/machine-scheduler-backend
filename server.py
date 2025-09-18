@@ -102,6 +102,17 @@ _matlog_cache_ttl = 60.0      # seconds
 _last_directory = {"data": [], "ts": 0}
 _last_products  = {"data": [], "ts": 0}
 
+def _resize_thumbnail_link(link: str, sz: str) -> str:
+    """
+    Drive's thumbnailLink usually ends with '=s220' or '=w###'.
+    Replace that suffix with requested width (e.g., 'w640').
+    """
+    import re
+    width = "".join(ch for ch in str(sz) if ch.isdigit()) or "640"
+    # replace '=sNNN' or '=wNNN'
+    if re.search(r"=(s|w)\d+$", link):
+        return re.sub(r"=(s|w)\d+$", f"=w{width}", link)
+    return link  # if unexpected form, just return as-is
 
 def _thumb_cache_path(file_id: str, size: str, version: str) -> str:
     safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f"{file_id}_{size}_{version or 'nov'}.jpg")
@@ -1131,11 +1142,31 @@ def _warm_thumb_async(file_id: str, sz: str, ver: str):
 def drive_proxy(file_id):
     """
     Stream a Drive thumbnail back as image bytes, with debug logging.
+    Tries drive.google.com/thumbnail first; if it returns HTML (e.g., PDFs),
+    falls back to Drive API's files.get(thumbnailLink) which is a real image URL.
     Never 302 to Google (avoids CORS issues in fetch/img).
     """
     from flask import Response
-    import requests, sys
-    import mimetypes
+    import requests, sys, os
+    import re
+
+    def _resize_thumbnail_link(link: str, sz: str) -> str:
+        """
+        Drive's thumbnailLink usually ends with '=s220' or '=w###'.
+        Replace that suffix with requested width (e.g., 'w640').
+        """
+        width = "".join(ch for ch in str(sz) if ch.isdigit()) or "640"
+        if re.search(r"=(s|w)\d+$", link):
+            return re.sub(r"=(s|w)\d+$", f"=w{width}", link)
+        return link
+
+    def _get_drive_service_local():
+        # Use your existing helper if present; otherwise build from env creds.
+        if "_get_drive_service" in globals():
+            return _get_drive_service()
+        from googleapiclient.discovery import build
+        creds = get_google_credentials() if "get_google_credentials" in globals() else None
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
 
     size = request.args.get("sz", "w240")
     size = size if isinstance(size, str) else "w240"
@@ -1144,35 +1175,68 @@ def drive_proxy(file_id):
     print(f"[drive_proxy] file_id={file_id} sz={size}", file=sys.stderr)
     print(f"[drive_proxy] GET {g_url}", file=sys.stderr)
 
+    # 1) Primary: drive.google.com/thumbnail
     try:
         r = requests.get(g_url, stream=True, timeout=10)
         print(f"[drive_proxy] Google status={r.status_code} ctype={r.headers.get('Content-Type')}", file=sys.stderr)
     except Exception as e:
         print(f"[drive_proxy] ERROR fetch-failed: {e}", file=sys.stderr)
-        return jsonify({"error": f"fetch-failed: {e}"}), 502
+        r = None  # allow fallback
 
-    if r.status_code != 200:
+    def _stream_response(resp, override_ctype=None):
+        ctype = override_ctype or resp.headers.get("Content-Type", "image/jpeg")
+        def generate():
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        out = Response(generate(), status=200, mimetype=ctype)
+        out.headers["Cache-Control"] = "public, max-age=3600"
+        origin = request.headers.get("Origin", "")
+        allowed = os.environ.get("ALLOWED_ORIGINS", "")
+        if origin and (origin == os.environ.get("FRONTEND_URL") or (allowed and origin in allowed.split(","))):
+            out.headers["Access-Control-Allow-Origin"] = origin
+            out.headers["Vary"] = "Origin"
+            out.headers["Access-Control-Allow-Credentials"] = "true"
+        return out
+
+    # If primary succeeded with an image/*, stream it
+    if r is not None and r.status_code == 200:
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if ctype.startswith("image/"):
+            return _stream_response(r)
+        else:
+            print(f"[drive_proxy] Fallback: unexpected ctype={ctype!r} from drive.google.com/thumbnail", file=sys.stderr)
+    elif r is not None and r.status_code != 200:
+        # Log a short preview, then fall back
         body_preview = ""
         try:
             body_preview = next(r.iter_content(chunk_size=256)).decode("utf-8", errors="ignore")
         except Exception:
             pass
         print(f"[drive_proxy] Non-200 -> {r.status_code}; body[:256]={body_preview!r}", file=sys.stderr)
-        return "", 404
 
-    ctype = r.headers.get("Content-Type", "")
-    if not ctype or not ctype.startswith("image/"):
-        print(f"[drive_proxy] Unexpected ctype={ctype!r}; forcing image/jpeg", file=sys.stderr)
-        ctype = "image/jpeg"
+    # 2) Fallback: Drive API thumbnailLink (works for PDFs)
+    try:
+        svc = _get_drive_service_local()
+        meta = svc.files().get(fileId=file_id, fields="thumbnailLink,mimeType,hasThumbnail").execute()
+        tl = meta.get("thumbnailLink")
+        if tl:
+            url2 = _resize_thumbnail_link(tl, size)
+            print(f"[drive_proxy] Fallback GET {url2}", file=sys.stderr)
+            rr = requests.get(url2, stream=True, timeout=10)
+            if rr.status_code == 200:
+                # thumbnailLink returns a real image (png/jpeg)
+                return _stream_response(rr, override_ctype=rr.headers.get("Content-Type", "image/jpeg"))
+            else:
+                print(f"[drive_proxy] Fallback non-200 -> {rr.status_code}", file=sys.stderr)
+        else:
+            print(f"[drive_proxy] No thumbnailLink for file_id={file_id} (mime={meta.get('mimeType')})", file=sys.stderr)
+    except Exception as e:
+        print(f"[drive_proxy] Drive API fallback failed: {e}", file=sys.stderr)
 
-    def generate():
-        for chunk in r.iter_content(chunk_size=8192):
-            if chunk:
-                yield chunk
-
-    resp = Response(generate(), status=200, mimetype=ctype)
-    resp.headers["Cache-Control"] = "public, max-age=3600"
-
+    # 3) Final: no image available
+    print(f"[drive_proxy] No usable thumbnail for file_id={file_id}; returning 204", file=sys.stderr)
+    resp = Response("", status=204)
     origin = request.headers.get("Origin", "")
     allowed = os.environ.get("ALLOWED_ORIGINS", "")
     if origin and (origin == os.environ.get("FRONTEND_URL") or (allowed and origin in allowed.split(","))):
