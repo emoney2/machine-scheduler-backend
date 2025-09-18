@@ -2407,7 +2407,7 @@ SERVICE_TTL     = 900  # 15 minutes
 
 # ---- helpers: clear overview caches ----------------------------------------
 # --- BOM lookup config --------------------------------------------------------
-BOM_TABLE_RANGE = os.environ.get("BOM_TABLE_RANGE", "Table!A1:Z")
+BOM_TABLE_RANGE = os.environ.get("BOM_TABLE_RANGE", "Table!A1:AB50")
 # Set this in your backend env (Render) to the folder ID you gave me:
 # 1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu
 BOM_FOLDER_ID   = os.environ.get("BOM_FOLDER_ID", "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu")
@@ -6223,6 +6223,9 @@ def order_summary():
 
         thumbs = [u for u in (to_thumb(x) for x in links) if u]
         thumbnail_url = thumbs[0] if thumbs else None
+
+        # --- BOM lookup from Table tab (based on Products) ---------------------------
+        images = thumbs[:4] if thumbs else ([thumbnail_url] if thumbnail_url else [])
 
         # --- BOM lookup from Table tab (based on Products) ---------------------------
         imagesLabeled = [{"src": u, "label": ""} for u in (images or [])]  # start with current images
