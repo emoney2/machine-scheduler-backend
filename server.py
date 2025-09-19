@@ -2626,30 +2626,34 @@ def update_embroidery_start_time_in_sheet(order_id, new_start_time):
 
 import time
 
-def fetch_sheet(spreadsheet_id, range_a1, value_render=None):
+def fetch_sheet(spreadsheet_id, range_a1, **opts):
+    """
+    Optional opts:
+      - value_render_option: "UNFORMATTED_VALUE" | "FORMATTED_VALUE" | "FORMULA"
+      - value_render       : same as above (alias)
+    """
     service = get_sheets_service()
+    # accept either key, normalize to Google's camelCase param
+    _vr = opts.get("value_render_option") or opts.get("value_render")
+
     for attempt in range(1, 4):  # up to 3 tries: ~60s*3 worst-case
         try:
-            kwargs = {
-                "spreadsheetId": spreadsheet_id,
-                "range": range_a1,
-                "majorDimension": "ROWS",
-            }
-            # Map our Python arg to the Sheets API field
-            # Accepts: "FORMATTED_VALUE", "UNFORMATTED_VALUE", or "FORMULA"
-            if value_render:
-                kwargs["valueRenderOption"] = str(value_render).upper()
+            params = dict(
+                spreadsheetId=spreadsheet_id,
+                range=range_a1,
+                majorDimension="ROWS",
+            )
+            if _vr:
+                params["valueRenderOption"] = _vr
 
-            resp = service.spreadsheets().values().get(**kwargs).execute()
+            resp = service.spreadsheets().values().get(**params).execute()
             return resp.get("values", []) or []
         except Exception as e:
-            # Only retry on timeouts / transient transport errors
             msg = str(e)
             if "timed out" in msg.lower() or "transport" in msg.lower() or "unavailable" in msg.lower():
                 if attempt < 3:
                     time.sleep(1 * attempt)  # 1s, 2s
                     continue
-            # Non-retryable or final failure
             raise
 
 
