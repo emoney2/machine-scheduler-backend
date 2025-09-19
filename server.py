@@ -692,11 +692,12 @@ def login_required_session(f):
                     return jsonify({"error": "authentication required"}), 401
                 return redirect(url_for("login", next=request.path))
 
-            if datetime.utcnow() - last_dt > timedelta(hours=3):
+            if datetime.utcnow() - last_dt > timedelta(hours=12):
                 session.clear()
                 if request.path.startswith("/api/"):
                     return jsonify({"error": "session expired"}), 401
                 return redirect(url_for("login", next=request.path))
+
         else:
             session.clear()
             if request.path.startswith("/api/"):
@@ -1259,8 +1260,11 @@ def drive_proxy(file_id):
 
 
 @app.route("/api/ping", methods=["GET", "OPTIONS"])
+@login_required_session
 def api_ping():
+    # Hitting this endpoint updates session["last_activity"] via the decorator
     return jsonify({"ok": True}), 200
+
 
 @app.route("/labels/<path:filename>")
 def serve_label(filename):
