@@ -110,6 +110,19 @@ def _public_thumb(file_id: str, sz: str = "w640") -> str:
     """Public Drive thumbnail URL (no proxy)."""
     return f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
 
+def _resolve_bom_to_id(raw_name_or_link: str | None):
+    """Try direct id / link, else name search in BOM_FOLDER_ID via Drive."""
+    if not raw_name_or_link:
+        return None
+    fid = _extract_drive_id(raw_name_or_link)
+    if fid:
+        return fid
+    if not BOM_FOLDER_ID:
+        return None
+    f = _drive_find_first_in_folder_by_name(BOM_FOLDER_ID, raw_name_or_link)
+    return (f or {}).get("id") if f else None
+
+
 def _drive_find_first_in_folder_by_name(folder_id: str, name_hint: str):
     """
     Best-effort lookup for a file by name in a Drive folder. Tries common extensions,
@@ -6338,40 +6351,11 @@ def order_summary():
     """
     import os, re
 
-    def _extract_drive_id(val):
-        if not val:
-            return None
-        s = str(val).strip()
-        # raw id
-        if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
-            return s
-        # id=. or /d/<id>/
-        m = re.search(r"(?:\bid=|/d/)([A-Za-z0-9_-]{10,})", s)
-        return m.group(1) if m else None
-
     def _public_thumb(fid, size="w640"):
         return f"https://drive.google.com/thumbnail?id={fid}&sz={size}"
 
     def _norm_key(s):
         return re.sub(r"[^a-z0-9]+", "", (s or "").strip().lower())
-
-    # Drive BOM folder (from env)
-    BOM_FOLDER_ID = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
-
-    # Smarter BOM resolver: ID/link → exact name → name with common extensions → contains search
-    def _resolve_bom_to_id(raw_name_or_link: str):
-        # 1) direct id or id in a link
-        fid = _extract_drive_id(raw_name_or_link)
-        if fid:
-            return fid
-        name = (raw_name_or_link or "").strip()
-        if not (BOM_FOLDER_ID and name):
-            return None
-
-        try:
-            svc = _get_drive_service()
-        except Exception:
-            return None
 
         def _safe_single_quote(s: str) -> str:
             return s.replace("'", "\\'")
