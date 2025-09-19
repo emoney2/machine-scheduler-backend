@@ -6458,16 +6458,21 @@ def order_summary():
 
                     for name, label in bom_pairs:
                         if not name:
+                            app.logger.debug("BOM entry skipped (empty name)")
                             continue
 
-                        # Try the global helper first (may use a different BOM_FOLDER_ID in other parts of the file)
-                        fid = _resolve_bom_to_id(name)
+                        app.logger.debug("Attempting BOM lookup for name=%r label=%r", name, label)
 
-                        # Fallback: use the local bom_folder_id we read at the top of this handler
+                        # Try global resolver first
+                        fid = _resolve_bom_to_id(name)
+                        app.logger.debug("Global resolver returned: %r", fid)
+
+                        # Fallback: use local bom_folder_id
                         if not fid and bom_folder_id:
                             try:
                                 f = _drive_find_by_name(bom_folder_id, name)
                                 fid = f if isinstance(f, str) else (f.get("id") if f else None)
+                                app.logger.debug("Fallback lookup with bom_folder_id=%r returned: %r", bom_folder_id, fid)
                             except Exception as e:
                                 app.logger.warning("BOM fallback lookup failed for %r: %s", name, e)
 
@@ -6475,7 +6480,9 @@ def order_summary():
                             app.logger.info("BOM image not found for %r (check BOM_FOLDER_ID and Table headers)", name)
                             continue
 
+                        app.logger.info("BOM image found for %r -> fileId=%r", name, fid)
                         imagesLabeled.append({"src": _public_thumb(fid, "w640"), "label": label or ""})
+
 
         except Exception:
             app.logger.exception("BOM Table lookup failed")
