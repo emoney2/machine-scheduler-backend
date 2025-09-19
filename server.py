@@ -6351,6 +6351,7 @@ def order_summary():
     """
     import os, re
 
+
     def _public_thumb(fid, size="w640"):
         return f"https://drive.google.com/thumbnail?id={fid}&sz={size}"
 
@@ -6472,27 +6473,73 @@ def order_summary():
                          if main_id else [])
 
         # --- BOM1/2/3 from the ORDER row (names or links) --------------------
-        def _first_present_val(row, names):
-            for nm in names:
-                val = str(gv(row, nm, "") or "").strip()
-                if val:
-                    return val
-            return ""
+        # --- BOMs from TABLE sheet (by Product) → public Drive thumbs ---------
+        # Reads "Products", "BOM1/BOM1 Label", "BOM2/BOM2 Label", "BOM3/BOM3 Label"
+        # and resolves each to a Drive file id (ID/link first, then filename in BOM_FOLDER_ID).
+        try:
+            table_rows = fetch_sheet(SPREADSHEET_ID, BOM_TABLE_RANGE) or []
+            if table_rows:
+                t_hdr = [str(h or "").strip() for h in table_rows[0]]
 
-        def _add_bom_from_order(num: int):
-            name_raw  = _first_present_val(hit, [f"BOM{num}", f"BOM {num}", f"BOM {num} Name"])
-            if not name_raw:
-                return
-            fid = _resolve_bom_to_id(name_raw)
-            if not fid:
-                return
-            label_raw = _first_present_val(hit, [f"BOM{num} Label", f"BOM {num} Label", f"BOM{num}Label"])
-            label = label_raw or f"BOM{num}"
-            imagesLabeled.append({"src": _public_thumb(fid, "w640"), "label": label})
+                def idx(name: str):
+                    try:
+                        return t_hdr.index(name)
+                    except ValueError:
+                        return None
 
-        _add_bom_from_order(1)
-        _add_bom_from_order(2)
-        _add_bom_from_order(3)
+                # headers
+                prod_ix  = idx("Products")
+                bom1_ix  = idx("BOM1") or idx("BOM 1")
+                bom1l_ix = idx("BOM1 Label") or idx("BOM 1 Label")
+                bom2_ix  = idx("BOM2") or idx("BOM 2")
+                bom2l_ix = idx("BOM2 Label") or idx("BOM 2 Label")
+                bom3_ix  = idx("BOM3") or idx("BOM 3")
+                bom3l_ix = idx("BOM3 Label") or idx("BOM 3 Label")
+
+                # find the product row (exact match first, then fuzzy normalized contains)
+                prod_raw = (product or "").strip()
+                prod_key = prod_raw.lower()
+                table_hit = None
+                if prod_ix is not None and prod_key:
+                    for tr in table_rows[1:]:
+                        val = str(tr[prod_ix] if prod_ix < len(tr) else "").strip().lower()
+                        if val == prod_key:
+                            table_hit = tr
+                            break
+                    if not table_hit:
+                        import re as _re
+                        def norm(s): return _re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+                        pk = norm(prod_raw)
+                        for tr in table_rows[1:]:
+                            v = norm(str(tr[prod_ix] if prod_ix < len(tr) else ""))
+                            if v == pk or (pk and pk in v) or (v and v in pk):
+                                table_hit = tr
+                                break
+
+                if table_hit:
+                    def gvi(rw, ix):
+                        return (rw[ix] if ix is not None and ix < len(rw) else "")
+
+                    bom_pairs = [
+                        (str(gvi(table_hit, bom1_ix)).strip(), str(gvi(table_hit, bom1l_ix)).strip()),
+                        (str(gvi(table_hit, bom2_ix)).strip(), str(gvi(table_hit, bom2l_ix)).strip()),
+                        (str(gvi(table_hit, bom3_ix)).strip(), str(gvi(table_hit, bom3l_ix)).strip()),
+                    ]
+
+                    for name, label in bom_pairs:
+                        if not name:
+                            continue
+                        # Resolve: direct ID/link → filename search in BOM_FOLDER_ID (via your global helper)
+                        fid = _extract_drive_id(name) or _resolve_bom_to_id(name)
+                        if not fid:
+                            continue
+                        imagesLabeled.append({
+                            "src": _public_thumb(fid, "w640"),
+                            "label": label or ""
+                        })
+        except Exception:
+            app.logger.exception("Table BOM lookup failed; continuing without Table BOMs")
+
 
         # --- De-dup, cap at 4, compute images --------------------------------
         def _dedup_labeled(seq):
