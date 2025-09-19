@@ -95,16 +95,6 @@ BOM_FOLDER_ID = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
 import re, os
 _DRIVE_NAME_CACHE: dict[tuple[str,str], dict] = {}
 
-def _extract_drive_id(val: str | None) -> str | None:
-    """Find a Drive file id in a raw id or common link shapes."""
-    if not val:
-        return None
-    s = str(val).strip()
-    # raw id
-    if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
-        return s
-    m = re.search(r"(?:\bid=|/d/)([A-Za-z0-9_-]{10,})", s)
-    return m.group(1) if m else None
 
 def _public_thumb(file_id: str, sz: str = "w640") -> str:
     """Public Drive thumbnail URL (no proxy)."""
@@ -2436,6 +2426,7 @@ CUT_RANGE    = os.environ.get("CUT_RANGE",    "Cut List!A1:Z")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
+BOM_TABLE_RANGE = os.environ.get("BOM_TABLE_RANGE", "Table!A1:AF")
 
 # ── Legacy QuickBooks vars (still available if used elsewhere) ────
 QBO_CLIENT_ID     = os.environ.get("QBO_CLIENT_ID")
@@ -2591,7 +2582,7 @@ SERVICE_TTL     = 900  # 15 minutes
 
 # ---- helpers: clear overview caches ----------------------------------------
 # --- BOM lookup config --------------------------------------------------------
-BOM_TABLE_RANGE = os.environ.get("BOM_TABLE_RANGE", "Table!A1:AB50")
+BOM_TABLE_RANGE = os.environ.get("BOM_TABLE_RANGE", "Table!A1:AB")
 # Set this in your backend env (Render) to the folder ID you gave me:
 # 1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu
 BOM_FOLDER_ID   = os.environ.get("BOM_FOLDER_ID", "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu")
@@ -2621,50 +2612,6 @@ def _get_drive_service():
     from googleapiclient.discovery import build
     creds = get_google_credentials()
     return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-def _drive_find_first_in_folder_by_name(folder_id: str, name: str):
-    """
-    Find a file by name inside a specific folder. Tries exact match, then .pdf,
-    then case-insensitive scan of up to 100 files.
-    """
-    if not folder_id or not name:
-        return None
-    from googleapiclient.errors import HttpError
-    svc = _get_drive_service()
-
-    def _try_name(nm: str):
-        q = f"'{folder_id}' in parents and name = '{nm}' and trashed = false"
-        return svc.files().list(q=q, fields="files(id,name,mimeType)", pageSize=5).execute().get("files", [])
-
-    try:
-        files = _try_name(name)
-        if files:
-            return files[0]
-    except HttpError:
-        pass
-
-    base = name
-    alt = base if base.lower().endswith(".pdf") else f"{base}.pdf"
-    try:
-        files = _try_name(alt)
-        if files:
-            return files[0]
-    except HttpError:
-        pass
-
-    # Last resort: fetch a page and check case-insensitively
-    try:
-        q = f"'{folder_id}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
-        files = svc.files().list(q=q, fields="files(id,name,mimeType)", pageSize=100).execute().get("files", [])
-        lname = base.lower()
-        lname_pdf = lname if lname.endswith(".pdf") else lname + ".pdf"
-        for f in files:
-            fn = (f.get("name") or "").lower()
-            if fn == lname or fn == lname_pdf:
-                return f
-    except HttpError:
-        pass
-    return None
 
 # ─── ETag helper (weak ETag based on JSON bytes) ─────────────────────────────
 def _json_etag(payload_bytes: bytes) -> str:
@@ -6324,88 +6271,87 @@ def set_order_preview(order_number):
         # Don't blow up the client — report a clean error
         return jsonify(error=str(e)), 500
 
-# --- Order Summary (used by Scan.jsx) ---------------------------------------
 @app.route("/api/order-summary", methods=["GET"])
 @login_required_session
 def order_summary():
     """
-    Compact order summary for the scanner page.
-
-    Query:
-      - dept  : "fur", "cut", etc. (optional)
-      - order : order number (string)
-
-    Response: {
-      "order": "43",
-      "company": "Acme GC",
-      "title": "Quilted Black Driver",
-      "product": "Driver",
-      "stage": "Embroidery",
-      "dueDate": "09/22/2025",
-      "furColor": "Black",
-      "quantity": 24,
-      "thumbnailUrl": "https://drive.google.com/thumbnail?id=<id>&sz=w160",
-      "images": ["https://drive.google.com/thumbnail?id=.&sz=w640", ...],
-      "imagesLabeled": [{"src":".","label":"."}]
-    }
+    Returns a compact order summary for the scanner page.
+    Includes main image + BOM1/BOM2/BOM3 (from the Table sheet) when resolvable.
+    All images are public Drive thumbnails (no proxy).
     """
-    import os, re
+    def _extract_drive_id(val: str | None) -> str | None:
+        if not val:
+            return None
+        s = str(val).strip()
+        # raw id
+        import re
+        if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
+            return s
+        m = re.search(r"(?:\bid=|/d/)([A-Za-z0-9_-]{10,})", s)
+        return m.group(1) if m else None
 
+    def _public_thumb(file_id: str | None, sz: str = "w640") -> str | None:
+        return f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}" if file_id else None
 
-    def _public_thumb(fid, size="w640"):
-        return f"https://drive.google.com/thumbnail?id={fid}&sz={size}"
-
-    def _norm_key(s):
+    def _norm_key(s: str) -> str:
+        import re
         return re.sub(r"[^a-z0-9]+", "", (s or "").strip().lower())
 
-        def _safe_single_quote(s: str) -> str:
-            return s.replace("'", "\\'")
+    # Use the global BOM_FOLDER_ID and the global drive name search helper if present
+    bom_folder_id = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
 
-        def _list_by_q(q: str):
-            return (svc.files()
-                    .list(q=q,
-                          fields="files(id,name,mimeType,modifiedTime)",
-                          pageSize=50,
-                          supportsAllDrives=True,
-                          includeItemsFromAllDrives=True)
-                    .execute()
-                    .get("files", []))
-
-        # 2) exact name
-        q1 = "'{}' in parents and name = '{}' and trashed = false".format(
-            BOM_FOLDER_ID, _safe_single_quote(name)
-        )
-        files = _list_by_q(q1)
-        if files:
-            return files[0]["id"]
-
-        # 3) name + common extensions
-        for ext in (".pdf", ".png", ".jpg", ".jpeg", ".webp"):
-            guess = name if name.lower().endswith(ext) else (name + ext)
-            q2 = "'{}' in parents and name = '{}' and trashed = false".format(
-                BOM_FOLDER_ID, _safe_single_quote(guess)
-            )
-            files = _list_by_q(q2)
-            if files:
-                return files[0]["id"]
-
-        # 4) contains search; prefer PDFs, then images, then anything
-        q3 = "'{}' in parents and name contains '{}' and trashed = false".format(
-            BOM_FOLDER_ID, _safe_single_quote(name)
-        )
-        files = _list_by_q(q3)
-        if not files:
+    def _drive_find_by_name(folder_id: str, name_hint: str) -> str | None:
+        """
+        Find a Drive file id in the BOM folder by filename.
+        Tries exact name and common extensions (.pdf/.png/.jpg/.jpeg/.webp), then 'contains'.
+        """
+        if not (folder_id and name_hint):
             return None
-        # naive preference
-        def score(f):
-            mt = (f.get("mimeType") or "")
-            if mt == "application/pdf":
-                return 3
-            if mt.startswith("image/"):
-                return 2
-            return 1
-        files.sort(key=score, reverse=True)
-        return files[0]["id"]
+        base = os.path.splitext(str(name_hint).strip())[0]
+        try:
+            svc = _get_drive_service_local() if "_get_drive_service_local" in globals() else _get_drive_service()
+        except Exception:
+            return None
+
+        # exact names first
+        exts = ["", ".pdf", ".PDF", ".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG", ".webp", ".WEBP"]
+        for ext in exts:
+            qname = f"{base}{ext}"
+            safe_qname = qname.replace("'", "\\'")
+            q = f"'{folder_id}' in parents and name = '{safe_qname}' and trashed = false"
+            try:
+                resp = svc.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=1).execute()
+                files = resp.get("files", [])
+                if files:
+                    return files[0].get("id")
+            except Exception:
+                pass
+
+        # contains fallback
+        safe_base = base.replace("'", "\\'")
+        q = f"'{folder_id}' in parents and name contains '{safe_base}' and trashed = false"
+        try:
+            resp = svc.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10).execute()
+            files = resp.get("files", []) or []
+            # prefer exact base (case-insensitive), then anything
+            def _noext_lower(n): return os.path.splitext(n)[0].lower()
+            for f in files:
+                if _noext_lower(f.get("name", "")) == base.lower():
+                    return f.get("id")
+            if files:
+                return files[0].get("id")
+        except Exception:
+            pass
+        return None
+
+    def _resolve_bom_to_id(raw: str | None) -> str | None:
+        """Accepts an id, a public link, or a bare filename in the BOM folder."""
+        fid = _extract_drive_id(raw)
+        if fid:
+            return fid
+        if bom_folder_id and raw:
+            return _drive_find_by_name(bom_folder_id, raw)
+        return None
 
     try:
         dept  = (request.args.get("dept") or "").strip().lower()
@@ -6413,6 +6359,7 @@ def order_summary():
         if not order:
             return jsonify({"error": "missing order"}), 400
 
+        # Pull Production Orders
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE) or []
         if not rows:
             return jsonify({"error": "no data"}), 404
@@ -6426,13 +6373,12 @@ def order_summary():
                 return default
             return row[i] if i < len(row) else default
 
-        # Find the row where "Order #" matches exactly
+        # find the order row
         hit = None
         for r in rows[1:]:
             if str(gv(r, "Order #")).strip() == str(order):
                 hit = r
                 break
-
         if not hit:
             return jsonify({"error": "order not found"}), 404
 
@@ -6445,16 +6391,22 @@ def order_summary():
         qty_raw   = gv(hit, "Quantity", "")
 
         title = design or product or f"Order {order}"
-
         try:
             quantity = int(float(qty_raw))
         except Exception:
             quantity = str(qty_raw) if str(qty_raw).strip() else "—"
 
-        # date normalizer already exists in your file
+        def _fmt_date_mdy(s):
+            # keep your existing date formatter if you have one; this is a safe fallback
+            try:
+                from datetime import datetime
+                d = datetime.fromisoformat(s)
+                return d.strftime("%m/%d/%Y")
+            except Exception:
+                return s
         due_date = _fmt_date_mdy(due_raw)
 
-        # --- Main image(s) from order row ------------------------------------
+        # MAIN IMAGE (scan several columns)
         img_cols = [
             "Preview", "Image", "Thumbnail", "Image URL", "Image Link", "Photo",
             "Img", "Front Image", "Mockup", "Mockup Link", "Artwork", "Art",
@@ -6469,95 +6421,79 @@ def order_summary():
 
         main_id = main_ids[0] if main_ids else None
         thumbnail_url = _public_thumb(main_id, "w160") if main_id else None
-        imagesLabeled = ([{"src": _public_thumb(main_id, "w640"), "label": ""}]
-                         if main_id else [])
 
-        # --- BOM1/2/3 from the ORDER row (names or links) --------------------
-        # --- BOMs from TABLE sheet (by Product) → public Drive thumbs ---------
-        # Reads "Products", "BOM1/BOM1 Label", "BOM2/BOM2 Label", "BOM3/BOM3 Label"
-        # and resolves each to a Drive file id (ID/link first, then filename in BOM_FOLDER_ID).
+        imagesLabeled = ([{"src": _public_thumb(main_id, "w640"), "label": ""}] if main_id else [])
+
+        # BOMs from the Table sheet (by Product)
         try:
             table_rows = fetch_sheet(SPREADSHEET_ID, BOM_TABLE_RANGE) or []
             if table_rows:
                 t_hdr = [str(h or "").strip() for h in table_rows[0]]
-
-                def idx(name: str):
+                def tidx(name):
                     try:
                         return t_hdr.index(name)
                     except ValueError:
                         return None
+                key_ix  = tidx("Products")
+                bom1_ix, bom1l_ix = tidx("BOM1"), tidx("BOM1 Label")
+                bom2_ix, bom2l_ix = tidx("BOM2"), tidx("BOM2 Label")
+                bom3_ix, bom3l_ix = tidx("BOM3"), tidx("BOM3 Label")
 
-                # headers
-                prod_ix  = idx("Products")
-                bom1_ix  = idx("BOM1") or idx("BOM 1")
-                bom1l_ix = idx("BOM1 Label") or idx("BOM 1 Label")
-                bom2_ix  = idx("BOM2") or idx("BOM 2")
-                bom2l_ix = idx("BOM2 Label") or idx("BOM 2 Label")
-                bom3_ix  = idx("BOM3") or idx("BOM 3")
-                bom3l_ix = idx("BOM3 Label") or idx("BOM 3 Label")
-
-                # find the product row (exact match first, then fuzzy normalized contains)
-                prod_raw = (product or "").strip()
-                prod_key = prod_raw.lower()
-                table_hit = None
-                if prod_ix is not None and prod_key:
+                prod_key = (product or "").strip().lower()
+                match = None
+                if key_ix is not None and prod_key:
                     for tr in table_rows[1:]:
-                        val = str(tr[prod_ix] if prod_ix < len(tr) else "").strip().lower()
+                        val = str(tr[key_ix] if key_ix < len(tr) else "").strip().lower()
                         if val == prod_key:
-                            table_hit = tr
+                            match = tr
                             break
-                    if not table_hit:
-                        import re as _re
-                        def norm(s): return _re.sub(r"[^a-z0-9]+", "", (s or "").lower())
-                        pk = norm(prod_raw)
-                        for tr in table_rows[1:]:
-                            v = norm(str(tr[prod_ix] if prod_ix < len(tr) else ""))
-                            if v == pk or (pk and pk in v) or (v and v in pk):
-                                table_hit = tr
-                                break
 
-                if table_hit:
-                    def gvi(rw, ix):
-                        return (rw[ix] if ix is not None and ix < len(rw) else "")
-
+                if match:
+                    def gvi(rw, ix): return (rw[ix] if ix is not None and ix < len(rw) else "")
                     bom_pairs = [
-                        (str(gvi(table_hit, bom1_ix)).strip(), str(gvi(table_hit, bom1l_ix)).strip()),
-                        (str(gvi(table_hit, bom2_ix)).strip(), str(gvi(table_hit, bom2l_ix)).strip()),
-                        (str(gvi(table_hit, bom3_ix)).strip(), str(gvi(table_hit, bom3l_ix)).strip()),
+                        (str(gvi(match, bom1_ix)).strip(), str(gvi(match, bom1l_ix)).strip()),
+                        (str(gvi(match, bom2_ix)).strip(), str(gvi(match, bom2l_ix)).strip()),
+                        (str(gvi(match, bom3_ix)).strip(), str(gvi(match, bom3l_ix)).strip()),
                     ]
 
                     for name, label in bom_pairs:
                         if not name:
                             continue
-                        # Resolve: direct ID/link → filename search in BOM_FOLDER_ID (via your global helper)
-                        fid = _extract_drive_id(name) or _resolve_bom_to_id(name)
+
+                        # Try the global helper first (may use a different BOM_FOLDER_ID in other parts of the file)
+                        fid = _resolve_bom_to_id(name)
+
+                        # Fallback: use the local bom_folder_id we read at the top of this handler
+                        if not fid and bom_folder_id:
+                            try:
+                                f = _drive_find_by_name(bom_folder_id, name)
+                                fid = f if isinstance(f, str) else (f.get("id") if f else None)
+                            except Exception as e:
+                                app.logger.warning("BOM fallback lookup failed for %r: %s", name, e)
+
                         if not fid:
+                            app.logger.info("BOM image not found for %r (check BOM_FOLDER_ID and Table headers)", name)
                             continue
-                        imagesLabeled.append({
-                            "src": _public_thumb(fid, "w640"),
-                            "label": label or ""
-                        })
+
+                        imagesLabeled.append({"src": _public_thumb(fid, "w640"), "label": label or ""})
+
         except Exception:
-            app.logger.exception("Table BOM lookup failed; continuing without Table BOMs")
+            app.logger.exception("BOM Table lookup failed")
 
+        # de-dup + cap 4
+        seen = set()
+        deduped = []
+        for it in imagesLabeled:
+            src = (it or {}).get("src")
+            if not src or src in seen:
+                continue
+            seen.add(src)
+            deduped.append(it)
+        imagesLabeled = deduped[:4]
 
-        # --- De-dup, cap at 4, compute images --------------------------------
-        def _dedup_labeled(seq):
-            seen, out = set(), []
-            for x in seq:
-                src = (x or {}).get("src")
-                if not src or src in seen:
-                    continue
-                seen.add(src)
-                out.append(x)
-            return out
-
-        imagesLabeled = _dedup_labeled(imagesLabeled)[:4]
         images = [x["src"] for x in imagesLabeled]
-        if not thumbnail_url and images:
-            fid0 = _extract_drive_id(images[0])
-            if fid0:
-                thumbnail_url = _public_thumb(fid0, "w160")
+        if images and not thumbnail_url:
+            thumbnail_url = images[0]
 
         payload = {
             "order": str(order),
@@ -6569,17 +6505,14 @@ def order_summary():
             "furColor": fur_color or "",
             "quantity": quantity,
             "thumbnailUrl": thumbnail_url,
-            "images": images,
-            "imagesLabeled": imagesLabeled,
+            "images": images,                # array of public thumbs
+            "imagesLabeled": imagesLabeled,  # [{src,label}]
         }
         return jsonify(payload), 200
 
     except Exception:
         app.logger.exception("order_summary failed")
         return jsonify({"error": "server error"}), 500
-
-
-
 # ---- helpers for /api/order-summary ----------------------------------------
 
 def _fmt_date_mdy(s):
