@@ -6471,7 +6471,11 @@ def order_summary():
         main_id = main_ids[0] if main_ids else None
         thumbnail_url = (f"/api/drive/thumbnail?fileId={main_id}&sz=w160") if main_id else None
 
-        imagesLabeled = ([{"src": f"/api/drive/thumbnail?fileId={main_id}&sz=w640", "label": ""}] if main_id else []
+        imagesLabeled = (
+            [{"src": f"/api/drive/thumbnail?fileId={main_id}&sz=w640", "label": ""}]
+            if main_id else []
+        )
+
 
 
         # BOMs from the Table sheet (by Product)
