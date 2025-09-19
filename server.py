@@ -6271,6 +6271,55 @@ def set_order_preview(order_number):
         # Don't blow up the client — report a clean error
         return jsonify(error=str(e)), 500
 
+@app.get("/api/drive/thumb/<file_id>")
+def drive_thumb(file_id):
+    """
+    Server-side proxy for Google Drive thumbnails so the browser
+    doesn't need Drive auth. Supports ?sz=w160 / w640, etc.
+    """
+    import requests
+    from flask import Response, request
+
+    sz = request.args.get("sz", "w640")
+
+    drive = get_drive_service()
+    try:
+        # Ask Drive for the thumbnail link (auth'd)
+        meta = drive.files().get(fileId=file_id, fields="thumbnailLink,mimeType,name").execute()
+        tlink = meta.get("thumbnailLink")
+
+        # Some files (esp. PDFs just renamed) need size coercion
+        if tlink:
+            # Drive usually returns ...=s220  — replace with requested width
+            # Accept both ? and & forms, be defensive:
+            # - If it contains "=s", swap the numeric part.
+            # - Else fall back to the id+sz endpoint.
+            if "=s" in tlink:
+                import re
+                tlink = re.sub(r"=s\d+", f"=s{sz.replace('w','')}", tlink)
+        else:
+            # Fallback to the classic endpoint
+            tlink = f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
+
+        # Fetch the image bytes server-side
+        upstream = requests.get(tlink, timeout=10)
+        if upstream.status_code != 200 or not upstream.content:
+            app.logger.info("Thumb proxy miss for %r via %r: %s", file_id, tlink, upstream.status_code)
+            # Graceful 204: let frontend swap to a local placeholder
+            return Response(status=204)
+
+        # Try to preserve content-type, default to image/jpeg
+        ctype = upstream.headers.get("Content-Type", "image/jpeg")
+        resp = Response(upstream.content, status=200, mimetype=ctype)
+        # Short cache to avoid hammering Drive but still reflect updates
+        resp.headers["Cache-Control"] = "public, max-age=300"
+        return resp
+
+    except Exception as e:
+        app.logger.warning("drive_thumb error for %r: %s", file_id, e)
+        return Response(status=204)
+
+
 @app.route("/api/order-summary", methods=["GET"])
 @login_required_session
 def order_summary():
@@ -6420,9 +6469,10 @@ def order_summary():
                 main_ids.append(fid)
 
         main_id = main_ids[0] if main_ids else None
-        thumbnail_url = _public_thumb(main_id, "w160") if main_id else None
+        thumbnail_url = (f"/api/drive/thumbnail?fileId={main_id}&sz=w160") if main_id else None
 
-        imagesLabeled = ([{"src": _public_thumb(main_id, "w640"), "label": ""}] if main_id else [])
+        imagesLabeled = ([{"src": f"/api/drive/thumbnail?fileId={main_id}&sz=w640", "label": ""}] if main_id else []
+
 
         # BOMs from the Table sheet (by Product)
         try:
@@ -6481,8 +6531,7 @@ def order_summary():
                             continue
 
                         app.logger.info("BOM image found for %r -> fileId=%r", name, fid)
-                        imagesLabeled.append({"src": _public_thumb(fid, "w640"), "label": label or ""})
-
+                        imagesLabeled.append({"src": f"/api/drive/thumbnail?fileId={fid}&sz=w640", "label": label or ""})
 
         except Exception:
             app.logger.exception("BOM Table lookup failed")
