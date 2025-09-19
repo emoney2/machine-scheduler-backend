@@ -88,6 +88,82 @@ from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
+# --- BOM folder & Drive helpers ------------------------------------------------
+BOM_FOLDER_ID = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
+
+import re, os
+_DRIVE_NAME_CACHE: dict[tuple[str,str], dict] = {}
+
+def _extract_drive_id(val: str | None) -> str | None:
+    """Find a Drive file id in a raw id or common link shapes."""
+    if not val:
+        return None
+    s = str(val).strip()
+    # raw id
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
+        return s
+    m = re.search(r"(?:\bid=|/d/)([A-Za-z0-9_-]{10,})", s)
+    return m.group(1) if m else None
+
+def _public_thumb(file_id: str, sz: str = "w640") -> str:
+    """Public Drive thumbnail URL (no proxy)."""
+    return f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
+
+def _drive_find_first_in_folder_by_name(folder_id: str, name_hint: str):
+    """
+    Best-effort lookup for a file by name in a Drive folder. Tries common extensions,
+    then a 'name contains' fallback. Results are cached.
+    """
+    base = os.path.splitext(str(name_hint).strip())[0]
+    if not base:
+        return None
+    cache_key = (folder_id, base.lower())
+    if cache_key in _DRIVE_NAME_CACHE:
+        return _DRIVE_NAME_CACHE[cache_key]
+
+    try:
+        svc = _get_drive_service_local()  # your existing helper using OAuth creds
+    except Exception as e:
+        print(f"[bom_lookup] drive service unavailable: {e}", file=sys.stderr)
+        return None
+
+    # Try exact matches with common extensions first (case variants included)
+    exts = ["", ".pdf", ".PDF", ".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG", ".webp", ".WEBP"]
+    for ext in exts:
+        qname = f"{base}{ext}"
+        q = f"'{folder_id}' in parents and name = '{qname.replace(\"'\", \"\\'\")}' and trashed = false"
+        try:
+            resp = svc.files().list(
+                q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=1
+            ).execute()
+            files = resp.get("files", [])
+            if files:
+                _DRIVE_NAME_CACHE[cache_key] = files[0]
+                return files[0]
+        except Exception as e:
+            print(f"[bom_lookup] exact query failed for {qname}: {e}", file=sys.stderr)
+
+    # Fallback: contains; then filter by base (case-insensitive) without extension
+    q = f"'{folder_id}' in parents and name contains '{base.replace(\"'\", \"\\'\")}' and trashed = false"
+    try:
+        resp = svc.files().list(
+            q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10
+        ).execute()
+        files = resp.get("files", []) or []
+        def _noext_lower(n): return os.path.splitext(n)[0].lower()
+        for f in files:
+            if _noext_lower(f.get("name", "")) == base.lower():
+                _DRIVE_NAME_CACHE[cache_key] = f
+                return f
+        if files:
+            _DRIVE_NAME_CACHE[cache_key] = files[0]
+            return files[0]
+    except Exception as e:
+        print(f"[bom_lookup] contains query failed for {base}: {e}", file=sys.stderr)
+
+    return None
+
+
 # ---- Disk cache for thumbnails ----
 THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_cache")
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
@@ -6236,31 +6312,68 @@ def set_order_preview(order_number):
 @login_required_session
 def order_summary():
     """
-    Returns a compact order summary for the scanner page.
-    Query params:
-      - dept  : "fur", "cut", etc. (not required for lookup, but reserved)
-      - order : the order number (digits as string)
-    Response:
-      {
-        "order": "43",
-        "company": "Acme GC",
-        "title": "Quilted Black Driver",
-        "product": "Driver",
-        "stage": "Embroidery",
-        "dueDate": "09/22/2025",
-        "furColor": "Black",
-        "quantity": 24,
-        "thumbnailUrl": "https://.../api/drive/proxy/<fileId>?sz=w640",
-        "images": ["...thumb...", "...bom1...", "...bom2...", "...bom3..."]  # optional
-      }
+    Compact order summary for the scanner page.
+
+    Query:
+      - dept  : "fur", "cut", etc. (optional)
+      - order : order number (string)
+
+    Response: {
+      "order": "43",
+      "company": "Acme GC",
+      "title": "Quilted Black Driver",
+      "product": "Driver",
+      "stage": "Embroidery",
+      "dueDate": "09/22/2025",
+      "furColor": "Black",
+      "quantity": 24,
+      "thumbnailUrl": "https://drive.google.com/thumbnail?id=<id>&sz=w160",
+      "images": ["https://drive.google.com/thumbnail?id=...&sz=w640", ...],
+      "imagesLabeled": [{"src":"...","label":"..."}]
+    }
     """
+    import os, re
+
+    def _extract_drive_id(val):
+        if not val:
+            return None
+        s = str(val).strip()
+        # raw id
+        if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
+            return s
+        # id=... or /d/<id>/
+        m = re.search(r"(?:\bid=|/d/)([A-Za-z0-9_-]{10,})", s)
+        return m.group(1) if m else None
+
+    def _public_thumb(fid, size="w640"):
+        return f"https://drive.google.com/thumbnail?id={fid}&sz={size}"
+
+    def _norm_key(s):
+        return re.sub(r"[^a-z0-9]+", "", (s or "").strip().lower())
+
+    # Optional: resolve a BOM name to a file id inside BOM_FOLDER_ID using a global helper if present
+    BOM_FOLDER_ID = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
+    _lookup_helper = globals().get("_drive_find_first_in_folder_by_name")
+
+    def _resolve_bom_to_id(raw_name_or_link: str):
+        fid = _extract_drive_id(raw_name_or_link)
+        if fid:
+            return fid
+        if BOM_FOLDER_ID and _lookup_helper and raw_name_or_link:
+            try:
+                f = _lookup_helper(BOM_FOLDER_ID, raw_name_or_link)
+                return (f or {}).get("id")
+            except Exception:
+                # If Drive lookup is unavailable/flaky, just skip gracefully
+                return None
+        return None
+
     try:
         dept  = (request.args.get("dept") or "").strip().lower()
         order = (request.args.get("order") or "").strip()
         if not order:
             return jsonify({"error": "missing order"}), 400
 
-        # Pull "Production Orders" (you already define ORDERS_RANGE & SPREADSHEET_ID)
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE) or []
         if not rows:
             return jsonify({"error": "no data"}), 404
@@ -6293,59 +6406,55 @@ def order_summary():
         fur_color = str(gv(hit, "Fur Color", "") or "").strip()
         qty_raw   = gv(hit, "Quantity", "")
 
-        # Title preference: Design → Product → "Order <#>"
         title = design or product or f"Order {order}"
 
-        # Normalize quantity
         try:
             quantity = int(float(qty_raw))
         except Exception:
-            quantity = str(qty_raw) if str(qty_raw).strip() else "—"
+            quantity = str(qty_raw).strip() or "—"
 
-        # Normalize due date (keep original if parsing fails)
-        due_date = _fmt_date_mdy(due_raw)
+        # Use your existing date formatter if present; else fall back to raw
+        try:
+            due_date = _fmt_date_mdy(due_raw)
+        except Exception:
+            due_date = due_raw
 
-        # Gather possible image columns; first becomes thumbnail
+        # --- Main image(s) from order row ------------------------------------------------
         img_cols = [
             "Preview", "Image", "Thumbnail", "Image URL", "Image Link", "Photo",
             "Img", "Front Image", "Mockup", "Mockup Link", "Artwork", "Art",
             "Picture", "Picture URL", "Artwork Link",
         ]
-        links = []
+        main_ids = []
         for c in img_cols:
             v = str(gv(hit, c, "") or "").strip()
-            if v and v not in links:
-                links.append(v)
+            fid = _extract_drive_id(v)
+            if fid and fid not in main_ids:
+                main_ids.append(fid)
 
-        # Build public Drive thumbnails (no proxy)
-        def _public_thumb(fid, size="w640"):
-            return f"https://drive.google.com/thumbnail?id={fid}&sz={size}"
+        main_id = main_ids[0] if main_ids else None
+        thumbnail_url = _public_thumb(main_id, "w160") if main_id else None
 
-        def to_thumb(url, size="w640"):
-            fid = _safe_drive_id(url)
-            return _public_thumb(fid, size) if fid else None
+        imagesLabeled = ([{"src": _public_thumb(main_id, "w640"), "label": ""}]
+                         if main_id else [])
 
-        thumbs = [u for u in (to_thumb(x) for x in links) if u]
-        # First “main” image (if any)
-        main_thumb = thumbs[0] if thumbs else None
-        thumbnail_url = _public_thumb(_safe_drive_id(links[0]), "w160") if links else None
-
-        # Also read BOMs directly from the order row, when present
-        order_boms = []
-        for col_name, label_col in [("BOM1", "BOM1 Label"), ("BOM2", "BOM2 Label"), ("BOM3", "BOM3 Label")]:
+        # --- BOMs from ORDER ROW: BOM1/2/3 (names or links) ------------------------------
+        def _add_bom_from_order(col_name: str, label_col: str, label_default: str):
             raw = str(gv(hit, col_name, "") or "").strip()
             if not raw:
-                continue
-            fid = _safe_drive_id(raw)
+                return
+            fid = _resolve_bom_to_id(raw)
             if not fid:
-                continue
-            lab = str(gv(hit, label_col, "") or "").strip()
-            order_boms.append({"src": _public_thumb(fid, "w640"), "label": lab})
+                return
+            lab = str(gv(hit, label_col, "") or "").strip() or label_default
+            imagesLabeled.append({"src": _public_thumb(fid, "w640"), "label": lab})
 
-        # Start labeled list with the main image (if any), then add BOMs from the order row
-        imagesLabeled = ([{"src": main_thumb, "label": ""}] if main_thumb else []) + order_boms
+        _add_bom_from_order("BOM1", "BOM1 Label", "BOM1")
+        _add_bom_from_order("BOM2", "BOM2 Label", "BOM2")
+        _add_bom_from_order("BOM3", "BOM3 Label", "BOM3")
 
-
+        # --- BOMs from TABLE sheet (by product match) -----------------------------------
+        # Optional, but kept for parity with your existing logic
         try:
             table_rows = fetch_sheet(SPREADSHEET_ID, BOM_TABLE_RANGE) or []
             if table_rows:
@@ -6355,86 +6464,75 @@ def order_summary():
                         return t_hdr.index(name)
                     except ValueError:
                         return None
+
                 hdr_idx_map = { _norm_key(h): i for i, h in enumerate(t_hdr) }
 
-
-                # Key column in Table sheet: "Products" (your header)
-                key_ix = idx("Products")
+                key_ix  = idx("Products")
                 bom1_ix, bom1l_ix = idx("BOM1"), idx("BOM1 Label")
                 bom2_ix, bom2l_ix = idx("BOM2"), idx("BOM2 Label")
                 bom3_ix, bom3l_ix = idx("BOM3"), idx("BOM3 Label")
 
-                # We matched the order row earlier and have the product string already
                 prod_key = (product or "").strip().lower()
+                table_hit = None
                 if key_ix is not None and prod_key:
-                    hit = None
-                    for r in table_rows[1:]:
-                        val = str(r[key_ix] if key_ix < len(r) else "").strip().lower()
+                    for tr in table_rows[1:]:
+                        val = str(tr[key_ix] if key_ix < len(tr) else "").strip().lower()
                         if val == prod_key:
-                            hit = r
+                            table_hit = tr
                             break
 
-                    if hit:
-                        def gv(rw, ix):
-                            return (rw[ix] if ix is not None and ix < len(rw) else "")
+                if table_hit:
+                    def gvi(rw, ix):
+                        return (rw[ix] if ix is not None and ix < len(rw) else "")
 
-                        bom_pairs = [
-                            (str(gv(hit, bom1_ix)).strip(), str(gv(hit, bom1l_ix)).strip()),
-                            (str(gv(hit, bom2_ix)).strip(), str(gv(hit, bom2l_ix)).strip()),
-                            (str(gv(hit, bom3_ix)).strip(), str(gv(hit, bom3l_ix)).strip()),
-                        ]
+                    bom_pairs = [
+                        (str(gvi(table_hit, bom1_ix)).strip(), str(gvi(table_hit, bom1l_ix)).strip()),
+                        (str(gvi(table_hit, bom2_ix)).strip(), str(gvi(table_hit, bom2l_ix)).strip()),
+                        (str(gvi(table_hit, bom3_ix)).strip(), str(gvi(table_hit, bom3l_ix)).strip()),
+                    ]
 
-                        bom_items = []
-                        for name, label in bom_pairs:
-                            if not name:
-                                continue
+                    bom_items = []
+                    for name, label in bom_pairs:
+                        if not name:
+                            continue
+                        fid = _resolve_bom_to_id(name)
+                        if not fid:
+                            continue
 
-                            # Resolve file id (name can be a raw ID, link, or a filename in the BOM folder)
-                            fid = _safe_drive_id(name)
-                            if not fid and BOM_FOLDER_ID:
-                                f = _drive_find_first_in_folder_by_name(BOM_FOLDER_ID, name)
-                                fid = f.get("id") if f else ""
+                        # Optional quantity column: use label text as header to pull qty
+                        qty_prefix = ""
+                        if label:
+                            hdr_ix = hdr_idx_map.get(_norm_key(label))
+                            if hdr_ix is not None and hdr_ix < len(table_hit):
+                                qty_val = str(table_hit[hdr_ix]).strip()
+                                if qty_val and qty_val not in ("0", "0.0"):
+                                    qty_prefix = qty_val
 
-                            if not fid:
-                                continue
+                        final_label = f"{qty_prefix} - {label}" if qty_prefix else (label or "")
+                        bom_items.append({"src": _public_thumb(fid, "w640"), "label": final_label})
 
-                            # Look up quantity from the Table row using the BOM label as a header key
-                            qty_prefix = ""
-                            if label:
-                                hdr_ix = hdr_idx_map.get(_norm_key(label))
-                                if hdr_ix is not None and hdr_ix < len(hit):
-                                    qty_val = str(hit[hdr_ix]).strip()
-                                    # show only if non-empty and not zero
-                                    if qty_val and qty_val not in ("0", "0.0"):
-                                        qty_prefix = qty_val
-
-                            final_label = f"{qty_prefix} - {label}" if qty_prefix else (label or "")
-
-                            src = _public_thumb(fid, "w640")
-                            bom_items.append({"src": src, "label": final_label})
-
-                        # Merge: keep existing imagesLabeled (main + order-row BOMs), then Table BOMs; de-dup; cap to 4
-                        def _dedup_labeled(seq):
-                            seen = set(); out = []
-                            for x in seq:
-                                src = (x or {}).get("src")
-                                if not src or src in seen:
-                                    continue
-                                seen.add(src)
-                                out.append(x)
-                            return out
-
-                        # Add BOMs from Table (if found)
-                        imagesLabeled = _dedup_labeled(imagesLabeled + bom_items)
-                        imagesLabeled = imagesLabeled[:4]
-                        images = [x["src"] for x in imagesLabeled]
-                        # Prefer “main” as thumbnail if available
-                        thumbnail_url = images[0] if images else thumbnail_url
-
+                    imagesLabeled.extend(bom_items)
         except Exception:
             app.logger.exception("BOM lookup failed; continuing without BOMs")
-            imagesLabeled = [{"src": u, "label": ""} for u in (images or [])][:4]
 
+        # --- De-dup, cap at 4, compute images -------------------------------------------
+        def _dedup_labeled(seq):
+            seen, out = set(), []
+            for x in seq:
+                src = (x or {}).get("src")
+                if not src or src in seen:
+                    continue
+                seen.add(src)
+                out.append(x)
+            return out
+
+        imagesLabeled = _dedup_labeled(imagesLabeled)[:4]
+        images = [x["src"] for x in imagesLabeled]
+        if not thumbnail_url and images:
+            # Use first image as small thumbnail if main was missing
+            fid0 = _extract_drive_id(images[0])
+            if fid0:
+                thumbnail_url = _public_thumb(fid0, "w160")
 
         payload = {
             "order": str(order),
@@ -6446,11 +6544,10 @@ def order_summary():
             "furColor": fur_color or "",
             "quantity": quantity,
             "thumbnailUrl": thumbnail_url,
-            "images": images,                  # keeps backward compat
-            "imagesLabeled": imagesLabeled,    # NEW: each item {src, label}
+            "images": images,
+            "imagesLabeled": imagesLabeled,
         }
         return jsonify(payload), 200
-
 
     except Exception:
         app.logger.exception("order_summary failed")
