@@ -6317,19 +6317,34 @@ def order_summary():
             if v and v not in links:
                 links.append(v)
 
-        # Convert Drive links → IDs → proxied thumbnails
+        # Build public Drive thumbnails (no proxy)
+        def _public_thumb(fid, size="w640"):
+            return f"https://drive.google.com/thumbnail?id={fid}&sz={size}"
+
         def to_thumb(url, size="w640"):
             fid = _safe_drive_id(url)
-            return f"{request.host_url.rstrip('/')}/api/drive/proxy/{fid}?sz={size}" if fid else None
+            return _public_thumb(fid, size) if fid else None
 
         thumbs = [u for u in (to_thumb(x) for x in links) if u]
-        thumbnail_url = thumbs[0] if thumbs else None
+        # First “main” image (if any)
+        main_thumb = thumbs[0] if thumbs else None
+        thumbnail_url = _public_thumb(_safe_drive_id(links[0]), "w160") if links else None
 
-        # --- BOM lookup from Table tab (based on Products) ---------------------------
-        images = thumbs[:4] if thumbs else ([thumbnail_url] if thumbnail_url else [])
+        # Also read BOMs directly from the order row, when present
+        order_boms = []
+        for col_name, label_col in [("BOM1", "BOM1 Label"), ("BOM2", "BOM2 Label"), ("BOM3", "BOM3 Label")]:
+            raw = str(gv(hit, col_name, "") or "").strip()
+            if not raw:
+                continue
+            fid = _safe_drive_id(raw)
+            if not fid:
+                continue
+            lab = str(gv(hit, label_col, "") or "").strip()
+            order_boms.append({"src": _public_thumb(fid, "w640"), "label": lab})
 
-        # --- BOM lookup from Table tab (based on Products) ---------------------------
-        imagesLabeled = [{"src": u, "label": ""} for u in (images or [])]  # start with current images
+        # Start labeled list with the main image (if any), then add BOMs from the order row
+        imagesLabeled = ([{"src": main_thumb, "label": ""}] if main_thumb else []) + order_boms
+
 
         try:
             table_rows = fetch_sheet(SPREADSHEET_ID, BOM_TABLE_RANGE) or []
@@ -6395,15 +6410,27 @@ def order_summary():
 
                             final_label = f"{qty_prefix} - {label}" if qty_prefix else (label or "")
 
-                            src = f"{request.host_url.rstrip('/')}/api/drive/proxy/{fid}?sz=w640"
+                            src = _public_thumb(fid, "w640")
                             bom_items.append({"src": src, "label": final_label})
 
+                        # Merge: keep existing imagesLabeled (main + order-row BOMs), then Table BOMs; de-dup; cap to 4
+                        def _dedup_labeled(seq):
+                            seen = set(); out = []
+                            for x in seq:
+                                src = (x or {}).get("src")
+                                if not src or src in seen:
+                                    continue
+                                seen.add(src)
+                                out.append(x)
+                            return out
 
-                        # Merge: main images first (keep original order), then BOMs (max 3). Cap total at 4.
-                        imagesLabeled = [{"src": u, "label": ""} for u in (images or [])]
-                        imagesLabeled.extend(bom_items[:3])
-                        images = [x["src"] for x in imagesLabeled][:4]
+                        # Add BOMs from Table (if found)
+                        imagesLabeled = _dedup_labeled(imagesLabeled + bom_items)
                         imagesLabeled = imagesLabeled[:4]
+                        images = [x["src"] for x in imagesLabeled]
+                        # Prefer “main” as thumbnail if available
+                        thumbnail_url = images[0] if images else thumbnail_url
+
         except Exception:
             app.logger.exception("BOM lookup failed; continuing without BOMs")
             imagesLabeled = [{"src": u, "label": ""} for u in (images or [])][:4]
