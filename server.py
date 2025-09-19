@@ -1230,6 +1230,12 @@ def drive_proxy(file_id):
 
     # 2) Fallback: Drive API thumbnailLink (works for PDFs)
     try:
+        # quick probe without raising
+        creds = _load_google_creds()
+        if not creds:
+            print("[drive_proxy] Skipping Drive API fallback (no creds)", file=sys.stderr)
+            raise RuntimeError("skip-fallback")
+
         svc = _get_drive_service_local()
         meta = svc.files().get(fileId=file_id, fields="thumbnailLink,mimeType,hasThumbnail").execute()
         tl = meta.get("thumbnailLink")
@@ -1245,7 +1251,8 @@ def drive_proxy(file_id):
         else:
             print(f"[drive_proxy] No thumbnailLink for file_id={file_id} (mime={meta.get('mimeType')})", file=sys.stderr)
     except Exception as e:
-        print(f"[drive_proxy] Drive API fallback failed: {e}", file=sys.stderr)
+        if str(e) != "skip-fallback":
+            print(f"[drive_proxy] Drive API fallback failed: {e}", file=sys.stderr)
 
     # 3) Final: no image available
     print(f"[drive_proxy] No usable thumbnail for file_id={file_id}; returning 204", file=sys.stderr)
@@ -2240,19 +2247,23 @@ def _load_google_creds():
         try:
             info = json.loads(env_val)
             token_scopes = info.get("scopes")
-            # If token already has scopes, don't override (prevents invalid_scope)
-            if token_scopes:
-                creds = OAuthCredentials.from_authorized_user_info(info)
-            else:
-                creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            creds = (OAuthCredentials.from_authorized_user_info(info)
+                     if token_scopes
+                     else OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES))
             print("🔎 token (env) scopes:", token_scopes)
-            if not creds.valid and creds.refresh_token:
-                from google.auth.transport.requests import Request as GoogleRequest
-                creds.refresh(GoogleRequest())
+            # Try to refresh, but don't fail if Google is flaky
+            try:
+                if not creds.valid and getattr(creds, "refresh_token", None):
+                    from google.auth.transport.requests import Request as GoogleRequest
+                    creds.refresh(GoogleRequest())
+            except Exception as _e:
+                # Log once but still return the creds; API calls can retry refresh
+                print("⚠️ ENV token refresh failed (will return creds anyway):", repr(_e))
             return creds
         except Exception as e:
             print("❌ ENV token could not build OAuthCredentials:", repr(e))
             # fall through to file
+
 
     # 2) File next
     try:
