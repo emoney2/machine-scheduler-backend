@@ -2626,15 +2626,21 @@ def update_embroidery_start_time_in_sheet(order_id, new_start_time):
 
 import time
 
-def fetch_sheet(spreadsheet_id, range_a1):
+def fetch_sheet(spreadsheet_id, range_a1, value_render=None):
     service = get_sheets_service()
     for attempt in range(1, 4):  # up to 3 tries: ~60s*3 worst-case
         try:
-            resp = service.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id,
-                range=range_a1,
-                majorDimension="ROWS"
-            ).execute()
+            kwargs = {
+                "spreadsheetId": spreadsheet_id,
+                "range": range_a1,
+                "majorDimension": "ROWS",
+            }
+            # Map our Python arg to the Sheets API field
+            # Accepts: "FORMATTED_VALUE", "UNFORMATTED_VALUE", or "FORMULA"
+            if value_render:
+                kwargs["valueRenderOption"] = str(value_render).upper()
+
+            resp = service.spreadsheets().values().get(**kwargs).execute()
             return resp.get("values", []) or []
         except Exception as e:
             # Only retry on timeouts / transient transport errors
