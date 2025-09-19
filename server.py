@@ -22,6 +22,7 @@ import io
 import tempfile
 import base64
 import asyncio
+import sys
 from flask import current_app
 from flask import request, jsonify
 from flask import request, make_response, jsonify, Response
@@ -131,7 +132,8 @@ def _drive_find_first_in_folder_by_name(folder_id: str, name_hint: str):
     exts = ["", ".pdf", ".PDF", ".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG", ".webp", ".WEBP"]
     for ext in exts:
         qname = f"{base}{ext}"
-        q = f"'{folder_id}' in parents and name = '{qname.replace(\"'\", \"\\'\")}' and trashed = false"
+        safe_qname = qname.replace("'", "\\'")  # precompute to avoid backslashes inside {}
+        q = f"'{folder_id}' in parents and name = '{safe_qname}' and trashed = false"
         try:
             resp = svc.files().list(
                 q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=1
@@ -144,7 +146,8 @@ def _drive_find_first_in_folder_by_name(folder_id: str, name_hint: str):
             print(f"[bom_lookup] exact query failed for {qname}: {e}", file=sys.stderr)
 
     # Fallback: contains; then filter by base (case-insensitive) without extension
-    q = f"'{folder_id}' in parents and name contains '{base.replace(\"'\", \"\\'\")}' and trashed = false"
+    safe_base = base.replace("'", "\\'")
+    q = f"'{folder_id}' in parents and name contains '{safe_base}' and trashed = false"
     try:
         resp = svc.files().list(
             q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10
@@ -162,6 +165,7 @@ def _drive_find_first_in_folder_by_name(folder_id: str, name_hint: str):
         print(f"[bom_lookup] contains query failed for {base}: {e}", file=sys.stderr)
 
     return None
+
 
 
 # ---- Disk cache for thumbnails ----
