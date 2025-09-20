@@ -1101,26 +1101,22 @@ def _mem_after(resp):
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
 def drive_thumbnail():
-    """
-    Server-side proxy for Google Drive thumbnails so the browser
-    doesn't need Drive auth. Supports ?sz=w160, w320, w640, etc.
-    """
-    import re
+    """Return a real image thumbnail for Drive files, never HTML."""
+    import re, requests, time
     from flask import Response, request
 
     file_id = (request.args.get("fileId") or "").strip()
-    sz = (request.args.get("sz") or "w640").strip()  # e.g., "w640"
-    app.logger.info("📸 /api/drive/thumbnail hit file_id=%s sz=%s", file_id, sz)
-
+    sz = (request.args.get("sz") or "w640").strip()
+    app.logger.info("📸 /api/drive/thumbnail file_id=%s sz=%s", file_id, sz)
     if not file_id:
         return jsonify({"error": "Missing fileId"}), 400
 
-    # normalize size: accept "w640" or "640"
+    # normalize size (accept "w640" or "640")
     m = re.search(r"(\d+)", sz)
     size_num = m.group(1) if m else "640"
     want_sz = f"w{size_num}"
 
-    # lightweight cache init (in case not defined elsewhere)
+    # tiny in-proc cache (present elsewhere, keep safe defaults)
     global _drive_thumb_cache, _drive_thumb_ttl
     try:
         _drive_thumb_cache
@@ -1129,48 +1125,34 @@ def drive_thumbnail():
     try:
         _drive_thumb_ttl
     except NameError:
-        _drive_thumb_ttl = 60 * 15  # 15 minutes
+        _drive_thumb_ttl = 60 * 15
+
+    def _looks_like_image(b: bytes) -> bool:
+        # JPEG, PNG, GIF, WEBP magic numbers
+        return (
+            (len(b) > 3 and b[0:3] == b"\xFF\xD8\xFF") or         # JPEG
+            (len(b) > 8 and b[0:8] == b"\x89PNG\r\n\x1a\n") or    # PNG
+            (len(b) > 6 and b[0:6] in (b"GIF87a", b"GIF89a")) or  # GIF
+            (len(b) > 12 and b[0:4] == b"RIFF" and b[8:12] == b"WEBP") # WEBP
+        )
 
     try:
         drive = get_drive_service()
         creds = get_oauth_credentials()
-        # refresh if needed
         if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
             creds.refresh(GoogleRequest())
 
-        # Ask Drive for a thumbnail link (fast)
+        # metadata for thumbnail link + versioning
         meta = drive.files().get(
             fileId=file_id,
             fields="thumbnailLink,hasThumbnail,name,mimeType,modifiedTime,md5Checksum"
         ).execute()
-
-        thumb_url = meta.get("thumbnailLink")
+        thumb_url = meta.get("thumbnailLink") or ""
         has_thumb = bool(meta.get("hasThumbnail"))
         modified  = meta.get("modifiedTime") or ""
         etag      = meta.get("md5Checksum") or ""
         mime      = meta.get("mimeType") or ""
 
-        # Prefer Drive-provided thumbnail. Coerce size if present.
-        if has_thumb and thumb_url:
-            # Drive often returns ...=s220 — swap to requested size
-            thumb_url = re.sub(r"(=s)(\d+)", rf"\1{size_num}", thumb_url)
-        else:
-            # If the file is an image, try direct media as a fallback
-            if mime.startswith("image/"):
-                session = AuthorizedSession(creds)
-                r = session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=10)
-                if r.status_code == 200 and r.content:
-                    headers = {
-                        "Cache-Control": "public, max-age=86400",
-                        **({"Last-Modified": modified} if modified else {}),
-                        **({"ETag": etag} if etag else {}),
-                    }
-                    return Response(r.content, mimetype=mime, headers=headers)
-            # Nothing we can render
-            app.logger.info("📸 No thumbnail/media available for file_id=%s mime=%s", file_id, mime)
-            return Response(status=204)
-
-        # --- Cache key includes size to avoid mixing sizes
         cache_key = f"{file_id}:{modified}:{want_sz}"
         now = time.time()
         cached = _drive_thumb_cache.get(cache_key)
@@ -1185,67 +1167,78 @@ def drive_thumbnail():
                 },
             )
 
-        # Fetch the Drive thumbnail with auth
-        import re, requests
+        # --- helper fetchers -------------------------------------------------
+        def _classic(fid: str) -> requests.Response:
+            u = f"https://drive.google.com/thumbnail?id={fid}&sz=w{size_num}"
+            r = requests.get(u, timeout=12, allow_redirects=True, headers={"Accept": "image/*"})
+            app.logger.info("📸 classic %s → %s %s", fid, r.status_code, r.headers.get("Content-Type",""))
+            return r
 
-        # Ensure the size param is present/correct on the URL that Drive returned
-        def _coerce_size(u: str, size: str) -> str:
-            # If the URL already has "=sNNN", replace it; otherwise append
-            if re.search(r"(=s)\d+$", u):
-                return re.sub(r"(=s)\d+$", rf"\1{size_num}", u)
-            # Some variants use "?sz=w###" or "&sz=w###" — normalize to "=s###"
-            if "sz=w" in u:
-                u = re.sub(r"sz=w\d+", f"sz=w{size_num}", u)
-            # If no explicit size token, append one
-            if not re.search(r"(=s)\d+$", u):
-                sep = "&" if "?" in u else "?"
-                u = f"{u}{sep}=s{size_num}"
-            return u
+        def _lh3(u: str) -> requests.Response:
+            if not u:
+                # no lh3 link available
+                resp = requests.Response()
+            else:
+                # keep URL stable; if it ends with =s### or =w###, normalize to requested size
+                if re.search(r"=(s|w)\d+$", u):
+                    u = re.sub(r"=(s|w)\d+$", f"=s{size_num}", u)
+                elif not re.search(r"=(s|w)\d+$", u):
+                    u = f"{u}=s{size_num}"
+                resp = requests.get(u, timeout=12, allow_redirects=True, headers={"Accept": "image/*"})
+            app.logger.info("📸 lh3 %s → %s %s", file_id, resp.status_code if resp else None, resp.headers.get("Content-Type","") if resp else "")
+            return resp
 
-        sized_url = _coerce_size(thumb_url, size_num)
+        def _good(r: requests.Response) -> bool:
+            if not r or r.status_code != 200 or not r.content:
+                return False
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            return (ctype.startswith("image/") and _looks_like_image(r.content))
 
-        # 1) Try lh3 URL WITHOUT OAuth headers (lh3 rejects Authorization sometimes)
-        r = requests.get(sized_url, timeout=10, allow_redirects=True)
-        if r.status_code != 200 or not r.content:
-            app.logger.info("📸 Thumb miss (lh3) for %s via %s (status=%s)", file_id, sized_url, r.status_code)
+        # 1) Try classic
+        r = _classic(file_id)
+        if not _good(r):
+            # 2) Try lh3 thumbnailLink
+            r = _lh3(thumb_url)
 
-            # 2) Fallback to classic Drive endpoint (often works even when lh3 400s)
-            classic = f"https://drive.google.com/thumbnail?id={file_id}&sz=w{size_num}"
-            r = requests.get(classic, timeout=10, allow_redirects=True)
-            if r.status_code != 200 or not r.content:
-                app.logger.info("📸 Thumb miss (classic) for %s via %s (status=%s)", file_id, classic, r.status_code)
+        # 3) If still not good and file itself is an image, stream raw media via OAuth
+        if not _good(r) and mime.startswith("image/"):
+            session = AuthorizedSession(creds)
+            media = session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=15)
+            app.logger.info("📸 raw image media → %s %s", media.status_code, media.headers.get("Content-Type",""))
+            if media.status_code == 200 and media.content and _looks_like_image(media.content):
+                _drive_thumb_cache[cache_key] = {"bytes": media.content, "ts": now}
+                return Response(
+                    media.content,
+                    mimetype=mime,
+                    headers={
+                        "Cache-Control": "public, max-age=86400",
+                        **({"Last-Modified": modified} if modified else {}),
+                        **({"ETag": etag} if etag else {}),
+                    },
+                )
 
-                # 3) Final fallback: if it's an image/* file, stream the raw media via OAuth
-                if mime.startswith("image/"):
-                    session = AuthorizedSession(creds)
-                    media = session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=10)
-                    if media.status_code == 200 and media.content:
-                        _drive_thumb_cache[cache_key] = {"bytes": media.content, "ts": now}
-                        headers = {
-                            "Cache-Control": "public, max-age=86400",
-                            **({"Last-Modified": modified} if modified else {}),
-                            **({"ETag": etag} if etag else {}),
-                        }
-                        return Response(media.content, mimetype=mime, headers=headers)
+        # 4) Final decision
+        if not _good(r):
+            app.logger.info("📸 no usable image for %s (mime=%s) → 204", file_id, mime)
+            return Response(status=204)
 
-                # No luck
-                return Response(status=204)
-
-        # Save to cache on success
+        # success
         _drive_thumb_cache[cache_key] = {"bytes": r.content, "ts": now}
-
-        headers = {
-            "Cache-Control": "public, max-age=86400",
-            **({"Last-Modified": modified} if modified else {}),
-            **({"ETag": etag} if etag else {}),
-        }
-        return Response(r.content, mimetype="image/jpeg", headers=headers)
+        # return with the actual content-type if present, else default jpeg
+        ctype = r.headers.get("Content-Type", "image/jpeg")
+        return Response(
+            r.content,
+            mimetype=ctype,
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                **({"Last-Modified": modified} if modified else {}),
+                **({"ETag": etag} if etag else {}),
+            },
+        )
 
     except Exception:
         app.logger.exception("drive_thumbnail error")
-        # Let the <img> fail silently; UI hides it onError
         return Response(status=204)
-
 
 
 @app.route("/api/drive/token-status", methods=["GET"])
