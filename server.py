@@ -1406,6 +1406,97 @@ def drive_thumbnail():
     return Response(status=204)
 
 
+# === ADD: DXF open/download endpoint =========================================
+@app.route("/api/drive/dxf", methods=["GET"])
+@login_required_session
+def drive_dxf():
+    """
+    ?name=BladeFur[.dxf]  -> streams the DXF file if found (or 404 JSON)
+    If &check=1 is present, returns JSON {ok, href?} without streaming.
+    Search order: exact name, name + .dxf/.DXF, then contains (name) AND extension endswith .dxf
+    Folder: DXF_FOLDER_ID (env) else BOM_FOLDER_ID (env)
+    """
+    name = (request.args.get("name") or "").strip()
+    check = (request.args.get("check") or "").strip()
+    if not name:
+        return jsonify({"error": "Missing name"}), 400
+
+    dxf_folder_id = (os.environ.get("DXF_FOLDER_ID") or "").strip() or (os.environ.get("BOM_FOLDER_ID") or "").strip()
+    if not dxf_folder_id:
+        return jsonify({"error": "DXF folder is not configured"}), 500
+
+    # strip extension to get base, but allow caller to pass a full name too
+    base = os.path.splitext(name)[0] if "." in name else name
+
+    def _find_dxf(folder_id: str, base_name: str) -> tuple[str, str] | None:
+        try:
+            svc = get_drive_service()
+        except Exception as e:
+            app.logger.exception("drive_dxf: drive service unavailable")
+            return None
+
+        # First try exact matches: with and without .dxf
+        candidates = [base_name, f"{base_name}.dxf", f"{base_name}.DXF"]
+        for qname in candidates:
+            safe = qname.replace("'", "\\'")
+            q = f"'{folder_id}' in parents and name = '{safe}' and trashed = false"
+            try:
+                resp = svc.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=1).execute()
+                files = resp.get("files", [])
+                if files:
+                    f = files[0]
+                    return f.get("id"), f.get("name") or f"{base_name}.dxf"
+            except Exception:
+                pass
+
+        # Then a 'contains' search but keep extension .dxf
+        safe_like = base_name.replace("'", "\\'")
+        q = f"'{folder_id}' in parents and name contains '{safe_like}' and trashed = false"
+        try:
+            resp = svc.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=50).execute()
+            files = resp.get("files", [])
+            # Prefer names that end with .dxf (case insensitive)
+            for f in files:
+                nm = f.get("name", "")
+                if nm.lower().endswith(".dxf"):
+                    return f.get("id"), nm
+        except Exception:
+            pass
+        return None
+
+    found = _find_dxf(dxf_folder_id, base)
+    if check:
+        if not found:
+            return jsonify({"ok": False, "error": f"No DXF found for '{name}'"}), 404
+        # Tell the client exactly where to go to download
+        href = f"{request.host_url.rstrip('/')}/api/drive/dxf?name={urllib.parse.quote(name)}"
+        return jsonify({"ok": True, "href": href})
+
+    if not found:
+        return jsonify({"error": f"No DXF found for '{name}'"}), 404
+
+    file_id, download_name = found
+    try:
+        creds = get_oauth_credentials()
+        if hasattr(creds, "expired") and creds.expired and hasattr(creds, "refresh_token"):
+            creds.refresh(GoogleRequest())
+
+        sess = AuthorizedSession(creds)
+        r = sess.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=30)
+        if r.status_code != 200 or not r.content:
+            return jsonify({"error": f"DXF fetch failed ({r.status_code})"}), 502
+
+        headers = {
+            "Content-Type": "application/dxf",
+            # inline is fine if LightBurn is associated; change to 'attachment' to force download
+            "Content-Disposition": f'inline; filename="{download_name}"',
+            "Cache-Control": "no-store",
+        }
+        return Response(r.content, headers=headers)
+    except Exception:
+        app.logger.exception("drive_dxf: stream failure")
+        return jsonify({"error": "DXF stream failed"}), 500
+# === END ADD =================================================================
 
 
 @app.route("/api/drive/token-status", methods=["GET"])
@@ -6756,7 +6847,7 @@ def order_summary():
         thumbnail_url = abs_thumb(main_id, "w160") if main_id else None
 
         imagesLabeled = (
-            [{"src": abs_thumb(main_id, "w640"), "label": ""}]
+            [{"src": _public_thumb(main_id, "w640"), "label": "", "kind": "main"}]
             if main_id else []
         )
 
@@ -6818,13 +6909,23 @@ def order_summary():
                             continue
 
                         app.logger.info("BOM image found for %r -> fileId=%r", name, fid)
+
+                        # Tint only when the BOM *cell* text contains "fur" (case-insensitive)
                         use_tint = ("fur" in (name or "").strip().lower())
                         src = (
                             abs_thumb(fid, "w640", fill_hex, white_tol)
                             if (use_tint and fill_hex)
                             else abs_thumb(fid, "w640")
                         )
-                        imagesLabeled.append({"src": src, "label": label or ""})
+                        app.logger.info("🎨 BOM tint (cell=%r) → %s", name, "ON" if (use_tint and fill_hex) else "off")
+
+                        # Mark this tile as a BOM and include its BOM cell name for DXF lookup in the UI
+                        imagesLabeled.append({
+                            "src": src,
+                            "label": label or "",
+                            "kind": "bom",
+                            "bomName": str(name).strip(),
+                        })
 
         except Exception:
             app.logger.exception("BOM Table lookup failed")
@@ -6840,7 +6941,7 @@ def order_summary():
             deduped.append(it)
         imagesLabeled = deduped[:4]
 
-        # 🚦 Always keep MAIN image first (stable)
+        # Always keep MAIN first
         def _has_main_id(u: str) -> bool:
             return bool(main_id) and (str(main_id) in str(u or ""))
 
@@ -6850,9 +6951,9 @@ def order_summary():
                 imagesLabeled.insert(0, imagesLabeled.pop(idx))
 
         images = [x["src"] for x in imagesLabeled]
-
         if images and not thumbnail_url:
             thumbnail_url = images[0]
+
 
         payload = {
             "order": str(order),
