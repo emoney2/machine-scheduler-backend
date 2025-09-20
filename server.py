@@ -1101,22 +1101,26 @@ def _mem_after(resp):
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
 def drive_thumbnail():
-    """Return a real image thumbnail for Drive files, never HTML."""
+    """Return a real image thumbnail for Drive files, optionally recolored."""
     import re, requests, time
     from flask import Response, request
 
+    # --- params
     file_id = (request.args.get("fileId") or "").strip()
     sz = (request.args.get("sz") or "w640").strip()
-    app.logger.info("📸 /api/drive/thumbnail file_id=%s sz=%s", file_id, sz)
+    fill_hex_raw = (request.args.get("fillHex") or "").strip()
+    white_tol_raw = (request.args.get("whiteTol") or "").strip()
+    app.logger.info("📸 /api/drive/thumbnail file_id=%s sz=%s fillHex=%s whiteTol=%s",
+                    file_id, sz, fill_hex_raw, white_tol_raw)
+
     if not file_id:
         return jsonify({"error": "Missing fileId"}), 400
 
-    # normalize size (accept "w640" or "640")
     m = re.search(r"(\d+)", sz)
     size_num = m.group(1) if m else "640"
     want_sz = f"w{size_num}"
 
-    # tiny in-proc cache (present elsewhere, keep safe defaults)
+    # tiny in-proc cache
     global _drive_thumb_cache, _drive_thumb_ttl
     try:
         _drive_thumb_cache
@@ -1128,12 +1132,11 @@ def drive_thumbnail():
         _drive_thumb_ttl = 60 * 15
 
     def _looks_like_image(b: bytes) -> bool:
-        # JPEG, PNG, GIF, WEBP magic numbers
         return (
             (len(b) > 3 and b[0:3] == b"\xFF\xD8\xFF") or         # JPEG
             (len(b) > 8 and b[0:8] == b"\x89PNG\r\n\x1a\n") or    # PNG
             (len(b) > 6 and b[0:6] in (b"GIF87a", b"GIF89a")) or  # GIF
-            (len(b) > 12 and b[0:4] == b"RIFF" and b[8:12] == b"WEBP") # WEBP
+            (len(b) > 12 and b[0:4] == b"RIFF" and b[8:12] == b"WEBP")
         )
 
     try:
@@ -1142,7 +1145,6 @@ def drive_thumbnail():
         if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
             creds.refresh(GoogleRequest())
 
-        # metadata for thumbnail link + versioning
         meta = drive.files().get(
             fileId=file_id,
             fields="thumbnailLink,hasThumbnail,name,mimeType,modifiedTime,md5Checksum"
@@ -1156,13 +1158,12 @@ def drive_thumbnail():
         cache_key = f"{file_id}:{modified}:{want_sz}"
         now = time.time()
 
-        fill_hex_raw = (request.args.get("fillHex") or "").strip()
-        white_tol_raw = (request.args.get("whiteTol") or "").strip()
+        # Parse tint args & prep tinted cache key
         tinted_key = None
         raw_cached_bytes = None
-
+        hex_clean = None
+        tol = None
         if fill_hex_raw:
-            import re
             hex_clean = re.sub(r"[^0-9A-Fa-f]", "", fill_hex_raw)[:6]
             if len(hex_clean) == 3:
                 hex_clean = "".join(ch * 2 for ch in hex_clean)
@@ -1171,8 +1172,9 @@ def drive_thumbnail():
             except Exception:
                 tol = 16
             tol = max(0, min(50, tol))
-
             tinted_key = f"{cache_key}:fill={hex_clean}:tol={tol}"
+
+            # 1) If tinted cached, return immediately
             cached_tinted = _drive_thumb_cache.get(tinted_key)
             if cached_tinted and (now - cached_tinted["ts"] < _drive_thumb_ttl):
                 return Response(
@@ -1184,7 +1186,7 @@ def drive_thumbnail():
                         **({"ETag": etag} if etag else {}),
                     },
                 )
-            # don't return raw here — just keep it to tint without re-downloading
+            # 2) Else keep raw cache as source for tint (do NOT return it)
             cached_raw = _drive_thumb_cache.get(cache_key)
             if cached_raw and (now - cached_raw["ts"] < _drive_thumb_ttl):
                 raw_cached_bytes = cached_raw["bytes"]
@@ -1202,211 +1204,138 @@ def drive_thumbnail():
                     },
                 )
 
-        # --- helper fetchers -------------------------------------------------
-        def _classic(fid: str) -> requests.Response:
-            u = f"https://drive.google.com/thumbnail?id={fid}&sz=w{size_num}"
-            r = requests.get(u, timeout=12, allow_redirects=True, headers={"Accept": "image/*"})
-            app.logger.info("📸 classic %s → %s %s", fid, r.status_code, r.headers.get("Content-Type",""))
-            return r
+        # --- helpers
+        def _classic(fid: str) -> requests.Response | None:
+            try:
+                u = f"https://drive.google.com/thumbnail?id={fid}&sz=w{size_num}"
+                r = requests.get(u, timeout=12, allow_redirects=True, headers={"Accept": "image/*"})
+                app.logger.info("📸 classic %s → %s %s", fid, r.status_code, r.headers.get("Content-Type",""))
+                return r
+            except requests.RequestException as e:
+                app.logger.info("📸 classic exception %s: %s", fid, e)
+                return None
 
-        def _lh3(u: str) -> requests.Response:
-            if not u:
-                # no lh3 link available
-                resp = requests.Response()
-            else:
-                # keep URL stable; if it ends with =s### or =w###, normalize to requested size
+        def _lh3(u: str) -> requests.Response | None:
+            try:
+                if not u:
+                    return None
                 if re.search(r"=(s|w)\d+$", u):
                     u = re.sub(r"=(s|w)\d+$", f"=s{size_num}", u)
-                elif not re.search(r"=(s|w)\d+$", u):
+                else:
                     u = f"{u}=s{size_num}"
-                resp = requests.get(u, timeout=12, allow_redirects=True, headers={"Accept": "image/*"})
-            app.logger.info("📸 lh3 %s → %s %s", file_id, resp.status_code if resp else None, resp.headers.get("Content-Type","") if resp else "")
-            return resp
+                r = requests.get(u, timeout=12, allow_redirects=True, headers={"Accept": "image/*"})
+                app.logger.info("📸 lh3 %s → %s %s", file_id, r.status_code, r.headers.get("Content-Type",""))
+                return r
+            except requests.RequestException as e:
+                app.logger.info("📸 lh3 exception %s: %s", file_id, e)
+                return None
 
-        def _good(r: requests.Response) -> bool:
+        def _good(r: requests.Response | None) -> bool:
             if not r or r.status_code != 200 or not r.content:
                 return False
             ctype = (r.headers.get("Content-Type") or "").lower()
             return (ctype.startswith("image/") and _looks_like_image(r.content))
 
-        import requests
-
-        r = None
-
-        # 1) Try classic FIRST, but don't die on exceptions/timeouts
-        try:
-            r = _classic(file_id)
-        except requests.RequestException as e:
-            app.logger.info("📸 classic exception for %s: %s", file_id, e)
-        except Exception as e:
-            app.logger.info("📸 classic unexpected for %s: %s", file_id, e)
-
-        # 2) If classic failed or not an image, try lh3 (again, don't die on errors)
+        # --- fetch image bytes (network or cached raw)
+        r = _classic(file_id)
         if not _good(r):
-            try:
-                r = _lh3(thumb_url)
-            except requests.RequestException as e:
-                app.logger.info("📸 lh3 exception for %s: %s", file_id, e)
-            except Exception as e:
-                app.logger.info("📸 lh3 unexpected for %s: %s", file_id, e)
+            r = _lh3(thumb_url)
 
-        # 3) If still not good and the file itself is an image, stream raw media via OAuth
         if not _good(r) and mime.startswith("image/"):
             try:
                 session = AuthorizedSession(creds)
                 media = session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=12)
-                app.logger.info("📸 raw image media → %s %s", media.status_code, media.headers.get("Content-Type",""))
+                app.logger.info("📸 raw media → %s %s", media.status_code, media.headers.get("Content-Type",""))
                 if media.status_code == 200 and media.content and _looks_like_image(media.content):
+                    # cache raw for next time
                     _drive_thumb_cache[cache_key] = {"bytes": media.content, "ts": now}
-                    return Response(
-                        media.content,
-                        mimetype=mime,
-                        headers={
-                            "Cache-Control": "public, max-age=86400",
-                            **({"Last-Modified": modified} if modified else {}),
-                            **({"ETag": etag} if etag else {}),
-                        },
-                    )
+                    if not fill_hex_raw:
+                        return Response(
+                            media.content,
+                            mimetype=mime,
+                            headers={
+                                "Cache-Control": "public, max-age=86400",
+                                **({"Last-Modified": modified} if modified else {}),
+                                **({"ETag": etag} if etag else {}),
+                            },
+                        )
+                    # else fall-through to tint
+                    r = None
+                    raw = media.content
+                else:
+                    raw = None
             except requests.RequestException as e:
-                app.logger.info("📸 raw media exception for %s: %s", file_id, e)
-            except Exception as e:
-                app.logger.info("📸 raw media unexpected for %s: %s", file_id, e)
+                app.logger.info("📸 raw media exception %s: %s", file_id, e)
+                raw = None
+        else:
+            raw = (r.content if r is not None else None)
 
-        # 4) Final decision
-        if not _good(r):
-            app.logger.info("📸 no usable image for %s (mime=%s) → 204", file_id, mime)
-            return Response(status=204)
-
-        # success
-        _drive_thumb_cache[cache_key] = {"bytes": r.content, "ts": now}
-        ctype = r.headers.get("Content-Type", "image/jpeg")
-        return Response(
-            r.content,
-            mimetype=ctype,
-            headers={
-                "Cache-Control": "public, max-age=86400",
-                **({"Last-Modified": modified} if modified else {}),
-                **({"ETag": etag} if etag else {}),
-            },
-        )
-
-
-        # 4) Final decision
-        if not _good(r):
-            app.logger.info("📸 no usable image for %s (mime=%s) → 204", file_id, mime)
-            return Response(status=204)
-
-
-        # success
-        raw_bytes = None
-        ctype = "image/jpeg"
-
-        if r is not None and getattr(r, "content", None):
-            raw_bytes = r.content
-            ctype = r.headers.get("Content-Type", "image/jpeg")
-        elif raw_cached_bytes:
-            # use cached raw bytes as the source when tinting was requested
-            raw_bytes = raw_cached_bytes
+        # choose bytes to work with
+        raw_bytes = raw or raw_cached_bytes
+        ctype = (r.headers.get("Content-Type") if r is not None else "image/jpeg")
 
         if raw_bytes is None:
-            app.logger.info("📸 no bytes to return for %s → 204", file_id)
+            app.logger.info("📸 no usable bytes for %s → 204", file_id)
             return Response(status=204)
 
-        # Optional recolor (fast compositing path you already added)
-        fill_hex = fill_hex_raw  # reuse parsed arg
-        if fill_hex:
-            # ...keep your existing fast tint block here unchanged...
-            # (it writes to the tinted cache and returns PNG)
-            pass  # <-- this line just illustrates "keep your current tint block"
-
-        # default (untinted) response + cache
-        _drive_thumb_cache[cache_key] = {"bytes": raw_bytes, "ts": now}
-        return Response(
-            raw_bytes,
-            mimetype=ctype,
-            headers={
-                "Cache-Control": "public, max-age=86400",
-                **({"Last-Modified": modified} if modified else {}),
-                **({"ETag": etag} if etag else {}),
-            },
-        )
-
-
-        # Optional recolor: replace near-white with requested fillHex (fast, vectorized)
-        fill_hex = (request.args.get("fillHex") or "").strip()
-        if fill_hex:
-            import re
-            from io import BytesIO
-            from PIL import Image, ImageChops
-
-            hex_clean = re.sub(r"[^0-9A-Fa-f]", "", fill_hex)[:6]
-            if len(hex_clean) == 3:  # expand short #abc → aabbcc
-                hex_clean = "".join(ch * 2 for ch in hex_clean)
-            if len(hex_clean) == 6:
-                target_rgb = tuple(int(hex_clean[i:i+2], 16) for i in (0, 2, 4))
-                # tolerance for "white" detection (0=only pure white; 25=more forgiving; max 50)
-                try:
-                    tol = int(request.args.get("whiteTol") or "16")
-                except Exception:
-                    tol = 16
-                tol = max(0, min(50, tol))
+        # --- optional tint
+        if fill_hex_raw and hex_clean and tol is not None:
+            try:
+                from io import BytesIO
+                from PIL import Image, ImageChops
+                base = Image.open(BytesIO(raw_bytes)).convert("RGBA")
+                rch, gch, bch, ach = base.split()
                 thr = 255 - tol
 
+                # mask where r,g,b >= thr (near-white)
+                def _mask_band(band):
+                    return band.point(lambda v: 255 if v >= thr else 0, mode="L")
+
+                mr, mg, mb = _mask_band(rch), _mask_band(gch), _mask_band(bch)
+                mrg = ImageChops.multiply(mr, mg)
+                mask = ImageChops.multiply(mrg, mb)
+
+                # coverage log
                 try:
-                    base = Image.open(BytesIO(raw_bytes)).convert("RGBA")
-                    r, g, b, a = base.split()
-        
-                    # Build a mask where r,g,b are all >= thr (near white)
-                    def _mask_band(band):
-                        return band.point(lambda v: 255 if v >= thr else 0, mode="L")
-
-                    mr, mg, mb = _mask_band(r), _mask_band(g), _mask_band(b)
-                    # Combine channel masks via multiply (AND)
-                    mrg = ImageChops.multiply(mr, mg)
-                    mask = ImageChops.multiply(mrg, mb)
-
-                    try:
-                        hist = mask.histogram()
-                        white_pixels = hist[255] if len(hist) >= 256 else 0
-                        total = mask.size[0] * mask.size[1]
-                        pct = 100.0 * white_pixels / max(1, total)
-                        app.logger.info("🎨 tint applied hex=%s tol=%d coverage=%.1f%%", hex_clean, tol, pct)
-                    except Exception as _e:
-                        app.logger.info("🎨 tint coverage calc failed: %s", _e)
-
-                    # Solid fill image in target color
-                    fill = Image.new("RGBA", base.size, (*target_rgb, 255))
-                    # Composite: where mask=255, pick from fill; else from base
-                    tinted = Image.composite(fill, base, mask)
-                    # Keep original alpha exactly
-                    tinted.putalpha(a)
-
-                    out = BytesIO()
-                    tinted.save(out, format="PNG", optimize=True)
-                    out_bytes = out.getvalue()
-
-                    # cache the tinted PNG for this file/version/size/tolerance/fill
-                    if tinted_key:
-                        _drive_thumb_cache[tinted_key] = {"bytes": out_bytes, "ts": time.time()}
-        
-                    return Response(
-                        out_bytes,
-                        mimetype="image/png",
-                        headers={
-                            "Cache-Control": "public, max-age=86400",
-                            **({"Last-Modified": modified} if modified else {}),
-                            **({"ETag": etag} if etag else {}),
-                        },
-                    )
+                    hist = mask.histogram()
+                    white_pixels = hist[255] if len(hist) >= 256 else 0
+                    total = mask.size[0] * mask.size[1]
+                    pct = 100.0 * white_pixels / max(1, total)
+                    app.logger.info("🎨 tint applied hex=%s tol=%d coverage=%.1f%%", hex_clean, tol, pct)
                 except Exception as _e:
-                    app.logger.info("🎨 tint skipped (error): %s", _e)
+                    app.logger.info("🎨 tint coverage calc failed: %s", _e)
 
+                # compose target color
+                target_rgb = tuple(int(hex_clean[i:i+2], 16) for i in (0, 2, 4))
+                fill = Image.new("RGBA", base.size, (*target_rgb, 255))
+                tinted = Image.composite(fill, base, mask)
+                tinted.putalpha(ach)
 
-        # default (untinted) response + cache
+                out = BytesIO()
+                tinted.save(out, format="PNG", optimize=True)
+                out_bytes = out.getvalue()
+
+                # cache tinted and return
+                if tinted_key:
+                    _drive_thumb_cache[tinted_key] = {"bytes": out_bytes, "ts": time.time()}
+                return Response(
+                    out_bytes,
+                    mimetype="image/png",
+                    headers={
+                        "Cache-Control": "public, max-age=86400",
+                        **({"Last-Modified": modified} if modified else {}),
+                        **({"ETag": etag} if etag else {}),
+                    },
+                )
+            except Exception as _e:
+                app.logger.info("🎨 tint skipped (error): %s", _e)
+                # fall through to return raw image below
+
+        # --- return raw (untinted) and cache
         _drive_thumb_cache[cache_key] = {"bytes": raw_bytes, "ts": now}
         return Response(
             raw_bytes,
-            mimetype=ctype,
+            mimetype=ctype or "image/jpeg",
             headers={
                 "Cache-Control": "public, max-age=86400",
                 **({"Last-Modified": modified} if modified else {}),
@@ -1417,6 +1346,7 @@ def drive_thumbnail():
     except Exception:
         app.logger.exception("drive_thumbnail error")
         return Response(status=204)
+
 
 
 @app.route("/api/drive/token-status", methods=["GET"])
