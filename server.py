@@ -1222,12 +1222,61 @@ def drive_thumbnail():
             app.logger.info("📸 no usable image for %s (mime=%s) → 204", file_id, mime)
             return Response(status=204)
 
+
         # success
-        _drive_thumb_cache[cache_key] = {"bytes": r.content, "ts": now}
-        # return with the actual content-type if present, else default jpeg
+        raw_bytes = r.content
         ctype = r.headers.get("Content-Type", "image/jpeg")
+
+        # Optional recolor: replace near-white with requested fillHex
+        fill_hex = (request.args.get("fillHex") or "").strip()
+        if fill_hex:
+            import re
+            from io import BytesIO
+            from PIL import Image
+
+            hex_clean = re.sub(r"[^0-9A-Fa-f]", "", fill_hex)[:6]
+            if len(hex_clean) == 3:  # expand short #abc → aabbcc
+                hex_clean = "".join(ch*2 for ch in hex_clean)
+            if len(hex_clean) == 6:
+                target_rgb = tuple(int(hex_clean[i:i+2], 16) for i in (0, 2, 4))
+                # tolerance for "white" detection (0=only pure white; 25=more forgiving)
+                tol = max(0, min(50, int((request.args.get("whiteTol") or "16"))))
+                thr = 255 - tol
+
+                try:
+                    img = Image.open(BytesIO(raw_bytes)).convert("RGBA")
+                    w, h = img.size
+                    px = img.load()
+                    # replace near-white pixels
+                    for y in range(h):
+                        for x in range(w):
+                            r0, g0, b0, a0 = px[x, y]
+                            if r0 >= thr and g0 >= thr and b0 >= thr:
+                                px[x, y] = (*target_rgb, a0)
+                    # re-encode as PNG (preserves alpha and exact colors)
+                    out = BytesIO()
+                    img.save(out, format="PNG", optimize=True)
+                    out_bytes = out.getvalue()
+                    ctype = "image/png"
+                    # cache the tinted result separately
+                    tinted_key = f"{cache_key}:fill={hex_clean}"
+                    _drive_thumb_cache[tinted_key] = {"bytes": out_bytes, "ts": time.time()}
+                    return Response(
+                        out_bytes,
+                        mimetype=ctype,
+                        headers={
+                            "Cache-Control": "public, max-age=86400",
+                            **({"Last-Modified": modified} if modified else {}),
+                            **({"ETag": etag} if etag else {}),
+                        },
+                    )
+                except Exception as _e:
+                    app.logger.info("🎨 tint skipped (error): %s", _e)
+
+        # default (untinted) response + cache
+        _drive_thumb_cache[cache_key] = {"bytes": raw_bytes, "ts": now}
         return Response(
-            r.content,
+            raw_bytes,
             mimetype=ctype,
             headers={
                 "Cache-Control": "public, max-age=86400",
@@ -6531,16 +6580,35 @@ def order_summary():
         from urllib.parse import urljoin
 
         # Build an absolute base that always points to the backend host.
-        # Priority: BACKEND_PUBLIC_URL env var → current request host
         BACKEND_BASE = (os.environ.get("BACKEND_PUBLIC_URL") or request.host_url).rstrip("/")
-        def abs_thumb(file_id: str, sz: str) -> str:
-            return f"{BACKEND_BASE}/api/drive/thumbnail?fileId={file_id}&sz={sz}"
+
+        # Map Fur Color → hex (extend as you like)
+        def _fur_hex(name: str | None) -> str | None:
+            m = {
+                "White Fur": "FFFFFF",
+                "Light Grey Fur": "BFC3C7",
+                "Grey Fur": "9AA0A6",
+                "Black Fur": "111111",
+                "Navy Fur": "1E2A44",
+                "Red Fur": "C43A3A",
+                "Royal Blue Fur": "2A5BD7",
+                "Forest Green Fur": "165A33",
+                "Cream Fur": "F1EDE4",
+            }
+            key = (name or "").strip()
+            return m.get(key)
+
+        def abs_thumb(file_id: str, sz: str, fill_hex: str | None = None) -> str:
+            base = f"{BACKEND_BASE}/api/drive/thumbnail?fileId={file_id}&sz={sz}"
+            return f"{base}&fillHex={fill_hex}" if fill_hex else base
 
         main_id = main_ids[0] if main_ids else None
-        thumbnail_url = abs_thumb(main_id, "w160") if main_id else None
+        fill_hex = _fur_hex(order_data.get("furColor"))  # e.g., "Light Grey Fur" → "BFC3C7"
+
+        thumbnail_url = abs_thumb(main_id, "w160", fill_hex) if main_id else None
 
         imagesLabeled = (
-            [{"src": abs_thumb(main_id, "w640"), "label": ""}]
+            [{"src": abs_thumb(main_id, "w640", fill_hex), "label": ""}]
             if main_id else []
         )
 
@@ -6601,7 +6669,7 @@ def order_summary():
                             continue
 
                         app.logger.info("BOM image found for %r -> fileId=%r", name, fid)
-                        imagesLabeled.append({"src": abs_thumb(fid, "w640"), "label": label or ""})
+                        imagesLabeled.append({"src": abs_thumb(fid, "w640", fill_hex), "label": label or ""})
 
         except Exception:
             app.logger.exception("BOM Table lookup failed")
