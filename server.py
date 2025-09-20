@@ -1194,28 +1194,67 @@ def drive_thumbnail():
             ctype = (r.headers.get("Content-Type") or "").lower()
             return (ctype.startswith("image/") and _looks_like_image(r.content))
 
-        # 1) Try classic
-        r = _classic(file_id)
-        if not _good(r):
-            # 2) Try lh3 thumbnailLink
-            r = _lh3(thumb_url)
+        import requests
 
-        # 3) If still not good and file itself is an image, stream raw media via OAuth
+        r = None
+
+        # 1) Try classic FIRST, but don't die on exceptions/timeouts
+        try:
+            r = _classic(file_id)
+        except requests.RequestException as e:
+            app.logger.info("📸 classic exception for %s: %s", file_id, e)
+        except Exception as e:
+            app.logger.info("📸 classic unexpected for %s: %s", file_id, e)
+
+        # 2) If classic failed or not an image, try lh3 (again, don't die on errors)
+        if not _good(r):
+            try:
+                r = _lh3(thumb_url)
+            except requests.RequestException as e:
+                app.logger.info("📸 lh3 exception for %s: %s", file_id, e)
+            except Exception as e:
+                app.logger.info("📸 lh3 unexpected for %s: %s", file_id, e)
+
+        # 3) If still not good and the file itself is an image, stream raw media via OAuth
         if not _good(r) and mime.startswith("image/"):
-            session = AuthorizedSession(creds)
-            media = session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=15)
-            app.logger.info("📸 raw image media → %s %s", media.status_code, media.headers.get("Content-Type",""))
-            if media.status_code == 200 and media.content and _looks_like_image(media.content):
-                _drive_thumb_cache[cache_key] = {"bytes": media.content, "ts": now}
-                return Response(
-                    media.content,
-                    mimetype=mime,
-                    headers={
-                        "Cache-Control": "public, max-age=86400",
-                        **({"Last-Modified": modified} if modified else {}),
-                        **({"ETag": etag} if etag else {}),
-                    },
-                )
+            try:
+                session = AuthorizedSession(creds)
+                media = session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=12)
+                app.logger.info("📸 raw image media → %s %s", media.status_code, media.headers.get("Content-Type",""))
+                if media.status_code == 200 and media.content and _looks_like_image(media.content):
+                    _drive_thumb_cache[cache_key] = {"bytes": media.content, "ts": now}
+                    return Response(
+                        media.content,
+                        mimetype=mime,
+                        headers={
+                            "Cache-Control": "public, max-age=86400",
+                            **({"Last-Modified": modified} if modified else {}),
+                            **({"ETag": etag} if etag else {}),
+                        },
+                    )
+            except requests.RequestException as e:
+                app.logger.info("📸 raw media exception for %s: %s", file_id, e)
+            except Exception as e:
+                app.logger.info("📸 raw media unexpected for %s: %s", file_id, e)
+
+        # 4) Final decision
+        if not _good(r):
+            app.logger.info("📸 no usable image for %s (mime=%s) → 204", file_id, mime)
+            return Response(status=204)
+
+        # success
+        _drive_thumb_cache[cache_key] = {"bytes": r.content, "ts": now}
+        ctype = r.headers.get("Content-Type", "image/jpeg")
+        return Response(
+            r.content,
+            mimetype=ctype,
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                **({"Last-Modified": modified} if modified else {}),
+                **({"ETag": etag} if etag else {}),
+            },
+        )
+
 
         # 4) Final decision
         if not _good(r):
