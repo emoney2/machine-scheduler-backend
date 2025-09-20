@@ -1365,6 +1365,15 @@ def drive_thumbnail():
                     mrg = ImageChops.multiply(mr, mg)
                     mask = ImageChops.multiply(mrg, mb)
 
+                    try:
+                        hist = mask.histogram()
+                        white_pixels = hist[255] if len(hist) >= 256 else 0
+                        total = mask.size[0] * mask.size[1]
+                        pct = 100.0 * white_pixels / max(1, total)
+                        app.logger.info("🎨 tint applied hex=%s tol=%d coverage=%.1f%%", hex_clean, tol, pct)
+                    except Exception as _e:
+                        app.logger.info("🎨 tint coverage calc failed: %s", _e)
+
                     # Solid fill image in target color
                     fill = Image.new("RGBA", base.size, (*target_rgb, 255))
                     # Composite: where mask=255, pick from fill; else from base
@@ -6699,10 +6708,9 @@ def order_summary():
 
         from urllib.parse import urljoin
 
-        # Build an absolute base that always points to the backend host.
         BACKEND_BASE = (os.environ.get("BACKEND_PUBLIC_URL") or request.host_url).rstrip("/")
 
-        # Map Fur Color → hex (extend as you like)
+        # Map Fur Color → hex
         def _fur_hex(name: str | None) -> str | None:
             m = {
                 "White Fur": "FFFFFF",
@@ -6715,21 +6723,37 @@ def order_summary():
                 "Forest Green Fur": "165A33",
                 "Cream Fur": "F1EDE4",
             }
-            key = (name or "").strip()
-            return m.get(key)
+            return m.get((name or "").strip())
 
-        def abs_thumb(file_id: str, sz: str, fill_hex: str | None = None) -> str:
+        # Choose how aggressively to treat “near-white”
+        def _fur_white_tol(name: str | None) -> int:
+            tbl = {
+                "White Fur": 0,            # basically don't recolor
+                "Light Grey Fur": 28,      # more aggressive to catch whites in photos
+                "Grey Fur": 26,
+                "Cream Fur": 22,
+                "Black Fur": 24,
+                "Navy Fur": 24,
+                "Red Fur": 24,
+                "Royal Blue Fur": 24,
+                "Forest Green Fur": 24,
+            }
+            return tbl.get((name or "").strip(), 24)
+
+        def abs_thumb(file_id: str, sz: str, fill_hex: str | None = None, white_tol: int | None = None) -> str:
             base = f"{BACKEND_BASE}/api/drive/thumbnail?fileId={file_id}&sz={sz}"
-            return f"{base}&fillHex={fill_hex}" if fill_hex else base
+            if fill_hex:
+                base += f"&fillHex={fill_hex}"
+                if isinstance(white_tol, int):
+                    base += f"&whiteTol={white_tol}"
+            return base
 
-        main_id = main_ids[0] if main_ids else None
-        fill_hex = _fur_hex(fur_color)  # e.g., "Light Grey Fur" → "BFC3C7"
-        app.logger.info("🎨 furColor=%r → fill_hex=%r", fur_color, fill_hex)
+        fill_hex = _fur_hex(fur_color)
+        white_tol = _fur_white_tol(fur_color) if fill_hex else None
 
-        thumbnail_url = abs_thumb(main_id, "w160", fill_hex) if main_id else None
-
+        thumbnail_url = abs_thumb(main_id, "w160", fill_hex, white_tol) if main_id else None
         imagesLabeled = (
-            [{"src": abs_thumb(main_id, "w640", fill_hex), "label": ""}]
+            [{"src": abs_thumb(main_id, "w640", fill_hex, white_tol), "label": ""}]
             if main_id else []
         )
 
@@ -6790,7 +6814,10 @@ def order_summary():
                             continue
 
                         app.logger.info("BOM image found for %r -> fileId=%r", name, fid)
-                        imagesLabeled.append({"src": abs_thumb(fid, "w640", fill_hex), "label": label or ""})
+                        imagesLabeled.append({
+                            "src": abs_thumb(fid, "w640", fill_hex, white_tol),
+                            "label": label or ""
+                        })
 
         except Exception:
             app.logger.exception("BOM Table lookup failed")
