@@ -6751,7 +6751,11 @@ def order_summary():
         fill_hex = _fur_hex(fur_color)
         white_tol = _fur_white_tol(fur_color) if fill_hex else None
 
+        # ✅ make sure main_id is defined BEFORE we use it
+        main_id = main_ids[0] if main_ids else None
+
         thumbnail_url = abs_thumb(main_id, "w160", fill_hex, white_tol) if main_id else None
+
         imagesLabeled = (
             [{"src": abs_thumb(main_id, "w640", fill_hex, white_tol), "label": ""}]
             if main_id else []
