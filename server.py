@@ -6728,12 +6728,12 @@ def order_summary():
         # Choose how aggressively to treat “near-white”
         def _fur_white_tol(name: str | None) -> int:
             tbl = {
-                "White Fur": 0,            # basically don't recolor
-                "Light Grey Fur": 28,      # more aggressive to catch whites in photos
+                "White Fur": 0,
+                "Light Grey Fur": 32,  # was 28 — recolor more near-whites
                 "Grey Fur": 26,
                 "Cream Fur": 22,
                 "Black Fur": 24,
-                "Navy Fur": 24,
+                "Navy Blue Fur": 24,
                 "Red Fur": 24,
                 "Royal Blue Fur": 24,
                 "Forest Green Fur": 24,
