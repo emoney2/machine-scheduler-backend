@@ -1186,13 +1186,52 @@ def drive_thumbnail():
             )
 
         # Fetch the Drive thumbnail with auth
-        session = AuthorizedSession(creds)
-        r = session.get(thumb_url, timeout=10)
-        if r.status_code != 200 or not r.content:
-            app.logger.info("📸 Thumb fetch miss for %s via %s (status=%s)", file_id, thumb_url, r.status_code)
-            return Response(status=204)
+        import re, requests
 
-        # Save to cache
+        # Ensure the size param is present/correct on the URL that Drive returned
+        def _coerce_size(u: str, size: str) -> str:
+            # If the URL already has "=sNNN", replace it; otherwise append
+            if re.search(r"(=s)\d+$", u):
+                return re.sub(r"(=s)\d+$", rf"\1{size_num}", u)
+            # Some variants use "?sz=w###" or "&sz=w###" — normalize to "=s###"
+            if "sz=w" in u:
+                u = re.sub(r"sz=w\d+", f"sz=w{size_num}", u)
+            # If no explicit size token, append one
+            if not re.search(r"(=s)\d+$", u):
+                sep = "&" if "?" in u else "?"
+                u = f"{u}{sep}=s{size_num}"
+            return u
+
+        sized_url = _coerce_size(thumb_url, size_num)
+
+        # 1) Try lh3 URL WITHOUT OAuth headers (lh3 rejects Authorization sometimes)
+        r = requests.get(sized_url, timeout=10, allow_redirects=True)
+        if r.status_code != 200 or not r.content:
+            app.logger.info("📸 Thumb miss (lh3) for %s via %s (status=%s)", file_id, sized_url, r.status_code)
+
+            # 2) Fallback to classic Drive endpoint (often works even when lh3 400s)
+            classic = f"https://drive.google.com/thumbnail?id={file_id}&sz=w{size_num}"
+            r = requests.get(classic, timeout=10, allow_redirects=True)
+            if r.status_code != 200 or not r.content:
+                app.logger.info("📸 Thumb miss (classic) for %s via %s (status=%s)", file_id, classic, r.status_code)
+
+                # 3) Final fallback: if it's an image/* file, stream the raw media via OAuth
+                if mime.startswith("image/"):
+                    session = AuthorizedSession(creds)
+                    media = session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=10)
+                    if media.status_code == 200 and media.content:
+                        _drive_thumb_cache[cache_key] = {"bytes": media.content, "ts": now}
+                        headers = {
+                            "Cache-Control": "public, max-age=86400",
+                            **({"Last-Modified": modified} if modified else {}),
+                            **({"ETag": etag} if etag else {}),
+                        }
+                        return Response(media.content, mimetype=mime, headers=headers)
+
+                # No luck
+                return Response(status=204)
+
+        # Save to cache on success
         _drive_thumb_cache[cache_key] = {"bytes": r.content, "ts": now}
 
         headers = {
