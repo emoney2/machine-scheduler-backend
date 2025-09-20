@@ -1100,7 +1100,6 @@ def _mem_after(resp):
     return resp
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
-@login_required_session
 def drive_thumbnail():
     file_id = (request.args.get("fileId") or "").strip()
     if not file_id:
@@ -6468,15 +6467,27 @@ def order_summary():
             if fid and fid not in main_ids:
                 main_ids.append(fid)
 
-        main_id = main_ids[0] if main_ids else None
-        thumbnail_url = (f"/api/drive/thumbnail?fileId={main_id}&sz=w160") if main_id else None
+        # Build absolute base for images so <img> hits the backend host (not Netlify)
+        BACKEND_BASE = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
 
-        imagesLabeled = (
-            [{"src": f"/api/drive/thumbnail?fileId={main_id}&sz=w640", "label": ""}]
-            if main_id else []
+        main_id = main_ids[0] if main_ids else None
+        thumbnail_url = (
+            f"{BACKEND_BASE}/api/drive/thumbnail?fileId={main_id}&sz=w160"
+            if (BACKEND_BASE and main_id) else
+            (f"/api/drive/thumbnail?fileId={main_id}&sz=w160" if main_id else None)
         )
 
-
+        imagesLabeled = (
+            [{
+                "src": (
+                    f"{BACKEND_BASE}/api/drive/thumbnail?fileId={main_id}&sz=w640"
+                    if BACKEND_BASE else
+                    f"/api/drive/thumbnail?fileId={main_id}&sz=w640"
+                ),
+                "label": ""
+            }]
+            if main_id else []
+        )
 
         # BOMs from the Table sheet (by Product)
         try:
@@ -6535,7 +6546,14 @@ def order_summary():
                             continue
 
                         app.logger.info("BOM image found for %r -> fileId=%r", name, fid)
-                        imagesLabeled.append({"src": f"/api/drive/thumbnail?fileId={fid}&sz=w640", "label": label or ""})
+                        imagesLabeled.append({
+                            "src": (
+                                f"{BACKEND_BASE}/api/drive/thumbnail?fileId={fid}&sz=w640"
+                                if BACKEND_BASE else
+                                f"/api/drive/thumbnail?fileId={fid}&sz=w640"
+                            ),
+                            "label": label or ""
+                        })
 
         except Exception:
             app.logger.exception("BOM Table lookup failed")
