@@ -6603,7 +6603,8 @@ def order_summary():
             return f"{base}&fillHex={fill_hex}" if fill_hex else base
 
         main_id = main_ids[0] if main_ids else None
-        fill_hex = _fur_hex(order_data.get("furColor"))  # e.g., "Light Grey Fur" → "BFC3C7"
+        fill_hex = _fur_hex(fur_color)  # e.g., "Light Grey Fur" → "BFC3C7"
+        app.logger.info("🎨 furColor=%r → fill_hex=%r", fur_color, fill_hex)
 
         thumbnail_url = abs_thumb(main_id, "w160", fill_hex) if main_id else None
 
