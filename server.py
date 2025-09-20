@@ -6693,12 +6693,14 @@ def order_summary():
         # ✅ make sure main_id is defined BEFORE we use it
         main_id = main_ids[0] if main_ids else None
 
-        thumbnail_url = abs_thumb(main_id, "w160", fill_hex, white_tol) if main_id else None
+        # ⛔ no tint on the MAIN image
+        thumbnail_url = abs_thumb(main_id, "w160") if main_id else None
 
         imagesLabeled = (
-            [{"src": abs_thumb(main_id, "w640", fill_hex, white_tol), "label": ""}]
+            [{"src": abs_thumb(main_id, "w640"), "label": ""}]
             if main_id else []
         )
+
 
         # BOMs from the Table sheet (by Product)
         try:
@@ -6757,10 +6759,13 @@ def order_summary():
                             continue
 
                         app.logger.info("BOM image found for %r -> fileId=%r", name, fid)
-                        imagesLabeled.append({
-                            "src": abs_thumb(fid, "w640", fill_hex, white_tol),
-                            "label": label or ""
-                        })
+                        use_tint = ("fur" in (name or "").strip().lower())
+                        src = (
+                            abs_thumb(fid, "w640", fill_hex, white_tol)
+                            if (use_tint and fill_hex)
+                            else abs_thumb(fid, "w640")
+                        )
+                        imagesLabeled.append({"src": src, "label": label or ""})
 
         except Exception:
             app.logger.exception("BOM Table lookup failed")
