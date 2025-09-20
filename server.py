@@ -6955,6 +6955,7 @@ def order_summary():
             thumbnail_url = images[0]
 
 
+
         payload = {
             "order": str(order),
             "company": company or "—",
