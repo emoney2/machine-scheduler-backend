@@ -1156,21 +1156,22 @@ def drive_thumbnail():
         cache_key = f"{file_id}:{modified}:{want_sz}"
         now = time.time()
 
-        # If we previously cached a tinted image for this file/version/size, return it immediately.
         fill_hex_raw = (request.args.get("fillHex") or "").strip()
         white_tol_raw = (request.args.get("whiteTol") or "").strip()
         tinted_key = None
+        raw_cached_bytes = None
+
         if fill_hex_raw:
             import re
             hex_clean = re.sub(r"[^0-9A-Fa-f]", "", fill_hex_raw)[:6]
             if len(hex_clean) == 3:
                 hex_clean = "".join(ch * 2 for ch in hex_clean)
-            tol = 16
             try:
-                t = int(white_tol_raw) if white_tol_raw else 16
-                tol = max(0, min(50, t))
+                tol = int(white_tol_raw) if white_tol_raw else 16
             except Exception:
-                pass
+                tol = 16
+            tol = max(0, min(50, tol))
+
             tinted_key = f"{cache_key}:fill={hex_clean}:tol={tol}"
             cached_tinted = _drive_thumb_cache.get(tinted_key)
             if cached_tinted and (now - cached_tinted["ts"] < _drive_thumb_ttl):
@@ -1183,19 +1184,23 @@ def drive_thumbnail():
                         **({"ETag": etag} if etag else {}),
                     },
                 )
-
-        # Raw (untinted) cache
-        cached = _drive_thumb_cache.get(cache_key)
-        if cached and (now - cached["ts"] < _drive_thumb_ttl):
-            return Response(
-                cached["bytes"],
-                mimetype="image/jpeg",
-                headers={
-                    "Cache-Control": "public, max-age=86400",
-                    **({"Last-Modified": modified} if modified else {}),
-                    **({"ETag": etag} if etag else {}),
-                },
-            )
+            # don't return raw here — just keep it to tint without re-downloading
+            cached_raw = _drive_thumb_cache.get(cache_key)
+            if cached_raw and (now - cached_raw["ts"] < _drive_thumb_ttl):
+                raw_cached_bytes = cached_raw["bytes"]
+        else:
+            # No tint requested → raw cache may be returned as-is
+            cached = _drive_thumb_cache.get(cache_key)
+            if cached and (now - cached["ts"] < _drive_thumb_ttl):
+                return Response(
+                    cached["bytes"],
+                    mimetype="image/jpeg",
+                    headers={
+                        "Cache-Control": "public, max-age=86400",
+                        **({"Last-Modified": modified} if modified else {}),
+                        **({"ETag": etag} if etag else {}),
+                    },
+                )
 
         # --- helper fetchers -------------------------------------------------
         def _classic(fid: str) -> requests.Response:
@@ -1293,8 +1298,39 @@ def drive_thumbnail():
 
 
         # success
-        raw_bytes = r.content
-        ctype = r.headers.get("Content-Type", "image/jpeg")
+        raw_bytes = None
+        ctype = "image/jpeg"
+
+        if r is not None and getattr(r, "content", None):
+            raw_bytes = r.content
+            ctype = r.headers.get("Content-Type", "image/jpeg")
+        elif raw_cached_bytes:
+            # use cached raw bytes as the source when tinting was requested
+            raw_bytes = raw_cached_bytes
+
+        if raw_bytes is None:
+            app.logger.info("📸 no bytes to return for %s → 204", file_id)
+            return Response(status=204)
+
+        # Optional recolor (fast compositing path you already added)
+        fill_hex = fill_hex_raw  # reuse parsed arg
+        if fill_hex:
+            # ...keep your existing fast tint block here unchanged...
+            # (it writes to the tinted cache and returns PNG)
+            pass  # <-- this line just illustrates "keep your current tint block"
+
+        # default (untinted) response + cache
+        _drive_thumb_cache[cache_key] = {"bytes": raw_bytes, "ts": now}
+        return Response(
+            raw_bytes,
+            mimetype=ctype,
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                **({"Last-Modified": modified} if modified else {}),
+                **({"ETag": etag} if etag else {}),
+            },
+        )
+
 
         # Optional recolor: replace near-white with requested fillHex (fast, vectorized)
         fill_hex = (request.args.get("fillHex") or "").strip()
