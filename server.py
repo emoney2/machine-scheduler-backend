@@ -1101,48 +1101,77 @@ def _mem_after(resp):
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
 def drive_thumbnail():
+    """
+    Server-side proxy for Google Drive thumbnails so the browser
+    doesn't need Drive auth. Supports ?sz=w160, w320, w640, etc.
+    """
+    import re
+    from flask import Response, request
+
     file_id = (request.args.get("fileId") or "").strip()
+    sz = (request.args.get("sz") or "w640").strip()  # e.g., "w640"
+    app.logger.info("📸 /api/drive/thumbnail hit file_id=%s sz=%s", file_id, sz)
+
     if not file_id:
         return jsonify({"error": "Missing fileId"}), 400
+
+    # normalize size: accept "w640" or "640"
+    m = re.search(r"(\d+)", sz)
+    size_num = m.group(1) if m else "640"
+    want_sz = f"w{size_num}"
+
+    # lightweight cache init (in case not defined elsewhere)
+    global _drive_thumb_cache, _drive_thumb_ttl
     try:
-        # Use your existing Drive service + OAuth creds
+        _drive_thumb_cache
+    except NameError:
+        _drive_thumb_cache = {}
+    try:
+        _drive_thumb_ttl
+    except NameError:
+        _drive_thumb_ttl = 60 * 15  # 15 minutes
+
+    try:
         drive = get_drive_service()
-        creds = get_oauth_credentials()  # same creds mechanism you use elsewhere
-        if hasattr(creds, "expired") and creds.expired and hasattr(creds, "refresh_token"):
-            # Refresh if needed
+        creds = get_oauth_credentials()
+        # refresh if needed
+        if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
             creds.refresh(GoogleRequest())
 
-
-        # Ask Drive for its lightweight thumbnail URL (much faster than full download)
+        # Ask Drive for a thumbnail link (fast)
         meta = drive.files().get(
             fileId=file_id,
             fields="thumbnailLink,hasThumbnail,name,mimeType,modifiedTime,md5Checksum"
         ).execute()
 
         thumb_url = meta.get("thumbnailLink")
-        has_thumb = meta.get("hasThumbnail")
+        has_thumb = bool(meta.get("hasThumbnail"))
         modified  = meta.get("modifiedTime") or ""
         etag      = meta.get("md5Checksum") or ""
+        mime      = meta.get("mimeType") or ""
 
-        # Fallback: if no Drive thumbnail, try direct media for image/* files
-        if not has_thumb or not thumb_url:
-            mime = meta.get("mimeType", "")
+        # Prefer Drive-provided thumbnail. Coerce size if present.
+        if has_thumb and thumb_url:
+            # Drive often returns ...=s220 — swap to requested size
+            thumb_url = re.sub(r"(=s)(\d+)", rf"\1{size_num}", thumb_url)
+        else:
+            # If the file is an image, try direct media as a fallback
             if mime.startswith("image/"):
                 session = AuthorizedSession(creds)
-                r = session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=8)
+                r = session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=10)
                 if r.status_code == 200 and r.content:
-                    headers = {"Cache-Control": "public, max-age=86400"}
-                    if modified:
-                        headers["Last-Modified"] = modified
-                    if etag:
-                        headers["ETag"] = etag
+                    headers = {
+                        "Cache-Control": "public, max-age=86400",
+                        **({"Last-Modified": modified} if modified else {}),
+                        **({"ETag": etag} if etag else {}),
+                    }
                     return Response(r.content, mimetype=mime, headers=headers)
-            # otherwise, no image we can stream → no content
+            # Nothing we can render
+            app.logger.info("📸 No thumbnail/media available for file_id=%s mime=%s", file_id, mime)
             return Response(status=204)
 
-
-        # --- In-process cache lookup ---
-        cache_key = f"{file_id}:{modified}"
+        # --- Cache key includes size to avoid mixing sizes
+        cache_key = f"{file_id}:{modified}:{want_sz}"
         now = time.time()
         cached = _drive_thumb_cache.get(cache_key)
         if cached and (now - cached["ts"] < _drive_thumb_ttl):
@@ -1156,28 +1185,28 @@ def drive_thumbnail():
                 },
             )
 
-        # Miss → fetch from Drive once
+        # Fetch the Drive thumbnail with auth
         session = AuthorizedSession(creds)
-        r = session.get(thumb_url, timeout=8)
+        r = session.get(thumb_url, timeout=10)
         if r.status_code != 200 or not r.content:
+            app.logger.info("📸 Thumb fetch miss for %s via %s (status=%s)", file_id, thumb_url, r.status_code)
             return Response(status=204)
 
         # Save to cache
         _drive_thumb_cache[cache_key] = {"bytes": r.content, "ts": now}
 
-        # Respond with strong cache headers for browsers/CDNs
-        headers = {"Cache-Control": "public, max-age=86400"}
-        if modified:
-            headers["Last-Modified"] = modified
-        if etag:
-            headers["ETag"] = etag
-
+        headers = {
+            "Cache-Control": "public, max-age=86400",
+            **({"Last-Modified": modified} if modified else {}),
+            **({"ETag": etag} if etag else {}),
+        }
         return Response(r.content, mimetype="image/jpeg", headers=headers)
 
     except Exception:
         app.logger.exception("drive_thumbnail error")
         # Let the <img> fail silently; UI hides it onError
         return Response(status=204)
+
 
 
 @app.route("/api/drive/token-status", methods=["GET"])
@@ -6467,25 +6496,19 @@ def order_summary():
             if fid and fid not in main_ids:
                 main_ids.append(fid)
 
-        # Build absolute base for images so <img> hits the backend host (not Netlify)
-        BACKEND_BASE = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
+        from urllib.parse import urljoin
+
+        # Build an absolute base that always points to the backend host.
+        # Priority: BACKEND_PUBLIC_URL env var → current request host
+        BACKEND_BASE = (os.environ.get("BACKEND_PUBLIC_URL") or request.host_url).rstrip("/")
+        def abs_thumb(file_id: str, sz: str) -> str:
+            return f"{BACKEND_BASE}/api/drive/thumbnail?fileId={file_id}&sz={sz}"
 
         main_id = main_ids[0] if main_ids else None
-        thumbnail_url = (
-            f"{BACKEND_BASE}/api/drive/thumbnail?fileId={main_id}&sz=w160"
-            if (BACKEND_BASE and main_id) else
-            (f"/api/drive/thumbnail?fileId={main_id}&sz=w160" if main_id else None)
-        )
+        thumbnail_url = abs_thumb(main_id, "w160") if main_id else None
 
         imagesLabeled = (
-            [{
-                "src": (
-                    f"{BACKEND_BASE}/api/drive/thumbnail?fileId={main_id}&sz=w640"
-                    if BACKEND_BASE else
-                    f"/api/drive/thumbnail?fileId={main_id}&sz=w640"
-                ),
-                "label": ""
-            }]
+            [{"src": abs_thumb(main_id, "w640"), "label": ""}]
             if main_id else []
         )
 
@@ -6546,14 +6569,7 @@ def order_summary():
                             continue
 
                         app.logger.info("BOM image found for %r -> fileId=%r", name, fid)
-                        imagesLabeled.append({
-                            "src": (
-                                f"{BACKEND_BASE}/api/drive/thumbnail?fileId={fid}&sz=w640"
-                                if BACKEND_BASE else
-                                f"/api/drive/thumbnail?fileId={fid}&sz=w640"
-                            ),
-                            "label": label or ""
-                        })
+                        imagesLabeled.append({"src": abs_thumb(fid, "w640"), "label": label or ""})
 
         except Exception:
             app.logger.exception("BOM Table lookup failed")
@@ -6586,6 +6602,7 @@ def order_summary():
             "images": images,                # array of public thumbs
             "imagesLabeled": imagesLabeled,  # [{src,label}]
         }
+        app.logger.info("🧪 image URLs: thumb=%r, imagesLabeled=%r", thumbnail_url, [i.get("src") for i in imagesLabeled])
         return jsonify(payload), 200
 
     except Exception:
