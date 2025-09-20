@@ -6746,7 +6746,16 @@ def order_summary():
                 base += f"&fillHex={fill_hex}"
                 if isinstance(white_tol, int):
                     base += f"&whiteTol={white_tol}"
+            # cache-buster: change URL when tint params change
+            vbits = []
+            if fill_hex:
+                vbits.append(fill_hex)
+            if isinstance(white_tol, int):
+                vbits.append(str(white_tol))
+            if vbits:
+                base += f"&v={'-'.join(vbits)}"
             return base
+
 
         fill_hex = _fur_hex(fur_color)
         white_tol = _fur_white_tol(fur_color) if fill_hex else None
