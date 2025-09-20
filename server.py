@@ -1155,6 +1155,36 @@ def drive_thumbnail():
 
         cache_key = f"{file_id}:{modified}:{want_sz}"
         now = time.time()
+
+        # If we previously cached a tinted image for this file/version/size, return it immediately.
+        fill_hex_raw = (request.args.get("fillHex") or "").strip()
+        white_tol_raw = (request.args.get("whiteTol") or "").strip()
+        tinted_key = None
+        if fill_hex_raw:
+            import re
+            hex_clean = re.sub(r"[^0-9A-Fa-f]", "", fill_hex_raw)[:6]
+            if len(hex_clean) == 3:
+                hex_clean = "".join(ch * 2 for ch in hex_clean)
+            tol = 16
+            try:
+                t = int(white_tol_raw) if white_tol_raw else 16
+                tol = max(0, min(50, t))
+            except Exception:
+                pass
+            tinted_key = f"{cache_key}:fill={hex_clean}:tol={tol}"
+            cached_tinted = _drive_thumb_cache.get(tinted_key)
+            if cached_tinted and (now - cached_tinted["ts"] < _drive_thumb_ttl):
+                return Response(
+                    cached_tinted["bytes"],
+                    mimetype="image/png",
+                    headers={
+                        "Cache-Control": "public, max-age=86400",
+                        **({"Last-Modified": modified} if modified else {}),
+                        **({"ETag": etag} if etag else {}),
+                    },
+                )
+
+        # Raw (untinted) cache
         cached = _drive_thumb_cache.get(cache_key)
         if cached and (now - cached["ts"] < _drive_thumb_ttl):
             return Response(
@@ -1266,43 +1296,57 @@ def drive_thumbnail():
         raw_bytes = r.content
         ctype = r.headers.get("Content-Type", "image/jpeg")
 
-        # Optional recolor: replace near-white with requested fillHex
+        # Optional recolor: replace near-white with requested fillHex (fast, vectorized)
         fill_hex = (request.args.get("fillHex") or "").strip()
         if fill_hex:
             import re
             from io import BytesIO
-            from PIL import Image
+            from PIL import Image, ImageChops
 
             hex_clean = re.sub(r"[^0-9A-Fa-f]", "", fill_hex)[:6]
             if len(hex_clean) == 3:  # expand short #abc → aabbcc
-                hex_clean = "".join(ch*2 for ch in hex_clean)
+                hex_clean = "".join(ch * 2 for ch in hex_clean)
             if len(hex_clean) == 6:
                 target_rgb = tuple(int(hex_clean[i:i+2], 16) for i in (0, 2, 4))
-                # tolerance for "white" detection (0=only pure white; 25=more forgiving)
-                tol = max(0, min(50, int((request.args.get("whiteTol") or "16"))))
+                # tolerance for "white" detection (0=only pure white; 25=more forgiving; max 50)
+                try:
+                    tol = int(request.args.get("whiteTol") or "16")
+                except Exception:
+                    tol = 16
+                tol = max(0, min(50, tol))
                 thr = 255 - tol
 
                 try:
-                    img = Image.open(BytesIO(raw_bytes)).convert("RGBA")
-                    w, h = img.size
-                    px = img.load()
-                    # replace near-white pixels
-                    for y in range(h):
-                        for x in range(w):
-                            r0, g0, b0, a0 = px[x, y]
-                            if r0 >= thr and g0 >= thr and b0 >= thr:
-                                px[x, y] = (*target_rgb, a0)
-                    # re-encode as PNG (preserves alpha and exact colors)
+                    base = Image.open(BytesIO(raw_bytes)).convert("RGBA")
+                    r, g, b, a = base.split()
+        
+                    # Build a mask where r,g,b are all >= thr (near white)
+                    def _mask_band(band):
+                        return band.point(lambda v: 255 if v >= thr else 0, mode="L")
+
+                    mr, mg, mb = _mask_band(r), _mask_band(g), _mask_band(b)
+                    # Combine channel masks via multiply (AND)
+                    mrg = ImageChops.multiply(mr, mg)
+                    mask = ImageChops.multiply(mrg, mb)
+
+                    # Solid fill image in target color
+                    fill = Image.new("RGBA", base.size, (*target_rgb, 255))
+                    # Composite: where mask=255, pick from fill; else from base
+                    tinted = Image.composite(fill, base, mask)
+                    # Keep original alpha exactly
+                    tinted.putalpha(a)
+
                     out = BytesIO()
-                    img.save(out, format="PNG", optimize=True)
+                    tinted.save(out, format="PNG", optimize=True)
                     out_bytes = out.getvalue()
-                    ctype = "image/png"
-                    # cache the tinted result separately
-                    tinted_key = f"{cache_key}:fill={hex_clean}"
-                    _drive_thumb_cache[tinted_key] = {"bytes": out_bytes, "ts": time.time()}
+
+                    # cache the tinted PNG for this file/version/size/tolerance/fill
+                    if tinted_key:
+                        _drive_thumb_cache[tinted_key] = {"bytes": out_bytes, "ts": time.time()}
+        
                     return Response(
                         out_bytes,
-                        mimetype=ctype,
+                        mimetype="image/png",
                         headers={
                             "Cache-Control": "public, max-age=86400",
                             **({"Last-Modified": modified} if modified else {}),
@@ -1311,6 +1355,7 @@ def drive_thumbnail():
                     )
                 except Exception as _e:
                     app.logger.info("🎨 tint skipped (error): %s", _e)
+
 
         # default (untinted) response + cache
         _drive_thumb_cache[cache_key] = {"bytes": raw_bytes, "ts": now}
