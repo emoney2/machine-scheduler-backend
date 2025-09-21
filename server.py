@@ -5311,6 +5311,146 @@ def get_inventory_ordered():
     app.logger.info("📦 /api/inventoryOrdered requested")
 
     def build():
+        """
+        Fast path:
+          - Read precomputed 'Inventory Ordered (View)'!A:F  (Date | Type | Name | Qty | Unit | Vendor)
+          - Map each row back to its ORIGINAL sheet row:
+                * Material  -> 'Material Log' row where O/R='ordered'
+                * Thread    -> 'Thread Data' row where O/R='ordered'
+            (we match by name, and prefer same quantity if available)
+        Fallback:
+          - if view empty/unavailable, use the original slow builder logic.
+        """
+        # --------- Try FAST VIEW first ---------
+        view = fetch_sheet(SPREADSHEET_ID, "Inventory Ordered (View)!A1:F")
+        if view and len(view) > 1:
+            # Load originals ONCE to map name -> row
+            mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z") or []
+            th  = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z") or []
+
+            # Indices for Material Log
+            mat_i = {}
+            if mat:
+                mhdr = mat[0]
+                try:
+                    mat_i["Date"]     = mhdr.index("Date")
+                    mat_i["Material"] = mhdr.index("Material")
+                    mat_i["O/R"]      = mhdr.index("O/R")
+                    # In your sheet, Quantity is two columns left of O/R (same rule as before)
+                    mat_i["Qty"]      = mat_i["O/R"] - 2
+                except ValueError:
+                    mat_i = {}
+
+            # Indices for Thread Data
+            th_i = {}
+            if th:
+                thdr = th[0]
+                try:
+                    th_i["Date"]   = thdr.index("Date")
+                    th_i["Color"]  = thdr.index("Color")
+                    th_i["LenFt"]  = thdr.index("Length (ft)")
+                    th_i["O/R"]    = thdr.index("O/R")
+                except ValueError:
+                    th_i = {}
+
+            # Build name -> candidate rows (ordered only)
+            mat_by_name = {}
+            if mat and mat_i:
+                for rix, r in enumerate(mat[1:], start=2):
+                    try:
+                        orv = (r[mat_i["O/R"]] or "").strip().lower()
+                        name = (r[mat_i["Material"]] or "").strip()
+                    except Exception:
+                        continue
+                    if orv == "ordered" and name:
+                        mat_by_name.setdefault(name.lower(), []).append((rix, r))
+
+            thr_by_name = {}
+            if th and th_i:
+                for rix, r in enumerate(th[1:], start=2):
+                    try:
+                        orv = (r[th_i["O/R"]] or "").strip().lower()
+                        name = (r[th_i["Color"]] or "").strip()
+                    except Exception:
+                        continue
+                    if orv == "ordered" and name:
+                        thr_by_name.setdefault(name.lower(), []).append((rix, r))
+
+            def _to_float(x):
+                try:
+                    return float(str(x).replace(",", "").strip())
+                except Exception:
+                    return None
+
+            out = []
+            hdr = view[0]  # Date | Type | Name | Quantity | Unit | Vendor
+            for vix, vrow in enumerate(view[1:], start=2):
+                # safe unpack
+                vrow = (vrow + ["", "", "", "", "", ""])[:6]
+                date, typ, name, qty, unit, vendor = vrow[0], vrow[1], vrow[2], vrow[3], vrow[4], vrow[5]
+                if not name:
+                    continue
+
+                typ_l = (typ or "").strip().lower()
+                name_l = name.strip().lower()
+                src_row = None
+
+                if typ_l == "material" and mat_by_name:
+                    cands = mat_by_name.get(name_l, [])
+                    if cands:
+                        # if we can parse quantities, prefer matching qty
+                        vq = _to_float(qty)
+                        best = None
+                        for rix, r in cands:
+                            rq = None
+                            try:
+                                rq = _to_float(r[mat_i["Qty"]])
+                            except Exception:
+                                pass
+                            if vq is not None and rq is not None and abs(vq - rq) < 1e-9:
+                                best = rix
+                                break
+                        src_row = best or cands[0][0]
+
+                elif typ_l == "thread" and thr_by_name:
+                    cands = thr_by_name.get(name_l, [])
+                    if cands:
+                        vq = _to_float(qty)  # view qty already divided by 16500 in the sheet
+                        best = None
+                        for rix, r in cands:
+                            rq = None
+                            try:
+                                rq = _to_float(r[th_i["LenFt"]])
+                                if rq is not None:
+                                    rq = rq / 16500.0
+                            except Exception:
+                                pass
+                            if vq is not None and rq is not None and abs(vq - rq) < 1e-9:
+                                best = rix
+                                break
+                        src_row = best or (cands[0][0] if cands else None)
+
+                    # normalize quantity label for thread (add " cones" if missing)
+                    if qty and "cone" not in str(qty).lower():
+                        try:
+                            qf = float(qty)
+                            qty = f"{qf:.2f} cones"
+                        except Exception:
+                            pass
+
+                out.append({
+                    "row":      src_row,     # original row in Material Log / Thread Data
+                    "date":     date,
+                    "type":     typ or "",
+                    "name":     name,
+                    "quantity": qty,
+                    "unit":     unit or "",
+                    "vendor":   vendor or "",
+                })
+
+            return out
+
+        # --------- Fallback to your ORIGINAL (slow) logic if view empty ---------
         orders = []
 
         # 0) Build Material→Unit and Material→Vendor maps (from Inventory sheet A2:I)
@@ -5375,6 +5515,121 @@ def get_inventory_ordered():
 
     # Cache for 60s: (key, ttl, builder)
     return send_cached_json("inventoryOrdered", 60, build)
+
+
+# --- Fast reader for the "Inventory Ordered (View)" sheet + row mapping ---
+def _fast_inventory_view_entries():
+    """
+    Returns a list of entries from 'Inventory Ordered (View)' with fields:
+      { date, type, name, quantity, unit, vendor, row }
+    'row' is the 1-based row index in the ORIGINAL sheet:
+      - if type == 'Material' → row in 'Material Log'
+      - if type == 'Thread'   → row in 'Thread Data'
+    """
+    sheets = get_sheets_service()  # use your existing helper
+    ssid   = os.environ.get("SPREADSHEET_ID") or app.config.get("SPREADSHEET_ID")
+    if not ssid:
+        app.logger.warning("SPREADSHEET_ID missing; falling back to slow path")
+        return None
+
+    # Read the precomputed view (fast)
+    view_range = "'Inventory Ordered (View)'!A2:F"  # Date | Type | Name | Qty | Unit | Vendor
+    view_vals  = sheets.spreadsheets().values().get(
+        spreadsheetId=ssid, range=view_range, majorDimension="ROWS"
+    ).execute().get("values", [])
+
+    # If the view is empty, bail out so the caller can fallback
+    if not view_vals:
+        return None
+
+    # Read original sheets ONCE so we can map back to row numbers
+    # Material Log: we need row index where O/R == "ordered"
+    mat_range = "'Material Log'!A:I"
+    material_vals = sheets.spreadsheets().values().get(
+        spreadsheetId=ssid, range=mat_range, majorDimension="ROWS"
+    ).execute().get("values", [])
+
+    # Thread Data: row index where O/R == "ordered"
+    thr_range = "'Thread Data'!A:I"
+    thread_vals = sheets.spreadsheets().values().get(
+        spreadsheetId=ssid, range=thr_range, majorDimension="ROWS"
+    ).execute().get("values", [])
+
+    # Build quick lookup maps by name → list of candidate row indices
+    # Material Log columns (per your header): A=Date, F=Material, G=QTY, I=O/R
+    mat_by_name = {}
+    for idx, r in enumerate(material_vals, start=1):  # 1-based row
+        try:
+            name = (r[5] or "").strip()   # F
+            orv  = (r[8] or "").strip().lower()  # I
+        except IndexError:
+            continue
+        if orv == "ordered" and name:
+            mat_by_name.setdefault(name.lower(), []).append((idx, r))
+
+    # Thread Data columns: A=Date, C=Color, E=Length(ft), H=O/R
+    thr_by_name = {}
+    for idx, r in enumerate(thread_vals, start=1):
+        try:
+            name = (r[2] or "").strip()   # C
+            orv  = (r[7] or "").strip().lower()  # H
+        except IndexError:
+            continue
+        if orv == "ordered" and name:
+            thr_by_name.setdefault(name.lower(), []).append((idx, r))
+
+    def _js_date_to_str(sheet_val):
+        # pass through as-is; your frontend already handles serials/strings
+        return sheet_val
+
+    entries = []
+    for row in view_vals:
+        # Safe unpack with padding
+        row += [""] * (6 - len(row))
+        date, typ, name, qty, unit, vendor = row[0], row[1], row[2], row[3], row[4], row[5]
+        if not name:
+            continue
+
+        # Default: no mapping (will be None for safety)
+        src_row = None
+
+        # Try to find the original row by name (and try to tighten by qty if possible)
+        lname = name.strip().lower()
+        if typ.strip().lower() == "material":
+            cands = mat_by_name.get(lname, [])
+            if cands:
+                # If qty is numeric, prefer matching quantity (G)
+                try:
+                    qnum = float(qty)
+                except Exception:
+                    qnum = None
+                best = None
+                for idx, r in cands:
+                    try:
+                        rq = float(r[6])  # G
+                    except Exception:
+                        rq = None
+                    if qnum is not None and rq is not None and abs(rq - qnum) < 1e-9:
+                        best = idx
+                        break
+                src_row = best or cands[0][0]
+        else:
+            # Thread
+            cands = thr_by_name.get(lname, [])
+            src_row = cands[0][0] if cands else None
+
+        entries.append({
+            "date": _js_date_to_str(date),
+            "type": typ,
+            "name": name,
+            "quantity": qty,
+            "unit": unit,
+            "vendor": vendor,
+            "row": src_row,  # may be None if no match found
+        })
+
+    return entries
+
 
 
 @app.route("/api/inventoryOrdered", methods=["PUT"])
