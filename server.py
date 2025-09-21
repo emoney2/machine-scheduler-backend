@@ -6895,32 +6895,49 @@ def drive_thumb(file_id):
         app.logger.warning("drive_thumb error for %r: %s", file_id, e)
         return Response(status=204)
 
+def _drive_version_token(file_id: str) -> str:
+    """Return a short version token that changes when the Drive file updates."""
+    try:
+        drive = get_drive_service()
+        meta = drive.files().get(fileId=file_id, fields="md5Checksum,modifiedTime").execute()
+        token = meta.get("md5Checksum") or meta.get("modifiedTime") or ""
+        # sanitize for URLs
+        return "".join(ch for ch in token if ch.isalnum())
+    except Exception:
+        return ""
 
 @app.route("/api/order-summary", methods=["GET"])
 @login_required_session
 def order_summary():
     """
     Returns a compact order summary for the scanner page.
-    Includes main image + BOM1/BOM2/BOM3 (from the Table sheet) when resolvable.
-    All images are public Drive thumbnails (no proxy).
+    Uses our /api/drive/thumbnail proxy for ALL images and adds a version token
+    (&ver=...) so cache busts when a Drive file is updated.
     """
+
     def _extract_drive_id(val: str | None) -> str | None:
         if not val:
             return None
         s = str(val).strip()
-        # raw id
         import re
         if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
             return s
         m = re.search(r"(?:\bid=|/d/)([A-Za-z0-9_-]{10,})", s)
         return m.group(1) if m else None
 
-    def _public_thumb(file_id: str | None, sz: str = "w640") -> str | None:
-        return f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}" if file_id else None
-
     def _norm_key(s: str) -> str:
         import re
         return re.sub(r"[^a-z0-9]+", "", (s or "").strip().lower())
+
+    # NEW: small helper – version token changes when Drive file changes
+    def _drive_version_token(file_id: str) -> str:
+        try:
+            svc = _get_drive_service_local() if "_get_drive_service_local" in globals() else _get_drive_service()
+            meta = svc.files().get(fileId=file_id, fields="md5Checksum,modifiedTime").execute()
+            token = meta.get("md5Checksum") or meta.get("modifiedTime") or ""
+            return "".join(ch for ch in token if ch.isalnum())
+        except Exception:
+            return ""
 
     # Use the global BOM_FOLDER_ID and the global drive name search helper if present
     bom_folder_id = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
@@ -6958,7 +6975,6 @@ def order_summary():
         try:
             resp = svc.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10).execute()
             files = resp.get("files", []) or []
-            # prefer exact base (case-insensitive), then anything
             def _noext_lower(n): return os.path.splitext(n)[0].lower()
             for f in files:
                 if _noext_lower(f.get("name", "")) == base.lower():
@@ -6984,7 +7000,6 @@ def order_summary():
         if not order:
             return jsonify({"error": "missing order"}), 400
 
-        # Pull Production Orders
         rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE) or []
         if not rows:
             return jsonify({"error": "no data"}), 404
@@ -7022,7 +7037,6 @@ def order_summary():
             quantity = str(qty_raw) if str(qty_raw).strip() else "—"
 
         def _fmt_date_mdy(s):
-            # keep your existing date formatter if you have one; this is a safe fallback
             try:
                 from datetime import datetime
                 d = datetime.fromisoformat(s)
@@ -7031,7 +7045,7 @@ def order_summary():
                 return s
         due_date = _fmt_date_mdy(due_raw)
 
-        # MAIN IMAGE (scan several columns)
+        # MAIN IMAGE: scan several columns for first Drive id
         img_cols = [
             "Preview", "Image", "Thumbnail", "Image URL", "Image Link", "Photo",
             "Img", "Front Image", "Mockup", "Mockup Link", "Artwork", "Art",
@@ -7044,11 +7058,9 @@ def order_summary():
             if fid and fid not in main_ids:
                 main_ids.append(fid)
 
-        from urllib.parse import urljoin
-
         BACKEND_BASE = (os.environ.get("BACKEND_PUBLIC_URL") or request.host_url).rstrip("/")
 
-        # Map Fur Color → hex
+        # Fur color → hex and white tolerance
         def _fur_hex(name: str | None) -> str | None:
             m = {
                 "White Fur": "FFFFFF",
@@ -7063,11 +7075,10 @@ def order_summary():
             }
             return m.get((name or "").strip())
 
-        # Choose how aggressively to treat “near-white”
         def _fur_white_tol(name: str | None) -> int:
             tbl = {
                 "White Fur": 0,
-                "Light Grey Fur": 32,  # was 28 — recolor more near-whites
+                "Light Grey Fur": 32,
                 "Grey Fur": 26,
                 "Cream Fur": 22,
                 "Black Fur": 24,
@@ -7078,13 +7089,14 @@ def order_summary():
             }
             return tbl.get((name or "").strip(), 24)
 
+        # Build a proxied thumbnail URL, optional tint, plus small cache-buster when tint params change.
         def abs_thumb(file_id: str, sz: str, fill_hex: str | None = None, white_tol: int | None = None) -> str:
             base = f"{BACKEND_BASE}/api/drive/thumbnail?fileId={file_id}&sz={sz}"
             if fill_hex:
                 base += f"&fillHex={fill_hex}"
                 if isinstance(white_tol, int):
                     base += f"&whiteTol={white_tol}"
-            # cache-buster: change URL when tint params change
+            # keep tiny v for tint param changes only (we'll add &ver= for file version below)
             vbits = []
             if fill_hex:
                 vbits.append(fill_hex)
@@ -7094,21 +7106,27 @@ def order_summary():
                 base += f"&v={'-'.join(vbits)}"
             return base
 
-
-        fill_hex = _fur_hex(fur_color)
+        fill_hex  = _fur_hex(fur_color)
         white_tol = _fur_white_tol(fur_color) if fill_hex else None
+        main_id   = main_ids[0] if main_ids else None
 
-        # ✅ make sure main_id is defined BEFORE we use it
-        main_id = main_ids[0] if main_ids else None
+        # MAIN image: NO tint, always via our proxy, and add file version token
+        imagesLabeled = []
+        thumbnail_url = None
+        if main_id:
+            ver_main = _drive_version_token(main_id)
+            main_src = abs_thumb(main_id, "w640")
+            if ver_main:
+                main_src += f"&ver={ver_main}"
+            thumbnail_url = abs_thumb(main_id, "w160")
+            if ver_main:
+                thumbnail_url += f"&ver={ver_main}"
 
-        # ⛔ no tint on the MAIN image
-        thumbnail_url = abs_thumb(main_id, "w160") if main_id else None
-
-        imagesLabeled = (
-            [{"src": _public_thumb(main_id, "w640"), "label": "", "kind": "main"}]
-            if main_id else []
-        )
-
+            imagesLabeled.append({
+                "kind":  "main",
+                "label": "",
+                "src":   main_src,
+            })
 
         # BOMs from the Table sheet (by Product)
         try:
@@ -7150,24 +7168,22 @@ def order_summary():
                         base = (name or "").strip()
                         app.logger.debug("Attempting BOM lookup for name=%r label=%r", base, label)
 
-                        # Heuristic: does this look like a real Drive ID?
+                        # Does this look like a real Drive ID?
                         def _looks_like_drive_id(s: str) -> bool:
                             s = (s or "").strip()
                             return len(s) >= 20 and all(ch.isalnum() or ch in "-_" for ch in s)
 
-                        # 1) Try resolver (ID or link)
+                        # 1) ID/link straight parse
                         fid = _resolve_bom_to_id(base) or ""
-                        app.logger.debug("Global resolver returned: %r", fid)
 
-                        # 2) If not a real ID, search by name in the BOM folder using common variants
+                        # 2) If not a real ID, search in BOM folder with variants
                         if not _looks_like_drive_id(fid):
                             fid = ""
                             if bom_folder_id:
-                                # build variants: exact, with extensions, and spaced CamelCase
-                                variants = [base, f"{base}.pdf", f"{base}.png", f"{base}.jpg", f"{base}.jpeg"]
+                                variants = [base, f"{base}.pdf", f"{base}.png", f"{base}.jpg", f"{base}.jpeg", f"{base}.webp"]
                                 spaced = "".join((" " + c if c.isupper() else c) for c in base).strip()
                                 if spaced.lower() != base.lower():
-                                    variants += [spaced, f"{spaced}.pdf", f"{spaced}.png", f"{spaced}.jpg", f"{spaced}.jpeg"]
+                                    variants += [spaced, f"{spaced}.pdf", f"{spaced}.png", f"{spaced}.jpg", f"{spaced}.jpeg", f"{spaced}.webp"]
 
                                 found = None
                                 for q in variants:
@@ -7194,12 +7210,18 @@ def order_summary():
                             if (use_tint and fill_hex)
                             else abs_thumb(fid, "w640")
                         )
+
+                        # ADD file-version token so swaps in Drive show immediately
+                        ver_bom = _drive_version_token(fid)
+                        if ver_bom:
+                            src += f"&ver={ver_bom}"
+
                         app.logger.info("🎨 BOM tint (cell=%r) → %s", base, "ON" if (use_tint and fill_hex) else "off")
 
                         imagesLabeled.append({
-                            "src":   src,
-                            "label": label or "",
-                            "kind":  "bom",
+                            "src":    src,
+                            "label":  label or "",
+                            "kind":   "bom",
                             "bomName": base,
                         })
 
@@ -7230,8 +7252,6 @@ def order_summary():
         if images and not thumbnail_url:
             thumbnail_url = images[0]
 
-
-
         payload = {
             "order": str(order),
             "company": company or "—",
@@ -7242,8 +7262,8 @@ def order_summary():
             "furColor": fur_color or "",
             "quantity": quantity,
             "thumbnailUrl": thumbnail_url,
-            "images": images,                # array of public thumbs
-            "imagesLabeled": imagesLabeled,  # [{src,label}]
+            "images": images,                # array of proxied thumbs
+            "imagesLabeled": imagesLabeled,  # [{src,label,kind,...}]
         }
         app.logger.info("🧪 image URLs: thumb=%r, imagesLabeled=%r", thumbnail_url, [i.get("src") for i in imagesLabeled])
         return jsonify(payload), 200
