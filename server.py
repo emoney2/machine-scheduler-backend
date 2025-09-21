@@ -96,9 +96,14 @@ import re, os
 _DRIVE_NAME_CACHE: dict[tuple[str,str], dict] = {}
 
 
-def _public_thumb(file_id: str, sz: str = "w640") -> str:
-    """Public Drive thumbnail URL (no proxy)."""
-    return f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
+def _public_thumb(file_id: str | None, sz: str = "w640", ver: str | None = None) -> str | None:
+    if not file_id:
+        return None
+    url = f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
+    if ver:
+        url += f"&v={ver}"
+    return url
+
 
 def _resolve_bom_to_id(raw_name_or_link: str | None):
     """Try direct id / link, else name search in BOM_FOLDER_ID via Drive."""
@@ -7090,14 +7095,16 @@ def order_summary():
             return tbl.get((name or "").strip(), 24)
 
         # Build a proxied thumbnail URL, optional tint, plus small cache-buster when tint params change.
-        def abs_thumb(file_id: str, sz: str, fill_hex: str | None = None, white_tol: int | None = None) -> str:
+        def abs_thumb(file_id: str, sz: str, fill_hex: str | None = None, white_tol: int | None = None, ver: str | None = None) -> str:
             base = f"{BACKEND_BASE}/api/drive/thumbnail?fileId={file_id}&sz={sz}"
             if fill_hex:
                 base += f"&fillHex={fill_hex}"
                 if isinstance(white_tol, int):
                     base += f"&whiteTol={white_tol}"
-            # keep tiny v for tint param changes only (we'll add &ver= for file version below)
+            # cache-buster: include Drive file version + tint params
             vbits = []
+            if ver:
+                vbits.append(ver)
             if fill_hex:
                 vbits.append(fill_hex)
             if isinstance(white_tol, int):
@@ -7106,27 +7113,41 @@ def order_summary():
                 base += f"&v={'-'.join(vbits)}"
             return base
 
+        # Per-file version cache (for this request only)
+        _ver_cache: dict[str, str] = {}
+
+        def _file_ver(file_id: str | None) -> str | None:
+            """
+            Returns a short version string for cache-busting (md5Checksum or modifiedTime).
+            """
+            if not file_id:
+                return None
+            if file_id in _ver_cache:
+                return _ver_cache[file_id]
+            try:
+                svc = _get_drive_service_local() if "_get_drive_service_local" in globals() else _get_drive_service()
+                meta = svc.files().get(fileId=file_id, fields="md5Checksum, modifiedTime, version").execute()
+                ver = meta.get("md5Checksum") or meta.get("modifiedTime") or str(meta.get("version") or "")
+                # Keep it short but unique enough
+                ver = ver.replace(":", "").replace("-", "").replace(".", "")
+                _ver_cache[file_id] = ver
+                return ver
+            except Exception:
+                return None
+
         fill_hex  = _fur_hex(fur_color)
         white_tol = _fur_white_tol(fur_color) if fill_hex else None
         main_id   = main_ids[0] if main_ids else None
 
         # MAIN image: NO tint, always via our proxy, and add file version token
         imagesLabeled = []
-        thumbnail_url = None
-        if main_id:
-            ver_main = _drive_version_token(main_id)
-            main_src = abs_thumb(main_id, "w640")
-            if ver_main:
-                main_src += f"&ver={ver_main}"
-            thumbnail_url = abs_thumb(main_id, "w160")
-            if ver_main:
-                thumbnail_url += f"&ver={ver_main}"
+        main_ver = _file_ver(main_id) if main_id else None
+        thumbnail_url = abs_thumb(main_id, "w160", ver=main_ver) if main_id else None
 
-            imagesLabeled.append({
-                "kind":  "main",
-                "label": "",
-                "src":   main_src,
-            })
+        imagesLabeled = (
+            [{"src": _public_thumb(main_id, "w640", main_ver), "label": "", "kind": "main"}]
+            if main_id else []
+        )
 
         # BOMs from the Table sheet (by Product)
         try:
@@ -7205,10 +7226,11 @@ def order_summary():
 
                         # Tint only when the BOM cell text contains "fur"
                         use_tint = ("fur" in base.lower())
+                        fid_ver = _file_ver(fid)
                         src = (
-                            abs_thumb(fid, "w640", fill_hex, white_tol)
+                            abs_thumb(fid, "w640", fill_hex, white_tol, ver=fid_ver)
                             if (use_tint and fill_hex)
-                            else abs_thumb(fid, "w640")
+                            else abs_thumb(fid, "w640", ver=fid_ver)
                         )
 
                         # ADD file-version token so swaps in Drive show immediately
