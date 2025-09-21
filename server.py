@@ -5305,74 +5305,77 @@ def submit_thread_inventory():
 
     return jsonify({"added": len(to_log)}), 200
 
-
-
+# AFTER (server.py)
 @app.route("/api/inventoryOrdered", methods=["GET"])
 @login_required_session
 def get_inventory_ordered():
-    orders = []
+    # Build list on-demand, but cache the JSON for a short time
+    def build():
+        orders = []
 
-    # 0) Build Material→Unit and Material→Vendor maps (from Inventory sheet A2:I)
-    inv_rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:I")
-    unit_map = {
-        r[0]: (r[3] if len(r) > 3 else "")
-        for r in inv_rows if r and str(r[0]).strip()
-    }
-    vendor_map = {
-        r[0]: (r[8] if len(r) > 8 else "")
-        for r in inv_rows if r and str(r[0]).strip()
-    }
+        # 0) Build Material→Unit and Material→Vendor maps (from Inventory sheet A2:I)
+        inv_rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:I")
+        unit_map = {
+            r[0]: (r[3] if len(r) > 3 else "")
+            for r in inv_rows if r and str(r[0]).strip()
+        }
+        vendor_map = {
+            r[0]: (r[8] if len(r) > 8 else "")
+            for r in inv_rows if r and str(r[0]).strip()
+        }
 
+        # 1) Material Log sheet
+        mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
+        if mat:
+            hdr     = mat[0]
+            i_dt    = hdr.index("Date")
+            i_or    = hdr.index("O/R")
+            qty_idx = i_or - 2
+            i_mat   = hdr.index("Material")
 
-    # 1) Material Log sheet
-    mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
-    if mat:
-        hdr     = mat[0]
-        i_dt    = hdr.index("Date")
-        i_or    = hdr.index("O/R")
-        qty_idx = i_or - 2              # Quantity is one column left of O/R
-        i_mat   = hdr.index("Material")
+            for idx, row in enumerate(mat[1:], start=2):
+                if len(row) > i_or and row[i_or].strip().lower() == "ordered":
+                    name = row[i_mat] if len(row) > i_mat else ""
+                    qty  = row[qty_idx] if len(row) > qty_idx else ""
+                    orders.append({
+                        "row":      idx,
+                        "date":     row[i_dt] if len(row) > i_dt else "",
+                        "type":     "Material",
+                        "name":     name,
+                        "quantity": qty,
+                        "unit":     unit_map.get(name, ""),
+                        "vendor":   vendor_map.get(name, "")
+                    })
 
-        for idx, row in enumerate(mat[1:], start=2):
-            if len(row) > i_or and row[i_or].strip().lower() == "ordered":
-                name = row[i_mat] if len(row) > i_mat else ""
-                qty  = row[qty_idx] if len(row) > qty_idx else ""
-                orders.append({
-                    "row":      idx,
-                    "date":     row[i_dt] if len(row) > i_dt else "",
-                    "type":     "Material",
-                    "name":     name,
-                    "quantity": qty,
-                    "unit":     unit_map.get(name, ""),
-                    "vendor":   vendor_map.get(name, "")
-                })
+        # 2) Thread Data sheet
+        th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
+        if th:
+            hdr    = th[0]
+            i_or   = hdr.index("O/R")
+            i_dt   = hdr.index("Date")
+            i_col  = hdr.index("Color")
+            i_len  = hdr.index("Length (ft)")
 
+            for idx, row in enumerate(th[1:], start=2):
+                if len(row) > i_or and row[i_or].strip().lower() == "ordered":
+                    qty = row[i_len] if len(row) > i_len else ""
+                    try:
+                        qty = f"{float(qty) / 16500:.2f} cones"
+                    except:
+                        pass
+                    orders.append({
+                        "row":      idx,
+                        "date":     row[i_dt] if len(row) > i_dt else "",
+                        "type":     "Thread",
+                        "name":     row[i_col] if len(row) > i_col else "",
+                        "quantity": qty
+                    })
 
-    # 2) Thread Data sheet (unchanged)
-    th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
-    if th:
-        hdr    = th[0]
-        i_or   = hdr.index("O/R")
-        i_dt   = hdr.index("Date")
-        i_col  = hdr.index("Color")
-        i_len  = hdr.index("Length (ft)")
+        return orders
 
-        for idx, row in enumerate(th[1:], start=2):
-            if len(row) > i_or and row[i_or].strip().lower() == "ordered":
-                qty = row[i_len] if len(row) > i_len else ""
-                try:
-                    qty = f"{float(qty) / 16500:.2f} cones"
-                except:
-                    pass
-                orders.append({
-                    "row":      idx,
-                    "date":     row[i_dt] if len(row) > i_dt else "",
-                    "type":     "Thread",
-                    "name":     row[i_col] if len(row) > i_col else "",
-                    "quantity": qty
-                })
+    # short TTL (e.g., 60s) keeps the UI snappy while staying fresh
+    return send_cached_json("inventoryOrdered", build, ttl=60)
 
-    return jsonify(orders), 200
 
 @app.route("/api/inventoryOrdered", methods=["PUT"])
 @login_required_session
