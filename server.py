@@ -7147,42 +7147,60 @@ def order_summary():
                             app.logger.debug("BOM entry skipped (empty name)")
                             continue
 
-                        app.logger.debug("Attempting BOM lookup for name=%r label=%r", name, label)
+                        base = (name or "").strip()
+                        app.logger.debug("Attempting BOM lookup for name=%r label=%r", base, label)
 
-                        # Try global resolver first
-                        fid = _resolve_bom_to_id(name)
+                        # Heuristic: does this look like a real Drive ID?
+                        def _looks_like_drive_id(s: str) -> bool:
+                            s = (s or "").strip()
+                            return len(s) >= 20 and all(ch.isalnum() or ch in "-_" for ch in s)
+
+                        # 1) Try resolver (ID or link)
+                        fid = _resolve_bom_to_id(base) or ""
                         app.logger.debug("Global resolver returned: %r", fid)
 
-                        # Fallback: use local bom_folder_id
-                        if not fid and bom_folder_id:
-                            try:
-                                f = _drive_find_by_name(bom_folder_id, name)
-                                fid = f if isinstance(f, str) else (f.get("id") if f else None)
-                                app.logger.debug("Fallback lookup with bom_folder_id=%r returned: %r", bom_folder_id, fid)
-                            except Exception as e:
-                                app.logger.warning("BOM fallback lookup failed for %r: %s", name, e)
+                        # 2) If not a real ID, search by name in the BOM folder using common variants
+                        if not _looks_like_drive_id(fid):
+                            fid = ""
+                            if bom_folder_id:
+                                # build variants: exact, with extensions, and spaced CamelCase
+                                variants = [base, f"{base}.pdf", f"{base}.png", f"{base}.jpg", f"{base}.jpeg"]
+                                spaced = "".join((" " + c if c.isupper() else c) for c in base).strip()
+                                if spaced.lower() != base.lower():
+                                    variants += [spaced, f"{spaced}.pdf", f"{spaced}.png", f"{spaced}.jpg", f"{spaced}.jpeg"]
 
-                        if not fid:
-                            app.logger.info("BOM image not found for %r (check BOM_FOLDER_ID and Table headers)", name)
+                                found = None
+                                for q in variants:
+                                    try:
+                                        found_try = _drive_find_by_name(bom_folder_id, q)
+                                        found = found_try if isinstance(found_try, str) else (found_try.get("id") if found_try else None)
+                                        if found:
+                                            app.logger.debug("Found BOM by variant=%r → %r", q, found)
+                                            break
+                                    except Exception as e:
+                                        app.logger.warning("BOM lookup failed for %r variant %r: %s", base, q, e)
+                                fid = found or ""
+
+                        if not _looks_like_drive_id(fid):
+                            app.logger.info("BOM image not found for %r (no ID; check BOM_FOLDER_ID and filename in Drive)", base)
                             continue
 
-                        app.logger.info("BOM image found for %r -> fileId=%r", name, fid)
+                        app.logger.info("BOM image found for %r -> fileId=%r", base, fid)
 
-                        # Tint only when the BOM *cell* text contains "fur" (case-insensitive)
-                        use_tint = ("fur" in (name or "").strip().lower())
+                        # Tint only when the BOM cell text contains "fur"
+                        use_tint = ("fur" in base.lower())
                         src = (
                             abs_thumb(fid, "w640", fill_hex, white_tol)
                             if (use_tint and fill_hex)
                             else abs_thumb(fid, "w640")
                         )
-                        app.logger.info("🎨 BOM tint (cell=%r) → %s", name, "ON" if (use_tint and fill_hex) else "off")
+                        app.logger.info("🎨 BOM tint (cell=%r) → %s", base, "ON" if (use_tint and fill_hex) else "off")
 
-                        # Mark this tile as a BOM and include its BOM cell name for DXF lookup in the UI
                         imagesLabeled.append({
-                            "src": src,
+                            "src":   src,
                             "label": label or "",
-                            "kind": "bom",
-                            "bomName": str(name).strip(),
+                            "kind":  "bom",
+                            "bomName": base,
                         })
 
         except Exception:
