@@ -3946,163 +3946,183 @@ def material_log_recut_append():
 @app.route("/api/prepare-shipment", methods=["POST"])
 @login_required_session
 def prepare_shipment():
-    data = request.get_json()
-    order_ids = data.get("order_ids", [])
-    if not order_ids:
-        return jsonify({"error": "Missing order_ids"}), 400
+    try:
+        data = request.get_json() or {}
+        order_ids = data.get("order_ids", [])
+        if not order_ids:
+            # keep shape stable for the UI
+            return jsonify({"error": "Missing order_ids", "boxes": [], "missing": []}), 400
 
-    # Fetch both Production Orders and Table tabs
-    prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
-    table_data = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z")
+        # ✅ ensure exists before use
+        shipped_quantities = data.get("shipped_quantities", {}) or {}
 
-    prod_headers = prod_data[0]
-    table_headers = table_data[0]
+        # ── Fetch both tabs defensively ────────────────────────────────
+        try:
+            prod_data  = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM") or []
+            table_data = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z") or []
+        except Exception as e:
+            logging.exception("prepare-shipment: sheets fetch failed")
+            # Don’t 500 → return safe, empty structure so UI stays up
+            return jsonify({"boxes": [], "missing": [], "note": "sheets-unavailable"}), 200
 
-    # ✅ Moved up so it exists before being used
-    shipped_quantities = data.get("shipped_quantities", {})
+        if not prod_data or not prod_data[0] or not table_data or not table_data[0]:
+            # Missing headers or empty data; still no 500
+            return jsonify({"boxes": [], "missing": [], "note": "empty-data"}), 200
 
-    # Step 1: Find orders that match the given Order #
-    prod_rows = []
-    all_order_data = []  # ✅ declare this before using it
+        prod_headers  = prod_data[0]
+        table_headers = table_data[0]
 
-    for row in prod_data[1:]:
-        row_dict = dict(zip(prod_headers, row))
-        order_id = str(row_dict.get("Order #")).strip()
+        # ── Step 1: Filter rows matching given Order # ─────────────────
+        prod_rows = []
+        all_order_data = []
 
-        if order_id in order_ids:
-            parsed_qty = shipped_quantities.get(order_id, 0)
-            headers = list(row_dict.keys())
-            order_data = {
-                h: (
-                    str(parsed_qty) if h == "Shipped" else
-                    row_dict.get(h, "")
-                )
-                for h in headers
-            }
-            order_data["ShippedQty"] = parsed_qty
-            all_order_data.append(order_data)
-            prod_rows.append(row_dict)
+        for r in prod_data[1:]:
+            row = dict(zip(prod_headers, r))
+            order_id = str(row.get("Order #", "")).strip()
 
-    # Step 2: Create product→volume map
-    table_map = {}
-    for r in table_data[1:]:
-        if len(r) >= 2:
-            product = r[0]
-            volume_str = r[13] if len(r) >= 14 else r[1]  # use column N if available
-            try:
-                volume = float(volume_str)
-                table_map[product.strip().lower()] = volume
-            except:
+            if order_id in order_ids:
+                raw = shipped_quantities.get(order_id, 0)
+                try:
+                    parsed_qty = int(float(raw))
+                except Exception:
+                    parsed_qty = 0
+
+                headers = list(row.keys())
+                order_data = {
+                    h: (str(parsed_qty) if h == "Shipped" else row.get(h, ""))
+                    for h in headers
+                }
+                order_data["ShippedQty"] = parsed_qty
+                all_order_data.append(order_data)
+                prod_rows.append(row)
+
+        # ── Step 2: Build product → volume map (prefer column N) ───────
+        table_map = {}
+        for r in table_data[1:]:
+            if len(r) >= 2:
+                product = (r[0] or "").strip()
+                volume_str = r[13] if len(r) >= 14 else r[1]
+                try:
+                    volume = float(volume_str)
+                    if product:
+                        table_map[product.lower()] = volume
+                except Exception:
+                    continue
+
+        # ── Step 3: Validate volumes & build jobs list ─────────────────
+        missing_products = []
+        jobs = []
+
+        for row in prod_rows:
+            order_id = str(row.get("Order #", "")).strip()
+            product  = str(row.get("Product", "")).strip()
+
+            # Ignore “Back” jobs entirely
+            if re.search(r"\s+Back$", product, flags=re.IGNORECASE):
                 continue
 
-    # Step 3: Check for missing volumes and build job list
-    missing_products = []
-    jobs = []
+            volume = table_map.get(product.lower())
+            if volume is None:
+                missing_products.append(product)
+                continue
 
-    for row in prod_rows:
-        order_id = str(row["Order #"])
-        product  = row.get("Product","").strip()
-        # ── IGNORE Back jobs entirely in prepare-shipment ──
-        if re.search(r"\s+Back$", product, flags=re.IGNORECASE):
-            continue
-        key = product.lower()
-        volume = table_map.get(key)
-
-        if volume is None:
-            missing_products.append(product)
-        else:
-            # Use shipQty from frontend if provided, fallback to Quantity column
+            # ship qty: prefer front-end value, else fall back to sheet Quantity
             raw_ship_qty = shipped_quantities.get(order_id, row.get("Quantity", 0))
             try:
-                ship_qty = int(raw_ship_qty)
-            except:
+                ship_qty = int(float(raw_ship_qty))
+            except Exception:
                 ship_qty = 0
 
-            # parse physical dimensions (in inches) from your sheet
-            length = float(row_dict.get("Length", 0)   or 0)
-            width  = float(row_dict.get("Width",  0)   or 0)
-            height = float(row_dict.get("Height", 0)   or 0)
+            # physical dimensions from sheet (optional)
+            try:
+                length = float(row.get("Length", 0) or 0)
+                width  = float(row.get("Width",  0) or 0)
+                height = float(row.get("Height", 0) or 0)
+            except Exception:
+                length = width = height = 0.0
+
             jobs.append({
                 "order_id":  order_id,
                 "product":   product,
                 "volume":    volume,
                 "dimensions": (length, width, height),
-                "ship_qty":  ship_qty
+                "ship_qty":  ship_qty,
             })
 
-    if missing_products:
-        return jsonify({
-            "error": "Missing volume data",
-            "missing_products": list(set(missing_products))
-        }), 400
+        # If volumes missing, return 200 with a helpful payload (don’t 500/502)
+        if missing_products:
+            return jsonify({
+                "status": "needs-volume",
+                "boxes": [],
+                "missing": sorted(set(missing_products)),
+            }), 200
 
-    # Step 4: Pack items into as few boxes as possible, respecting both vol & dims
-    BOX_TYPES = [
-        {"size": "Small",  "dims": (10, 10, 10), "vol": 10*10*10},
-        {"size": "Medium", "dims": (15, 15, 15), "vol": 15*15*15},
-        {"size": "Large",  "dims": (20, 20, 20), "vol": 20*20*20},
-    ]
-
-    def can_fit(prod_dims, box_dims):
-        p_sorted = sorted(prod_dims)
-        b_sorted = sorted(box_dims)
-        return all(p <= b for p, b in zip(p_sorted, b_sorted))
-
-    # 4a) Expand each item by its quantity
-    items = []
-    for job in jobs:
-        for _ in range(job["ship_qty"]):
-            items.append({
-                "order_id": job["order_id"],
-                "dims":      job["dimensions"],
-                "volume":    job["volume"]
-            })
-
-    # 4b) Greedily fill boxes
-    boxes = []
-    while items:
-        # start a new box with the first item
-        group     = [items.pop(0)]
-        total_vol = group[0]["volume"]
-        max_dims  = list(group[0]["dims"])
-
-        # try to pack more items into this same box
-        i = 0
-        while i < len(items):
-            it       = items[i]
-            new_dims = (
-                max(max_dims[0], it["dims"][0]),
-                max(max_dims[1], it["dims"][1]),
-                max(max_dims[2], it["dims"][2]),
-            )
-            # check against the largest box capacity and dims
-            largest = BOX_TYPES[-1]
-            if (total_vol + it["volume"] <= largest["vol"]
-                and can_fit(new_dims, largest["dims"])):
-                total_vol += it["volume"]
-                max_dims  = list(new_dims)
-                group.append(it)
-                items.pop(i)
-                continue
-            i += 1
-
-        # 4c) Choose the smallest box that fits this group
-        eligible = [
-            b for b in BOX_TYPES
-            if can_fit(max_dims, b["dims"]) and b["vol"] >= total_vol
+        # ── Step 4: Pack items (greedy, by vol & dims) ─────────────────
+        BOX_TYPES = [
+            {"size": "Small",  "dims": (10, 10, 10), "vol": 10 * 10 * 10},
+            {"size": "Medium", "dims": (15, 15, 15), "vol": 15 * 15 * 15},
+            {"size": "Large",  "dims": (20, 20, 20), "vol": 20 * 20 * 20},
         ]
-        eligible.sort(key=lambda b: b["vol"])
-        chosen = (eligible[0]["size"] if eligible else BOX_TYPES[-1]["size"])
 
-        boxes.append({
-            "size": chosen,
-            "jobs": [g["order_id"] for g in group]
-        })
+        def can_fit(prod_dims, box_dims):
+            p_sorted = sorted(prod_dims)
+            b_sorted = sorted(box_dims)
+            return all(p <= b for p, b in zip(p_sorted, b_sorted))
 
-    return jsonify({
-        "status": "ok",
-        "boxes": boxes
-    })
+        # 4a) Expand by quantity
+        items = []
+        for job in jobs:
+            for _ in range(max(0, int(job["ship_qty"]))):
+                items.append({
+                    "order_id": job["order_id"],
+                    "dims":     job["dimensions"],
+                    "volume":   job["volume"],
+                })
+
+        # 4b) Greedy fill
+        boxes = []
+        while items:
+            group     = [items.pop(0)]
+            total_vol = group[0]["volume"]
+            max_dims  = list(group[0]["dims"])
+
+            i = 0
+            while i < len(items):
+                it       = items[i]
+                new_dims = (
+                    max(max_dims[0], it["dims"][0]),
+                    max(max_dims[1], it["dims"][1]),
+                    max(max_dims[2], it["dims"][2]),
+                )
+                largest = BOX_TYPES[-1]
+                if (total_vol + it["volume"] <= largest["vol"]
+                        and can_fit(new_dims, largest["dims"])):
+                    total_vol += it["volume"]
+                    max_dims   = list(new_dims)
+                    group.append(it)
+                    items.pop(i)
+                    continue
+                i += 1
+
+            eligible = [
+                b for b in BOX_TYPES
+                if can_fit(max_dims, b["dims"]) and b["vol"] >= total_vol
+            ]
+            eligible.sort(key=lambda b: b["vol"])
+            chosen = (eligible[0]["size"] if eligible else BOX_TYPES[-1]["size"])
+
+            boxes.append({
+                "size": chosen,
+                "jobs": [g["order_id"] for g in group],
+            })
+
+        return jsonify({"status": "ok", "boxes": boxes, "missing": []}), 200
+
+    except Exception as e:
+        logging.exception("prepare-shipment failed")
+        # Never bubble a 500 → keep the UI stable
+        return jsonify({"boxes": [], "missing": [], "error": str(e)}), 200
+
 @app.route("/api/jobs-for-company")
 @login_required_session
 def jobs_for_company():
