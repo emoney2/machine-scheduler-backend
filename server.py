@@ -6407,21 +6407,6 @@ def ensure_qbo_auth():
     """
     Ensure the current session is authorized with QuickBooks.
     Returns:
-      { "ok": true } if already authorized
-      { "redirect": "<oauth_url>" } if login is needed
-    """
-    try:
-        headers, realm_id = get_quickbooks_credentials()
-        return jsonify({"ok": True, "realmId": realm_id}), 200
-    except RedirectException as e:
-        return jsonify({"redirect": e.redirect_url}), 200
-
-@app.route("/api/ensure-qbo-auth", methods=["POST"])
-@login_required_session
-def ensure_qbo_auth():
-    """
-    Ensure the current session is authorized with QuickBooks.
-    Returns:
       {"ok": true, "realmId": "..."} if already authorized
       {"redirect": "<oauth_url>"} if login is needed
     """
