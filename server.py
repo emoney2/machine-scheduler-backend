@@ -6401,6 +6401,32 @@ def qbo_callback():
     logger.info("🔁 OAuth callback complete — redirecting to Ship page: %s", resume_url)
     return redirect(resume_url)
 
+@app.route("/api/ensure-qbo-auth", methods=["POST"])
+@login_required_session
+def ensure_qbo_auth():
+    """
+    Ensure the current session is authorized with QuickBooks.
+    Returns:
+      { "ok": true } if already authorized
+      { "redirect": "<oauth_url>" } if login is needed
+    """
+    try:
+        headers, realm_id = get_quickbooks_credentials()
+        return jsonify({"ok": True, "realmId": realm_id}), 200
+    except RedirectException as e:
+        return jsonify({"redirect": e.redirect_url}), 200
+
+@app.route("/authorize-quickbooks")
+def authorize_quickbooks():
+    from requests_oauthlib import OAuth2Session
+
+    qbo = OAuth2Session(
+        client_id=QBO_CLIENT_ID,
+        redirect_uri=QBO_REDIRECT_URI,
+        scope=QBO_SCOPE
+    )
+
+
 @app.route("/authorize-quickbooks")
 def authorize_quickbooks():
     from requests_oauthlib import OAuth2Session
