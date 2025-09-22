@@ -2217,8 +2217,8 @@ def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start
         if invs:
             last = (invs[0].get("DocNumber") or "").strip()
             if last.isdigit():
-                return str(int(last) + 1)
-    return str(fallback_start)
+                return str(int(last) + 1).zfill(4)
+    return str(fallback_start).zfill(4)
 
 
 def fetch_customer_email_from_directory(sheet_service, company_name):
@@ -5900,7 +5900,66 @@ def process_shipment():
                 order_dict["ShippedQty"] = parsed_qty
                 all_order_data.append(order_dict)
 
-        # 4) Push updates (NOW safe because QBO is confirmed)
+        # 4) Create invoice in QBO (headers/realm_id already validated)
+        invoice_url = create_consolidated_invoice_in_quickbooks(
+            all_order_data,
+            shipping_method,
+            tracking_list=[],
+            base_shipping_cost=0.0,
+            sheet=service,
+            env_override=env_override
+        )
+        print("✅ Invoice created:", invoice_url)
+
+        # 5) Build packing slip PDF
+        company_info = fetch_company_info(headers, realm_id, env_override)
+        pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
+        filename = f"packing_slip_{int(time.time())}.pdf"
+        tmp_path = os.path.join(tempfile.gettempdir(), filename)
+        with open(tmp_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        # 6) Build a public URL for the front-end
+        slip_url = url_for("serve_slip", filename=filename, _external=True)
+
+        # 7) Upload packing slip to Drive for shop printer/watcher
+        order_ids_str = "-".join(order_ids)
+        num_slips = max(1, len(boxes or []))
+        pdf_filename = f"{order_ids_str}_copies_{num_slips}_packing_slip.pdf"
+        media = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
+        drive = get_drive_service()
+        drive.files().create(
+            body={"name": pdf_filename, "parents": [os.environ["PACKING_SLIP_PRINT_FOLDER_ID"]]},
+            media_body=media
+        ).execute()
+        print("✅ Packing slip uploaded to watcher folder.")
+
+        # 7b) ALSO upload the packing slip into each order's Drive folder
+        ORDERS_PARENT_FOLDER_ID = os.environ.get("ORDERS_PARENT_FOLDER_ID", "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
+        def _find_folder_by_name(name, parent_id):
+            q = (
+                f"name = '{name}' and "
+                f"mimeType = 'application/vnd.google-apps.folder' and "
+                f"trashed = false and "
+                f"'{parent_id}' in parents"
+            )
+            res = drive.files().list(q=q, fields="files(id)").execute()
+            files = res.get("files", []) or []
+            return files[0]["id"] if files else None
+
+        for oid in order_ids:
+            folder_id = _find_folder_by_name(str(oid), ORDERS_PARENT_FOLDER_ID)
+            if not folder_id:
+                # Create the folder if it's missing (no delete!)
+                meta = {"name": str(oid), "mimeType": "application/vnd.google-apps.folder", "parents": [ORDERS_PARENT_FOLDER_ID]}
+                folder_id = drive.files().create(body=meta, fields="id").execute()["id"]
+            drive.files().create(
+                body={"name": f"{oid}_packing_slip.pdf", "parents": [folder_id]},
+                media_body=MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
+            ).execute()
+        print("✅ Packing slip copied into each order folder.")
+
+        # 8) Only after invoice + slips succeed, write Shipped to the sheet
         if updates:
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=sheet_id,
@@ -5910,44 +5969,13 @@ def process_shipment():
         else:
             print("⚠️ No updates to push—check order_ids match sheet.")
 
-        # 5) Create invoice in QBO (headers/realm_id already validated)
-        invoice_url = create_consolidated_invoice_in_quickbooks(
-            all_order_data,
-            shipping_method,
-            tracking_list=[],
-            base_shipping_cost=0.0,
-            sheet=service,
-            env_override=env_override
-        )
-
-        # 6) Fetch company info & build packing slip
-        company_info = fetch_company_info(headers, realm_id, env_override)
-        pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
-        filename = f"packing_slip_{int(time.time())}.pdf"
-        tmp_path = os.path.join(tempfile.gettempdir(), filename)
-        with open(tmp_path, "wb") as f:
-            f.write(pdf_bytes)
-
-        # 7) Build a public URL for the front-end
-        slip_url = url_for("serve_slip", filename=filename, _external=True)
-
-        # 8) Upload packing slip to Drive for the watcher
-        order_ids_str = "-".join(order_ids)
-        num_slips = len(boxes)
-        pdf_filename = f"{order_ids_str}_copies_{num_slips}_packing_slip.pdf"
-        media = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
-        drive = get_drive_service()
-        drive.files().create(
-            body={"name": pdf_filename, "parents": [os.environ["PACKING_SLIP_PRINT_FOLDER_ID"]]},
-            media_body=media
-        ).execute()
-
         # 9) Respond
         return jsonify({
             "labels": [],
             "invoice": invoice_url,
             "slips": [slip_url]
         })
+
 
     except RedirectException as e:
         # (Shouldn't hit here because we gate auth at the top, but safe to keep.)
