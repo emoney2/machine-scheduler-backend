@@ -4110,49 +4110,60 @@ def jobs_for_company():
     if not company:
         return jsonify({"error": "Missing company parameter"}), 400
 
-    # 🔸 15s micro-cache per company
     global _jobs_company_cache
     now = time.time()
+
+    # 15s micro-cache
     cached = _jobs_company_cache.get(company)
     if cached and (now - cached["ts"] < 15):
         return jsonify(cached["data"])
 
-    prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
+    try:
+        # Narrow the range a bit if you like; A1:AM is fine but bigger = slower
+        prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
+        if not prod_data or not prod_data[0]:
+            return jsonify({"jobs": []}), 200
 
-    headers = prod_data[0]
-    jobs = []
+        headers = prod_data[0]
+        # Defensive: header lookup helper
+        def idx(h):
+            try:
+                return headers.index(h)
+            except ValueError:
+                return None
 
-    for row in prod_data[1:]:
-        # ✅ Pad the row so it matches the length of headers
-        while len(row) < len(headers):
-            row.append("")
+        jobs = []
+        # Walk rows safely
+        for r in prod_data[1:]:
+            row = dict(zip(headers, r))
+            row_company = str(row.get("Company Name", "")).strip().lower()
+            stage = str(row.get("Stage", "")).strip().lower()
+            if row_company == company and stage != "complete":
+                image_link = str(row.get("Image", "")).strip()
+                file_id = ""
+                if "id=" in image_link:
+                    file_id = image_link.split("id=")[-1].split("&")[0]
+                elif "file/d/" in image_link:
+                    file_id = image_link.split("file/d/")[-1].split("/")[0]
 
-        row_dict = dict(zip(headers, row))
-        row_company = str(row_dict.get("Company Name", "")).strip().lower()
-        stage = str(row_dict.get("Stage", "")).strip().lower()
+                preview_url = f"https://drive.google.com/thumbnail?id={file_id}" if file_id else ""
 
-        if row_company == company and stage != "complete":
-            # Parse Google Drive file ID from image link
-            image_link = str(row_dict.get("Image", "")).strip()
-            file_id = ""
-            if "id=" in image_link:
-                file_id = image_link.split("id=")[-1].split("&")[0]
-            elif "file/d/" in image_link:
-                file_id = image_link.split("file/d/")[-1].split("/")[0]
+                row["image"] = preview_url
+                row["orderId"] = str(row.get("Order #", "")).strip()
+                jobs.append(row)
 
-            preview_url = (
-                f"https://drive.google.com/thumbnail?id={file_id}"
-                if file_id else ""
-            )
+        data = {"jobs": jobs}
+        _jobs_company_cache[company] = {"ts": now, "data": data}
+        return jsonify(data)
 
-            # Add required fields to job dict
-            row_dict["image"] = preview_url
-            row_dict["orderId"] = str(row_dict.get("Order #", "")).strip()
-            jobs.append(row_dict)
-
-    data = {"jobs": jobs}
-    _jobs_company_cache[company] = {"ts": now, "data": data}
-    return jsonify(data)
+    except Exception as e:
+        # Log & return safe JSON (your global error handler also sets CORS, but let’s be explicit here)
+        logger.exception("jobs-for-company failed:")
+        resp = jsonify({"error": "jobs-for-company failed", "detail": str(e)})
+        resp.status_code = 500
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
 
 
 
@@ -5791,28 +5802,34 @@ def company_list():
     return jsonify({"companies": companies})
 
 @app.route("/api/process-shipment", methods=["POST"])
+@login_required_session
 def process_shipment():
     data = request.get_json()
-    env_override = data.get("qboEnv")  # either "sandbox" or "production"
-    session["qboEnv"] = (env_override or "production")  # ← store desired env
-    print("📥 Reorder API received:", data)
+    env_override = data.get("qboEnv")  # "sandbox" or "production"
+    session["qboEnv"] = (env_override or "production")
+    print("📥 process-shipment received:", data)
 
-
-    print("📥 Reorder API received:", data)
+    # ──────────────────────────────────────────────────────────────────────────
+    # 0) STOP EARLY unless the user is signed into QuickBooks
+    #    If not authenticated, get_quickbooks_credentials() raises RedirectException,
+    #    which we catch below and return {"redirect": "..."} to the front-end.
+    # ──────────────────────────────────────────────────────────────────────────
+    try:
+        headers, realm_id = get_quickbooks_credentials()
+    except RedirectException as e:
+        print("🔁 Redirecting to OAuth:", e.redirect_url)
+        return jsonify({"redirect": e.redirect_url}), 200
 
     # 1) Parse incoming
     order_ids = [str(oid).strip() for oid in data.get("order_ids", [])]
-    shipped_quantities = {
-        str(k).strip(): v
-        for k, v in data.get("shipped_quantities", {}).items()
-    }
+    shipped_quantities = {str(k).strip(): v for k, v in data.get("shipped_quantities", {}).items()}
     boxes = data.get("boxes", [])
     shipping_method = data.get("shipping_method", "")
-    service_code    = data.get("service_code")   # e.g., "03", "02", "01", etc.
+    service_code = data.get("service_code")  # e.g., "03", "02", "01", etc.
 
-    print("🔍 Received order_ids:", order_ids)
-    print("🔍 Received shipped_quantities:", shipped_quantities)
-    print("🔍 Received shipping_method:", shipping_method)
+    print("🔍 order_ids:", order_ids)
+    print("🔍 shipped_quantities:", shipped_quantities)
+    print("🔍 shipping_method:", shipping_method)
 
     if not order_ids:
         return jsonify({"error": "Missing order_ids"}), 400
@@ -5822,17 +5839,18 @@ def process_shipment():
 
     try:
         service = get_sheets_service()
+
         # 2) Read the full sheet
         result = service.spreadsheets().values().get(
             spreadsheetId=sheet_id,
             range=f"{sheet_name}!A1:Z",
         ).execute()
         rows = result.get("values", [])
-        headers = rows[0]
+        headers_row = rows[0]
 
         # locate columns
-        id_col      = headers.index("Order #")
-        shipped_col = headers.index("Shipped")
+        id_col = headers_row.index("Order #")
+        shipped_col = headers_row.index("Shipped")
 
         updates = []
         all_order_data = []
@@ -5844,7 +5862,7 @@ def process_shipment():
                 raw = shipped_quantities.get(order_id, 0)
                 try:
                     parsed_qty = int(float(raw))
-                except:
+                except Exception:
                     parsed_qty = 0
 
                 # queue sheet update
@@ -5854,18 +5872,15 @@ def process_shipment():
                 })
 
                 # build order_data dict for invoice
-                row_dict = dict(zip(headers, row))
+                row_dict = dict(zip(headers_row, row))
                 order_dict = {
-                    h: (
-                        str(parsed_qty) if h in ("Shipped", "ShippedQty")
-                        else row_dict.get(h, "")
-                    )
-                    for h in headers
+                    h: (str(parsed_qty) if h in ("Shipped", "ShippedQty") else row_dict.get(h, ""))
+                    for h in headers_row
                 }
                 order_dict["ShippedQty"] = parsed_qty
                 all_order_data.append(order_dict)
 
-        # 4) Push updates
+        # 4) Push updates (NOW safe because QBO is confirmed)
         if updates:
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=sheet_id,
@@ -5875,8 +5890,7 @@ def process_shipment():
         else:
             print("⚠️ No updates to push—check order_ids match sheet.")
 
-        # 5) Create invoice in QBO…
-        headers, realm_id = get_quickbooks_credentials()
+        # 5) Create invoice in QBO (headers/realm_id already validated)
         invoice_url = create_consolidated_invoice_in_quickbooks(
             all_order_data,
             shipping_method,
@@ -5886,10 +5900,8 @@ def process_shipment():
             env_override=env_override
         )
 
-        # fetch your company’s info
+        # 6) Fetch company info & build packing slip
         company_info = fetch_company_info(headers, realm_id, env_override)
-
-        # 6) Generate packing‐slip PDF with real company_info
         pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
         filename = f"packing_slip_{int(time.time())}.pdf"
         tmp_path = os.path.join(tempfile.gettempdir(), filename)
@@ -5900,38 +5912,32 @@ def process_shipment():
         slip_url = url_for("serve_slip", filename=filename, _external=True)
 
         # 8) Upload packing slip to Drive for the watcher
-        # Use the first order_id from the request (not the loop variable)
         order_ids_str = "-".join(order_ids)
-        num_slips     = len(boxes)
-        pdf_filename  = f"{order_ids_str}_copies_{len(boxes)}_packing_slip.pdf"
-        media            = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
+        num_slips = len(boxes)
+        pdf_filename = f"{order_ids_str}_copies_{num_slips}_packing_slip.pdf"
+        media = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
         drive = get_drive_service()
         drive.files().create(
-            body={
-                "name":    pdf_filename,
-                "parents": [os.environ["PACKING_SLIP_PRINT_FOLDER_ID"]]
-            },
+            body={"name": pdf_filename, "parents": [os.environ["PACKING_SLIP_PRINT_FOLDER_ID"]]},
             media_body=media
         ).execute()
 
-        # now return just the labels & invoice—no more pop-up slips
+        # 9) Respond
         return jsonify({
-            "labels":  [],
+            "labels": [],
             "invoice": invoice_url,
-            "slips":   [slip_url]
+            "slips": [slip_url]
         })
 
-
     except RedirectException as e:
-        # No valid QuickBooks token → tell client to start OAuth flow
-        print("🔁 Redirecting to OAuth:", e.redirect_url)
+        # (Shouldn't hit here because we gate auth at the top, but safe to keep.)
+        print("🔁 Redirecting to OAuth (late):", e.redirect_url)
         return jsonify({"redirect": e.redirect_url}), 200
-
     except Exception as e:
-        # Any other error
         print("❌ Shipment error:", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 
 @app.errorhandler(Exception)
