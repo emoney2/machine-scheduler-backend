@@ -5374,10 +5374,16 @@ def get_inventory_ordered():
                     mat_i["Date"]     = mhdr.index("Date")
                     mat_i["Material"] = mhdr.index("Material")
                     mat_i["O/R"]      = mhdr.index("O/R")
-                    # In your sheet, Quantity is two columns left of O/R (same rule as before)
-                    mat_i["Qty"]      = mat_i["O/R"] - 2
+                    # Quantity by header if present; otherwise fall back to one left of O/R
+                    if "Quantity" in mhdr:
+                        mat_i["Qty"] = mhdr.index("Quantity")
+                    elif "Qty" in mhdr:
+                        mat_i["Qty"] = mhdr.index("Qty")
+                    else:
+                        mat_i["Qty"] = mat_i["O/R"] - 1
                 except ValueError:
                     mat_i = {}
+
 
             # Indices for Thread Data
             th_i = {}
@@ -5505,10 +5511,14 @@ def get_inventory_ordered():
         # 1) Material Log sheet
         mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
         if mat:
-            hdr     = mat[0]
             i_dt    = hdr.index("Date")
             i_or    = hdr.index("O/R")
-            qty_idx = i_or - 2              # Quantity is one column left of O/R
+            if "Quantity" in hdr:
+                qty_idx = hdr.index("Quantity")
+            elif "Qty" in hdr:
+                qty_idx = hdr.index("Qty")
+            else:
+                qty_idx = i_or - 1
             i_mat   = hdr.index("Material")
 
             for idx, row in enumerate(mat[1:], start=2):
@@ -5752,7 +5762,7 @@ def update_inventory_ordered_quantity():
             return s
 
         if sheet_type.lower() == "material":
-            # Material Log: quantity is 2 columns left of "O/R" (matches your GET)
+            # Material Log: find Quantity by header; fall back to one left of O/R
             rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
             if not rows:
                 return jsonify({"error": "Material Log empty"}), 500
@@ -5761,7 +5771,14 @@ def update_inventory_ordered_quantity():
             if "O/R" not in hdr:
                 return jsonify({"error": "Could not find 'O/R' in Material Log"}), 500
             i_or = hdr.index("O/R")
-            idx_qty = i_or - 2
+
+            if "Quantity" in hdr:
+                idx_qty = hdr.index("Quantity")
+            elif "Qty" in hdr:
+                idx_qty = hdr.index("Qty")
+            else:
+                idx_qty = i_or - 1
+
             if idx_qty < 0:
                 return jsonify({"error": "Invalid Quantity position"}), 500
 
@@ -5772,6 +5789,7 @@ def update_inventory_ordered_quantity():
                 valueInputOption="USER_ENTERED",
                 body={"values": [[qty]]}
             ).execute()
+
 
         else:
             # Threads: update "Length (ft)" in Thread Data
