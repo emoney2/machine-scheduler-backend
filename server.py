@@ -5737,40 +5737,41 @@ def mark_inventory_received():
 
     return jsonify({"status":"ok"}), 200
 
-@app.route("/api/inventoryOrdered/quantity", methods=["PATCH"])
+@app.route("/api/inventoryOrdered/quantity", methods=["PATCH", "OPTIONS"])
 @login_required_session
 def update_inventory_ordered_quantity():
-    """
-    Update the ordered quantity for an item still in 'Ordered' status.
+    # CORS preflight short-circuit (Render/Netlify proxies sometimes need this)
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
 
-    JSON:
-      { "type": "Material" | "Thread", "row": <1-based row>, "quantity": <str|num> }
-    """
     try:
-        data = request.get_json(silent=True) or {}
-        sheet_type = (data.get("type") or "").strip()
-        row = data.get("row")
-        qty = data.get("quantity")
+        payload = request.get_json(silent=True) or {}
+        sheet_type = str(payload.get("type", "")).strip().lower()
+        row        = payload.get("row")
+        qty_raw    = payload.get("quantity", "")
 
+        app.logger.info("📝 PATCH /api/inventoryOrdered/quantity payload=%s", payload)
+
+        if sheet_type not in {"material", "thread"}:
+            return jsonify({"error": "Invalid type; expected 'Material' or 'Thread'"}), 400
         try:
             row = int(row)
         except Exception:
-            return jsonify({"error": "Invalid 'row'"}), 400
+            return jsonify({"error": "Invalid row"}), 400
+        if row < 2:
+            return jsonify({"error": "Row must be >= 2 (header is row 1)"}), 400
 
-        if not sheet_type or qty is None:
-            return jsonify({"error": "Missing 'type' or 'quantity'"}), 400
+        # Coerce quantity to a simple string to avoid Sheets API quirks
+        qty_val = "" if qty_raw is None else str(qty_raw)
 
-        # helper: 0-based index → A1
-        def col_to_a1(idx0: int) -> str:
-            n = idx0 + 1
-            s = ""
-            while n:
-                n, rem = divmod(n - 1, 26)
-                s = chr(65 + rem) + s
-            return s
+        sheets = get_sheets_service()
 
-        if sheet_type.lower() == "material":
-            # Material Log: prefer QTY (case-insensitive), then Quantity; else fall back to one left of O/R
+        if sheet_type == "material":
+            # Material Log: prefer QTY/Qty/Quantity by header; else O/R - 1
             rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
             if not rows:
                 return jsonify({"error": "Material Log empty"}), 500
@@ -5793,15 +5794,16 @@ def update_inventory_ordered_quantity():
                 return jsonify({"error": "Invalid QTY position"}), 500
 
             colA1 = col_to_a1(idx_qty)
+            app.logger.info("✏️ Updating Material Log %s%d = %s", colA1, row, qty_val)
             sheets.values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Material Log!{colA1}{row}",
                 valueInputOption="USER_ENTERED",
-                body={"values": [[qty]]}
+                body={"values": [[qty_val]]}
             ).execute()
 
-        else:
-            # Threads: update "Length (ft)" in Thread Data
+        else:  # thread
+            # Thread Data: update "Length (ft)" then the view will show cones (length / 16500)
             rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
             if not rows:
                 return jsonify({"error": "Thread Data empty"}), 500
@@ -5809,22 +5811,38 @@ def update_inventory_ordered_quantity():
             hdr = rows[0]
             if "Length (ft)" not in hdr:
                 return jsonify({"error": "Could not find 'Length (ft)' in Thread Data"}), 500
+            i_len = hdr.index("Length (ft)")
 
-            idx_len = hdr.index("Length (ft)")
-            colA1 = col_to_a1(idx_len)
+            # Accept "X cones" by converting back to feet, or raw number
+            qty_str = str(qty_val).strip().lower()
+            try:
+                if "cone" in qty_str:
+                    num = float(qty_str.replace("cones", "").replace("cone", "").strip())
+                    feet = num * 16500.0
+                else:
+                    feet = float(qty_str)
+                write_val = f"{feet:.0f}"
+            except Exception:
+                write_val = qty_val  # write whatever was provided
+
+            colA1 = col_to_a1(i_len)
+            app.logger.info("✏️ Updating Thread Data %s%d = %s", colA1, row, write_val)
             sheets.values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Thread Data!{colA1}{row}",
                 valueInputOption="USER_ENTERED",
-                body={"values": [[qty]]}
+                body={"values": [[write_val]]}
             ).execute()
 
-        return jsonify({"status": "ok"}), 200
+        # Force no caching on proxies
+        resp = jsonify({"ok": True})
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+        return resp
 
     except Exception as e:
-        print("🔥 update_inventory_ordered_quantity error:", str(e))
-        traceback.print_exc()
-        return jsonify({"error": "Internal server error"}), 500
+        app.logger.exception("❌ Error in PATCH /api/inventoryOrdered/quantity")
+        # Return JSON (not HTML) so axios can show a useful message
+        return jsonify({"error": str(e)}), 500
 
 
 
