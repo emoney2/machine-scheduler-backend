@@ -1056,7 +1056,7 @@ def handle_preflight():
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
         return resp  # short-circuit OPTIONS
 
 @app.after_request
@@ -5686,9 +5686,7 @@ def _fast_inventory_view_entries():
 
     return entries
 
-
-
-@app.route("/api/inventoryOrdered", methods=["PUT"])
+@app.route("/api/inventoryOrdered", methods=["PUT", "OPTIONS"])
 @login_required_session
 def mark_inventory_received():
     """
@@ -5698,33 +5696,45 @@ def mark_inventory_received():
       - Column A (Date) to now
       - O/R column to "Received" (I for Material, H for Thread)
     """
+    # CORS preflight
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
+
     data      = request.get_json(silent=True) or {}
-    sheetType = data.get("type")
+    sheetType = (data.get("type") or "").strip()
     row       = data.get("row")
 
     try:
         row = int(row)
-    except:
-        return jsonify({"error":"invalid row"}), 400
+    except Exception:
+        return jsonify({"error": "invalid row"}), 400
+    if row < 2:
+        return jsonify({"error": "row must be >= 2"}), 400
 
     # choose sheet & O/R column
     if sheetType == "Material":
-        sheet   = "Material Log"
-        col_or  = "I"
+        sheet  = "Material Log"
+        col_or = "I"
     else:
-        sheet   = "Thread Data"
-        col_or  = "H"
+        sheet  = "Thread Data"
+        col_or = "H"
+
+    # Sheets client
+    sheets = get_sheets_service()
 
     # timestamp in A
-    now = datetime.now(ZoneInfo("America/New_York"))\
-              .strftime("%-m/%-d/%Y %H:%M:%S")
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
 
     # 1) Update the Date cell (col A)
     sheets.values().update(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{sheet}!A{row}",
         valueInputOption="USER_ENTERED",
-        body={"values":[[now]]}
+        body={"values": [[now]]}
     ).execute()
 
     # 2) Update the O/R cell to "Received"
@@ -5732,10 +5742,28 @@ def mark_inventory_received():
         spreadsheetId=SPREADSHEET_ID,
         range=f"{sheet}!{col_or}{row}",
         valueInputOption="USER_ENTERED",
-        body={"values":[["Received"]]}
+        body={"values": [["Received"]]}
     ).execute()
 
-    return jsonify({"status":"ok"}), 200
+    resp = jsonify({"status": "ok"})
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+# 0-based column index -> A1 column letters (0 -> A, 1 -> B, … 25 -> Z, 26 -> AA, etc.)
+def col_to_a1(idx):
+    i = int(idx)
+    if i < 0:
+        i = 0
+    letters = ""
+    while True:
+        i, rem = divmod(i, 26)
+        letters = chr(ord("A") + rem) + letters
+        if i == 0:
+            break
+        i -= 1  # Excel-style carry
+    return letters
+
 
 @app.route("/api/inventoryOrdered/quantity", methods=["PATCH", "OPTIONS"])
 @login_required_session
