@@ -5374,16 +5374,18 @@ def get_inventory_ordered():
                     mat_i["Date"]     = mhdr.index("Date")
                     mat_i["Material"] = mhdr.index("Material")
                     mat_i["O/R"]      = mhdr.index("O/R")
-                    # Quantity by header if present; otherwise fall back to one left of O/R
-                    if "Quantity" in mhdr:
-                        mat_i["Qty"] = mhdr.index("Quantity")
-                    elif "Qty" in mhdr:
-                        mat_i["Qty"] = mhdr.index("Qty")
+
+                    # Prefer QTY (case-insensitive), then Qty, then Quantity; else fall back to O/R - 1
+                    names = [str(h or "").strip() for h in mhdr]
+                    lower = [n.lower() for n in names]
+                    if "qty" in lower:
+                        mat_i["Qty"] = lower.index("qty")
+                    elif "quantity" in lower:
+                        mat_i["Qty"] = lower.index("quantity")
                     else:
                         mat_i["Qty"] = mat_i["O/R"] - 1
                 except ValueError:
                     mat_i = {}
-
 
             # Indices for Thread Data
             th_i = {}
@@ -5513,13 +5515,16 @@ def get_inventory_ordered():
         if mat:
             i_dt    = hdr.index("Date")
             i_or    = hdr.index("O/R")
-            if "Quantity" in hdr:
-                qty_idx = hdr.index("Quantity")
-            elif "Qty" in hdr:
-                qty_idx = hdr.index("Qty")
+            names   = [str(h or "").strip() for h in hdr]
+            lower   = [n.lower() for n in names]
+            if "qty" in lower:
+                qty_idx = lower.index("qty")
+            elif "quantity" in lower:
+                qty_idx = lower.index("quantity")
             else:
                 qty_idx = i_or - 1
             i_mat   = hdr.index("Material")
+
 
             for idx, row in enumerate(mat[1:], start=2):
                 if len(row) > i_or and row[i_or].strip().lower() == "ordered":
@@ -5762,7 +5767,7 @@ def update_inventory_ordered_quantity():
             return s
 
         if sheet_type.lower() == "material":
-            # Material Log: find Quantity by header; fall back to one left of O/R
+            # Material Log: prefer QTY (case-insensitive), then Quantity; else fall back to one left of O/R
             rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
             if not rows:
                 return jsonify({"error": "Material Log empty"}), 500
@@ -5770,17 +5775,19 @@ def update_inventory_ordered_quantity():
             hdr = rows[0]
             if "O/R" not in hdr:
                 return jsonify({"error": "Could not find 'O/R' in Material Log"}), 500
-            i_or = hdr.index("O/R")
+            i_or  = hdr.index("O/R")
+            names = [str(h or "").strip() for h in hdr]
+            lower = [n.lower() for n in names]
 
-            if "Quantity" in hdr:
-                idx_qty = hdr.index("Quantity")
-            elif "Qty" in hdr:
-                idx_qty = hdr.index("Qty")
+            if "qty" in lower:
+                idx_qty = lower.index("qty")
+            elif "quantity" in lower:
+                idx_qty = lower.index("quantity")
             else:
                 idx_qty = i_or - 1
 
             if idx_qty < 0:
-                return jsonify({"error": "Invalid Quantity position"}), 500
+                return jsonify({"error": "Invalid QTY position"}), 500
 
             colA1 = col_to_a1(idx_qty)
             sheets.values().update(
@@ -5789,7 +5796,6 @@ def update_inventory_ordered_quantity():
                 valueInputOption="USER_ENTERED",
                 body={"values": [[qty]]}
             ).execute()
-
 
         else:
             # Threads: update "Length (ft)" in Thread Data
