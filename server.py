@@ -5730,7 +5730,7 @@ def mark_inventory_received():
     now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
 
     # 1) Update the Date cell (col A)
-    sheets.values().update(
+    sheets.spreadsheets().values().update(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{sheet}!A{row}",
         valueInputOption="USER_ENTERED",
@@ -5738,7 +5738,7 @@ def mark_inventory_received():
     ).execute()
 
     # 2) Update the O/R cell to "Received"
-    sheets.values().update(
+    sheets.spreadsheets().values().update(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{sheet}!{col_or}{row}",
         valueInputOption="USER_ENTERED",
@@ -5823,12 +5823,13 @@ def update_inventory_ordered_quantity():
 
             colA1 = col_to_a1(idx_qty)
             app.logger.info("✏️ Updating Material Log %s%d = %s", colA1, row, qty_val)
-            sheets.values().update(
+            sheets.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Material Log!{colA1}{row}",
                 valueInputOption="USER_ENTERED",
                 body={"values": [[qty_val]]}
             ).execute()
+
 
         else:  # thread
             # Thread Data: update "Length (ft)" then the view will show cones (length / 16500)
@@ -5855,7 +5856,7 @@ def update_inventory_ordered_quantity():
 
             colA1 = col_to_a1(i_len)
             app.logger.info("✏️ Updating Thread Data %s%d = %s", colA1, row, write_val)
-            sheets.values().update(
+            sheets.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Thread Data!{colA1}{row}",
                 valueInputOption="USER_ENTERED",
