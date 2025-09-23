@@ -1076,10 +1076,12 @@ def apply_cors(response):
 
     if origin in allowed:
         response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Vary"] = "Origin"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
-    return response  # short-circuit OPTIONS
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+    return response
+
 
 # NEW: capture RSS before each request
 @app.before_request
@@ -2705,7 +2707,7 @@ def drive_make_public():
         resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
         return resp
 
     data = request.get_json(silent=True) or {}
