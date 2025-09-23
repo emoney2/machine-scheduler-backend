@@ -5375,7 +5375,7 @@ def get_inventory_ordered():
                     mat_i["Material"] = mhdr.index("Material")
                     mat_i["O/R"]      = mhdr.index("O/R")
 
-                    # Prefer QTY (case-insensitive), then Qty, then Quantity; else fall back to O/R - 1
+                    # Prefer QTY (case-insensitive), then Quantity; else fall back to O/R - 1
                     names = [str(h or "").strip() for h in mhdr]
                     lower = [n.lower() for n in names]
                     if "qty" in lower:
@@ -5431,7 +5431,6 @@ def get_inventory_ordered():
             out = []
             hdr = view[0]  # Date | Type | Name | Quantity | Unit | Vendor
             for vix, vrow in enumerate(view[1:], start=2):
-                # safe unpack
                 vrow = (vrow + ["", "", "", "", "", ""])[:6]
                 date, typ, name, qty, unit, vendor = vrow[0], vrow[1], vrow[2], vrow[3], vrow[4], vrow[5]
                 if not name:
@@ -5444,7 +5443,6 @@ def get_inventory_ordered():
                 if typ_l == "material" and mat_by_name:
                     cands = mat_by_name.get(name_l, [])
                     if cands:
-                        # if we can parse quantities, prefer matching qty
                         vq = _to_float(qty)
                         best = None
                         for rix, r in cands:
@@ -5476,7 +5474,6 @@ def get_inventory_ordered():
                                 break
                         src_row = best or (cands[0][0] if cands else None)
 
-                    # normalize quantity label for thread (add " cones" if missing)
                     if qty and "cone" not in str(qty).lower():
                         try:
                             qf = float(qty)
@@ -5485,7 +5482,7 @@ def get_inventory_ordered():
                             pass
 
                 out.append({
-                    "row":      src_row,     # original row in Material Log / Thread Data
+                    "row":      src_row,
                     "date":     date,
                     "type":     typ or "",
                     "name":     name,
@@ -5501,33 +5498,27 @@ def get_inventory_ordered():
 
         # 0) Build Material→Unit and Material→Vendor maps (from Inventory sheet A2:I)
         inv_rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:I")
-        unit_map = {
-            r[0]: (r[3] if len(r) > 3 else "")
-            for r in inv_rows if r and str(r[0]).strip()
-        }
-        vendor_map = {
-            r[0]: (r[8] if len(r) > 8 else "")
-            for r in inv_rows if r and str(r[0]).strip()
-        }
+        unit_map = {r[0]: (r[3] if len(r) > 3 else "") for r in inv_rows if r and str(r[0]).strip()}
+        vendor_map = {r[0]: (r[8] if len(r) > 8 else "") for r in inv_rows if r and str(r[0]).strip()}
 
         # 1) Material Log sheet
         mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
         if mat:
-            i_dt    = hdr.index("Date")
-            i_or    = hdr.index("O/R")
-            names   = [str(h or "").strip() for h in hdr]
-            lower   = [n.lower() for n in names]
+            hdr    = mat[0]  # ✅ define hdr for Material section
+            i_dt   = hdr.index("Date")
+            i_or   = hdr.index("O/R")
+            names  = [str(h or "").strip() for h in hdr]
+            lower  = [n.lower() for n in names]
             if "qty" in lower:
                 qty_idx = lower.index("qty")
             elif "quantity" in lower:
                 qty_idx = lower.index("quantity")
             else:
                 qty_idx = i_or - 1
-            i_mat   = hdr.index("Material")
-
+            i_mat  = hdr.index("Material")
 
             for idx, row in enumerate(mat[1:], start=2):
-                if len(row) > i_or and row[i_or].strip().lower() == "ordered":
+                if len(row) > i_or and str(row[i_or]).strip().lower() == "ordered":
                     name = row[i_mat] if len(row) > i_mat else ""
                     qty  = row[qty_idx] if len(row) > qty_idx else ""
                     orders.append({
@@ -5550,11 +5541,11 @@ def get_inventory_ordered():
             i_len  = hdr.index("Length (ft)")
 
             for idx, row in enumerate(th[1:], start=2):
-                if len(row) > i_or and row[i_or].strip().lower() == "ordered":
+                if len(row) > i_or and str(row[i_or]).strip().lower() == "ordered":
                     qty = row[i_len] if len(row) > i_len else ""
                     try:
                         qty = f"{float(qty) / 16500:.2f} cones"
-                    except:
+                    except Exception:
                         pass
                     orders.append({
                         "row":      idx,
@@ -5566,8 +5557,20 @@ def get_inventory_ordered():
 
         return orders
 
-    # Cache for 60s: (key, ttl, builder)
-    return send_cached_json("inventoryOrdered", 60, build)
+    # If caller passes a cache-busting param (?t=...), BYPASS server cache
+    if request.args.get("t"):
+        rows = build()
+        resp = jsonify(rows)
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+        return resp
+
+    # Otherwise, serve from server-side cache but still tell the browser not to cache
+    resp = send_cached_json("inventoryOrdered", 60, build)
+    try:
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+    except Exception:
+        pass
+    return resp
 
 
 # --- Fast reader for the "Inventory Ordered (View)" sheet + row mapping ---
