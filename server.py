@@ -3410,97 +3410,26 @@ def overview_materials_needed():
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
         return jsonify({"error": "materials-needed failed"}), 500
 
-# ─── API ENDPOINTS ────────────────────────────────────────────────────────────
-# ─── Fur: mark complete (write Quantity Made in "Fur List") ───────────────────
 @app.route("/api/fur/complete", methods=["POST", "OPTIONS"])
 @login_required_session
 def api_fur_complete():
-    try:
-        data = request.get_json(silent=True) or {}
-        order_id = str(data.get("orderId") or data.get("order_id") or "").strip()
-        quantity = data.get("quantity")
-
-        if not order_id:
-            return jsonify({"error": "Missing 'orderId'"}), 400
-        try:
-            qty_int = int(quantity)
-        except Exception:
-            return jsonify({"error": "Invalid 'quantity'"}), 400
-
-        # Read Fur List to locate the row for this Order #
-        svc = get_sheets_service().spreadsheets().values()
-        resp = svc.get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Fur List!A1:ZZ",
-            valueRenderOption="FORMATTED_VALUE"
-        ).execute()
-        rows = resp.get("values", []) or []
-        if not rows:
-            return jsonify({"error": "Fur List tab is empty"}), 500
-
-        headers = [str(h or "").strip() for h in rows[0]]
-        def idx_of(name):
-            try:
-                return headers.index(name)
-            except ValueError:
-                return -1
-
-        order_idx = idx_of("Order #")
-        qty_idx   = idx_of("Quantity Made")
-        if order_idx < 0 or qty_idx < 0:
-            return jsonify({"error": "Missing 'Order #' or 'Quantity Made' header in Fur List"}), 500
-
-        # find row where Order # matches
-        row_num = None
-        for i, r in enumerate(rows[1:], start=2):
-            val = r[order_idx] if order_idx < len(r) else ""
-            if str(val).strip() == order_id:
-                row_num = i
-                break
-
-        if not row_num:
-            return jsonify({"error": f"Order # {order_id} not found in Fur List"}), 404
-
-        # small helper: 0-based column index → A1 letter(s)
-        def col_to_a1(idx0):
-            n = idx0 + 1
-            s = ""
-            while n:
-                n, rem = divmod(n - 1, 26)
-                s = chr(65 + rem) + s
-            return s
-
-        target_cell = f"Fur List!{col_to_a1(qty_idx)}{row_num}"
-        write_sheet(SPREADSHEET_ID, target_cell, [[qty_int]])
-
-        # (Optional) we could emit a socket event here; UI already removes the card.
-        return jsonify({"ok": True, "orderId": order_id, "wrote": qty_int})
-
-    except Exception:
-        logger.exception("Error in /api/fur/complete")
-        return jsonify({"error": "Internal error"}), 500
-
-@app.route("/api/fur/completeBatch", methods=["POST"])
-@login_required_session
-def fur_complete_batch():
     """
-    Body: { items: [ {orderId: "<Order #>", quantity: <number>}, ... ] }
-    For each item, find the row in 'Fur List' by 'Order #' and write 'quantity'
-    into the 'Quantity Made' column. All writes happen in one Sheets batchUpdate.
+    Body: { orderId: "<Order #>", quantity: <number> }
+    Writes Quantity Made for the given 'front' order AND its 'back' (order+1) if present.
     """
     data = request.get_json(silent=True) or {}
-    items = data.get("items") or []
-    if not isinstance(items, list) or not items:
-        return jsonify(ok=False, error="No items to complete"), 400
+    oid_raw = (data.get("orderId") or "").strip()
+    try:
+        qty = int(data.get("quantity"))
+    except Exception:
+        return jsonify(ok=False, error="Invalid quantity"), 400
 
-    # Initialize Sheets client
     try:
         vsvc = get_sheets_service().spreadsheets().values()
     except Exception:
-        app.logger.exception("fur_complete_batch: unable to init Google Sheets client")
-        return jsonify(ok=False, error="Could not initialize Google Sheets client."), 503
+        app.logger.exception("api_fur_complete: init sheets failed")
+        return jsonify(ok=False, error="Sheets init failed"), 503
 
-    # Helper: 0-based column → A1 letter(s)
     def col_letter(idx0: int) -> str:
         n = idx0 + 1
         s = ""
@@ -3510,7 +3439,89 @@ def fur_complete_batch():
         return s
 
     try:
-        # Load Fur List once
+        with sheet_lock:
+            resp = vsvc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Fur List!A1:ZZ",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        rows = resp.get("values", []) or []
+        if not rows:
+            return jsonify(ok=False, error="Fur List is empty"), 404
+
+        headers = [str(h).strip() for h in rows[0]]
+        if "Order #" not in headers or "Quantity Made" not in headers:
+            return jsonify(ok=False, error="Missing 'Order #' or 'Quantity Made'"), 400
+
+        order_ix = headers.index("Order #")
+        qty_ix   = headers.index("Quantity Made")
+
+        # Build lookup of order -> 1-based row number
+        order_to_row = {}
+        for i in range(1, len(rows)):
+            r = rows[i] or []
+            val = str(r[order_ix] if order_ix < len(r) else "").strip()
+            if val:
+                order_to_row[val] = i + 1
+
+        # Prepare front + back updates
+        updates = []
+
+        # Front
+        row_num = order_to_row.get(oid_raw)
+        if row_num:
+            updates.append({"range": f"Fur List!{col_letter(qty_ix)}{row_num}", "values": [[qty]]})
+
+        # Back (order+1), only if orderId is integer and exists in sheet
+        try:
+            back_oid = str(int(oid_raw) + 1)
+            back_row = order_to_row.get(back_oid)
+            if back_row:
+                updates.append({"range": f"Fur List!{col_letter(qty_ix)}{back_row}", "values": [[qty]]})
+        except Exception:
+            pass  # ignore non-integer order IDs
+
+        if not updates:
+            return jsonify(ok=False, error="Order not found"), 404
+
+        body = {"valueInputOption": "USER_ENTERED", "data": updates}
+        with sheet_lock:
+            vsvc.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+
+        return jsonify(ok=True, wrote=len(updates))
+    except Exception as e:
+        app.logger.exception("api_fur_complete failed")
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.route("/api/fur/completeBatch", methods=["POST"])
+@login_required_session
+def fur_complete_batch():
+    """
+    Body: { items: [ {orderId: "<Order #>", quantity: <number>}, ... ] }
+    For each item, write Quantity Made for 'front' and also the 'back' (order+1) if present.
+    All writes happen in one Sheets batchUpdate.
+    """
+    data = request.get_json(silent=True) or {}
+    items = data.get("items") or []
+    if not isinstance(items, list) or not items:
+        return jsonify(ok=False, error="No items to complete"), 400
+
+    try:
+        vsvc = get_sheets_service().spreadsheets().values()
+    except Exception:
+        app.logger.exception("fur_complete_batch: unable to init Sheets")
+        return jsonify(ok=False, error="Could not initialize Google Sheets client."), 503
+
+    def col_letter(idx0: int) -> str:
+        n = idx0 + 1
+        s = ""
+        while n:
+            n, rem = divmod(n - 1, 26)
+            s = chr(65 + rem) + s
+        return s
+
+    try:
         with sheet_lock:
             resp = vsvc.get(
                 spreadsheetId=SPREADSHEET_ID,
@@ -3528,28 +3539,39 @@ def fur_complete_batch():
         order_ix = headers.index("Order #")
         qty_ix   = headers.index("Quantity Made")
 
-        # Build lookup: orderId → 1-based row number
+        # order -> 1-based row
         order_to_row = {}
         for i in range(1, len(rows)):
-            r = rows[i] if i < len(rows) else []
+            r = rows[i] or []
             val = str(r[order_ix] if order_ix < len(r) else "").strip()
             if val:
                 order_to_row[val] = i + 1
 
         updates = []
-        wrote = 0
+        wrote   = 0
+
         for it in items:
-            oid = str(it.get("orderId") or "").strip()
+            oid_raw = str(it.get("orderId") or "").strip()
             try:
                 qty = int(it.get("quantity"))
             except Exception:
                 continue
-            row_num = order_to_row.get(oid)
-            if not row_num:
-                continue
-            a1 = f"Fur List!{col_letter(qty_ix)}{row_num}"
-            updates.append({"range": a1, "values": [[qty]]})
-            wrote += 1
+
+            # front
+            row_num = order_to_row.get(oid_raw)
+            if row_num:
+                updates.append({"range": f"Fur List!{col_letter(qty_ix)}{row_num}", "values": [[qty]]})
+                wrote += 1
+
+            # back (order+1)
+            try:
+                back_oid = str(int(oid_raw) + 1)
+                back_row = order_to_row.get(back_oid)
+                if back_row:
+                    updates.append({"range": f"Fur List!{col_letter(qty_ix)}{back_row}", "values": [[qty]]})
+                    wrote += 1
+            except Exception:
+                pass
 
         if not updates:
             return jsonify(ok=True, wrote=0)
@@ -3559,7 +3581,6 @@ def fur_complete_batch():
             vsvc.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
 
         return jsonify(ok=True, wrote=wrote)
-
     except Exception as e:
         app.logger.exception("fur_complete_batch failed")
         return jsonify(ok=False, error=str(e)), 500
