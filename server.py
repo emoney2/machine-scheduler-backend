@@ -3480,6 +3480,91 @@ def api_fur_complete():
         logger.exception("Error in /api/fur/complete")
         return jsonify({"error": "Internal error"}), 500
 
+@app.route("/api/fur/completeBatch", methods=["POST"])
+@login_required_session
+def fur_complete_batch():
+    """
+    Body: { items: [ {orderId: "<Order #>", quantity: <number>}, ... ] }
+    For each item, find the row in 'Fur List' by 'Order #' and write 'quantity'
+    into the 'Quantity Made' column. All writes happen in one Sheets batchUpdate.
+    """
+    data = request.get_json(silent=True) or {}
+    items = data.get("items") or []
+    if not isinstance(items, list) or not items:
+        return jsonify(ok=False, error="No items to complete"), 400
+
+    # Initialize Sheets client
+    try:
+        vsvc = get_sheets_service().spreadsheets().values()
+    except Exception:
+        app.logger.exception("fur_complete_batch: unable to init Google Sheets client")
+        return jsonify(ok=False, error="Could not initialize Google Sheets client."), 503
+
+    # Helper: 0-based column → A1 letter(s)
+    def col_letter(idx0: int) -> str:
+        n = idx0 + 1
+        s = ""
+        while n:
+            n, rem = divmod(n - 1, 26)
+            s = chr(65 + rem) + s
+        return s
+
+    try:
+        # Load Fur List once
+        with sheet_lock:
+            resp = vsvc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Fur List!A1:ZZ",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        rows = resp.get("values", []) or []
+        if not rows:
+            return jsonify(ok=False, error="Fur List is empty"), 404
+
+        headers = [str(h).strip() for h in rows[0]]
+        if "Order #" not in headers or "Quantity Made" not in headers:
+            return jsonify(ok=False, error="Missing 'Order #' or 'Quantity Made' in Fur List"), 400
+
+        order_ix = headers.index("Order #")
+        qty_ix   = headers.index("Quantity Made")
+
+        # Build lookup: orderId → 1-based row number
+        order_to_row = {}
+        for i in range(1, len(rows)):
+            r = rows[i] if i < len(rows) else []
+            val = str(r[order_ix] if order_ix < len(r) else "").strip()
+            if val:
+                order_to_row[val] = i + 1
+
+        updates = []
+        wrote = 0
+        for it in items:
+            oid = str(it.get("orderId") or "").strip()
+            try:
+                qty = int(it.get("quantity"))
+            except Exception:
+                continue
+            row_num = order_to_row.get(oid)
+            if not row_num:
+                continue
+            a1 = f"Fur List!{col_letter(qty_ix)}{row_num}"
+            updates.append({"range": a1, "values": [[qty]]})
+            wrote += 1
+
+        if not updates:
+            return jsonify(ok=True, wrote=0)
+
+        body = {"valueInputOption": "USER_ENTERED", "data": updates}
+        with sheet_lock:
+            vsvc.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+
+        return jsonify(ok=True, wrote=wrote)
+
+    except Exception as e:
+        app.logger.exception("fur_complete_batch failed")
+        return jsonify(ok=False, error=str(e)), 500
+
+
 @app.route("/api/cut/complete", methods=["POST"])
 @login_required_session
 def cut_complete():
