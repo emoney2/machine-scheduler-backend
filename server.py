@@ -3410,6 +3410,58 @@ def overview_materials_needed():
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
         return jsonify({"error": "materials-needed failed"}), 500
 
+# NEW: Overview metrics (V1:X2)
+@app.route("/api/overview/metrics", methods=["GET"])
+@login_required_session
+def overview_metrics():
+    """
+    Reads Overview!V1:X2:
+      Row 1 (headers): e.g., Headcovers Sold | Business Days | Goal
+      Row 2 (values):  e.g., 32.25           | 51            | 80
+    Returns JSON with headcovers_sold, business_days, goal, and sold_per_day.
+    """
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, "Overview!V1:X2") or []
+        # Normalize to 2 rows
+        headers = (rows[0] if len(rows) > 0 else [])
+        values  = (rows[1] if len(rows) > 1 else [])
+
+        def idx(name):
+            try:
+                return [h.strip().lower() for h in headers].index(name.strip().lower())
+            except Exception:
+                return None
+
+        ix_sold = idx("Headcovers Sold") or idx("Headcovers") or idx("Sold")
+        ix_days = idx("Business Days") or idx("Days")
+        ix_goal = idx("Goal")
+
+        def num_at(ix):
+            if ix is None or ix >= len(values): return None
+            try:
+                return float(str(values[ix]).strip())
+            except Exception:
+                return None
+
+        headcovers_sold = num_at(ix_sold)
+        business_days   = num_at(ix_days)
+        goal            = num_at(ix_goal)
+
+        sold_per_day = None
+        if headcovers_sold is not None and business_days and business_days > 0:
+            sold_per_day = headcovers_sold / business_days
+
+        return jsonify({
+            "headcovers_sold": headcovers_sold,
+            "business_days": business_days,
+            "goal": goal,
+            "sold_per_day": sold_per_day,
+        })
+    except Exception as e:
+        app.logger.exception("overview_metrics failed")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/fur/complete", methods=["POST", "OPTIONS"])
 @login_required_session
 def api_fur_complete():
