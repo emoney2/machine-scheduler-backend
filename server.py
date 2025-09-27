@@ -3432,9 +3432,15 @@ def overview_metrics():
             except Exception:
                 return None
 
-        ix_sold = idx("Headcovers Sold") or idx("Headcovers") or idx("Sold")
-        ix_days = idx("Business Days") or idx("Days")
-        ix_goal = idx("Goal")
+        def first_not_none(*vals):
+            for v in vals:
+                if v is not None:
+                    return v
+            return None
+
+        ix_sold = first_not_none(idx("Headcovers Sold"), idx("Headcovers"), idx("Sold"))
+        ix_days = first_not_none(idx("Business Days"), idx("Days"))
+        ix_goal = first_not_none(idx("Goal"), idx("Target"))
 
         def num_at(ix):
             if ix is None or ix >= len(values): return None
