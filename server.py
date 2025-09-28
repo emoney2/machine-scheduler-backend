@@ -3459,7 +3459,7 @@ def overview_metrics():
 
         # Also pull Average Price per Cover from Production Orders!Y2
         try:
-            avg_rows = fetch_sheet(SPREADSHEET_ID, "Production Orders!Y2:Y2") or []
+            avg_rows = fetch_sheet(SPREADSHEET_ID, "Overview!Y2:Y2") or []
             average_price = (avg_rows[0][0] if avg_rows and avg_rows[0] else None)
         except Exception:
             average_price = None
