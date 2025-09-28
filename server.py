@@ -3457,12 +3457,21 @@ def overview_metrics():
         if headcovers_sold is not None and business_days and business_days > 0:
             sold_per_day = headcovers_sold / business_days
 
+        # Also pull Average Price per Cover from Production Orders!Y2
+        try:
+            avg_rows = fetch_sheet(SPREADSHEET_ID, "Production Orders!Y2:Y2") or []
+            average_price = (avg_rows[0][0] if avg_rows and avg_rows[0] else None)
+        except Exception:
+            average_price = None
+
         return jsonify({
             "headcovers_sold": headcovers_sold,
             "business_days": business_days,
             "goal": goal,
             "sold_per_day": sold_per_day,
+            "average_price": average_price,  # NEW
         })
+
     except Exception as e:
         app.logger.exception("overview_metrics failed")
         return jsonify({"error": str(e)}), 500
