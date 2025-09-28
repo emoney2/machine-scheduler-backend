@@ -46,6 +46,11 @@ import psutil, tracemalloc, gc
 tracemalloc.start()
 _process = psutil.Process(os.getpid())
 
+from copy import deepcopy
+
+# Simple in-process cache
+_METRICS_CACHE = {"ts": 0.0, "payload": None}
+_METRICS_TTL_SECONDS = 60
 
 
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
@@ -3410,25 +3415,31 @@ def overview_materials_needed():
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
         return jsonify({"error": "materials-needed failed"}), 500
 
-# NEW: Overview metrics (V1:X2)
 @app.route("/api/overview/metrics", methods=["GET"])
 @login_required_session
 def overview_metrics():
     """
-    Reads Overview!V1:X2:
-      Row 1 (headers): e.g., Headcovers Sold | Business Days | Goal
-      Row 2 (values):  e.g., 32.25           | 51            | 80
-    Returns JSON with headcovers_sold, business_days, goal, and sold_per_day.
+    Reads Overview!V1:X2 for:
+      - Headcovers Sold
+      - Business Days
+      - Goal
+    And Overview!Y2 for:
+      - Average Price per Cover
+    Caches the result for 60 seconds to speed up the UI.
     """
+    # Serve from cache if fresh
+    now = time.time()
+    if _METRICS_CACHE["payload"] is not None and (now - _METRICS_CACHE["ts"] < _METRICS_TTL_SECONDS):
+        return jsonify(deepcopy(_METRICS_CACHE["payload"]))
+
     try:
         rows = fetch_sheet(SPREADSHEET_ID, "Overview!V1:X2") or []
-        # Normalize to 2 rows
-        headers = (rows[0] if len(rows) > 0 else [])
-        values  = (rows[1] if len(rows) > 1 else [])
+        headers = rows[0] if len(rows) > 0 else []
+        values  = rows[1] if len(rows) > 1 else []
 
         def idx(name):
             try:
-                return [h.strip().lower() for h in headers].index(name.strip().lower())
+                return [str(h or "").strip().lower() for h in headers].index(str(name).strip().lower())
             except Exception:
                 return None
 
@@ -3442,36 +3453,49 @@ def overview_metrics():
         ix_days = first_not_none(idx("Business Days"), idx("Days"))
         ix_goal = first_not_none(idx("Goal"), idx("Target"))
 
-        def num_at(ix):
-            if ix is None or ix >= len(values): return None
+        def val_at(ix):
+            if ix is None or ix >= len(values):
+                return None
+            return values[ix]
+
+        headcovers_sold = val_at(ix_sold)
+        # Coerce numeric where useful
+        def to_float(v):
             try:
-                return float(str(values[ix]).strip())
+                return float(str(v).replace(",", "").strip())
             except Exception:
                 return None
 
-        headcovers_sold = num_at(ix_sold)
-        business_days   = num_at(ix_days)
-        goal            = num_at(ix_goal)
+        business_days = to_float(val_at(ix_days))
+        goal          = to_float(val_at(ix_goal))
 
         sold_per_day = None
-        if headcovers_sold is not None and business_days and business_days > 0:
-            sold_per_day = headcovers_sold / business_days
+        try:
+            if headcovers_sold not in (None, "") and business_days and business_days > 0:
+                sold_per_day = float(headcovers_sold) / float(business_days)
+        except Exception:
+            sold_per_day = None
 
-        # Also pull Average Price per Cover from Production Orders!Y2
+        # Average Price per Cover from Overview!Y2
         try:
             avg_rows = fetch_sheet(SPREADSHEET_ID, "Overview!Y2:Y2") or []
             average_price = (avg_rows[0][0] if avg_rows and avg_rows[0] else None)
         except Exception:
             average_price = None
 
-        return jsonify({
+        payload = {
             "headcovers_sold": headcovers_sold,
             "business_days": business_days,
             "goal": goal,
             "sold_per_day": sold_per_day,
-            "average_price": average_price,  # NEW
-        })
+            "average_price": average_price,
+        }
 
+        # Update cache
+        _METRICS_CACHE["payload"] = deepcopy(payload)
+        _METRICS_CACHE["ts"] = now
+
+        return jsonify(payload)
     except Exception as e:
         app.logger.exception("overview_metrics failed")
         return jsonify({"error": str(e)}), 500
