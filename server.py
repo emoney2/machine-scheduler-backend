@@ -3253,26 +3253,30 @@ def overview_combined():
             row = dict(zip(TARGET_HEADERS, r))
 
             # Primary: Overview!Y for the same row index
+            # derive imageUrl from Y; fallback to Preview, then scan row for any Drive link/id
             link = ""
             if i < len(y_vals) and y_vals[i]:
                 link = y_vals[i][0] if len(y_vals[i]) else ""
-            fid = _extract_file_id(link)
+            fid = _drive_id_from_link(link)
 
-            # Fallback 1: Preview column
+            # Fallback 1: try the Preview column in A:K
             if not fid:
-                fid = _extract_file_id(row.get("Preview", ""))
+                fid = _drive_id_from_link(row.get("Preview", ""))
 
-            # Fallback 2: scan all A:K values
+            # Fallback 2: scan all visible fields in the row for any Drive link/id
             if not fid:
-                for v in row.values():
-                    fid = _extract_file_id(v)
+                for _v in row.values():
+                    fid = _drive_id_from_link(_v)
                     if fid:
                         break
 
             if fid:
-                row["imageUrl"] = _thumb_url_from_id(fid)
+                backend_root = request.url_root.rstrip("/")
+                row["imageUrl"] = f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
+                row["thumbnailUrl"] = row["imageUrl"]
 
             upcoming.append(row)
+
 
         # ---------- MATERIALS (Overview!M3:M) ----------
         mat_vals = (vrs[1].get("values") if len(vrs) > 1 and isinstance(vrs[1].get("values"), list) else []) or []
@@ -3335,7 +3339,12 @@ def overview_combined():
                         return -1
 
                 i_order = _idx("Order #")
-                i_image = _idx("Image")
+
+                i_image = -1
+                for _name in ["Image", "Images", "Image Link", "Art", "Art Link", "Design Image", "Preview", "Preview Link"]:
+                    i_image = _idx(_name)
+                    if i_image >= 0:
+                        break
 
                 if i_order >= 0 and i_image >= 0:
                     po_rows = svc_vals.get(
