@@ -3227,16 +3227,28 @@ def overview_combined():
             row = dict(zip(TARGET_HEADERS, r))
 
             # derive imageUrl from the raw link in column Y for the same row index
-            link = ""
-            if i < len(y_vals) and y_vals[i]:
-                link = y_vals[i][0] if len(y_vals[i]) else ""
-            fid = _drive_id_from_link(link)
-            if fid:
-                backend_root = request.url_root.rstrip("/")
-                row["imageUrl"] = f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
+                   link = ""
+                   if i < len(y_vals) and y_vals[i]:
+                       link = y_vals[i][0] if len(y_vals[i]) else ""
+                   fid = _drive_id_from_link(link)
 
+                   # Fallback 1: use Preview column if Y is empty
+                   if not fid:
+                       fid = _drive_id_from_link(row.get("Preview", ""))
 
-            upcoming.append(row)
+                   # Fallback 2: scan all row fields for any drive id/link
+                   if not fid:
+                       for v in list(row.values()):
+                           fid = _drive_id_from_link(v)
+                           if fid:
+                               break
+
+                   if fid:
+                       backend_root = request.url_root.rstrip("/")
+                       row["imageUrl"] = f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
+
+                   upcoming.append(row)
+
         # ---------- MATERIALS ----------
         mat_vals = (vrs[1].get("values") if len(vrs) > 1 and isinstance(vrs[1].get("values"), list) else []) or []
         grouped = {}
