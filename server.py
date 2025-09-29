@@ -3163,13 +3163,38 @@ def overview_combined():
     Returns: { upcoming: [...], materials: [...], daysWindow: "7" }
     - 15s micro-cache + ETag/304
     - On error: logs and returns last-good or empty payload (never 500s)
-    Requires existing helpers: get_sheets_service(), sheet_lock, SPREADSHEET_ID,
-    _json_etag(), _drive_id_from_link()
+    Requires: get_sheets_service(), sheet_lock, SPREADSHEET_ID, _json_etag()
     """
-    # 15s micro-cache + ETag/304
+
+    # ---------- helpers ----------
+    def _extract_file_id(val) -> str | None:
+        if not val:
+            return None
+        s = str(val).strip()
+        # quick bare-id check
+        if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
+            return s
+        # id=... param
+        m = re.search(r"[?&]id=([A-Za-z0-9_-]{10,})", s)
+        if m:
+            return m.group(1)
+        # /file/d/<id>/...
+        m = re.search(r"/(?:file/)?d/([A-Za-z0-9_-]{10,})", s)
+        if m:
+            return m.group(1)
+        return None
+
+    def _thumb_url_from_id(fid: str | None) -> str | None:
+        if not fid:
+            return None
+        backend_root = request.url_root.rstrip("/")
+        # use your proxy so auth/caching stays consistent
+        return f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
+
+    # ---------- 15s micro-cache ----------
     global _overview_cache, _overview_ts
     now = time.time()
-    if _overview_cache is not None and (now - _overview_ts) < 15:
+    if _overview_cache is not None and (_overview_ts is not None) and (now - _overview_ts) < 15:
         payload_bytes = json.dumps(_overview_cache, separators=(",", ":")).encode("utf-8")
         etag = _json_etag(payload_bytes)
         inm = request.headers.get("If-None-Match", "")
@@ -3184,10 +3209,9 @@ def overview_combined():
         return resp
 
     try:
-        # ---- Read ranges from the Overview sheet ----------------------------
         svc = get_sheets_service().spreadsheets().values()
 
-        # 2 quick attempts to ride out transient network hiccups
+        # read Overview ranges
         resp = None
         for attempt in (1, 2):
             try:
@@ -3198,68 +3222,66 @@ def overview_combined():
                         valueRenderOption="UNFORMATTED_VALUE",
                         fields="valueRanges(values)"
                     ).execute()
-                break  # success → leave the loop
+                break
             except Exception as e:
                 app.logger.warning("Sheets batchGet failed (attempt %d): %s", attempt, e)
                 if attempt == 2:
                     raise
-                time.sleep(0.6)  # tiny backoff before final try
+                time.sleep(0.6)
 
         vrs = resp.get("valueRanges", []) if resp else []
 
-        # ---------- UPCOMING ---------- (Overview!A:K plus image from Y/Preview)
+        # ---------- UPCOMING (Overview!A:K) ----------
         TARGET_HEADERS = [
             "Order #", "Preview", "Company Name", "Design", "Quantity",
             "Product", "Stage", "Due Date", "Print", "Ship Date", "Hard Date/Soft Date"
         ]
         up_vals = (vrs[0].get("values") if len(vrs) > 0 and isinstance(vrs[0].get("values"), list) else []) or []
 
-        # Drop header row if present
+        # drop header if present
         if up_vals:
             first_row = [str(x or "").strip() for x in up_vals[0]]
             if [h.lower() for h in first_row] == [h.lower() for h in TARGET_HEADERS]:
                 up_vals = up_vals[1:]
 
-        # Y column values (raw Drive links)
+        # Y column (raw drive links)
         y_vals = (vrs[3].get("values") if len(vrs) > 3 and isinstance(vrs[3].get("values"), list) else []) or []
 
-        upcoming = []
+        upcoming: list[dict] = []
         for i, r in enumerate(up_vals):
             r = (r or []) + [""] * (len(TARGET_HEADERS) - len(r))
             row = dict(zip(TARGET_HEADERS, r))
 
-            # derive imageUrl from the raw link in column Y for the same row index
+            # Primary: Overview!Y for the same row index
             link = ""
             if i < len(y_vals) and y_vals[i]:
                 link = y_vals[i][0] if len(y_vals[i]) else ""
-            fid = _drive_id_from_link(link)
+            fid = _extract_file_id(link)
 
-            # Fallback 1: use Preview column if Y is empty
+            # Fallback 1: Preview column
             if not fid:
-                fid = _drive_id_from_link(row.get("Preview", ""))
+                fid = _extract_file_id(row.get("Preview", ""))
 
-            # Fallback 2: scan all row fields for any drive id/link
+            # Fallback 2: scan all A:K values
             if not fid:
-                for v in list(row.values()):
-                    fid = _drive_id_from_link(v)
+                for v in row.values():
+                    fid = _extract_file_id(v)
                     if fid:
                         break
 
             if fid:
-                backend_root = request.url_root.rstrip("/")
-                row["imageUrl"] = f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
+                row["imageUrl"] = _thumb_url_from_id(fid)
 
             upcoming.append(row)
 
-        # ---------- MATERIALS ---------- (Overview!M3:M, grouped by vendor)
+        # ---------- MATERIALS (Overview!M3:M) ----------
         mat_vals = (vrs[1].get("values") if len(vrs) > 1 and isinstance(vrs[1].get("values"), list) else []) or []
-        grouped = {}
-        for row in mat_vals:
-            s = str((row[0] if row else "") or "").strip()
+        grouped: dict[str, list] = {}
+        for mrow in mat_vals:
+            s = str((mrow[0] if mrow else "") or "").strip()
             if not s:
                 continue
 
-            # Split: "... Qty Unit - Vendor"
             vendor = "Misc."
             left = s
             if " - " in s:
@@ -3285,7 +3307,7 @@ def overview_combined():
 
         materials = [{"vendor": v, "items": items} for v, items in grouped.items()]
 
-        # ---- Read B1 for days window ---------------------------------------
+        # ---------- daysWindow from B1 ----------
         days_window = "7"
         try:
             b1_vals = (vrs[2].get("values") if len(vrs) > 2 and isinstance(vrs[2].get("values"), list) else []) or []
@@ -3294,7 +3316,53 @@ def overview_combined():
         except Exception:
             pass
 
-        # ---- Cache + respond -----------------------------------------------
+        # ---------- Final fallback: use Production Orders "Image" by Order # ----------
+        missing_orders = [str(j.get("Order #")).strip() for j in upcoming if not j.get("imageUrl") and j.get("Order #")]
+        if missing_orders:
+            try:
+                svc_vals = get_sheets_service().spreadsheets().values()
+                # read header row to find columns
+                po_hdr = svc_vals.get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range="Production Orders!A1:AE1",
+                    valueRenderOption="UNFORMATTED_VALUE",
+                ).execute().get("values", [[]])[0]
+
+                def _idx(name: str) -> int:
+                    try:
+                        return [h.strip() for h in po_hdr].index(name)
+                    except Exception:
+                        return -1
+
+                i_order = _idx("Order #")
+                i_image = _idx("Image")
+
+                if i_order >= 0 and i_image >= 0:
+                    po_rows = svc_vals.get(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range="Production Orders!A2:AE",
+                        valueRenderOption="UNFORMATTED_VALUE",
+                    ).execute().get("values", [])
+
+                    image_map: dict[str, str] = {}
+                    for prow in po_rows:
+                        prow = (prow or []) + [""] * (max(i_order, i_image) + 1 - len(prow))
+                        oid = str(prow[i_order]).strip() if len(prow) > i_order else ""
+                        img = prow[i_image] if len(prow) > i_image else ""
+                        fid = _extract_file_id(img)
+                        if oid and fid:
+                            image_map[oid] = _thumb_url_from_id(fid)
+
+                    for j in upcoming:
+                        if not j.get("imageUrl"):
+                            oid = str(j.get("Order #") or "").strip()
+                            url = image_map.get(oid)
+                            if url:
+                                j["imageUrl"] = url
+            except Exception as e:
+                app.logger.warning(f"overview: Production Orders image fallback failed: {e}")
+
+        # ---------- cache + return ----------
         resp_data = {"upcoming": upcoming, "materials": materials, "daysWindow": days_window}
         _overview_cache = resp_data
         _overview_ts = now
@@ -3308,7 +3376,6 @@ def overview_combined():
 
     except Exception:
         app.logger.exception("overview_combined failed")
-        # Serve last-good if we have it
         if _overview_cache is not None:
             payload_bytes = json.dumps(_overview_cache, separators=(",", ":")).encode("utf-8")
             etag = _json_etag(payload_bytes)
@@ -3316,7 +3383,6 @@ def overview_combined():
             resp.headers["ETag"] = etag
             resp.headers["Cache-Control"] = "public, max-age=15"
             return resp
-        # Otherwise serve empty payload (200)
         fallback = {"upcoming": [], "materials": [], "daysWindow": "7"}
         payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
         etag = _json_etag(payload_bytes)
