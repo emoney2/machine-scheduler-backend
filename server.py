@@ -1697,6 +1697,20 @@ def serve_label(filename):
     # Let browser open in a new tab for printing
     return send_from_directory(tmp, safe, as_attachment=False)
 
+@app.route("/slips/<path:filename>")
+def serve_slip(filename):
+    """
+    Serve packing slip PDFs saved to the system temp directory.
+    """
+    tmp = tempfile.gettempdir()
+    safe = os.path.basename(filename)
+    full = os.path.join(tmp, safe)
+    if not os.path.exists(full):
+        return abort(404)
+    # Open in a new tab for easy printing
+    return send_from_directory(tmp, safe, as_attachment=False)
+
+
 def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers, env_override=None):
     """
     Fetch the invoice PDF from QuickBooks (sandbox or production).
@@ -6696,11 +6710,34 @@ def qbo_callback():
     session["qboEnv"] = env_override
     logger.info("✅ Stored QBO token in session, environment: %s", env_override)
 
-    # ── 6) Redirect back into your Ship UI ────────────────────────
+    # ── 6) Close the popup and refocus the main tab ─────────────────
     frontend = FRONTEND_URL.rstrip("/")
-    resume_url = f"{frontend}/ship"
-    logger.info("🔁 OAuth callback complete — redirecting to Ship page: %s", resume_url)
-    return redirect(resume_url)
+    html = f"""
+    <!doctype html>
+    <html>
+      <head><meta charset="utf-8"><title>QuickBooks connected</title></head>
+      <body>
+        <script>
+          try {{
+            // Tell opener we're done (optional; your app doesn't need this)
+            if (window.opener) {{
+              window.opener.postMessage({{type: "qbo-auth-complete"}}, "{frontend}");
+              // If you named your main tab, try to focus it
+              try {{
+                const main = window.opener.name === "mainShipTab" ? window.opener : null;
+                if (main) main.focus();
+              }} catch (e) {{}}
+            }}
+          }} catch (e) {{}}
+          // Close the popup either way
+          window.close();
+        </script>
+        QuickBooks connected. You can close this window.
+      </body>
+    </html>
+    """
+    return Response(html, mimetype="text/html")
+
 
 @app.route("/api/ensure-qbo-auth", methods=["POST"])
 @login_required_session
