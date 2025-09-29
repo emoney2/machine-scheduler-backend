@@ -3163,7 +3163,8 @@ def overview_combined():
     Returns: { upcoming: [...], materials: [...], daysWindow: "7" }
     - 15s micro-cache + ETag/304
     - On error: logs and returns last-good or empty payload (never 500s)
-    Requires your existing: get_sheets_service(), sheet_lock, SPREADSHEET_ID
+    Requires existing helpers: get_sheets_service(), sheet_lock, SPREADSHEET_ID,
+    _json_etag(), _drive_id_from_link()
     """
     # 15s micro-cache + ETag/304
     global _overview_cache, _overview_ts
@@ -3206,12 +3207,13 @@ def overview_combined():
 
         vrs = resp.get("valueRanges", []) if resp else []
 
-        # ---------- UPCOMING ----------
+        # ---------- UPCOMING ---------- (Overview!A:K plus image from Y/Preview)
         TARGET_HEADERS = [
-            "Order #","Preview","Company Name","Design","Quantity",
-            "Product","Stage","Due Date","Print","Ship Date","Hard Date/Soft Date"
+            "Order #", "Preview", "Company Name", "Design", "Quantity",
+            "Product", "Stage", "Due Date", "Print", "Ship Date", "Hard Date/Soft Date"
         ]
         up_vals = (vrs[0].get("values") if len(vrs) > 0 and isinstance(vrs[0].get("values"), list) else []) or []
+
         # Drop header row if present
         if up_vals:
             first_row = [str(x or "").strip() for x in up_vals[0]]
@@ -3227,35 +3229,36 @@ def overview_combined():
             row = dict(zip(TARGET_HEADERS, r))
 
             # derive imageUrl from the raw link in column Y for the same row index
-                   link = ""
-                   if i < len(y_vals) and y_vals[i]:
-                       link = y_vals[i][0] if len(y_vals[i]) else ""
-                   fid = _drive_id_from_link(link)
+            link = ""
+            if i < len(y_vals) and y_vals[i]:
+                link = y_vals[i][0] if len(y_vals[i]) else ""
+            fid = _drive_id_from_link(link)
 
-                   # Fallback 1: use Preview column if Y is empty
-                   if not fid:
-                       fid = _drive_id_from_link(row.get("Preview", ""))
+            # Fallback 1: use Preview column if Y is empty
+            if not fid:
+                fid = _drive_id_from_link(row.get("Preview", ""))
 
-                   # Fallback 2: scan all row fields for any drive id/link
-                   if not fid:
-                       for v in list(row.values()):
-                           fid = _drive_id_from_link(v)
-                           if fid:
-                               break
+            # Fallback 2: scan all row fields for any drive id/link
+            if not fid:
+                for v in list(row.values()):
+                    fid = _drive_id_from_link(v)
+                    if fid:
+                        break
 
-                   if fid:
-                       backend_root = request.url_root.rstrip("/")
-                       row["imageUrl"] = f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
+            if fid:
+                backend_root = request.url_root.rstrip("/")
+                row["imageUrl"] = f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
 
-                   upcoming.append(row)
+            upcoming.append(row)
 
-        # ---------- MATERIALS ----------
+        # ---------- MATERIALS ---------- (Overview!M3:M, grouped by vendor)
         mat_vals = (vrs[1].get("values") if len(vrs) > 1 and isinstance(vrs[1].get("values"), list) else []) or []
         grouped = {}
         for row in mat_vals:
             s = str((row[0] if row else "") or "").strip()
             if not s:
                 continue
+
             # Split: "... Qty Unit - Vendor"
             vendor = "Misc."
             left = s
@@ -3314,7 +3317,7 @@ def overview_combined():
             resp.headers["Cache-Control"] = "public, max-age=15"
             return resp
         # Otherwise serve empty payload (200)
-        fallback = {"upcoming": [], "materials": []}
+        fallback = {"upcoming": [], "materials": [], "daysWindow": "7"}
         payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
         etag = _json_etag(payload_bytes)
         resp = Response(payload_bytes, mimetype="application/json")
