@@ -2854,30 +2854,103 @@ def rate_all_services():
         ]), 200
 
 
+# >>> REPLACE the entire /api/updateStartTime route with this <<<
+
+from flask import request, jsonify
+from datetime import datetime
+# Assuming: socketio, fetch_sheet, write_sheet, SPREADSHEET_ID already exist/imported
+
 @app.route("/api/updateStartTime", methods=["POST"])
 @login_required_session
 def update_start_time():
+    """
+    Body: { "orderNumber": "<Order # as string or int>", "startTime": "<ISO 8601>" }
+    Behavior:
+      - Look up row in 'Production Orders' by 'Order #' column.
+      - If 'Embroidery Start Time' is blank, write startTime (as-is).
+      - If non-blank, no-op.
+      - Emit 'startTimeUpdated' with { orderNumber, startTime, wrote }.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    order_number = str(data.get("orderNumber", "")).strip()
+    iso_start = str(data.get("startTime", "")).strip()
+
+    if not order_number or not iso_start:
+        return jsonify({"ok": False, "error": "orderNumber and startTime required"}), 400
+
     try:
-        data = request.get_json() or {}
-        job_id    = data.get("id")
-        iso_start = data.get("startTime")
+        # Validate ISO
+        datetime.fromisoformat(iso_start.replace("Z", "+00:00"))
+    except Exception:
+        return jsonify({"ok": False, "error": "startTime must be ISO 8601"}), 400
 
-        if not job_id or not iso_start:
-            return jsonify({"error": "Missing job ID or start time"}), 400
+    # Read header + rows
+    sheet_name = "Production Orders"
+    rows = fetch_sheet(SPREADSHEET_ID, f"{sheet_name}!A1:ZZ")  # full width, cheap for headers
+    if not rows or not rows[0]:
+        return jsonify({"ok": False, "error": "Sheet empty or unreadable"}), 500
 
-        # Write ISO directly to Production Orders
-        update_embroidery_start_time_in_sheet(job_id, iso_start)
+    header = rows[0]
+    def col_idx(name): 
+        try: return header.index(name)
+        except ValueError: return -1
 
-        # 🔔 Notify all clients so UIs patch immediately
-        try:
-            socketio.emit("startTimeUpdated", {"orderId": str(job_id), "startTime": iso_start})
-        except Exception:
-            app.logger.exception("socket emit failed for startTimeUpdated")
+    col_order = col_idx("Order #")
+    col_start = col_idx("Embroidery Start Time")
+    if col_order == -1 or col_start == -1:
+        return jsonify({"ok": False, "error": "Missing required columns"}), 500
 
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    # Find row (1-based in Sheets UI; 0 is header)
+    target_row_idx = None
+    for r_i in range(1, len(rows)):
+        cell = rows[r_i][col_order] if col_order < len(rows[r_i]) else ""
+        if str(cell).strip() == order_number:
+            target_row_idx = r_i
+            break
 
+    if target_row_idx is None:
+        return jsonify({"ok": False, "error": f"Order # {order_number} not found"}), 404
+
+    # Current value?
+    current_val = ""
+    row = rows[target_row_idx]
+    if col_start < len(row):
+        current_val = str(row[col_start]).strip()
+
+    wrote = False
+    if not current_val:
+        # Write start time (as-is) into the target cell
+        # Convert zero-based row to 1-based, plus header: +1 for header row, +1 to switch to 1-based = +1
+        sheet_row_1_based = target_row_idx + 1 + 0  # rows[0] is header => target_row_idx already includes header offset
+        # Note: target_row_idx is 1 for first data row; that is already 2 in UI. So:
+        # rows index: 0=header, 1=data row 2 in UI. Therefore:
+        sheet_row_1_based = target_row_idx + 1  # correct for A1 notation
+
+        # Convert column to A1 letter
+        def to_a1_col(n):  # 0-based -> letters
+            s, n = "", n
+            while True:
+                s = chr(n % 26 + 65) + s
+                n = n // 26 - 1
+                if n < 0: break
+            return s
+        a1_col = to_a1_col(col_start)
+        a1_cell = f"{sheet_name}!{a1_col}{sheet_row_1_based}"
+
+        write_sheet(SPREADSHEET_ID, a1_cell, [[iso_start]])
+        wrote = True
+
+    # Nudge clients
+    try:
+        socketio.emit("startTimeUpdated", {
+            "orderNumber": order_number,
+            "startTime": iso_start,
+            "wrote": wrote
+        })
+    except Exception:
+        pass
+
+    return jsonify({"ok": True, "orderNumber": order_number, "startTime": iso_start, "wrote": wrote}), 200
 
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
@@ -5984,6 +6057,7 @@ def mark_inventory_received():
     """
     # CORS preflight
     if request.method == "OPTIONS":
+        from flask import make_response  # safe if already imported elsewhere
         resp = make_response("", 204)
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
@@ -5997,9 +6071,9 @@ def mark_inventory_received():
     try:
         row = int(row)
     except Exception:
-        return jsonify({"error": "invalid row"}), 400
+        return jsonify({"ok": False, "error": "invalid row"}), 400
     if row < 2:
-        return jsonify({"error": "row must be >= 2"}), 400
+        return jsonify({"ok": False, "error": "row must be >= 2"}), 400
 
     # choose sheet & O/R column
     if sheetType == "Material":
@@ -6012,43 +6086,108 @@ def mark_inventory_received():
     # Sheets client
     sheets = get_sheets_service()
 
-    # timestamp in A
-    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+    # Portable timestamp (avoid %-m/%-d which can crash on some platforms)
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%m/%d/%Y %H:%M:%S")
 
-    # 1) Update the Date cell (col A)
-    sheets.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{sheet}!A{row}",
-        valueInputOption="USER_ENTERED",
-        body={"values": [[now]]}
-    ).execute()
+    try:
+        # 1) Update the Date cell (col A)
+        sheets.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{sheet}!A{row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[now]]}
+        ).execute()
 
-    # 2) Update the O/R cell to "Received"
-    sheets.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{sheet}!{col_or}{row}",
-        valueInputOption="USER_ENTERED",
-        body={"values": [["Received"]]}
-    ).execute()
+        # 2) Update the O/R cell to "Received"
+        sheets.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{sheet}!{col_or}{row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [["Received"]]}
+        ).execute()
+    except Exception as e:
+        app.logger.exception("Receive failed for %s row %s", sheet, row)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-    resp = jsonify({"status": "ok"})
+    resp = jsonify({"ok": True})
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
 
+@app.route("/api/inventoryOrdered/batch", methods=["PUT", "OPTIONS"])
+@login_required_session
+def mark_inventory_received_batch():
+    """
+    Body:
+      { "items": [ { "type": "Material"|"Thread", "row": <int> }, ... ] }
+    Effect:
+      - Sets Date (col A) to now
+      - Sets O/R to "Received"  (I for Material, H for Thread)
+    """
+    # CORS preflight
+    if request.method == "OPTIONS":
+        from flask import make_response
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
 
-# 0-based column index -> A1 column letters (0 -> A, 1 -> B, … 25 -> Z, 26 -> AA, etc.)
-def col_to_a1(idx):
-    i = int(idx)
-    if i < 0:
-        i = 0
-    letters = ""
-    while True:
-        i, rem = divmod(i, 26)
-        letters = chr(ord("A") + rem) + letters
-        if i == 0:
-            break
-        i -= 1  # Excel-style carry
-    return letters
+    data = request.get_json(silent=True) or {}
+    items = data.get("items") or []
+    if not isinstance(items, list) or not items:
+        return jsonify({"ok": False, "error": "No items provided"}), 400
+
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%m/%d/%Y %H:%M:%S")
+    sheets = get_sheets_service()
+
+    # Build batch updates per sheet (group to minimize API calls)
+    mat_dates, mat_or = [], []
+    th_dates, th_or = [], []
+
+    for it in items:
+        t = str(it.get("type", "")).strip().lower()
+        r = it.get("row")
+        try:
+            r = int(r)
+        except Exception:
+            continue
+        if r < 2:
+            continue
+
+        if t == "material":
+            mat_dates.append((f"Material Log!A{r}", [[now]]))
+            mat_or.append((f"Material Log!I{r}", [["Received"]]))
+        elif t == "thread":
+            th_dates.append((f"Thread Data!A{r}", [[now]]))
+            th_or.append((f"Thread Data!H{r}", [["Received"]]))
+
+    def _batch(updates):
+        if not updates:
+            return
+        body = {
+            "valueInputOption": "USER_ENTERED",
+            "data": [{"range": rg, "values": vals} for rg, vals in updates],
+        }
+        sheets.spreadsheets().values().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID, body=body
+        ).execute()
+
+    try:
+        _batch(mat_dates); _batch(mat_or)
+        _batch(th_dates);  _batch(th_or)
+    except Exception as e:
+        app.logger.exception("Batch receive failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    # (Optional) kick any caches
+    try:
+        invalidate_materials_needed_cache()
+    except Exception:
+        pass
+
+    resp = jsonify({ "ok": True, "processed": len(items) })
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 
 @app.route("/api/inventoryOrdered/quantity", methods=["PATCH", "OPTIONS"])
