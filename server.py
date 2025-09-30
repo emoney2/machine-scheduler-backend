@@ -2860,7 +2860,7 @@ def update_start_time():
     try:
         data = request.get_json() or {}
         job_id    = data.get("id")
-        iso_start = clamp_iso_to_next_830_et(data.get("startTime"))  # enforce window server-side
+        iso_start = data.get("startTime")
 
         if not job_id or not iso_start:
             return jsonify({"error": "Missing job ID or start time"}), 400
