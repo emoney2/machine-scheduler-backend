@@ -5445,7 +5445,7 @@ def submit_material_inventory():
         items = request.get_json(silent=True) or []
         items = items if isinstance(items, list) else [items]
 
-        sheet = sheets.values()
+        sheet = get_sheets_service().spreadsheets().values()
         timestamp = datetime.now(ZoneInfo("America/New_York")) \
             .strftime("%-m/%-d/%Y %H:%M:%S")
 
