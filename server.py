@@ -5527,7 +5527,7 @@ def submit_material_inventory():
                     sheet.update(
                         spreadsheetId=SPREADSHEET_ID,
                         range=f"Material Inventory!A{target}:H{target}",
-                        valueInputOption="USER_INPUT",
+                        valueInputOption="USER_ENTERED",
                         body={"values": row_vals}
                     ).execute()
 
