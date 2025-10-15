@@ -3384,14 +3384,8 @@ def overview_combined():
 
         materials = [{"vendor": v, "items": items} for v, items in grouped.items()]
 
-        # ---------- daysWindow from B1 ----------
-        days_window = "7"
-        try:
-            b1_vals = (vrs[2].get("values") if len(vrs) > 2 and isinstance(vrs[2].get("values"), list) else []) or []
-            if b1_vals and b1_vals[0] and b1_vals[0][0] is not None:
-                days_window = str(b1_vals[0][0]).strip() or "7"
-        except Exception:
-            pass
+        days_window = None  # no time filtering on materials/threads
+       
 
         # ---------- Final fallback: use Production Orders "Image" by Order # ----------
         missing_orders = [str(j.get("Order #")).strip() for j in upcoming if not j.get("imageUrl") and j.get("Order #")]
@@ -3445,7 +3439,7 @@ def overview_combined():
                 app.logger.warning(f"overview: Production Orders image fallback failed: {e}")
 
         # ---------- cache + return ----------
-        resp_data = {"upcoming": upcoming, "materials": materials, "daysWindow": days_window}
+        resp_data = {"upcoming": upcoming, "materials": materials}
         _overview_cache = resp_data
         _overview_ts = now
 
