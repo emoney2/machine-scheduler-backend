@@ -1806,13 +1806,24 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
     elems.append(Paragraph("PACKING SLIP", title_style))
 
     # ─── Line Items ────────────────────────────────────────
+    def _normalize_product_for_slip(name: str) -> str:
+        # Remove the tokens front/full/back anywhere, collapse whitespace and trim
+        base = re.sub(r'(?i)\b(front|full|back)\b', '', name or '')
+        # Clean separators like " - " or "/" that might leave double spaces
+        base = re.sub(r'[\(\)\[\]\-_/]+', ' ', base)
+        base = re.sub(r'\s+', ' ', base).strip()
+        return base or (name or '')
+
     data = [["Product", "Design", "Qty"]]
     for od in order_data_list:
+        product_raw = od.get("Product", "")
+        product_norm = _normalize_product_for_slip(product_raw)
         data.append([
-            od.get("Product", ""),
+            product_norm,
             od.get("Design", ""),
             str(od.get("ShippedQty", ""))
         ])
+
 
     # widen the table columns
     table = Table(data, colWidths=[3.0*inch, 3.0*inch, 1.0*inch])
@@ -2421,17 +2432,27 @@ def create_consolidated_invoice_in_quickbooks(
 
     # ── 3) Build line items ─────────────────────────────────────────
     line_items = []
-    for order in order_data_list:
-        raw_name = order.get("Product", "").strip()
+    def _is_back_item(name: str) -> bool:
+        # treat ANY standalone "back" token as a back item
+        return bool(re.search(r'(?i)\bback\b', name or ''))
 
-        # Skip any “Back” jobs
-        if re.search(r"\s+Back$", raw_name, flags=re.IGNORECASE):
+    def _product_base(name: str) -> str:
+        # remove "front" and "full" tokens anywhere, and clean separators
+        base = re.sub(r'(?i)\b(front|full)\b', '', name or '')
+        base = re.sub(r'[\(\)\[\]\-_/]+', ' ', base)
+        base = re.sub(r'\s+', ' ', base).strip()
+        return base or (name or '')
+
+    for order in order_data_list:
+        raw_name = (order.get("Product") or "").strip()
+
+        # Skip any back items entirely on the INVOICE
+        if _is_back_item(raw_name):
             continue
 
-        product_base = re.sub(
-            r"\s+(Front|Full)$", "", raw_name, flags=re.IGNORECASE
-        ).strip()
-        design_name = order.get("Design", "").strip()
+        product_base = _product_base(raw_name)
+        design_name  = (order.get("Design") or "").strip()
+
 
         # Parse shipped quantity (fallback to other fields)
         try:
