@@ -3926,6 +3926,143 @@ def cut_complete():
         app.logger.exception("cut_complete failed")
         return jsonify(ok=False, error=str(e)), 500
 
+@app.route("/api/cut/submitMaterial", methods=["POST"])
+@login_required_session
+def cut_submit_material():
+    """
+    Body: { orderId: "<Order #>", materialKey: "Material1"|"Material2"|"Material3"|"Material4"|"Material5"|"Back Material", quantity?: number }
+    Behavior:
+      - Find the row in Cut List for orderId.
+      - Identify the source column (H..R) that matches the given materialKey.
+      - Write 'quantity' (or the job's main Quantity if not provided) into the cell one to the right (I..S).
+      - Return { ok: true, submitted: {Material1: bool, ... 'Back Material': bool} }
+    """
+    data = request.get_json(silent=True) or {}
+    order_id = str(data.get("orderId", "")).strip()
+    material_key = str(data.get("materialKey", "")).strip()
+    quantity = data.get("quantity", None)
+
+    VALID_KEYS = {"Material1", "Material2", "Material3", "Material4", "Material5", "Back Material"}
+    if not order_id:
+        return jsonify(ok=False, error="Missing orderId"), 400
+    if material_key not in VALID_KEYS:
+        return jsonify(ok=False, error="Invalid materialKey"), 400
+
+    # Initialize Sheets client
+    try:
+        vsvc = get_sheets_service().spreadsheets().values()
+    except Exception as e:
+        app.logger.exception("cut_submit_material: unable to init Google Sheets client")
+        return jsonify(ok=False, error="Could not initialize Google Sheets client."), 503
+
+    try:
+        with sheet_lock:
+            resp = vsvc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Cut List!A1:ZZ",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        rows = resp.get("values", []) or []
+        if not rows:
+            return jsonify(ok=False, error="Cut List is empty"), 404
+
+        headers = [str(h).strip() for h in rows[0]]
+        # Find columns for "Order #" and each material label in H..R
+        col_order = headers.index("Order #") if "Order #" in headers else None
+        if col_order is None:
+            return jsonify(ok=False, error="Order # column not found in Cut List"), 400
+
+        # Map Material keys to their source headers (sheet must use these exact header strings)
+        # (Customize these if your headers differ. The code below expects H..R to include these labels.)
+        material_headers = ["Material1", "Material2", "Material3", "Material4", "Material5", "Back Material"]
+        source_start_col = headers.index("Material1") if "Material1" in headers else None
+        if source_start_col is None:
+            # Fallback: search H..R for the first matching Material header
+            source_start_col = None
+            for idx, h in enumerate(headers):
+                if h in material_headers:
+                    source_start_col = idx
+                    break
+        if source_start_col is None:
+            return jsonify(ok=False, error="Could not locate material source columns (H..R)"), 400
+
+        # Find the row number by Order #
+        row_num = None
+        for i in range(1, len(rows)):
+            r = rows[i] or []
+            val = str(r[col_order] if col_order < len(r) else "").strip()
+            if val == order_id:
+                row_num = i + 1
+                break
+        if not row_num:
+            return jsonify(ok=False, error=f"Order {order_id} not found in Cut List"), 404
+
+        # If quantity isn’t provided, read job Quantity from this row (header must be "Quantity")
+        if quantity is None:
+            try:
+                col_qty = headers.index("Quantity")
+                row_vals = rows[row_num - 1] if row_num - 1 < len(rows) else []
+                raw_qty = row_vals[col_qty] if col_qty < len(row_vals) else ""
+                quantity = int(raw_qty or 0)
+            except Exception:
+                quantity = 0
+
+        # Identify exact source column for the requested material_key
+        try:
+            src_col = headers.index(material_key)
+        except ValueError:
+            return jsonify(ok=False, error=f"{material_key} column not found"), 400
+
+        # Destination is one to the right
+        dest_col = src_col + 1
+
+        # Build the A1 range
+        def col_letter(n0):
+            # n0 is 0-based
+            n = n0 + 1  # 1-based
+            s = ""
+            while n:
+                n, r = divmod(n - 1, 26)
+                s = chr(65 + r) + s
+            return s
+
+        dest_range = f"Cut List!{col_letter(dest_col)}{row_num}"
+        body = {
+            "valueInputOption": "USER_ENTERED",
+            "data": [{"range": dest_range, "values": [[quantity]]}],
+        }
+
+        with sheet_lock:
+            vsvc.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
+
+        # Return current submitted status for H..R→I..S
+        with sheet_lock:
+            row_read = vsvc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Cut List!A{row_num}:ZZ{row_num}",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        row_vals = (row_read.get("values") or [[]])[0]
+
+        submitted = {}
+        for key in material_headers:
+            try:
+                sc = headers.index(key)
+                dc = sc + 1
+                is_submitted = False
+                if dc < len(row_vals):
+                    v = row_vals[dc]
+                    is_submitted = (str(v).strip() != "")
+                submitted[key] = is_submitted
+            except ValueError:
+                submitted[key] = False
+
+        return jsonify(ok=True, submitted=submitted)
+    except Exception as e:
+        app.logger.exception("cut_submit_material failed")
+        return jsonify(ok=False, error=str(e)), 500
+
+
 @app.route("/api/cut/completeBatch", methods=["POST"])
 @login_required_session
 def cut_complete_batch():
