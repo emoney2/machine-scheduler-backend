@@ -640,6 +640,8 @@ FRONTEND_URL = raw_frontend.strip()
 
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
+
+
 # Optional GZIP compression (safe if package missing)
 try:
     from flask_compress import Compress
