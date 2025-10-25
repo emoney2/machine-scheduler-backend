@@ -104,43 +104,6 @@ BOM_FOLDER_ID = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
 import re, os
 _DRIVE_NAME_CACHE: dict[tuple[str,str], dict] = {}
 
-# ---- Delta hashing helpers ----
-def _rows_to_dicts(rows):
-    if not rows: return []
-    headers = [str(h).strip() for h in rows[0]]
-    out = []
-    for r in rows[1:]:
-        r = r or []
-        if len(r) < len(headers):
-            r += [""] * (len(headers) - len(r))
-        out.append(dict(zip(headers, r)))
-    return out
-
-def _orders_list():
-    svc = get_sheets_service().spreadsheets().values()
-    with sheet_lock:
-        resp = svc.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=ORDERS_RANGE
-        ).execute()
-    rows = resp.get("values", []) or []
-    return _rows_to_dicts(rows)
-
-# Choose the fields that define a "meaningful" change for the Scheduler
-_HASH_FIELDS = [
-    "Order #", "Company Name", "Design", "Quantity", "Product",
-    "Stage", "Due Date", "Hard Date/Soft Date",
-    "Embroidery Start Time", "Stitch Count", "Threads",
-]
-
-def _order_hash(obj: dict) -> str:
-    # Build a stable JSON over selected fields
-    payload = {k: str(obj.get(k, "")) for k in _HASH_FIELDS}
-    s = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
-
-
-
 def _public_thumb(file_id: str | None, sz: str = "w640", ver: str | None = None) -> str | None:
     if not file_id:
         return None
@@ -665,6 +628,95 @@ def get_drive_service():
     _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     _service_ts = _t.time()
     return _drive_service
+
+# === Delta hashing helpers (place near other helpers) ===
+
+def _rows_to_dicts(rows):
+    """Convert a Sheets A1 range into a list of dicts using row 1 as headers."""
+    if not rows:
+        return []
+    headers = [str(h).strip() for h in rows[0]]
+    out = []
+    for r in rows[1:]:
+        r = r or []
+        if len(r) < len(headers):
+            r += [""] * (len(headers) - len(r))
+        out.append(dict(zip(headers, r)))
+    return out
+
+def _orders_list_for_changes():
+    """
+    Read the 'Production Orders' sheet. Adjust the tab name if yours differs.
+    We read many columns so we get fields like Order #, Due Date, Stage, etc.
+    """
+    svc = get_sheets_service().spreadsheets().values()
+    # Read up to column ZZ to be safe
+    resp = svc.get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Production Orders!A1:ZZ",
+        valueRenderOption="FORMATTED_VALUE",
+    ).execute()
+    rows = resp.get("values", []) or []
+    return _rows_to_dicts(rows)
+
+# Fields that define a "meaningful change" for the Scheduler
+_HASH_FIELDS = [
+    "Order #", "Company Name", "Design", "Quantity", "Product",
+    "Stage", "Due Date", "Hard Date/Soft Date",
+    "Embroidery Start Time", "Stitch Count", "Threads",
+]
+
+def _order_hash(obj: dict) -> str:
+    """Stable SHA1 over selected fields (missing keys treated as empty)."""
+    payload = {k: str(obj.get(k, "")) for k in _HASH_FIELDS}
+    s = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    import hashlib  # local import ok; hashlib is already imported elsewhere too
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+@app.route("/api/changes", methods=["GET"])
+@login_required_session
+def api_changes():
+    """
+    Returns: {"hashes": {"<orderId>": "<sha1>", ...}, "ts": <epoch_seconds>}
+    The frontend compares to last-seen hashes; if anything changed/removed, it reloads once.
+    """
+    try:
+        orders = _orders_list_for_changes()
+        mapping = {}
+        for o in orders:
+            oid = str(o.get("Order #", "")).strip()
+            if not oid:
+                continue
+            mapping[oid] = _order_hash(o)
+        return jsonify({"hashes": mapping, "ts": time.time()})
+    except Exception as e:
+        # Log the error to your server logs to make debugging easy
+        current_app.logger.exception("api_changes failed: %s", e)
+        return jsonify({"error": "changes failed"}), 500
+
+@app.route("/api/order", methods=["GET"])
+@login_required_session
+def api_order_single():
+    """
+    Params: orderNumber=<Order #>
+    Returns: { "order": { ... } } or 404
+    Useful if later you want to patch just one order instead of full reload.
+    """
+    try:
+        order_number = str(request.args.get("orderNumber", "")).strip()
+        if not order_number:
+            return jsonify({"error": "orderNumber required"}), 400
+
+        orders = _orders_list_for_changes()
+        for o in orders:
+            if str(o.get("Order #", "")).strip() == order_number:
+                return jsonify({"order": o})
+        return jsonify({"error": f"Order {order_number} not found"}), 404
+    except Exception as e:
+        current_app.logger.exception("api_order failed: %s", e)
+        return jsonify({"error": "order fetch failed"}), 500
+
+
 
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
 load_dotenv()
@@ -4955,37 +5007,7 @@ def handle_placeholders_updated(data):
 MANUAL_PLACEHOLDERS_RANGE = "Manual State!A2:H"
 MANUAL_MACHINES_RANGE     = "Manual State!I2:J2"
 
-@app.route("/api/changes", methods=["GET"])
-@login_required_session
-def api_changes():
-    """
-    Returns: { "hashes": { "<orderId>": "<sha1>", ... }, "ts": <epoch> }
-    Client compares to its last-known hashes to decide what changed.
-    """
-    orders = _orders_list()
-    mapping = {}
-    for o in orders:
-        oid = str(o.get("Order #", "")).strip()
-        if not oid: 
-            continue
-        mapping[oid] = _order_hash(o)
-    return jsonify({"hashes": mapping, "ts": time.time()})
 
-@app.route("/api/order", methods=["GET"])
-@login_required_session
-def api_order_single():
-    """
-    Params: orderNumber=<Order #>
-    Returns: { order: { ... } } or 404
-    """
-    order_number = str(request.args.get("orderNumber", "")).strip()
-    if not order_number:
-        return jsonify({"error": "orderNumber required"}), 400
-    orders = _orders_list()
-    for o in orders:
-        if str(o.get("Order #", "")).strip() == order_number:
-            return jsonify({"order": o})
-    return jsonify({"error": f"Order {order_number} not found"}), 404
 
 
 @app.route("/api/manualState", methods=["GET"])
