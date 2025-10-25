@@ -673,48 +673,7 @@ def _order_hash(obj: dict) -> str:
     import hashlib  # local import ok; hashlib is already imported elsewhere too
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-@app.route("/api/changes", methods=["GET"])
-@login_required_session
-def api_changes():
-    """
-    Returns: {"hashes": {"<orderId>": "<sha1>", ...}, "ts": <epoch_seconds>}
-    The frontend compares to last-seen hashes; if anything changed/removed, it reloads once.
-    """
-    try:
-        orders = _orders_list_for_changes()
-        mapping = {}
-        for o in orders:
-            oid = str(o.get("Order #", "")).strip()
-            if not oid:
-                continue
-            mapping[oid] = _order_hash(o)
-        return jsonify({"hashes": mapping, "ts": time.time()})
-    except Exception as e:
-        # Log the error to your server logs to make debugging easy
-        current_app.logger.exception("api_changes failed: %s", e)
-        return jsonify({"error": "changes failed"}), 500
 
-@app.route("/api/order", methods=["GET"])
-@login_required_session
-def api_order_single():
-    """
-    Params: orderNumber=<Order #>
-    Returns: { "order": { ... } } or 404
-    Useful if later you want to patch just one order instead of full reload.
-    """
-    try:
-        order_number = str(request.args.get("orderNumber", "")).strip()
-        if not order_number:
-            return jsonify({"error": "orderNumber required"}), 400
-
-        orders = _orders_list_for_changes()
-        for o in orders:
-            if str(o.get("Order #", "")).strip() == order_number:
-                return jsonify({"order": o})
-        return jsonify({"error": f"Order {order_number} not found"}), 404
-    except Exception as e:
-        current_app.logger.exception("api_order failed: %s", e)
-        return jsonify({"error": "order fetch failed"}), 500
 
 
 
@@ -746,6 +705,8 @@ CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 
 logout_all_ts = int(os.environ.get("LOGOUT_ALL_TS", "0"))
+
+
 
 # === Tiny TTL cache & ETag helper ============================================
 import hashlib, threading
@@ -1204,6 +1165,50 @@ def _mem_after(resp):
     except Exception:
         pass
     return resp
+
+@app.route("/api/changes", methods=["GET"])
+@login_required_session
+def api_changes():
+    """
+    Returns: {"hashes": {"<orderId>": "<sha1>", ...}, "ts": <epoch_seconds>}
+    The frontend compares to last-seen hashes; if anything changed/removed, it reloads once.
+    """
+    try:
+        orders = _orders_list_for_changes()
+        mapping = {}
+        for o in orders:
+            oid = str(o.get("Order #", "")).strip()
+            if not oid:
+                continue
+            mapping[oid] = _order_hash(o)
+        return jsonify({"hashes": mapping, "ts": time.time()})
+    except Exception as e:
+        # Log the error to your server logs to make debugging easy
+        current_app.logger.exception("api_changes failed: %s", e)
+        return jsonify({"error": "changes failed"}), 500
+
+@app.route("/api/order", methods=["GET"])
+@login_required_session
+def api_order_single():
+    """
+    Params: orderNumber=<Order #>
+    Returns: { "order": { ... } } or 404
+    Useful if later you want to patch just one order instead of full reload.
+    """
+    try:
+        order_number = str(request.args.get("orderNumber", "")).strip()
+        if not order_number:
+            return jsonify({"error": "orderNumber required"}), 400
+
+        orders = _orders_list_for_changes()
+        for o in orders:
+            if str(o.get("Order #", "")).strip() == order_number:
+                return jsonify({"order": o})
+        return jsonify({"error": f"Order {order_number} not found"}), 404
+    except Exception as e:
+        current_app.logger.exception("api_order failed: %s", e)
+        return jsonify({"error": "order fetch failed"}), 500
+
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
 def drive_thumbnail():
