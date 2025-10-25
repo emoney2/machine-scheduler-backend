@@ -40,6 +40,10 @@ from googleapiclient.http import MediaIoBaseDownload
 import socket
 from requests.exceptions import ConnectionError as ReqConnError, Timeout as ReqTimeout, RequestException
 
+import hashlib, json, time
+from flask import request, jsonify, Response, make_response, redirect
+
+
 
 from flask import g
 import psutil, tracemalloc, gc
@@ -99,6 +103,42 @@ BOM_FOLDER_ID = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
 
 import re, os
 _DRIVE_NAME_CACHE: dict[tuple[str,str], dict] = {}
+
+# ---- Delta hashing helpers ----
+def _rows_to_dicts(rows):
+    if not rows: return []
+    headers = [str(h).strip() for h in rows[0]]
+    out = []
+    for r in rows[1:]:
+        r = r or []
+        if len(r) < len(headers):
+            r += [""] * (len(headers) - len(r))
+        out.append(dict(zip(headers, r)))
+    return out
+
+def _orders_list():
+    svc = get_sheets_service().spreadsheets().values()
+    with sheet_lock:
+        resp = svc.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=ORDERS_RANGE
+        ).execute()
+    rows = resp.get("values", []) or []
+    return _rows_to_dicts(rows)
+
+# Choose the fields that define a "meaningful" change for the Scheduler
+_HASH_FIELDS = [
+    "Order #", "Company Name", "Design", "Quantity", "Product",
+    "Stage", "Due Date", "Hard Date/Soft Date",
+    "Embroidery Start Time", "Stitch Count", "Threads",
+]
+
+def _order_hash(obj: dict) -> str:
+    # Build a stable JSON over selected fields
+    payload = {k: str(obj.get(k, "")) for k in _HASH_FIELDS}
+    s = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
 
 
 def _public_thumb(file_id: str | None, sz: str = "w640", ver: str | None = None) -> str | None:
@@ -4914,6 +4954,39 @@ def handle_placeholders_updated(data):
 
 MANUAL_PLACEHOLDERS_RANGE = "Manual State!A2:H"
 MANUAL_MACHINES_RANGE     = "Manual State!I2:J2"
+
+@app.route("/api/changes", methods=["GET"])
+@login_required_session
+def api_changes():
+    """
+    Returns: { "hashes": { "<orderId>": "<sha1>", ... }, "ts": <epoch> }
+    Client compares to its last-known hashes to decide what changed.
+    """
+    orders = _orders_list()
+    mapping = {}
+    for o in orders:
+        oid = str(o.get("Order #", "")).strip()
+        if not oid: 
+            continue
+        mapping[oid] = _order_hash(o)
+    return jsonify({"hashes": mapping, "ts": time.time()})
+
+@app.route("/api/order", methods=["GET"])
+@login_required_session
+def api_order_single():
+    """
+    Params: orderNumber=<Order #>
+    Returns: { order: { ... } } or 404
+    """
+    order_number = str(request.args.get("orderNumber", "")).strip()
+    if not order_number:
+        return jsonify({"error": "orderNumber required"}), 400
+    orders = _orders_list()
+    for o in orders:
+        if str(o.get("Order #", "")).strip() == order_number:
+            return jsonify({"order": o})
+    return jsonify({"error": f"Order {order_number} not found"}), 404
+
 
 @app.route("/api/manualState", methods=["GET"])
 @login_required_session
