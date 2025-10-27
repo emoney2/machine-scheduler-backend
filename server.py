@@ -1258,27 +1258,41 @@ def api_order_fast():
       GET /api/order_fast?orderNumber=123
     Returns: { order: {...}, cached: true|false }
     """
-    try:
-        order_number = str(request.args.get("orderNumber", "")).strip()
-        if not order_number:
-            return jsonify({"error": "orderNumber required"}), 400
+    order_number = str(request.args.get("orderNumber", "")).strip()
+    if not order_number:
+        return jsonify({"error": "orderNumber required"}), 400
 
-        # O(1) fast path (RAM)
-        o = _get_order_fast(order_number)
+    try:
+        # 1) Try plain cache without forcing a rebuild
+        o = _orders_index["by_id"].get(order_number) if _orders_index.get("by_id") else None
         if o:
             return jsonify({"order": o, "cached": True})
+    except Exception as e:
+        # Cache read should never fail, but don't let it 500
+        current_app.logger.warning("order_fast cache read failed: %s", e)
 
-        # Fallback: do one scan if not found in cache (then cache it)
+    try:
+        # 2) Single scan with short-circuit — stop as soon as we find the row
         rows = _orders_list_for_changes()
         for r in rows:
-            if str(r.get("Order #", "")).strip() == order_number:
-                _orders_index["by_id"][order_number] = r
-                return jsonify({"order": r, "cached": False})
+            try:
+                if str(r.get("Order #", "")).strip() == order_number:
+                    # Warm the cache for next time (don't rebuild whole index)
+                    _orders_index.setdefault("by_id", {})[order_number] = r
+                    _orders_index["ts"] = time.time()
+                    return jsonify({"order": r, "cached": False})
+            except Exception:
+                # Keep scanning other rows if one row is malformed
+                continue
 
+        # 3) Not found
         return jsonify({"error": f"Order {order_number} not found"}), 404
+
     except Exception as e:
-        current_app.logger.exception("api_order_fast failed: %s", e)
+        # 4) Final guard — never 500 without logging exactly why
+        current_app.logger.exception("api_order_fast failed during sheet scan for %s: %s", order_number, e)
         return jsonify({"error": "order fetch failed"}), 500
+
 
 
 # --- ADD alongside your other routes ---
