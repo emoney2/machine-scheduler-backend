@@ -37,6 +37,10 @@ from flask import send_file, Response
 from googleapiclient.discovery import build as gbuild
 from googleapiclient.http import MediaIoBaseDownload
 
+from datetime import datetime, timedelta
+import time
+from zoneinfo import ZoneInfo
+
 import socket
 from requests.exceptions import ConnectionError as ReqConnError, Timeout as ReqTimeout, RequestException
 
@@ -675,6 +679,43 @@ def _order_hash(obj: dict) -> str:
 
 
 
+# ------------------------------------------------------------------------------
+# In-memory index of Production Orders by "Order #"
+# Rebuilt periodically to make single-order lookup O(1) and very fast
+# ------------------------------------------------------------------------------
+_orders_index = {
+    "ts": 0.0,           # last built timestamp
+    "ttl": 30.0,         # seconds to keep before rebuild
+    "by_id": {}          # {"123": {...row dict...}, ...}
+}
+
+def _rebuild_orders_index():
+    """
+    Pull the full orders list once and index by 'Order #'.
+    Assumes you already have a function that returns a list[dict] of order rows.
+    """
+    rows = _orders_list_for_changes()  # <-- uses your existing helper
+    by = {}
+    for o in rows:
+        oid = str(o.get("Order #", "")).strip()
+        if oid:
+            by[oid] = o
+    _orders_index["by_id"] = by
+    _orders_index["ts"] = time.time()
+
+def _get_order_fast(order_number: str):
+    """
+    Return a single order dict from in-memory index.
+    Rebuilds the index if TTL expired or empty.
+    """
+    now = time.time()
+    if (now - _orders_index["ts"]) > _orders_index["ttl"] or not _orders_index["by_id"]:
+        try:
+            _rebuild_orders_index()
+        except Exception:
+            # don't crash fast path on index failure
+            pass
+    return _orders_index["by_id"].get(order_number)
 
 
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
@@ -1208,6 +1249,37 @@ def api_order_single():
     except Exception as e:
         current_app.logger.exception("api_order failed: %s", e)
         return jsonify({"error": "order fetch failed"}), 500
+
+@app.route("/api/order_fast", methods=["GET"])
+@login_required_session
+def api_order_fast():
+    """
+    Fast single-order lookup:
+      GET /api/order_fast?orderNumber=123
+    Returns: { order: {...}, cached: true|false }
+    """
+    try:
+        order_number = str(request.args.get("orderNumber", "")).strip()
+        if not order_number:
+            return jsonify({"error": "orderNumber required"}), 400
+
+        # O(1) fast path (RAM)
+        o = _get_order_fast(order_number)
+        if o:
+            return jsonify({"order": o, "cached": True})
+
+        # Fallback: do one scan if not found in cache (then cache it)
+        rows = _orders_list_for_changes()
+        for r in rows:
+            if str(r.get("Order #", "")).strip() == order_number:
+                _orders_index["by_id"][order_number] = r
+                return jsonify({"order": r, "cached": False})
+
+        return jsonify({"error": f"Order {order_number} not found"}), 404
+    except Exception as e:
+        current_app.logger.exception("api_order_fast failed: %s", e)
+        return jsonify({"error": "order fetch failed"}), 500
+
 
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
