@@ -1263,34 +1263,34 @@ def api_order_fast():
         return jsonify({"error": "orderNumber required"}), 400
 
     try:
-        # 1) Try plain cache without forcing a rebuild
-        o = _orders_index["by_id"].get(order_number) if _orders_index.get("by_id") else None
+        # 1) Try cache directly (do NOT trigger a rebuild here)
+        o = _orders_index.get("by_id", {}).get(order_number)
         if o:
             return jsonify({"order": o, "cached": True})
     except Exception as e:
-        # Cache read should never fail, but don't let it 500
         current_app.logger.warning("order_fast cache read failed: %s", e)
 
     try:
-        # 2) Single scan with short-circuit — stop as soon as we find the row
+        # 2) Single pass through the sheet; stop immediately when we find it
         rows = _orders_list_for_changes()
         for r in rows:
             try:
                 if str(r.get("Order #", "")).strip() == order_number:
-                    # Warm the cache for next time (don't rebuild whole index)
+                    # Warm cache just for this order (no full rebuild)
                     _orders_index.setdefault("by_id", {})[order_number] = r
                     _orders_index["ts"] = time.time()
                     return jsonify({"order": r, "cached": False})
             except Exception:
-                # Keep scanning other rows if one row is malformed
+                # If one row is malformed, keep scanning
                 continue
 
         # 3) Not found
         return jsonify({"error": f"Order {order_number} not found"}), 404
 
     except Exception as e:
-        # 4) Final guard — never 500 without logging exactly why
-        current_app.logger.exception("api_order_fast failed during sheet scan for %s: %s", order_number, e)
+        current_app.logger.exception(
+            "api_order_fast failed during sheet scan for %s: %s", order_number, e
+        )
         return jsonify({"error": "order fetch failed"}), 500
 
 
@@ -7836,6 +7836,55 @@ def _drive_version_token(file_id: str) -> str:
         return "".join(ch for ch in token if ch.isalnum())
     except Exception:
         return ""
+
+@app.route("/api/order-summary-lite", methods=["GET"])
+@login_required_session
+def order_summary_lite():
+    """
+    Fast, minimal summary for the scanner page.
+    No Drive calls. Returns only core fields so UI can paint quickly.
+    Query: /api/order-summary-lite?dept=fur&order=123
+    """
+    try:
+        dept = (request.args.get("dept") or "").strip().lower()
+        order_number = str(request.args.get("order") or "").strip()
+        if not order_number:
+            return jsonify({"error": "order required"}), 400
+
+        # Scan the sheet once and short-circuit when we find the row
+        rows = _orders_list_for_changes()
+        found = None
+        for r in rows:
+            try:
+                if str(r.get("Order #", "")).strip() == order_number:
+                    found = r
+                    break
+            except Exception:
+                continue
+
+        if not found:
+            return jsonify({"error": f"Order {order_number} not found"}), 404
+
+        # Normalize to the shape Scan.jsx expects
+        data = {
+            "order": order_number,
+            "company": found.get("Company Name") or "—",
+            "title": found.get("Design") or "",
+            "product": found.get("Product") or "",
+            "stage": found.get("Stage") or "",
+            "dueDate": found.get("Due Date") or "",
+            "furColor": found.get("Fur Color") or "",
+            "quantity": found.get("Quantity") or "—",
+            # keep media empty; full /order-summary will fill these later
+            "thumbnailUrl": None,
+            "images": [],
+            "imagesLabeled": [],
+        }
+        return jsonify(data)
+    except Exception as e:
+        current_app.logger.exception("order_summary_lite failed: %s", e)
+        return jsonify({"error": "order summary lite failed"}), 500
+
 
 @app.route("/api/order-summary", methods=["GET"])
 @login_required_session
