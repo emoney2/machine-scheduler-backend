@@ -677,45 +677,41 @@ def _order_hash(obj: dict) -> str:
     import hashlib  # local import ok; hashlib is already imported elsewhere too
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-
-
 # ------------------------------------------------------------------------------
-# In-memory index of Production Orders by "Order #"
-# Rebuilt periodically to make single-order lookup O(1) and very fast
+# Cached snapshot of Production Orders (rows + by_id) with short TTL
 # ------------------------------------------------------------------------------
-_orders_index = {
-    "ts": 0.0,           # last built timestamp
-    "ttl": 30.0,         # seconds to keep before rebuild
-    "by_id": {}          # {"123": {...row dict...}, ...}
-}
+_orders_rows_cache = {"ts": 0.0, "ttl": 15.0, "rows": None, "by_id": {}}
 
-def _rebuild_orders_index():
+def _orders_rows_snapshot():
     """
-    Pull the full orders list once and index by 'Order #'.
-    Assumes you already have a function that returns a list[dict] of order rows.
-    """
-    rows = _orders_list_for_changes()  # <-- uses your existing helper
-    by = {}
-    for o in rows:
-        oid = str(o.get("Order #", "")).strip()
-        if oid:
-            by[oid] = o
-    _orders_index["by_id"] = by
-    _orders_index["ts"] = time.time()
-
-def _get_order_fast(order_number: str):
-    """
-    Return a single order dict from in-memory index.
-    Rebuilds the index if TTL expired or empty.
+    Return (rows, by_id) for Production Orders with a short-lived cache.
+    Builds the cache if expired or empty.
     """
     now = time.time()
-    if (now - _orders_index["ts"]) > _orders_index["ttl"] or not _orders_index["by_id"]:
-        try:
-            _rebuild_orders_index()
-        except Exception:
-            # don't crash fast path on index failure
-            pass
-    return _orders_index["by_id"].get(order_number)
+    c = _orders_rows_cache
+    if (now - c["ts"]) > c["ttl"] or not c["rows"] or not c["by_id"]:
+        rows = _orders_list_for_changes()  # existing helper
+        by = {}
+        for r in rows:
+            try:
+                oid = str(r.get("Order #", "")).strip()
+                if oid:
+                    by[oid] = r
+            except Exception:
+                continue
+        c["rows"] = rows
+        c["by_id"] = by
+        c["ts"] = now
+    return c["rows"], c["by_id"]
+
+def _orders_get_by_id_cached(order_number: str):
+    """
+    O(1) lookup from the cached snapshot.
+    """
+    _, by = _orders_rows_snapshot()
+    return by.get(order_number)
+
+
 
 
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
@@ -7841,9 +7837,8 @@ def _drive_version_token(file_id: str) -> str:
 @login_required_session
 def order_summary_lite():
     """
-    Fast, minimal summary for the scanner page.
-    No Drive calls. Returns only core fields so UI can paint quickly.
-    Query: /api/order-summary-lite?dept=fur&order=123
+    Fast, minimal summary for the scanner page (cached lookup).
+    No Drive calls. Query: /api/order-summary-lite?dept=fur&order=123
     """
     try:
         dept = (request.args.get("dept") or "").strip().lower()
@@ -7851,21 +7846,10 @@ def order_summary_lite():
         if not order_number:
             return jsonify({"error": "order required"}), 400
 
-        # Scan the sheet once and short-circuit when we find the row
-        rows = _orders_list_for_changes()
-        found = None
-        for r in rows:
-            try:
-                if str(r.get("Order #", "")).strip() == order_number:
-                    found = r
-                    break
-            except Exception:
-                continue
-
+        found = _orders_get_by_id_cached(order_number)
         if not found:
             return jsonify({"error": f"Order {order_number} not found"}), 404
 
-        # Normalize to the shape Scan.jsx expects
         data = {
             "order": order_number,
             "company": found.get("Company Name") or "—",
@@ -7875,7 +7859,6 @@ def order_summary_lite():
             "dueDate": found.get("Due Date") or "",
             "furColor": found.get("Fur Color") or "",
             "quantity": found.get("Quantity") or "—",
-            # keep media empty; full /order-summary will fill these later
             "thumbnailUrl": None,
             "images": [],
             "imagesLabeled": [],
@@ -7884,6 +7867,7 @@ def order_summary_lite():
     except Exception as e:
         current_app.logger.exception("order_summary_lite failed: %s", e)
         return jsonify({"error": "order summary lite failed"}), 500
+
 
 
 @app.route("/api/order-summary", methods=["GET"])
