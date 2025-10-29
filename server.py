@@ -4449,7 +4449,8 @@ def get_orders():
             out.append(obj)
         return out
 
-    return send_cached_json("orders", TTL, build_payload)
+    return send_cached_json("combined", TTL, build_payload)
+
 
 
 
