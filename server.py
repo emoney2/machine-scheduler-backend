@@ -726,6 +726,8 @@ logger = logging.getLogger(__name__)
 raw_frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
 FRONTEND_URL = raw_frontend.strip()
 
+from flask_cors import CORS
+
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -738,7 +740,10 @@ except Exception:
     # gzip not available; continue without it
     pass
 
-CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
+CORS(app, resources={r"/*": {"origins": [
+    "https://machineschedule.netlify.app",
+    "http://localhost:3000"
+]}}, supports_credentials=True, expose_headers=["ETag", "Content-Type"])
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 
 logout_all_ts = int(os.environ.get("LOGOUT_ALL_TS", "0"))
@@ -8355,6 +8360,15 @@ def on_connect():
 @socketio.on("disconnect")
 def on_disconnect():
     logger.info(f"Client disconnected: {request.sid}")
+
+# Ensure all responses include CORS headers, even on errors
+@app.after_request
+def apply_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "https://machineschedule.netlify.app"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,PUT,DELETE"
+    return response
 
 # ─── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
