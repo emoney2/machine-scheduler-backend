@@ -812,10 +812,24 @@ def send_cached_json(key, ttl, payload_obj_builder):
         resp.headers["Warning"] = '110 - "stale response served while refreshing"'
         return resp
 
-    # Build fresh payload
+    # Build fresh payload (resilient on cold-miss)
     started = time.time()
-    payload_obj = payload_obj_builder()
-    payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+    try:
+        payload_obj = payload_obj_builder()
+        payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+    except Exception as e:
+        app.logger.warning("Fresh build failed for %s: %s", key, e)
+        stale = _cache_peek(key)
+        if stale:
+            # Serve stale immediately
+            resp = Response(stale['data'], mimetype="application/json")
+            resp.headers["ETag"] = stale['etag']
+            resp.headers["Cache-Control"] = "public, max-age=5, stale-while-revalidate=300"
+            resp.headers["Warning"] = '110 - "stale response served while refreshing"'
+            return resp
+        # Last resort: small empty payload to keep UI up
+        payload_bytes = b"{}"
+
     etag = _cache_set(key, payload_bytes, ttl)
     resp = Response(payload_bytes, mimetype="application/json")
     resp.headers["ETag"] = etag
@@ -1207,22 +1221,43 @@ def _mem_after(resp):
 @login_required_session
 def api_changes():
     """
-    Returns: {"hashes": {"<orderId>": "<sha1>", ...}, "ts": <epoch_seconds>}
-    The frontend compares to last-seen hashes; if anything changed/removed, it reloads once.
+    Fast diff endpoint used by Overview.jsx to detect changed orders.
+    Uses short in-memory cache to avoid repeated full-sheet reads.
     """
+    now = time.time()
+    key = "changes-v1"
+    ttl = 15  # seconds
+
+    # Serve from cache if fresh
+    ent = _cache_get(key)
+    if ent and (now - ent["ts"] < ttl):
+        if _maybe_304(ent["etag"]):
+            return make_response("", 304)
+        resp = Response(ent["data"], mimetype="application/json")
+        resp.headers["ETag"] = ent["etag"]
+        resp.headers["Cache-Control"] = f"public, max-age={ttl}"
+        return resp
+
     try:
-        orders = _orders_list_for_changes()
+        rows = _orders_list_for_changes()
         mapping = {}
-        for o in orders:
+        for o in rows:
             oid = str(o.get("Order #", "")).strip()
-            if not oid:
-                continue
-            mapping[oid] = _order_hash(o)
-        return jsonify({"hashes": mapping, "ts": time.time()})
+            if oid:
+                mapping[oid] = _order_hash(o)
+
+        payload = {"hashes": mapping, "ts": time.time()}
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        etag = _cache_set(key, data, ttl)
+
+        resp = Response(data, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = f"public, max-age={ttl}"
+        return resp
     except Exception as e:
-        # Log the error to your server logs to make debugging easy
         current_app.logger.exception("api_changes failed: %s", e)
         return jsonify({"error": "changes failed"}), 500
+
 
 @app.route("/api/order", methods=["GET"])
 @login_required_session
