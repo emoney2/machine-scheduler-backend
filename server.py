@@ -1788,116 +1788,66 @@ def _warm_thumb_async(file_id: str, sz: str, ver: str):
 @login_required_session
 def drive_proxy(file_id):
     """
-    Stream a Drive thumbnail back as image bytes, with debug logging.
-    Tries drive.google.com/thumbnail first; if it returns HTML (e.g., PDFs),
-    falls back to Drive API's files.get(thumbnailLink) which is a real image URL.
-    Never 302 to Google (avoids CORS issues in fetch/img).
+    Safe proxy for small Drive thumbs.
+    - 1h in-memory cache
+    - 5s hard timeout
+    - serve stale on error
+    - return 204 if nothing available
     """
-    from flask import Response
-    import requests, sys, os
-    import re
+    import requests
 
-    def _resize_thumbnail_link(link: str, sz: str) -> str:
-        """
-        Drive's thumbnailLink usually ends with '=s220' or '=w###'.
-        Replace that suffix with requested width (e.g., 'w640').
-        """
-        width = "".join(ch for ch in str(sz) if ch.isdigit()) or "640"
-        if re.search(r"=(s|w)\d+$", link):
-            return re.sub(r"=(s|w)\d+$", f"=w{width}", link)
-        return link
+    # Build Google-hosted thumbnail URL from the incoming query (?sz=w160 etc.)
+    sz = request.args.get("sz", "w160")
+    # NOTE: adjust build url if you used a different pattern previously
+    g_url = f"https://lh3.googleusercontent.com/d/{file_id}={sz}"
 
-    def _get_drive_service_local():
-        # Use your existing helper if present; otherwise build from env creds.
-        if "_get_drive_service" in globals():
-            return _get_drive_service()
-        from googleapiclient.discovery import build
-        creds = get_google_credentials() if "get_google_credentials" in globals() else None
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    # Cache key
+    key = f"{file_id}|{sz}"
+    now = time.time()
 
-    size = request.args.get("sz", "w240")
-    size = size if isinstance(size, str) else "w240"
+    # Serve from cache if fresh
+    ent = _thumb_cache.get(key)
+    if ent and (now - ent["ts"] < THUMB_TTL):
+        # Support conditional GET via ETag
+        inm = request.headers.get("If-None-Match", "")
+        if ent["etag"] and inm and ent["etag"] in inm:
+            resp = make_response("", 304)
+            resp.headers["ETag"] = ent["etag"]
+            resp.headers["Cache-Control"] = f"public, max-age={THUMB_TTL}"
+            return resp
+        resp = Response(ent["data"], mimetype=ent["ct"])
+        resp.headers["ETag"] = ent["etag"]
+        resp.headers["Cache-Control"] = f"public, max-age={THUMB_TTL}"
+        return resp
 
-    g_url = f"https://drive.google.com/thumbnail?id={file_id}&sz={size}"
-    print(f"[drive_proxy] file_id={file_id} sz={size}", file=sys.stderr)
-    print(f"[drive_proxy] GET {g_url}", file=sys.stderr)
-
-    # 1) Primary: drive.google.com/thumbnail
+    # Fetch (no streaming), short timeout; do NOT allow this to kill a worker
     try:
-        r = requests.get(g_url, stream=True, timeout=10)
-        print(f"[drive_proxy] Google status={r.status_code} ctype={r.headers.get('Content-Type')}", file=sys.stderr)
+        r = requests.get(g_url, timeout=5)  # no stream=True
+        r.raise_for_status()
+        data = r.content
+        ct = r.headers.get("Content-Type", "image/jpeg")
+        etag = '"' + hashlib.sha1(data).hexdigest() + '"'  # weak-ish ETag
+
+        # Save to cache
+        _thumb_cache[key] = {"data": data, "ct": ct, "ts": now, "etag": etag}
+
+        resp = Response(data, mimetype=ct)
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = f"public, max-age={THUMB_TTL}"
+        return resp
+
     except Exception as e:
-        print(f"[drive_proxy] ERROR fetch-failed: {e}", file=sys.stderr)
-        r = None  # allow fallback
+        # On failure: serve stale if we have it
+        if ent:
+            resp = Response(ent["data"], mimetype=ent["ct"])
+            resp.headers["ETag"] = ent["etag"]
+            resp.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=600"
+            resp.headers["Warning"] = '110 - "served stale thumbnail due to upstream error"'
+            return resp
+        # No cache: return 204 so the UI shows a fallback, but do NOT crash the worker
+        app.logger.warning("drive_proxy failed for %s (%s): %s", file_id, sz, e)
+        return Response(status=204)
 
-    def _stream_response(resp, override_ctype=None):
-        ctype = override_ctype or resp.headers.get("Content-Type", "image/jpeg")
-        def generate():
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    yield chunk
-        out = Response(generate(), status=200, mimetype=ctype)
-        out.headers["Cache-Control"] = "public, max-age=3600"
-        origin = request.headers.get("Origin", "")
-        allowed = os.environ.get("ALLOWED_ORIGINS", "")
-        if origin and (origin == os.environ.get("FRONTEND_URL") or (allowed and origin in allowed.split(","))):
-            out.headers["Access-Control-Allow-Origin"] = origin
-            out.headers["Vary"] = "Origin"
-            out.headers["Access-Control-Allow-Credentials"] = "true"
-        return out
-
-    # If primary succeeded with an image/*, stream it
-    if r is not None and r.status_code == 200:
-        ctype = (r.headers.get("Content-Type") or "").lower()
-        if ctype.startswith("image/"):
-            return _stream_response(r)
-        else:
-            print(f"[drive_proxy] Fallback: unexpected ctype={ctype!r} from drive.google.com/thumbnail", file=sys.stderr)
-    elif r is not None and r.status_code != 200:
-        # Log a short preview, then fall back
-        body_preview = ""
-        try:
-            body_preview = next(r.iter_content(chunk_size=256)).decode("utf-8", errors="ignore")
-        except Exception:
-            pass
-        print(f"[drive_proxy] Non-200 -> {r.status_code}; body[:256]={body_preview!r}", file=sys.stderr)
-
-    # 2) Fallback: Drive API thumbnailLink (works for PDFs)
-    try:
-        # quick probe without raising
-        creds = _load_google_creds()
-        if not creds:
-            print("[drive_proxy] Skipping Drive API fallback (no creds)", file=sys.stderr)
-            raise RuntimeError("skip-fallback")
-
-        svc = _get_drive_service_local()
-        meta = svc.files().get(fileId=file_id, fields="thumbnailLink,mimeType,hasThumbnail").execute()
-        tl = meta.get("thumbnailLink")
-        if tl:
-            url2 = _resize_thumbnail_link(tl, size)
-            print(f"[drive_proxy] Fallback GET {url2}", file=sys.stderr)
-            rr = requests.get(url2, stream=True, timeout=10)
-            if rr.status_code == 200:
-                # thumbnailLink returns a real image (png/jpeg)
-                return _stream_response(rr, override_ctype=rr.headers.get("Content-Type", "image/jpeg"))
-            else:
-                print(f"[drive_proxy] Fallback non-200 -> {rr.status_code}", file=sys.stderr)
-        else:
-            print(f"[drive_proxy] No thumbnailLink for file_id={file_id} (mime={meta.get('mimeType')})", file=sys.stderr)
-    except Exception as e:
-        if str(e) != "skip-fallback":
-            print(f"[drive_proxy] Drive API fallback failed: {e}", file=sys.stderr)
-
-    # 3) Final: no image available
-    print(f"[drive_proxy] No usable thumbnail for file_id={file_id}; returning 204", file=sys.stderr)
-    resp = Response("", status=204)
-    origin = request.headers.get("Origin", "")
-    allowed = os.environ.get("ALLOWED_ORIGINS", "")
-    if origin and (origin == os.environ.get("FRONTEND_URL") or (allowed and origin in allowed.split(","))):
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-    return resp
 
 
 @app.route("/api/ping", methods=["GET", "OPTIONS"])
