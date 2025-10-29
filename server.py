@@ -3504,19 +3504,22 @@ def overview_combined():
     # ---------- 15s micro-cache ----------
     global _overview_cache, _overview_ts
     now = time.time()
-    if _overview_cache is not None and (_overview_ts is not None) and (now - _overview_ts) < 15:
+    TTL = 30  # seconds, increase cache window
+
+    if _overview_cache is not None and _overview_ts and (now - _overview_ts) < TTL:
         payload_bytes = json.dumps(_overview_cache, separators=(",", ":")).encode("utf-8")
         etag = _json_etag(payload_bytes)
         inm = request.headers.get("If-None-Match", "")
         if etag and inm and etag in inm:
             resp = make_response("", 304)
             resp.headers["ETag"] = etag
-            resp.headers["Cache-Control"] = "public, max-age=15"
+            resp.headers["Cache-Control"] = f"public, max-age={TTL}"
             return resp
         resp = Response(payload_bytes, mimetype="application/json")
         resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "public, max-age=15"
+        resp.headers["Cache-Control"] = f"public, max-age={TTL}"
         return resp
+
 
     try:
         svc = get_sheets_service().spreadsheets().values()
@@ -3697,6 +3700,12 @@ def overview_combined():
             resp.headers["Cache-Control"] = "public, max-age=15"
             return resp
         fallback = {"upcoming": [], "materials": [], "daysWindow": "7"}
+
+
+        # --- cache rebuilt payload for reuse ---
+        _overview_cache = payload
+        _overview_ts = time.time()
+
         payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
         etag = _json_etag(payload_bytes)
         resp = Response(payload_bytes, mimetype="application/json")
