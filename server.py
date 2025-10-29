@@ -1805,20 +1805,32 @@ def drive_proxy(file_id):
     key = f"{file_id}|{sz}"
     now = time.time()
 
+    # Ensure cache globals exist (reuse the same cache/ttl as /api/drive/thumbnail)
+    global _drive_thumb_cache, _drive_thumb_ttl
+    try:
+        _drive_thumb_cache
+    except NameError:
+        _drive_thumb_cache = {}
+    try:
+        _drive_thumb_ttl
+    except NameError:
+        _drive_thumb_ttl = 60 * 60  # 1h
+
     # Serve from cache if fresh
-    ent = _thumb_cache.get(key)
-    if ent and (now - ent["ts"] < THUMB_TTL):
+    ent = _drive_thumb_cache.get(key)
+    if ent and (now - ent["ts"] < _drive_thumb_ttl):
         # Support conditional GET via ETag
         inm = request.headers.get("If-None-Match", "")
-        if ent["etag"] and inm and ent["etag"] in inm:
+        if ent.get("etag") and inm and ent["etag"] in inm:
             resp = make_response("", 304)
             resp.headers["ETag"] = ent["etag"]
-            resp.headers["Cache-Control"] = f"public, max-age={THUMB_TTL}"
+            resp.headers["Cache-Control"] = f"public, max-age={_drive_thumb_ttl}"
             return resp
         resp = Response(ent["data"], mimetype=ent["ct"])
         resp.headers["ETag"] = ent["etag"]
-        resp.headers["Cache-Control"] = f"public, max-age={THUMB_TTL}"
+        resp.headers["Cache-Control"] = f"public, max-age={_drive_thumb_ttl}"
         return resp
+
 
     # Fetch (no streaming), short timeout; do NOT allow this to kill a worker
     try:
@@ -1829,11 +1841,12 @@ def drive_proxy(file_id):
         etag = '"' + hashlib.sha1(data).hexdigest() + '"'  # weak-ish ETag
 
         # Save to cache
-        _thumb_cache[key] = {"data": data, "ct": ct, "ts": now, "etag": etag}
+        _drive_thumb_cache[key] = {"data": data, "ct": ct, "etag": etag, "ts": now}
+
 
         resp = Response(data, mimetype=ct)
         resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = f"public, max-age={THUMB_TTL}"
+        resp.headers["Cache-Control"] = f"public, max-age={_drive_thumb_ttl}"
         return resp
 
     except Exception as e:
