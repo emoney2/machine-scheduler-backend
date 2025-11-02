@@ -1362,6 +1362,62 @@ def _mem_after(resp):
         pass
     return resp
 
+# === Kanban order status update ===
+@app.route("/api/kanban/mark-ordered", methods=["POST"])
+@login_required_session
+def api_kanban_mark_ordered():
+    """
+    Body: { "kanbanId": "K-FAC-PTOW-PTW-01", "orderedBy": "username or email" }
+    Marks an existing Kanban REQUEST row as 'Ordered' in the sheet.
+    """
+    try:
+        data = request.get_json(force=True)
+        kid = str(data.get("kanbanId", "")).strip()
+        ordered_by = str(data.get("orderedBy", "System")).strip()
+        if not kid:
+            return jsonify({"error": "kanbanId required"}), 400
+
+        svc = get_sheets_service().spreadsheets().values()
+        rows = _kanban_read_all()
+        if not rows:
+            return jsonify({"error": "no Kanban rows"}), 404
+        hdr = rows[0]
+        hix = _kanban_headers_index(hdr)
+        id_ix = hix.get("Kanban ID")
+        type_ix = hix.get("Type")
+        status_ix = hix.get("Event Status")
+        ordered_ix = hix.get("Ordered By")
+        ts_ix = hix.get("Timestamp")
+
+        found_row = None
+        for i, r in enumerate(rows[1:], start=2):
+            if i > len(rows):
+                break
+            if len(r) < len(hdr):
+                r += [""] * (len(hdr) - len(r))
+            if r[type_ix].strip().upper() == "REQUEST" and r[id_ix].strip() == kid:
+                found_row = i
+                break
+
+        if not found_row:
+            return jsonify({"error": f"request for {kid} not found"}), 404
+
+        # Update Event Status, Ordered By, and Timestamp
+        now_str = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+        updates = [
+            {"range": f"{KANBAN_SHEET_TAB}!{chr(65+status_ix)}{found_row}", "values": [["Ordered"]]},
+            {"range": f"{KANBAN_SHEET_TAB}!{chr(65+ordered_ix)}{found_row}", "values": [[ordered_by]]},
+            {"range": f"{KANBAN_SHEET_TAB}!{chr(65+ts_ix)}{found_row}", "values": [[now_str]]},
+        ]
+        body = {"valueInputOption": "USER_ENTERED", "data": updates}
+        svc.batchUpdate(spreadsheetId=SPREADSHEET_ID, body={"valueInputOption": "USER_ENTERED", "data": updates}).execute()
+
+        return jsonify({"ok": True, "row": found_row})
+    except Exception as e:
+        current_app.logger.exception("mark-ordered failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/changes", methods=["GET"])
 @login_required_session
 def api_changes():
@@ -2139,6 +2195,155 @@ def kanban_queue_manager():
     # newest first
     out.sort(key=lambda x: x.get("Timestamp") or "", reverse=True)
     return jsonify({"rows": out})
+
+def _kanban_find_request_row_by_event(event_id):
+    rows = _kanban_read_all()
+    if not rows:
+        return None, None, None
+    headers = rows[0]
+    hix = _kanban_headers_index(headers)
+    type_ix = hix.get("Type")
+    ev_id_ix = hix.get("Event ID")
+    for ridx, r in enumerate(rows[1:], start=2):  # 1-based + header
+        if not r:
+            continue
+        t = (r[type_ix] if type_ix is not None and type_ix < len(r) else "")
+        e = (r[ev_id_ix] if ev_id_ix is not None and ev_id_ix < len(r) else "")
+        if str(t).strip().upper() == KANBAN_REQUEST_TYPE and str(e).strip().upper() == str(event_id).strip().upper():
+            # pad and return
+            if len(r) < len(headers):
+                r = r + [""] * (len(headers) - len(r))
+            return rows, headers, (ridx, dict(zip(headers, r)))
+    return rows, (rows[0] if rows else []), None
+
+
+@app.route("/api/kanban/ordered", methods=["POST"])
+@login_required_session
+def kanban_mark_ordered():
+    """
+    Body: { eventId: str, orderedQty: number, po: str }
+    - Appends ORDERED row
+    - Sets REQUEST row's Event Status = Ordered
+    """
+    data = request.get_json(silent=True) or {}
+    event_id = (data.get("eventId") or "").strip()
+    if not event_id:
+        return jsonify({"ok": False, "error": "missing eventId"}), 400
+
+    ordered_qty = str(data.get("orderedQty") or "")
+    po = (data.get("po") or "").strip()
+    user_name = (request.headers.get("X-User-Name") or "Manager").strip()
+    now_iso = _now_iso_utc()
+
+    rows, headers, found = _kanban_find_request_row_by_event(event_id)
+    if not found:
+        return jsonify({"ok": False, "error": "request not found"}), 404
+
+    req_row_index, req = found
+    hix = _kanban_headers_index(headers)
+
+    # 1) Append ORDERED row (copy useful fields)
+    body_row = [""] * len(headers)
+    for i, h in enumerate(headers):
+        if h == "Type": body_row[i] = KANBAN_ORDERED_TYPE
+        elif h == "Kanban ID": body_row[i] = req.get("Kanban ID") or ""
+        elif h == "Item Name": body_row[i] = req.get("Item Name") or ""
+        elif h == "SKU": body_row[i] = req.get("SKU") or ""
+        elif h == "Supplier": body_row[i] = req.get("Supplier") or ""
+        elif h == "Units Basis (units/cases)": body_row[i] = req.get("Units Basis (units/cases)") or "cases"
+        elif h == "Event ID": body_row[i] = event_id
+        elif h == "Event Qty": body_row[i] = ordered_qty or (req.get("Event Qty") or "")
+        elif h == "Ordered By": body_row[i] = user_name
+        elif h == "PO #": body_row[i] = po
+        elif h == "Timestamp": body_row[i] = now_iso
+    _kanban_values_api().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{KANBAN_SHEET_TAB}!A2",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [body_row]}
+    ).execute()
+
+    # 2) Flip REQUEST row status to Ordered + Approved By
+    status_ix = hix.get("Event Status"); ap_ix = hix.get("Approved By")
+    if status_ix is not None:
+        # Read current row values, update in place
+        cur = rows[req_row_index - 1]
+        if len(cur) < len(headers):
+            cur = cur + [""] * (len(headers) - len(cur))
+        cur[status_ix] = "Ordered"
+        if ap_ix is not None:
+            cur[ap_ix] = user_name
+        _kanban_values_api().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{KANBAN_SHEET_TAB}!A{req_row_index}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [cur[:len(headers)]]}
+        ).execute()
+
+    return jsonify({ "ok": True })
+
+@app.route("/api/kanban/received", methods=["POST"])
+@login_required_session
+def kanban_mark_received():
+    """
+    Body: { eventId: str, receivedQty: number }
+    - Appends RECEIVED row
+    - Sets REQUEST row's Event Status = Received (Closed)
+    """
+    data = request.get_json(silent=True) or {}
+    event_id = (data.get("eventId") or "").strip()
+    if not event_id:
+        return jsonify({"ok": False, "error": "missing eventId"}), 400
+
+    received_qty = str(data.get("receivedQty") or "")
+    user_name = (request.headers.get("X-User-Name") or "Manager").strip()
+    now_iso = _now_iso_utc()
+
+    rows, headers, found = _kanban_find_request_row_by_event(event_id)
+    if not found:
+        return jsonify({"ok": False, "error": "request not found"}), 404
+
+    req_row_index, req = found
+    hix = _kanban_headers_index(headers)
+
+    # 1) Append RECEIVED row
+    body_row = [""] * len(headers)
+    for i, h in enumerate(headers):
+        if h == "Type": body_row[i] = KANBAN_RECEIVED_TYPE
+        elif h == "Kanban ID": body_row[i] = req.get("Kanban ID") or ""
+        elif h == "Item Name": body_row[i] = req.get("Item Name") or ""
+        elif h == "SKU": body_row[i] = req.get("SKU") or ""
+        elif h == "Supplier": body_row[i] = req.get("Supplier") or ""
+        elif h == "Units Basis (units/cases)": body_row[i] = req.get("Units Basis (units/cases)") or "cases"
+        elif h == "Event ID": body_row[i] = event_id
+        elif h == "Event Qty": body_row[i] = received_qty or (req.get("Event Qty") or "")
+        elif h == "Received By": body_row[i] = user_name
+        elif h == "Timestamp": body_row[i] = now_iso
+    _kanban_values_api().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{KANBAN_SHEET_TAB}!A2",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [body_row]}
+    ).execute()
+
+    # 2) Flip REQUEST row status to Received (Closed)
+    status_ix = hix.get("Event Status")
+    if status_ix is not None:
+        cur = rows[req_row_index - 1]
+        if len(cur) < len(headers):
+            cur = cur + [""] * (len(headers) - len(cur))
+        cur[status_ix] = "Received"
+        _kanban_values_api().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{KANBAN_SHEET_TAB}!A{req_row_index}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [cur[:len(headers)]]}
+        ).execute()
+
+    return jsonify({ "ok": True })
+
 
 
 
