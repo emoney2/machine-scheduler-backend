@@ -2056,32 +2056,43 @@ def kanban_upsert_item():
     data = request.get_json(silent=True) or {}
     try:
         # Map frontend names → sheet header keys
+        def _val(x):
+            # Preserve 0; strip whitespace; None/"" -> ""
+            if x is None:
+                return ""
+            s = str(x).strip()
+            return s
+
         item = {
-            "Type": KANBAN_ITEM_TYPE,
-            "Kanban ID": (data.get("kanbanId") or data.get("Kanban ID") or "").strip(),
-            "Item Name": data.get("itemName") or data.get("Item Name") or "",
-            "SKU": data.get("sku") or "",
-            "Dept": data.get("dept") or "",
-            "Category": data.get("category") or "",
-            "Location": data.get("location") or "",
-            "Package Size": data.get("packageSize") or "",
-            "Bin Qty (units)": data.get("binQtyUnits") or "",
-            "Case Multiple": data.get("caseMultiple") or "",
-            "Reorder Qty (basis)": data.get("reorderQtyBasis") or "",
-            "Units Basis (units/cases)": data.get("unitsBasis") or "",
-            "Lead Time (days)": data.get("leadTimeDays") or "",
-            "Order Method (Email/Online)": data.get("orderMethod") or "",
-            "Order Email": data.get("orderEmail") or "",
-            "Order URL": data.get("orderUrl") or "",
-            "Supplier": data.get("supplier") or "",
-            "Supplier SKU": data.get("supplierSku") or "",
-            "Cost (per pkg)": data.get("costPerPkg") or "",
-            "Substitutes (Y/N)": data.get("substitutes") or "",
-            "Notes": data.get("notes") or "",
-            "Photo URL": data.get("photoUrl") or "",
-            "Usage Driver": data.get("usageDriver") or "",
-            "Usage Coefficient (cases/100 units)": data.get("usageCoeff") or "",
+            "kanbanId": _val(row.get("Kanban ID", "")),
+            "itemName": _val(row.get("Item Name", "")),
+            "sku": _val(row.get("SKU", "")),
+            "dept": _val(row.get("Dept", "")),
+            "category": _val(row.get("Category", "")),
+            "location": _val(row.get("Location", "")),
+            "packageSize": _val(row.get("Package Size", "")),
+            "leadTimeDays": _val(row.get("Lead Time (days)", "") or row.get("Lead Time", "")),
+            # ✅ NEW: Bin & Reorder – try exact headers first, then common aliases
+            "binQtyUnits": _val(
+                row.get("Bin Qty (units)", "")
+                or row.get("Bin Quantity (units)", "")
+                or row.get("binQtyUnits", "")
+                or row.get("binQty", "")
+                or row.get("binQuantity", "")
+            ),
+            "reorderQtyBasis": _val(
+                row.get("Reorder Qty (basis)", "")
+                or row.get("reorderQtyBasis", "")
+                or row.get("reorderQty", "")
+            ),
+            "orderMethod": _val(row.get("Order Method (Email/Online)", "") or row.get("orderMethod", "")),
+            "orderUrl": _val(row.get("Order URL", "") or row.get("orderUrl", "")),
+            "orderEmail": _val(row.get("Order Email", "") or row.get("orderEmail", "")),
+            "photoUrl": _val(row.get("Photo URL", "") or row.get("photoUrl", "")),
+            "supplier": _val(row.get("Supplier", "")),
+            "supplierSku": _val(row.get("Supplier SKU", "")),
         }
+
         res = _kanban_upsert_item(item)
         return jsonify({"ok": True, **res})
     except Exception as e:
