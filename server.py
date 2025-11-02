@@ -23,6 +23,9 @@ import tempfile
 import base64
 import asyncio
 import sys
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urljoin
 from flask import current_app
 from flask import request, jsonify
 from flask import request, make_response, jsonify, Response
@@ -647,6 +650,99 @@ def get_sheets_service():
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 # === Kanban helpers ============================================================
+# ---- Kanban URL scrape helpers ----
+def _kanban_safe_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    # Only allow http/https
+    p = urlparse(url)
+    if p.scheme not in ("http", "https"):
+        return ""
+    # Basic sanity
+    if not p.netloc:
+        return ""
+    return url
+
+def _kanban_http_get(url: str, timeout=10):
+    headers = {
+        "User-Agent": "JRCO-Kanban-Scraper/1.0 (+https://machineschedule.netlify.app)"
+    }
+    return requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+
+def _kanban_scrape_url(url: str):
+    """
+    Returns dict: { title, image, price, canonical }
+    - title: product/page title (og:title -> twitter:title -> <title>)
+    - image: main image URL (og:image or twitter:image)
+    - price: best-effort string like "$12.99" if found
+    - canonical: canonical URL if present
+    """
+    safe = _kanban_safe_url(url)
+    if not safe:
+        return {"ok": False, "error": "invalid url"}
+
+    try:
+        r = _kanban_http_get(safe, timeout=12)
+    except Exception as e:
+        return {"ok": False, "error": f"fetch failed: {e}"}
+    if r.status_code >= 400 or not r.text:
+        return {"ok": False, "error": f"http {r.status_code}"}
+
+    html = r.text
+    soup = BeautifulSoup(html, "lxml")
+
+    # Prefer canonical (to normalize)
+    canonical = ""
+    link_canon = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
+    if link_canon and link_canon.get("href"):
+        canonical = urljoin(safe, link_canon.get("href"))
+
+    def _meta(prop_name, attr="property"):
+        tag = soup.find("meta", attrs={attr: prop_name})
+        return (tag.get("content") or "").strip() if tag and tag.get("content") else ""
+
+    # Title candidates
+    title = (
+        _meta("og:title")
+        or _meta("twitter:title", attr="name")
+        or (soup.title.string.strip() if soup.title and soup.title.string else "")
+    )
+
+    # Image candidates
+    image = _meta("og:image") or _meta("twitter:image", attr="name")
+    if image:
+        image = urljoin(safe, image)
+
+    # Naive price sniff: look for $xx.xx or $x,xxx.xx near elements with price-ish classes
+    price = ""
+    # Try common meta
+    price = price or _meta("product:price:amount") or _meta("og:price:amount")
+    if price and not price.startswith("$"):
+        # if they gave "12.99" as meta amount, make it $12.99
+        try:
+            float(price.replace(",", ""))
+            price = f"${price}"
+        except:
+            pass
+
+    if not price:
+        # look in text for $X or $X.XX (take first reasonable)
+        import re
+        text = soup.get_text(" ", strip=True)
+        m = re.search(r"\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?", text)
+        if m:
+            price = m.group(0).replace(" ", "")
+
+    return {
+        "ok": True,
+        "title": title,
+        "image": image,
+        "price": price,
+        "canonical": canonical or safe,
+    }
+
+
 def _kanban_values_api():
     return get_sheets_service().spreadsheets().values()
 
@@ -2348,6 +2444,19 @@ def kanban_mark_received():
 
     return jsonify({ "ok": True })
 
+@app.route("/api/kanban/scrape", methods=["GET"])
+@login_required_session
+def api_kanban_scrape():
+    """
+    GET /api/kanban/scrape?url=...
+    Returns { ok, title, image, price, canonical } or { ok: False, error }
+    """
+    url = (request.args.get("url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "missing url"}), 400
+    data = _kanban_scrape_url(url)
+    status = 200 if data.get("ok") else 400
+    return jsonify(data), status
 
 
 
