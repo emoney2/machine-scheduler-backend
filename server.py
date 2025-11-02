@@ -2057,11 +2057,9 @@ def kanban_upsert_item():
     try:
         # Map frontend names → sheet header keys
         def _val(x):
-            # Preserve 0; strip whitespace; None/"" -> ""
             if x is None:
                 return ""
-            s = str(x).strip()
-            return s
+            return str(x).strip()
 
         item = {
             "kanbanId": _val(row.get("Kanban ID", "")),
@@ -2072,7 +2070,7 @@ def kanban_upsert_item():
             "location": _val(row.get("Location", "")),
             "packageSize": _val(row.get("Package Size", "")),
             "leadTimeDays": _val(row.get("Lead Time (days)", "") or row.get("Lead Time", "")),
-            # ✅ NEW: Bin & Reorder – try exact headers first, then common aliases
+            # ✅ Make sure these are present in the JSON
             "binQtyUnits": _val(
                 row.get("Bin Qty (units)", "")
                 or row.get("Bin Quantity (units)", "")
@@ -2092,6 +2090,7 @@ def kanban_upsert_item():
             "supplier": _val(row.get("Supplier", "")),
             "supplierSku": _val(row.get("Supplier SKU", "")),
         }
+
 
         res = _kanban_upsert_item(item)
         return jsonify({"ok": True, **res})
@@ -2193,76 +2192,29 @@ def kanban_get_item_public():
 # === KANBAN: public request (scan submit) =====================================
 @app.route("/api/kanban/request", methods=["POST"])
 def kanban_request_public():
-    """
-    Body: { id: <Kanban ID>, ts: <unix>, nonce: <8hex>, requestedQty: <int> }
-    Behavior: dedupe if an Open REQUEST exists for the same Kanban ID in the cooldown window.
-    """
-    data = request.get_json(silent=True) or {}
-    kid = (data.get("id") or "").strip()
-    req_qty = int(data.get("requestedQty") or 1)
-    user_name = (request.headers.get("X-User-Name") or "Unknown").strip()
+    try:
+        data = request.get_json(silent=True) or {}
+        kanban_id = (data.get("kanbanId") or data.get("id") or "").strip()
+        qty = str(data.get("qty") or data.get("quantity") or "1").strip()
+        requested_by = (data.get("requestedBy") or "QR").strip()
 
-    if not kid:
-        return jsonify({"error": "missing id"}), 400
+        if not kanban_id:
+            return jsonify({"ok": False, "error": "missing kanbanId"}), 400
 
-    rows = _kanban_read_all()
-    headers = rows[0] if rows else []
-    if not headers:
-        return jsonify({"error": "kanban sheet empty"}), 404
-    hix = _kanban_headers_index(headers)
+        now_iso = datetime.utcnow().isoformat() + "Z"
+        row = {
+            "Type": "REQUEST",
+            "Kanban ID": kanban_id,
+            "Event Qty": qty,
+            "Event Status": "Open",
+            "Requested By": requested_by,
+            "Timestamp": now_iso,
+        }
+        append_row_to_kanban_sheet(row)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-    # Dedupe: existing Open request for this Kanban ID within cooldown
-    type_ix = hix.get("Type"); id_ix = hix.get("Kanban ID"); ev_ix = hix.get("Event Status"); ts_ix = hix.get("Timestamp")
-    for r in rows[1:]:
-        if not r: 
-            continue
-        t = (r[type_ix] if type_ix is not None and type_ix < len(r) else "")
-        i = (r[id_ix]   if id_ix   is not None and id_ix   < len(r) else "")
-        st= (r[ev_ix]   if ev_ix   is not None and ev_ix   < len(r) else "")
-        ts= (r[ts_ix]   if ts_ix   is not None and ts_ix   < len(r) else "")
-        if str(t).strip().upper() == KANBAN_REQUEST_TYPE and str(i).strip() == kid and str(st).strip().lower() == "open":
-            if ts and _within_seconds(str(ts), KANBAN_REQUEST_COOLDOWN_SECS):
-                return jsonify({"ok": False, "duplicate": True, "message": "Already requested recently"}), 200
-
-    # Minimal item lookup (for email context)
-    _row_idx, item_row = _kanban_find_item_row(rows, kid)
-    if not item_row:
-        return jsonify({"error": "item not found"}), 404
-
-    # Append REQUEST
-    v = _kanban_values_api()
-    event_id = uuid4().hex[:10].upper()
-    now_iso = _now_iso_utc()
-    body_row = [""] * len(headers)
-    for i, h in enumerate(headers):
-        if h == "Type": body_row[i] = KANBAN_REQUEST_TYPE
-        elif h == "Kanban ID": body_row[i] = kid
-        elif h == "Item Name": body_row[i] = item_row.get("Item Name") or ""
-        elif h == "SKU": body_row[i] = item_row.get("SKU") or ""
-        elif h == "Units Basis (units/cases)": body_row[i] = item_row.get("Units Basis (units/cases)") or "cases"
-        elif h == "Event ID": body_row[i] = event_id
-        elif h == "Event Qty": body_row[i] = str(req_qty)
-        elif h == "Event Status": body_row[i] = "Open"
-        elif h == "Requested By": body_row[i] = user_name
-        elif h == "Timestamp": body_row[i] = now_iso
-        # copy useful display fields for convenience
-        elif h == "Order Method (Email/Online)": body_row[i] = item_row.get(h) or ""
-        elif h == "Order Email": body_row[i] = item_row.get(h) or ""
-        elif h == "Order URL": body_row[i] = item_row.get(h) or ""
-        elif h == "Supplier": body_row[i] = item_row.get(h) or ""
-    v.append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{KANBAN_SHEET_TAB}!A2",
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body={"values": [body_row]}
-    ).execute()
-
-    # TODO: hook up your existing email sender here (Gmail API or transactional)
-    # For now, log to server and return ok
-    app.logger.info(f"[KANBAN] Request Open — {kid} qty={req_qty} event={event_id}")
-
-    return jsonify({"ok": True, "eventId": event_id})
 
 # === KANBAN: manager queue (requires login) ===================================
 @app.route("/api/kanban/queue", methods=["GET"])
