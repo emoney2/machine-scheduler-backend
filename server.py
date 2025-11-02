@@ -9092,6 +9092,20 @@ def apply_cors_headers(response):
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,PUT,DELETE"
     return response
 
+# --- Public URL shortener (no auth, no app redirects) ---
+@app.get("/api/util/shorten")
+def util_shorten():
+    url = (request.args.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "missing url"}), 400
+    try:
+        r = requests.get("https://tinyurl.com/api-create.php",
+                         params={"url": url}, timeout=10)
+        if r.status_code == 200 and str(r.text).strip().startswith("http"):
+            return jsonify({"short": str(r.text).strip()})
+        return jsonify({"error": "shorten_failed"}), 502
+    except Exception as e:
+        return jsonify({"error": "shorten_exception", "detail": str(e)}), 500
 # ─── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     # --- Startup banner ---
