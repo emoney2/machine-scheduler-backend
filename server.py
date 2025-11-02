@@ -2191,7 +2191,9 @@ def kanban_queue_manager():
                 "Event Qty": row.get("Event Qty"),
                 "Timestamp": row.get("Timestamp"),
                 "Photo URL": row.get("Photo URL"),
+                "Event Status": row.get("Event Status"),
             })
+
     # newest first
     out.sort(key=lambda x: x.get("Timestamp") or "", reverse=True)
     return jsonify({"rows": out})
