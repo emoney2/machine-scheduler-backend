@@ -798,7 +798,7 @@ def _kanban_upsert_item(item_obj):
         rows = [headers]
 
     hix = _kanban_headers_index(headers)
-    kid = (item_obj.get("Kanban ID") or "").strip()
+    kid = (item_obj.get("Kanban ID") or item_obj.get("kanbanId") or "").strip()
     if not kid:
         raise ValueError("Kanban ID required")
 
@@ -2077,34 +2077,39 @@ def kanban_upsert_item():
             return str(x).strip()
 
         item = {
-            "kanbanId": _val(data.get("Kanban ID", "")),
-            "itemName": _val(data.get("Item Name", "")),
-            "sku": _val(data.get("SKU", "")),
-            "dept": _val(data.get("Dept", "")),
-            "category": _val(data.get("Category", "")),
-            "location": _val(data.get("Location", "")),
-            "packageSize": _val(data.get("Package Size", "")),
-            "leadTimeDays": _val(data.get("Lead Time (days)", "") or data.get("Lead Time", "")),
-            # ✅ Make sure these are present in the JSON
-            "binQtyUnits": _val(
-                data.get("Bin Qty (units)", "")
-                or data.get("Bin Quantity (units)", "")
-                or data.get("binQtyUnits", "")
-                or data.get("binQty", "")
-                or data.get("binQuantity", "")
+            "Kanban ID": _val(data.get("Kanban ID") or data.get("kanbanId")),
+            "Item Name": _val(data.get("Item Name") or data.get("itemName")),
+            "SKU": _val(data.get("SKU") or data.get("sku")),
+            "Dept": _val(data.get("Dept") or data.get("dept")),
+            "Category": _val(data.get("Category") or data.get("category")),
+            "Location": _val(data.get("Location") or data.get("location")),
+            "Package Size": _val(data.get("Package Size") or data.get("packageSize")),
+            "Lead Time (days)": _val(data.get("Lead Time (days)") or data.get("Lead Time") or data.get("leadTimeDays")),
+            "Bin Qty (units)": _val(
+                data.get("Bin Qty (units)")
+                or data.get("Bin Quantity (units)")
+                or data.get("binQtyUnits")
+                or data.get("binQty")
+                or data.get("binQuantity")
             ),
-            "reorderQtyBasis": _val(
-                data.get("Reorder Qty (basis)", "")
-                or data.get("reorderQtyBasis", "")
-                or data.get("reorderQty", "")
+            "Case Multiple": _val(data.get("Case Multiple") or data.get("caseMultiple")),
+            "Reorder Qty (basis)": _val(
+                data.get("Reorder Qty (basis)")
+                or data.get("reorderQtyBasis")
+                or data.get("reorderQty")
             ),
-            "orderMethod": _val(data.get("Order Method (Email/Online)", "") or data.get("orderMethod", "")),
-            "orderUrl": _val(data.get("Order URL", "") or data.get("orderUrl", "")),
-            "orderEmail": _val(data.get("Order Email", "") or data.get("orderEmail", "")),
-            "photoUrl": _val(data.get("Photo URL", "") or data.get("photoUrl", "")),
-            "supplier": _val(data.get("Supplier", "")),
-            "supplierSku": _val(data.get("Supplier SKU", "")),
+            "Units Basis (units/cases)": _val(data.get("Units Basis (units/cases)") or data.get("unitsBasis")),
+            "Order Method (Email/Online)": _val(data.get("Order Method (Email/Online)") or data.get("orderMethod")),
+            "Order URL": _val(data.get("Order URL") or data.get("orderUrl")),
+            "Order Email": _val(data.get("Order Email") or data.get("orderEmail")),
+            "Photo URL": _val(data.get("Photo URL") or data.get("photoUrl")),
+            "Supplier": _val(data.get("Supplier") or data.get("supplier")),
+            "Supplier SKU": _val(data.get("Supplier SKU") or data.get("supplierSku")),
+            "Cost (per pkg)": _val(data.get("Cost (per pkg)") or data.get("costPerPkg")),
+            "Substitutes (Y/N)": _val(data.get("Substitutes (Y/N)") or data.get("substitutes")),
+            "Notes": _val(data.get("Notes") or data.get("notes")),
         }
+
 
 
 
