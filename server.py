@@ -2458,6 +2458,35 @@ def api_kanban_scrape():
     status = 200 if data.get("ok") else 400
     return jsonify(data), status
 
+@app.route("/api/kanban/log-card", methods=["POST"])
+@login_required_session
+def api_kanban_log_card():
+    """
+    Body: { kanbanId: str }
+    Appends a 'CARD' row to the Kanban sheet so you can later sweep/print new cards.
+    """
+    data = request.get_json(silent=True) or {}
+    kid = (data.get("kanbanId") or "").strip()
+    if not kid:
+        return jsonify({"error": "missing kanbanId"}), 400
+
+    # Reuse your existing sheet append helper (adjust to your function names)
+    # Example row shape; map to your headers:
+    row = {
+        "Type": "CARD",
+        "Kanban ID": kid,
+        "Timestamp": _now_iso_utc(),
+        "Notes": "Card previewed/printed",
+    }
+    try:
+        _kanban_append_row(row)  # <-- use your existing write helper
+    except Exception as e:
+        current_app.logger.exception("log-card failed")
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ok": True})
+
+
 
 
 @app.route("/api/drive/token-status", methods=["GET"])
