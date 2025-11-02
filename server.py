@@ -2171,17 +2171,35 @@ def kanban_get_item_public():
             hint = f"Last order {days_since} days ago."
 
     item_min = {
-        "itemName": item_row.get("Item Name") or "",
-        "sku": item_row.get("SKU") or "",
-        "dept": item_row.get("Dept") or "",
-        "location": item_row.get("Location") or "",
+        "itemName":    item_row.get("Item Name") or "",
+        "sku":         item_row.get("SKU") or "",
+        "dept":        item_row.get("Dept") or "",
+        "location":    item_row.get("Location") or "",
         "packageSize": item_row.get("Package Size") or "",
+
+        # ✅ add these so the card shows real numbers instead of "—"
+        "binQtyUnits": (
+            item_row.get("Bin Qty (units)")
+            or item_row.get("Bin Quantity (units)")
+            or item_row.get("binQtyUnits")
+            or item_row.get("binQty")
+            or item_row.get("binQuantity")
+            or ""
+        ),
+        "reorderQtyBasis": (
+            item_row.get("Reorder Qty (basis)")
+            or item_row.get("reorderQtyBasis")
+            or item_row.get("reorderQty")
+            or ""
+        ),
+
         "orderMethod": item_row.get("Order Method (Email/Online)") or "",
-        "orderEmail": item_row.get("Order Email") or "",
-        "orderUrl": item_row.get("Order URL") or "",
-        "supplier": item_row.get("Supplier") or "",
-        "photoUrl": item_row.get("Photo URL") or "",
+        "orderEmail":  item_row.get("Order Email") or "",
+        "orderUrl":    item_row.get("Order URL") or "",
+        "supplier":    item_row.get("Supplier") or "",
+        "photoUrl":    item_row.get("Photo URL") or "",
     }
+
     return jsonify({
         "item": item_min,
         "suggestedQty": max(1, int(suggested_qty)),
