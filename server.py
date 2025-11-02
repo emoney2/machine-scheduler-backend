@@ -2023,20 +2023,6 @@ def drive_dxf():
         return jsonify({"error": "DXF stream failed"}), 500
 # === END ADD =================================================================
 
-# --- ADD: simple URL shortener proxy using TinyURL ---
-@app.route("/api/util/shorten")
-def util_shorten():
-    url = (request.args.get("url") or "").strip()
-    if not url:
-        return jsonify({"error": "missing url"}), 400
-    try:
-        r = requests.get("https://tinyurl.com/api-create.php", params={"url": url}, timeout=10)
-        if r.status_code == 200 and r.text.strip().startswith("http"):
-            return jsonify({"short": r.text.strip()})
-        return jsonify({"error": "shorten_failed"}), 502
-    except Exception as e:
-        return jsonify({"error": "shorten_exception", "detail": str(e)}), 500
-
 
 # === KANBAN: upload photo (manager) ===========================================
 @app.route("/api/kanban/upload-photo", methods=["POST"])
