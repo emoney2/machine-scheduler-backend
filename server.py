@@ -105,6 +105,29 @@ from flask import send_file  # ADD if not present
 # --- BOM folder & Drive helpers ------------------------------------------------
 BOM_FOLDER_ID = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
 
+# === Kanban config (one-tab model) ============================================
+KANBAN_SHEET_TAB = os.environ.get("KANBAN_SHEET_TAB", "Kanban").strip() or "Kanban"
+KANBAN_PHOTOS_FOLDER_ID = (os.environ.get("KANBAN_PHOTOS_FOLDER_ID") or "").strip() or None
+
+# Single-tab headers (exact order for A1 row)
+KANBAN_HEADERS = [
+    "Type", "Kanban ID", "Item Name", "SKU", "Dept", "Category", "Location",
+    "Package Size", "Bin Qty (units)", "Case Multiple", "Reorder Qty (basis)",
+    "Units Basis (units/cases)", "Lead Time (days)", "Order Method (Email/Online)",
+    "Order Email", "Order URL", "Supplier", "Supplier SKU", "Cost (per pkg)",
+    "Substitutes (Y/N)", "Notes", "Photo URL", "Usage Driver",
+    "Usage Coefficient (cases/100 units)", "Event ID", "Event Qty", "Event Status",
+    "Requested By", "Approved By", "Ordered By", "Received By", "PO #", "Timestamp",
+]
+KANBAN_ITEM_TYPE = "ITEM"
+KANBAN_REQUEST_TYPE = "REQUEST"
+KANBAN_ORDERED_TYPE = "ORDERED"
+KANBAN_RECEIVED_TYPE = "RECEIVED"
+
+# Dedupe window for duplicate scan requests
+KANBAN_REQUEST_COOLDOWN_SECS = int(os.environ.get("KANBAN_REQUEST_COOLDOWN_SECS", "7200"))  # 2h
+
+
 import re, os
 _DRIVE_NAME_CACHE: dict[tuple[str,str], dict] = {}
 
@@ -622,6 +645,123 @@ def get_sheets_service():
     creds = get_google_credentials()
     # Pass credentials directly; no httplib2/authorize dance needed
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+# === Kanban helpers ============================================================
+def _kanban_values_api():
+    return get_sheets_service().spreadsheets().values()
+
+def _kanban_read_all():
+    v = _kanban_values_api()
+    resp = v.get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{KANBAN_SHEET_TAB}!A1:ZZ",
+        valueRenderOption="UNFORMATTED_VALUE"
+    ).execute()
+    return resp.get("values", []) or []
+
+def _kanban_headers_index(headers):
+    return {str(h).strip(): i for i, h in enumerate(headers or [])}
+
+def _kanban_find_item_row(rows, kanban_id):
+    """Return (row_index, row_dict) for ITEM with Kanban ID; headers row is rows[0]."""
+    if not rows:
+        return None, None
+    hdr = rows[0]
+    hix = _kanban_headers_index(hdr)
+    id_ix = hix.get("Kanban ID")
+    type_ix = hix.get("Type")
+    for ridx, r in enumerate(rows[1:], start=2):  # 1-based + header
+        if not r: 
+            continue
+        t = (r[type_ix] if type_ix is not None and type_ix < len(r) else "")
+        kid = (r[id_ix] if id_ix is not None and id_ix < len(r) else "")
+        if str(t).strip().upper() == KANBAN_ITEM_TYPE and str(kid).strip() == str(kanban_id).strip():
+            # pad to headers width
+            if len(r) < len(hdr):
+                r = r + [""] * (len(hdr) - len(r))
+            return ridx, dict(zip(hdr, r))
+    return None, None
+
+def _kanban_upsert_item(item_obj):
+    """
+    item_obj keys must match Kanban ITEM columns (we fill defaults for missing).
+    If ITEM exists by Kanban ID, update that row; else append a new row.
+    """
+    rows = _kanban_read_all()
+    headers = rows[0] if rows else []
+    if not headers:
+        # Write headers if sheet is empty
+        v = _kanban_values_api()
+        v.update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{KANBAN_SHEET_TAB}!A1",
+            valueInputOption="RAW",
+            body={"values": [KANBAN_HEADERS]}
+        ).execute()
+        headers = KANBAN_HEADERS
+        rows = [headers]
+
+    hix = _kanban_headers_index(headers)
+    kid = (item_obj.get("Kanban ID") or "").strip()
+    if not kid:
+        raise ValueError("Kanban ID required")
+
+    row_index, _existing = _kanban_find_item_row(rows, kid)
+    # Build row array in header order
+    out = [""] * len(headers)
+    for i, h in enumerate(headers):
+        if h == "Type":
+            out[i] = KANBAN_ITEM_TYPE
+        else:
+            out[i] = item_obj.get(h, "")
+
+    v = _kanban_values_api()
+    if row_index:
+        # Update existing
+        v.update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{KANBAN_SHEET_TAB}!A{row_index}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [out]}
+        ).execute()
+        return {"updated": True, "row": row_index}
+    else:
+        # Append
+        v.append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{KANBAN_SHEET_TAB}!A2",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [out]}
+        ).execute()
+        return {"updated": False, "row": None}
+
+def _drive_upload_image_jpeg(file_stream, filename, folder_id=None):
+    """Upload image/jpeg to Drive; returns (fileId, publicish URL via your thumbnail proxy)."""
+    folder_id = folder_id or KANBAN_PHOTOS_FOLDER_ID
+    if not folder_id:
+        raise RuntimeError("KANBAN_PHOTOS_FOLDER_ID is not configured")
+    svc = get_drive_service()
+    file_metadata = {"name": filename, "parents": [folder_id]}
+    media = MediaIoBaseUpload(file_stream, mimetype="image/jpeg", resumable=False)
+    created = svc.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    fid = created.get("id")
+    # Use your fast thumbnail proxy (already in server): /api/drive/thumbnail
+    photo_url = f"/api/drive/thumbnail?fileId={fid}&sz=w640"
+    return fid, photo_url
+
+def _now_iso_utc():
+    return datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).isoformat().replace("+00:00","Z")
+
+def _within_seconds(iso_ts, seconds):
+    try:
+        t = datetime.fromisoformat(iso_ts.replace("Z","+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=ZoneInfo("UTC"))
+        return (datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")) - t).total_seconds() <= seconds
+    except Exception:
+        return False
+
 
 def get_drive_service():
     import time as _t
@@ -1730,6 +1870,276 @@ def drive_dxf():
         app.logger.exception("drive_dxf: stream failure")
         return jsonify({"error": "DXF stream failed"}), 500
 # === END ADD =================================================================
+
+# === KANBAN: upload photo (manager) ===========================================
+@app.route("/api/kanban/upload-photo", methods=["POST"])
+@login_required_session
+def kanban_upload_photo():
+    """
+    FormData: file=<jpeg>, kanbanId=<id>
+    Returns: { photoUrl, fileId }
+    """
+    f = request.files.get("file")
+    kid = (request.form.get("kanbanId") or "").strip() or "KANBAN"
+    if not f:
+        return jsonify({"error": "missing file"}), 400
+    try:
+        # Ensure JPEG; convert if needed (client sends jpeg from canvas, so OK)
+        stream = io.BytesIO(f.read())
+        stream.seek(0)
+        file_id, photo_url = _drive_upload_image_jpeg(stream, f"{kid}.jpg", KANBAN_PHOTOS_FOLDER_ID)
+        return jsonify({"photoUrl": photo_url, "fileId": file_id})
+    except Exception as e:
+        app.logger.exception("kanban_upload_photo failed")
+        return jsonify({"error": str(e)}), 500
+
+# === KANBAN: upsert item (manager) ============================================
+@app.route("/api/kanban/upsert-item", methods=["POST"])
+@login_required_session
+def kanban_upsert_item():
+    """
+    Body (JSON): fields keyed exactly to Kanban headers (for ITEM).
+    Must include: Kanban ID, Item Name, Order Method and one of Order Email/URL.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        # Map frontend names → sheet header keys
+        item = {
+            "Type": KANBAN_ITEM_TYPE,
+            "Kanban ID": (data.get("kanbanId") or data.get("Kanban ID") or "").strip(),
+            "Item Name": data.get("itemName") or data.get("Item Name") or "",
+            "SKU": data.get("sku") or "",
+            "Dept": data.get("dept") or "",
+            "Category": data.get("category") or "",
+            "Location": data.get("location") or "",
+            "Package Size": data.get("packageSize") or "",
+            "Bin Qty (units)": data.get("binQtyUnits") or "",
+            "Case Multiple": data.get("caseMultiple") or "",
+            "Reorder Qty (basis)": data.get("reorderQtyBasis") or "",
+            "Units Basis (units/cases)": data.get("unitsBasis") or "",
+            "Lead Time (days)": data.get("leadTimeDays") or "",
+            "Order Method (Email/Online)": data.get("orderMethod") or "",
+            "Order Email": data.get("orderEmail") or "",
+            "Order URL": data.get("orderUrl") or "",
+            "Supplier": data.get("supplier") or "",
+            "Supplier SKU": data.get("supplierSku") or "",
+            "Cost (per pkg)": data.get("costPerPkg") or "",
+            "Substitutes (Y/N)": data.get("substitutes") or "",
+            "Notes": data.get("notes") or "",
+            "Photo URL": data.get("photoUrl") or "",
+            "Usage Driver": data.get("usageDriver") or "",
+            "Usage Coefficient (cases/100 units)": data.get("usageCoeff") or "",
+        }
+        res = _kanban_upsert_item(item)
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        app.logger.exception("kanban_upsert_item failed")
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+# === KANBAN: public get-item (scan page) ======================================
+@app.route("/api/kanban/get-item", methods=["GET"])
+def kanban_get_item_public():
+    """
+    Query: id=<Kanban ID>&ts=<unix>&nonce=<8hex>
+    Returns minimal item data + suggested qty + history hint.
+    """
+    kid = (request.args.get("id") or "").strip()
+    if not kid:
+        return jsonify({"error": "missing id"}), 400
+
+    # Dedupe preview: if an Open REQUEST exists recently, we still show item but hint duplicate
+    rows = _kanban_read_all()
+    headers = rows[0] if rows else []
+    hix = _kanban_headers_index(headers)
+    if not headers:
+        return jsonify({"error": "kanban sheet empty"}), 404
+
+    # Find item
+    row_index, item_row = _kanban_find_item_row(rows, kid)
+    if not item_row:
+        return jsonify({"error": "item not found"}), 404
+
+    # Suggested quantity (simple rule: refill one bin)
+    units_basis = item_row.get("Units Basis (units/cases)") or "cases"
+    try:
+        bin_units = float(item_row.get("Bin Qty (units)") or 0)
+    except Exception:
+        bin_units = 0
+    try:
+        case_mult = float(item_row.get("Case Multiple") or 0)
+    except Exception:
+        case_mult = 0
+
+    # convert units → cases if needed
+    suggested_cases = 1
+    if units_basis == "cases" and case_mult > 0:
+        suggested_cases = int((bin_units + case_mult - 1) // case_mult) if bin_units > 0 else 1
+        suggested_qty = suggested_cases
+    else:
+        suggested_qty = int(bin_units or 1)
+
+    # Minimal history hint (last order time + avg between)
+    now = datetime.utcnow()
+    ordered_ts = []
+    type_ix = hix.get("Type"); id_ix = hix.get("Kanban ID"); ev_ix = hix.get("Event Status"); qty_ix = hix.get("Event Qty"); ts_ix = hix.get("Timestamp")
+    for r in rows[1:]:
+        if not r: 
+            continue
+        if type_ix is None or id_ix is None: 
+            continue
+        t = (r[type_ix] if type_ix < len(r) else "")
+        i = (r[id_ix]   if id_ix   < len(r) else "")
+        if str(t).strip().upper() == KANBAN_ORDERED_TYPE and str(i).strip() == kid:
+            ts = (r[ts_ix] if ts_ix is not None and ts_ix < len(r) else "")
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(str(ts).replace("Z","+00:00"))
+                except Exception:
+                    continue
+                ordered_ts.append(dt)
+    ordered_ts.sort()
+    hint = ""
+    if ordered_ts:
+        days_since = (now - ordered_ts[-1]).days
+        if len(ordered_ts) > 1:
+            spans = [(b - a).days for a, b in zip(ordered_ts, ordered_ts[1:])]
+            avg_days = int(sum(spans) / max(1, len(spans)))
+            hint = f"Avg every ~{avg_days} days; last order {days_since} days ago."
+        else:
+            hint = f"Last order {days_since} days ago."
+
+    item_min = {
+        "itemName": item_row.get("Item Name") or "",
+        "sku": item_row.get("SKU") or "",
+        "dept": item_row.get("Dept") or "",
+        "location": item_row.get("Location") or "",
+        "packageSize": item_row.get("Package Size") or "",
+        "orderMethod": item_row.get("Order Method (Email/Online)") or "",
+        "orderEmail": item_row.get("Order Email") or "",
+        "orderUrl": item_row.get("Order URL") or "",
+        "supplier": item_row.get("Supplier") or "",
+        "photoUrl": item_row.get("Photo URL") or "",
+    }
+    return jsonify({
+        "item": item_min,
+        "suggestedQty": max(1, int(suggested_qty)),
+        "unitsBasis": units_basis or "cases",
+        "historyHint": hint
+    })
+
+# === KANBAN: public request (scan submit) =====================================
+@app.route("/api/kanban/request", methods=["POST"])
+def kanban_request_public():
+    """
+    Body: { id: <Kanban ID>, ts: <unix>, nonce: <8hex>, requestedQty: <int> }
+    Behavior: dedupe if an Open REQUEST exists for the same Kanban ID in the cooldown window.
+    """
+    data = request.get_json(silent=True) or {}
+    kid = (data.get("id") or "").strip()
+    req_qty = int(data.get("requestedQty") or 1)
+    user_name = (request.headers.get("X-User-Name") or "Unknown").strip()
+
+    if not kid:
+        return jsonify({"error": "missing id"}), 400
+
+    rows = _kanban_read_all()
+    headers = rows[0] if rows else []
+    if not headers:
+        return jsonify({"error": "kanban sheet empty"}), 404
+    hix = _kanban_headers_index(headers)
+
+    # Dedupe: existing Open request for this Kanban ID within cooldown
+    type_ix = hix.get("Type"); id_ix = hix.get("Kanban ID"); ev_ix = hix.get("Event Status"); ts_ix = hix.get("Timestamp")
+    for r in rows[1:]:
+        if not r: 
+            continue
+        t = (r[type_ix] if type_ix is not None and type_ix < len(r) else "")
+        i = (r[id_ix]   if id_ix   is not None and id_ix   < len(r) else "")
+        st= (r[ev_ix]   if ev_ix   is not None and ev_ix   < len(r) else "")
+        ts= (r[ts_ix]   if ts_ix   is not None and ts_ix   < len(r) else "")
+        if str(t).strip().upper() == KANBAN_REQUEST_TYPE and str(i).strip() == kid and str(st).strip().lower() == "open":
+            if ts and _within_seconds(str(ts), KANBAN_REQUEST_COOLDOWN_SECS):
+                return jsonify({"ok": False, "duplicate": True, "message": "Already requested recently"}), 200
+
+    # Minimal item lookup (for email context)
+    _row_idx, item_row = _kanban_find_item_row(rows, kid)
+    if not item_row:
+        return jsonify({"error": "item not found"}), 404
+
+    # Append REQUEST
+    v = _kanban_values_api()
+    event_id = uuid4().hex[:10].upper()
+    now_iso = _now_iso_utc()
+    body_row = [""] * len(headers)
+    for i, h in enumerate(headers):
+        if h == "Type": body_row[i] = KANBAN_REQUEST_TYPE
+        elif h == "Kanban ID": body_row[i] = kid
+        elif h == "Item Name": body_row[i] = item_row.get("Item Name") or ""
+        elif h == "SKU": body_row[i] = item_row.get("SKU") or ""
+        elif h == "Units Basis (units/cases)": body_row[i] = item_row.get("Units Basis (units/cases)") or "cases"
+        elif h == "Event ID": body_row[i] = event_id
+        elif h == "Event Qty": body_row[i] = str(req_qty)
+        elif h == "Event Status": body_row[i] = "Open"
+        elif h == "Requested By": body_row[i] = user_name
+        elif h == "Timestamp": body_row[i] = now_iso
+        # copy useful display fields for convenience
+        elif h == "Order Method (Email/Online)": body_row[i] = item_row.get(h) or ""
+        elif h == "Order Email": body_row[i] = item_row.get(h) or ""
+        elif h == "Order URL": body_row[i] = item_row.get(h) or ""
+        elif h == "Supplier": body_row[i] = item_row.get(h) or ""
+    v.append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{KANBAN_SHEET_TAB}!A2",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [body_row]}
+    ).execute()
+
+    # TODO: hook up your existing email sender here (Gmail API or transactional)
+    # For now, log to server and return ok
+    app.logger.info(f"[KANBAN] Request Open — {kid} qty={req_qty} event={event_id}")
+
+    return jsonify({"ok": True, "eventId": event_id})
+
+# === KANBAN: manager queue (requires login) ===================================
+@app.route("/api/kanban/queue", methods=["GET"])
+@login_required_session
+def kanban_queue_manager():
+    """
+    Returns minimal list of Open REQUEST rows for the manager queue.
+    """
+    rows = _kanban_read_all()
+    if not rows:
+        return jsonify({"rows": []})
+    headers = rows[0]
+    hix = _kanban_headers_index(headers)
+    out = []
+    for r in rows[1:]:
+        if not r: 
+            continue
+        # pad
+        if len(r) < len(headers):
+            r = r + [""] * (len(headers) - len(r))
+        row = dict(zip(headers, r))
+        if (row.get("Type") or "").upper() == KANBAN_REQUEST_TYPE and (row.get("Event Status") or "").lower() == "open":
+            out.append({
+                "Event ID": row.get("Event ID"),
+                "Kanban ID": row.get("Kanban ID"),
+                "Item Name": row.get("Item Name"),
+                "SKU": row.get("SKU"),
+                "Supplier": row.get("Supplier"),
+                "Order Method": row.get("Order Method (Email/Online)"),
+                "Order Email": row.get("Order Email"),
+                "Order URL": row.get("Order URL"),
+                "Requested By": row.get("Requested By"),
+                "Event Qty": row.get("Event Qty"),
+                "Timestamp": row.get("Timestamp"),
+                "Photo URL": row.get("Photo URL"),
+            })
+    # newest first
+    out.sort(key=lambda x: x.get("Timestamp") or "", reverse=True)
+    return jsonify({"rows": out})
+
 
 
 @app.route("/api/drive/token-status", methods=["GET"])
