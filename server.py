@@ -2077,34 +2077,35 @@ def kanban_upsert_item():
             return str(x).strip()
 
         item = {
-            "kanbanId": _val(row.get("Kanban ID", "")),
-            "itemName": _val(row.get("Item Name", "")),
-            "sku": _val(row.get("SKU", "")),
-            "dept": _val(row.get("Dept", "")),
-            "category": _val(row.get("Category", "")),
-            "location": _val(row.get("Location", "")),
-            "packageSize": _val(row.get("Package Size", "")),
-            "leadTimeDays": _val(row.get("Lead Time (days)", "") or row.get("Lead Time", "")),
+            "kanbanId": _val(data.get("Kanban ID", "")),
+            "itemName": _val(data.get("Item Name", "")),
+            "sku": _val(data.get("SKU", "")),
+            "dept": _val(data.get("Dept", "")),
+            "category": _val(data.get("Category", "")),
+            "location": _val(data.get("Location", "")),
+            "packageSize": _val(data.get("Package Size", "")),
+            "leadTimeDays": _val(data.get("Lead Time (days)", "") or data.get("Lead Time", "")),
             # ✅ Make sure these are present in the JSON
             "binQtyUnits": _val(
-                row.get("Bin Qty (units)", "")
-                or row.get("Bin Quantity (units)", "")
-                or row.get("binQtyUnits", "")
-                or row.get("binQty", "")
-                or row.get("binQuantity", "")
+                data.get("Bin Qty (units)", "")
+                or data.get("Bin Quantity (units)", "")
+                or data.get("binQtyUnits", "")
+                or data.get("binQty", "")
+                or data.get("binQuantity", "")
             ),
             "reorderQtyBasis": _val(
-                row.get("Reorder Qty (basis)", "")
-                or row.get("reorderQtyBasis", "")
-                or row.get("reorderQty", "")
+                data.get("Reorder Qty (basis)", "")
+                or data.get("reorderQtyBasis", "")
+                or data.get("reorderQty", "")
             ),
-            "orderMethod": _val(row.get("Order Method (Email/Online)", "") or row.get("orderMethod", "")),
-            "orderUrl": _val(row.get("Order URL", "") or row.get("orderUrl", "")),
-            "orderEmail": _val(row.get("Order Email", "") or row.get("orderEmail", "")),
-            "photoUrl": _val(row.get("Photo URL", "") or row.get("photoUrl", "")),
-            "supplier": _val(row.get("Supplier", "")),
-            "supplierSku": _val(row.get("Supplier SKU", "")),
+            "orderMethod": _val(data.get("Order Method (Email/Online)", "") or data.get("orderMethod", "")),
+            "orderUrl": _val(data.get("Order URL", "") or data.get("orderUrl", "")),
+            "orderEmail": _val(data.get("Order Email", "") or data.get("orderEmail", "")),
+            "photoUrl": _val(data.get("Photo URL", "") or data.get("photoUrl", "")),
+            "supplier": _val(data.get("Supplier", "")),
+            "supplierSku": _val(data.get("Supplier SKU", "")),
         }
+
 
 
         res = _kanban_upsert_item(item)
