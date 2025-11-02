@@ -2177,7 +2177,9 @@ def kanban_queue_manager():
         if len(r) < len(headers):
             r = r + [""] * (len(headers) - len(r))
         row = dict(zip(headers, r))
-        if (row.get("Type") or "").upper() == KANBAN_REQUEST_TYPE and (row.get("Event Status") or "").lower() == "open":
+        status = (row.get("Event Status") or "").strip().lower()
+        if (row.get("Type") or "").upper() == KANBAN_REQUEST_TYPE and status in ("open", "ordered"):
+
             out.append({
                 "Event ID": row.get("Event ID"),
                 "Kanban ID": row.get("Kanban ID"),
