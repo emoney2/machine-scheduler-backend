@@ -1486,8 +1486,13 @@ def kanban_upload_card():
         drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
         # Ensure folder exists (by name under My Drive); create if missing
+        # Ensure folder exists (by name under My Drive); create if missing
         folder_id = None
-        q = f"name = '{folder_name.replace(\"'\",\"\\'\")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'root' in parents"
+        safe_name = folder_name.replace("'", "\\'")
+        q = (
+            "name = '{0}' and mimeType = 'application/vnd.google-apps.folder' "
+            "and trashed = false and 'root' in parents"
+        ).format(safe_name)
         res = drive.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
         files = res.get("files", [])
         if files:
@@ -1496,6 +1501,7 @@ def kanban_upload_card():
             meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
             created = drive.files().create(body=meta, fields="id").execute()
             folder_id = created["id"]
+
 
         # Upload the PDF
         media = MediaIoBaseUpload(io.BytesIO(file.read()), mimetype="application/pdf", resumable=False)
