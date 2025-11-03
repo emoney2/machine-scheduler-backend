@@ -1458,6 +1458,55 @@ def _mem_after(resp):
         pass
     return resp
 
+# --- Upload Kanban Card PDF to Google Drive ---
+@app.post("/api/kanban/upload-card")
+def kanban_upload_card():
+    try:
+        from werkzeug.utils import secure_filename
+        file = request.files.get("file")
+        filename = (request.form.get("filename") or "").strip()
+        folder_name = (request.form.get("folderName") or os.environ.get("KANBAN_CARDS_FOLDER", "Kanban Cards")).strip()
+
+        if not file:
+            return jsonify({"ok": False, "error": "missing file"}), 400
+
+        fname = secure_filename(filename or file.filename or f"kanban_{int(time.time())}.pdf")
+
+        # Build Drive service from your existing creds
+        # (assumes you already have token.json + googleapiclient in this project)
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
+
+        creds = Credentials.from_authorized_user_file("token.json", [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/spreadsheets",
+        ])
+        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        # Ensure folder exists (by name under My Drive); create if missing
+        folder_id = None
+        q = f"name = '{folder_name.replace(\"'\",\"\\'\")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and 'root' in parents"
+        res = drive.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
+        files = res.get("files", [])
+        if files:
+            folder_id = files[0]["id"]
+        else:
+            meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
+            created = drive.files().create(body=meta, fields="id").execute()
+            folder_id = created["id"]
+
+        # Upload the PDF
+        media = MediaIoBaseUpload(io.BytesIO(file.read()), mimetype="application/pdf", resumable=False)
+        metadata = {"name": fname, "parents": [folder_id]}
+        up = drive.files().create(body=metadata, media_body=media, fields="id,webViewLink,webContentLink").execute()
+
+        return jsonify({"ok": True, "id": up.get("id"), "webViewLink": up.get("webViewLink"), "webContentLink": up.get("webContentLink")})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # === Kanban order status update ===
 @app.route("/api/kanban/mark-ordered", methods=["POST"])
 @login_required_session
