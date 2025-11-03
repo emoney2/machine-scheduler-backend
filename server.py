@@ -2106,59 +2106,70 @@ def kanban_upload_photo():
 @login_required_session
 def kanban_upsert_item():
     """
-    Body (JSON): fields keyed exactly to Kanban headers (for ITEM).
-    Must include: Kanban ID, Item Name, Order Method and one of Order Email/URL.
+    Upsert Kanban ITEM row:
+    - If a row with matching 'Kanban ID' exists (the ITEM row), update it.
+    - Else append a new ITEM row at the bottom.
+    Required JSON (frontend names):
+      kanbanId, itemName, orderMethod, (orderUrl | orderEmail),
+      packageSize, costPerPkg, photoUrl
     """
     data = request.get_json(silent=True) or {}
     try:
-        # Map frontend names → sheet header keys
-        def _val(x):
-            if x is None:
-                return ""
-            return str(x).strip()
+        def val(x): return "" if x is None else str(x).strip()
 
-        item = {
-            "Kanban ID": _val(data.get("Kanban ID") or data.get("kanbanId")),
-            "Item Name": _val(data.get("Item Name") or data.get("itemName")),
-            "SKU": _val(data.get("SKU") or data.get("sku")),
-            "Dept": _val(data.get("Dept") or data.get("dept")),
-            "Category": _val(data.get("Category") or data.get("category")),
-            "Location": _val(data.get("Location") or data.get("location")),
-            "Package Size": _val(data.get("Package Size") or data.get("packageSize")),
-            "Lead Time (days)": _val(data.get("Lead Time (days)") or data.get("Lead Time") or data.get("leadTimeDays")),
-            "Bin Qty (units)": _val(
-                data.get("Bin Qty (units)")
-                or data.get("Bin Quantity (units)")
-                or data.get("binQtyUnits")
-                or data.get("binQty")
-                or data.get("binQuantity")
-            ),
-            "Case Multiple": _val(data.get("Case Multiple") or data.get("caseMultiple")),
-            "Reorder Qty (basis)": _val(
-                data.get("Reorder Qty (basis)")
-                or data.get("reorderQtyBasis")
-                or data.get("reorderQty")
-            ),
-            "Units Basis (units/cases)": _val(data.get("Units Basis (units/cases)") or data.get("unitsBasis")),
-            "Order Method (Email/Online)": _val(data.get("Order Method (Email/Online)") or data.get("orderMethod")),
-            "Order URL": _val(data.get("Order URL") or data.get("orderUrl")),
-            "Order Email": _val(data.get("Order Email") or data.get("orderEmail")),
-            "Photo URL": _val(data.get("Photo URL") or data.get("photoUrl")),
-            "Supplier": _val(data.get("Supplier") or data.get("supplier")),
-            "Supplier SKU": _val(data.get("Supplier SKU") or data.get("supplierSku")),
-            "Cost (per pkg)": _val(data.get("Cost (per pkg)") or data.get("costPerPkg")),
-            "Substitutes (Y/N)": _val(data.get("Substitutes (Y/N)") or data.get("substitutes")),
-            "Notes": _val(data.get("Notes") or data.get("notes")),
+        # Basic required checks
+        kid   = val(data.get("kanbanId"))
+        name  = val(data.get("itemName"))
+        om    = val(data.get("orderMethod"))
+        oUrl  = val(data.get("orderUrl"))
+        oMail = val(data.get("orderEmail"))
+        pkg   = val(data.get("packageSize"))
+        cost  = val(data.get("costPerPkg"))
+        photo = val(data.get("photoUrl"))
+
+        if not kid:   return jsonify({"ok": False, "error": "Kanban ID required"}), 400
+        if not name:  return jsonify({"ok": False, "error": "Item Name required"}), 400
+        if not pkg:   return jsonify({"ok": False, "error": "Package Size required"}), 400
+        if not cost:  return jsonify({"ok": False, "error": "Cost (per pkg) required"}), 400
+        if not photo: return jsonify({"ok": False, "error": "Photo URL required"}), 400
+        if om not in ("Online", "Email"):
+            return jsonify({"ok": False, "error": "Order Method must be Online or Email"}), 400
+        if om == "Online" and not oUrl:
+            return jsonify({"ok": False, "error": "Order URL required for Online"}), 400
+        if om == "Email" and not oMail:
+            return jsonify({"ok": False, "error": "Order Email required for Email"}), 400
+
+        # Map to exact sheet headers; anything not passed stays blank
+        item_obj = {
+            "Kanban ID": kid,
+            "Item Name": name,
+            "SKU":        val(data.get("sku")),  # optional
+            "Dept":       val(data.get("dept")),
+            "Category":   val(data.get("category")),
+            "Location":   val(data.get("location")),
+            "Package Size": pkg,
+            "Lead Time (days)": val(data.get("leadTimeDays")),
+            "Bin Qty (units)":  val(data.get("binQtyUnits")),
+            "Case Multiple":    val(data.get("caseMultiple")),
+            "Reorder Qty (basis)": val(data.get("reorderQtyBasis")),
+            "Units Basis (units/cases)": val(data.get("unitsBasis")),
+            "Order Method (Email/Online)": om,
+            "Order Email": oMail if om == "Email" else "",
+            "Order URL":   oUrl  if om == "Online" else "",
+            "Supplier":    val(data.get("supplier")),
+            "Supplier SKU": val(data.get("supplierSku")),
+            "Cost (per pkg)": cost,                 # <-- price
+            "Substitutes (Y/N)": val(data.get("substitutes")),
+            "Notes":      val(data.get("notes")),
+            "Photo URL":  photo,
         }
 
-
-
-
-        res = _kanban_upsert_item(item)
-        return jsonify({"ok": True, **res})
+        result = _kanban_upsert_item(item_obj)  # uses Kanban ID to update or append
+        return jsonify({"ok": True, **result})
     except Exception as e:
         app.logger.exception("kanban_upsert_item failed")
-        return jsonify({"ok": False, "error": str(e)}), 400
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # === KANBAN: public get-item (scan page) ======================================
 @app.route("/api/kanban/get-item", methods=["GET"])
