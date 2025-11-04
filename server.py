@@ -8375,6 +8375,11 @@ def _col_letter(idx0: int) -> str:
         s = chr(65 + r) + s
     return s
 
+# Back-compat alias for older code paths that call `col_to_a1`
+def col_to_a1(idx0: int) -> str:
+    return _col_letter(idx0)
+
+
 @app.route("/api/thread/relog", methods=["POST"])
 @login_required_session
 def thread_relog():
