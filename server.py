@@ -8125,12 +8125,17 @@ def ensure_qbo_auth():
     Returns:
       {"ok": true, "realmId": "..."} if already authorized
       {"redirect": "<oauth_url>"} if login is needed
+      {"error": "qbo_auth_failed", "detail": "..."} on unexpected errors
     """
     try:
         headers, realm_id = get_quickbooks_credentials()
         return jsonify({"ok": True, "realmId": realm_id}), 200
     except RedirectException as e:
         return jsonify({"redirect": e.redirect_url}), 200
+    except Exception as e:
+        logging.exception("ensure_qbo_auth failed")
+        return jsonify({"error": "qbo_auth_failed", "detail": str(e)}), 500
+
 
 
 @app.route("/authorize-quickbooks")
