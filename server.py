@@ -2266,12 +2266,16 @@ def kanban_get_item_public():
             or ""
         ),
 
+        # NEW: expose price for the preview
+        "costPerPkg": item_row.get("Cost (per pkg)") or item_row.get("costPerPkg") or "",
+
         "orderMethod": item_row.get("Order Method (Email/Online)") or "",
         "orderEmail":  item_row.get("Order Email") or "",
         "orderUrl":    item_row.get("Order URL") or "",
         "supplier":    item_row.get("Supplier") or "",
         "photoUrl":    item_row.get("Photo URL") or "",
     }
+
 
     return jsonify({
         "item": item_min,
