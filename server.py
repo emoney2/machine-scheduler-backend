@@ -8117,6 +8117,12 @@ def qbo_callback():
     return Response(html, mimetype="text/html")
 
 
+def _build_qbo_login_redirect():
+    # Build the same URL your /qbo/login route expects
+    env = os.getenv("QBO_ENV", "sandbox").lower()
+    qs = f"env={env}&source=ensure"
+    return f"/qbo/login?{qs}"
+
 @app.route("/api/ensure-qbo-auth", methods=["POST"])
 @login_required_session
 def ensure_qbo_auth():
@@ -8124,17 +8130,18 @@ def ensure_qbo_auth():
     Ensure the current session is authorized with QuickBooks.
     Returns:
       {"ok": true, "realmId": "..."} if already authorized
-      {"redirect": "<oauth_url>"} if login is needed
-      {"error": "qbo_auth_failed", "detail": "..."} on unexpected errors
+      {"redirect": "<oauth_url>"} if login is needed (or on any auth error)
     """
     try:
         headers, realm_id = get_quickbooks_credentials()
         return jsonify({"ok": True, "realmId": realm_id}), 200
     except RedirectException as e:
+        # Explicit "need login" path
         return jsonify({"redirect": e.redirect_url}), 200
-    except Exception as e:
-        logging.exception("ensure_qbo_auth failed")
-        return jsonify({"error": "qbo_auth_failed", "detail": str(e)}), 500
+    except Exception:
+        # Any auth error → force login instead of 500
+        logging.exception("ensure_qbo_auth: unexpected error, forcing login")
+        return jsonify({"redirect": _build_qbo_login_redirect()}), 200
 
 
 
