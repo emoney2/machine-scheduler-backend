@@ -2343,7 +2343,7 @@ def kanban_request_public():
             return jsonify({"ok": False, "error": "missing kanbanId"}), 400
 
         # === Look up item info from main Kanban sheet ===
-        sheet = client.open_by_key(SPREADSHEET_ID).worksheet("Kanban Data")
+        sheet = client.open_by_key(SPREADSHEET_ID).worksheet("Kanban")
         records = sheet.get_all_records()
         match = next((r for r in records if str(r.get("Kanban ID", "")).strip() == kanban_id.strip()), None)
 
