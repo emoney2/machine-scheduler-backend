@@ -1512,9 +1512,10 @@ def kanban_upload_card():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# === KANBAN: public request (scan submit) =====================================
 @app.route("/kanban/scan", methods=["GET"])
 def kanban_scan():
-    """Public endpoint triggered by QR scan — submits a Google Form entry and updates main queue"""
+    """Public QR scan handler — uses Google Form submission and prevents duplicates."""
     try:
         kanban_id = request.args.get("id") or request.args.get("kanbanId", "")
         qty = request.args.get("qty", "1")
@@ -1522,42 +1523,59 @@ def kanban_scan():
         if not kanban_id:
             return "<h3>❌ Missing Kanban ID</h3>", 400
 
-        # --- Google Form settings ---
+        # --- Check if already has an open request ---
+        rows = _kanban_read_all()
+        if not rows:
+            return "<h3>❌ Kanban sheet empty or inaccessible.</h3>", 500
+
+        headers = rows[0]
+        hix = _kanban_headers_index(headers)
+        for r in rows[1:]:
+            if not r:
+                continue
+            if (
+                (r[hix.get("Type", 0)].strip().upper() == "REQUEST") and
+                (r[hix.get("Kanban ID", 1)].strip().upper() == kanban_id.strip().upper()) and
+                (r[hix.get("Event Status", 26)].strip().lower() == "open")
+            ):
+                return """
+                <html>
+                  <body style="background:#fef9c3;display:flex;align-items:center;justify-content:center;height:100vh;">
+                    <div style="text-align:center;font-family:sans-serif;">
+                      <h1>⚠️ Already Scanned</h1>
+                      <p>This Kanban card already has an open request in the queue.</p>
+                    </div>
+                  </body>
+                </html>
+                """
+
+        # --- Submit once via Google Form ---
         GOOGLE_FORM_ID = "1FAIpQLScsQeFaR22LNHcSZWbqwtNSBQU-j5MJdbxK1AA3cF-yBBxutA"
         ENTRY_KANBAN = "entry.1189949378"
         ENTRY_QTY = "entry.312175649"
 
-        form_url = f"https://docs.google.com/forms/d/e/{GOOGLE_FORM_ID}/formResponse"
-        payload = {
-            ENTRY_KANBAN: kanban_id,
-            ENTRY_QTY: qty,
-            "submit": "Submit"
-        }
-
         import requests
-        r = requests.post(form_url, data=payload)
-        if r.status_code not in (200, 302):
-            return f"<h3>⚠️ Error submitting form ({r.status_code})</h3>", 500
+        form_url = f"https://docs.google.com/forms/d/e/{GOOGLE_FORM_ID}/formResponse"
+        payload = {ENTRY_KANBAN: kanban_id, ENTRY_QTY: qty, "submit": "Submit"}
+        response = requests.post(form_url, data=payload)
 
-        # --- also create a request in the main queue ---
-        try:
-            backend_api = "https://machine-scheduler-backend.onrender.com/api/kanban/request"
-            requests.post(backend_api, json={"kanbanId": kanban_id, "qty": qty})
-        except Exception as e:
-            print(f"Secondary queue insert failed: {e}")
+        if response.status_code not in (200, 302):
+            return f"<h3>⚠️ Error submitting form ({response.status_code})</h3>", 500
 
         return """
         <html>
           <body style="background:#ecfdf5;display:flex;align-items:center;justify-content:center;height:100vh;">
             <div style="text-align:center;font-family:sans-serif;">
               <h1>✅ Request Logged</h1>
-              <p>You can close this window.</p>
+              <p>Your scan was successfully submitted.</p>
             </div>
           </body>
         </html>
         """
+
     except Exception as e:
         return f"<h3>❌ Server error: {e}</h3>", 500
+
 
 # === Kanban order status update ===
 @app.route("/api/kanban/mark-ordered", methods=["POST"])
