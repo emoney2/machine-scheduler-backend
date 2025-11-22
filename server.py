@@ -1516,7 +1516,7 @@ def kanban_upload_card():
 def kanban_scan():
     """Public endpoint triggered by QR scan — submits a Google Form entry"""
     try:
-        kanban_id = request.args.get("id", "")
+        kanban_id = request.args.get("id") or request.args.get("kanbanId", "")
         qty = request.args.get("qty", "1")
 
         if not kanban_id:
