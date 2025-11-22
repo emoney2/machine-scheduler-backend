@@ -2330,7 +2330,7 @@ def kanban_get_item_public():
 def kanban_request_public():
     try:
         data = request.get_json(silent=True) or {}
-        kanban_id = (data.get("kanbanId") or data.get("id") or "").strip()
+        kanban_id = request.args.get("id") or request.args.get("kanbanId", "")
         qty = str(data.get("qty") or data.get("quantity") or "1").strip()
         requested_by = (data.get("requestedBy") or "QR").strip()
 
