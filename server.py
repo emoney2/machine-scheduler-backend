@@ -2342,36 +2342,37 @@ def kanban_request_public():
         if not kanban_id:
             return jsonify({"ok": False, "error": "missing kanbanId"}), 400
 
-        # === Look up item info from main Kanban sheet ===
-        sheet = client.open_by_key(SPREADSHEET_ID).worksheet("Kanban")
-        records = sheet.get_all_records()
-        match = next((r for r in records if str(r.get("Kanban ID", "")).strip() == kanban_id.strip()), None)
+        # === Use your Kanban helpers to find the matching item ===
+        rows = _kanban_read_all()
+        _, item = _kanban_find_item_row(rows, kanban_id)
+        if not item:
+            print(f"⚠️ No match found for Kanban ID: {kanban_id}")
+            return jsonify({"ok": False, "error": f"Kanban ID {kanban_id} not found"}), 404
 
-        # === Build full row ===
-        now_iso = datetime.utcnow().isoformat() + "Z"
-        row = {
+        # === Build the request row ===
+        now_iso = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+        row = dict(item)  # start with all existing item data
+        row.update({
             "Type": "REQUEST",
-            "Kanban ID": kanban_id,
             "Event Qty": qty,
             "Event Status": "Open",
             "Requested By": requested_by,
             "Timestamp": now_iso,
-        }
+        })
 
-        # Merge known item details if found
-        if match:
-            for k, v in match.items():
-                if k not in row:
-                    row[k] = v
+        # === Append to the Kanban sheet ===
+        _kanban_values_api().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{KANBAN_SHEET_TAB}!A2",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[row.get(h, "") for h in KANBAN_HEADERS]]},
+        ).execute()
 
-        append_row_to_kanban_sheet(row)
         return jsonify({"ok": True})
-
     except Exception as e:
-        print(f"Error in kanban_request_public: {e}")
+        print(f"❌ Error in kanban_request_public: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
-
-
 
 # === KANBAN: manager queue (requires login) ===================================
 @app.route("/api/kanban/queue", methods=["GET"])
