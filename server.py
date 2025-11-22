@@ -1514,7 +1514,7 @@ def kanban_upload_card():
 
 @app.route("/kanban/scan", methods=["GET"])
 def kanban_scan():
-    """Public endpoint triggered by QR scan — submits a Google Form entry"""
+    """Public endpoint triggered by QR scan — submits a Google Form entry and updates main queue"""
     try:
         kanban_id = request.args.get("id") or request.args.get("kanbanId", "")
         qty = request.args.get("qty", "1")
@@ -1524,8 +1524,8 @@ def kanban_scan():
 
         # --- Google Form settings ---
         GOOGLE_FORM_ID = "1FAIpQLScsQeFaR22LNHcSZWbqwtNSBQU-j5MJdbxK1AA3cF-yBBxutA"
-        ENTRY_KANBAN = "entry.1189949378"  # Kanban ID field
-        ENTRY_QTY = "entry.312175649"      # Quantity field
+        ENTRY_KANBAN = "entry.1189949378"
+        ENTRY_QTY = "entry.312175649"
 
         form_url = f"https://docs.google.com/forms/d/e/{GOOGLE_FORM_ID}/formResponse"
         payload = {
@@ -1539,6 +1539,13 @@ def kanban_scan():
         if r.status_code not in (200, 302):
             return f"<h3>⚠️ Error submitting form ({r.status_code})</h3>", 500
 
+        # --- also create a request in the main queue ---
+        try:
+            backend_api = "https://machine-scheduler-backend.onrender.com/api/kanban/request"
+            requests.post(backend_api, json={"kanbanId": kanban_id, "qty": qty})
+        except Exception as e:
+            print(f"Secondary queue insert failed: {e}")
+
         return """
         <html>
           <body style="background:#ecfdf5;display:flex;align-items:center;justify-content:center;height:100vh;">
@@ -1551,8 +1558,6 @@ def kanban_scan():
         """
     except Exception as e:
         return f"<h3>❌ Server error: {e}</h3>", 500
-
-
 
 # === Kanban order status update ===
 @app.route("/api/kanban/mark-ordered", methods=["POST"])
