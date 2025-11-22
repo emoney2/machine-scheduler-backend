@@ -2384,62 +2384,53 @@ def kanban_request_public():
 def kanban_queue_manager():
     """
     Returns minimal list of Open REQUEST rows for the manager queue.
+    Adds debugging to diagnose any 500 errors.
     """
-    rows = _kanban_read_all()
-    if not rows:
-        return jsonify({"rows": []})
-    headers = rows[0]
-    hix = _kanban_headers_index(headers)
-    out = []
-    for r in rows[1:]:
-        if not r: 
-            continue
-        # pad
-        if len(r) < len(headers):
-            r = r + [""] * (len(headers) - len(r))
-        row = dict(zip(headers, r))
-        status = (row.get("Event Status") or "").strip().lower()
-        if (row.get("Type") or "").upper() == KANBAN_REQUEST_TYPE and status in ("open", "ordered"):
+    try:
+        rows = _kanban_read_all()
+        if not rows:
+            print("⚠️ No rows found in Kanban sheet.")
+            return jsonify({"rows": []})
 
-            out.append({
-                "Event ID": row.get("Event ID"),
-                "Kanban ID": row.get("Kanban ID"),
-                "Item Name": row.get("Item Name"),
-                "SKU": row.get("SKU"),
-                "Supplier": row.get("Supplier"),
-                "Order Method": row.get("Order Method (Email/Online)"),
-                "Order Email": row.get("Order Email"),
-                "Order URL": row.get("Order URL"),
-                "Requested By": row.get("Requested By"),
-                "Event Qty": row.get("Event Qty"),
-                "Timestamp": row.get("Timestamp"),
-                "Photo URL": row.get("Photo URL"),
-                "Event Status": row.get("Event Status"),
-            })
+        headers = rows[0]
+        print("🧾 Kanban headers:", headers[:10])  # show first 10 headers for verification
+        hix = _kanban_headers_index(headers)
+        out = []
 
-    # newest first
-    out.sort(key=lambda x: x.get("Timestamp") or "", reverse=True)
-    return jsonify({"rows": out})
-
-def _kanban_find_request_row_by_event(event_id):
-    rows = _kanban_read_all()
-    if not rows:
-        return None, None, None
-    headers = rows[0]
-    hix = _kanban_headers_index(headers)
-    type_ix = hix.get("Type")
-    ev_id_ix = hix.get("Event ID")
-    for ridx, r in enumerate(rows[1:], start=2):  # 1-based + header
-        if not r:
-            continue
-        t = (r[type_ix] if type_ix is not None and type_ix < len(r) else "")
-        e = (r[ev_id_ix] if ev_id_ix is not None and ev_id_ix < len(r) else "")
-        if str(t).strip().upper() == KANBAN_REQUEST_TYPE and str(e).strip().upper() == str(event_id).strip().upper():
-            # pad and return
+        for r in rows[1:]:
+            if not r:
+                continue
             if len(r) < len(headers):
                 r = r + [""] * (len(headers) - len(r))
-            return rows, headers, (ridx, dict(zip(headers, r)))
-    return rows, (rows[0] if rows else []), None
+
+            row = dict(zip(headers, r))
+            status = (row.get("Event Status") or "").strip().lower()
+            row_type = (row.get("Type") or "").strip().upper()
+
+            if row_type == KANBAN_REQUEST_TYPE and status in ("open", "ordered"):
+                out.append({
+                    "Event ID": row.get("Event ID"),
+                    "Kanban ID": row.get("Kanban ID"),
+                    "Item Name": row.get("Item Name"),
+                    "SKU": row.get("SKU"),
+                    "Supplier": row.get("Supplier"),
+                    "Order Method": row.get("Order Method (Email/Online)"),
+                    "Order Email": row.get("Order Email"),
+                    "Order URL": row.get("Order URL"),
+                    "Requested By": row.get("Requested By"),
+                    "Event Qty": row.get("Event Qty"),
+                    "Timestamp": row.get("Timestamp"),
+                    "Photo URL": row.get("Photo URL"),
+                    "Event Status": row.get("Event Status"),
+                })
+
+        out.sort(key=lambda x: x.get("Timestamp") or "", reverse=True)
+        print(f"✅ Returning {len(out)} queue items.")
+        return jsonify({"rows": out})
+
+    except Exception as e:
+        print(f"❌ Error in /api/kanban/queue: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/kanban/ordered", methods=["POST"])
