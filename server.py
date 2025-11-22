@@ -2344,6 +2344,9 @@ def kanban_request_public():
 
         # === Use your Kanban helpers to find the matching item ===
         rows = _kanban_read_all()
+    print("📋 All rows count:", len(rows))
+    print("🔍 Looking for Kanban ID:", kanban_id)
+    print("🧾 First row sample:", rows[0] if rows else "No rows found")
         _, item = _kanban_find_item_row(rows, kanban_id)
         if not item:
             print(f"⚠️ No match found for Kanban ID: {kanban_id}")
