@@ -2337,11 +2337,17 @@ def kanban_request_public():
         data = request.get_json(silent=True) or {}
         kanban_id = data.get("kanbanId") or data.get("Kanban ID") or ""
         qty = str(data.get("qty") or data.get("quantity") or "1").strip()
-        requested_by = (data.get("requestedBy") or "QR").strip()
+        requested_by = (data.get("requestedBy") or "Public Scanner").strip()
 
         if not kanban_id:
             return jsonify({"ok": False, "error": "missing kanbanId"}), 400
 
+        # === Look up item info from main Kanban sheet ===
+        sheet = client.open_by_key(SPREADSHEET_ID).worksheet("Kanban Data")
+        records = sheet.get_all_records()
+        match = next((r for r in records if str(r.get("Kanban ID", "")).strip() == kanban_id.strip()), None)
+
+        # === Build full row ===
         now_iso = datetime.utcnow().isoformat() + "Z"
         row = {
             "Type": "REQUEST",
@@ -2351,10 +2357,20 @@ def kanban_request_public():
             "Requested By": requested_by,
             "Timestamp": now_iso,
         }
+
+        # Merge known item details if found
+        if match:
+            for k, v in match.items():
+                if k not in row:
+                    row[k] = v
+
         append_row_to_kanban_sheet(row)
         return jsonify({"ok": True})
+
     except Exception as e:
+        print(f"Error in kanban_request_public: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 # === KANBAN: manager queue (requires login) ===================================
