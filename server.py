@@ -2424,7 +2424,8 @@ def kanban_queue_manager():
                     "Event Status": row.get("Event Status"),
                 })
 
-        out.sort(key=lambda x: x.get("Timestamp") or "", reverse=True)
+        # ✅ FIXED: safely convert timestamps to strings before sorting
+        out.sort(key=lambda x: str(x.get("Timestamp") or ""), reverse=True)
         print(f"✅ Returning {len(out)} queue items.")
         return jsonify({"rows": out})
 
