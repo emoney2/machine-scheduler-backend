@@ -1542,7 +1542,7 @@ def kanban_scan():
         # --- also create a request in the main queue ---
         try:
             backend_api = "https://machine-scheduler-backend.onrender.com/api/kanban/request"
-            requests.post(backend_api, json={"Kanban ID": kanban_id, "qty": qty})
+            requests.post(backend_api, json={"kanbanId": kanban_id, "qty": qty})
         except Exception as e:
             print(f"Secondary queue insert failed: {e}")
 
@@ -2335,7 +2335,7 @@ def kanban_get_item_public():
 def kanban_request_public():
     try:
         data = request.get_json(silent=True) or {}
-        kanban_id = request.args.get("id") or request.args.get("kanbanId", "")
+        kanban_id = data.get("kanbanId") or data.get("Kanban ID") or ""
         qty = str(data.get("qty") or data.get("quantity") or "1").strip()
         requested_by = (data.get("requestedBy") or "QR").strip()
 
