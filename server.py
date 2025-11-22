@@ -1512,6 +1512,47 @@ def kanban_upload_card():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.route("/kanban/scan", methods=["GET"])
+def kanban_scan():
+    """Public endpoint triggered by QR scan — submits a Google Form entry"""
+    try:
+        kanban_id = request.args.get("id", "")
+        qty = request.args.get("qty", "1")
+
+        if not kanban_id:
+            return "<h3>❌ Missing Kanban ID</h3>", 400
+
+        # --- Google Form settings ---
+        GOOGLE_FORM_ID = "1FAIpQLScsQeFaR22LNHcSZWbqwtNSBQU-j5MJdbxK1AA3cF-yBBxutA"
+        ENTRY_KANBAN = "entry.1189949378"  # Kanban ID field
+        ENTRY_QTY = "entry.312175649"      # Quantity field
+
+        form_url = f"https://docs.google.com/forms/d/e/{GOOGLE_FORM_ID}/formResponse"
+        payload = {
+            ENTRY_KANBAN: kanban_id,
+            ENTRY_QTY: qty,
+            "submit": "Submit"
+        }
+
+        import requests
+        r = requests.post(form_url, data=payload)
+        if r.status_code not in (200, 302):
+            return f"<h3>⚠️ Error submitting form ({r.status_code})</h3>", 500
+
+        return """
+        <html>
+          <body style="background:#ecfdf5;display:flex;align-items:center;justify-content:center;height:100vh;">
+            <div style="text-align:center;font-family:sans-serif;">
+              <h1>✅ Request Logged</h1>
+              <p>You can close this window.</p>
+            </div>
+          </body>
+        </html>
+        """
+    except Exception as e:
+        return f"<h3>❌ Server error: {e}</h3>", 500
+
+
 
 # === Kanban order status update ===
 @app.route("/api/kanban/mark-ordered", methods=["POST"])
