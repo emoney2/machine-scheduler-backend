@@ -2486,7 +2486,7 @@ def kanban_queue_manager():
 
 @app.route("/api/kanban/ordered", methods=["POST"])
 @login_required_session
-def kanban_mark_ordered():
+def kanban_mark_ordered_v2():
     """
     Body: { eventId: str, orderedQty: number, po: str }
     - Appends ORDERED row
