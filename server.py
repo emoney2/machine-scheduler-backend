@@ -155,6 +155,79 @@ KANBAN_REQUEST_COOLDOWN_SECS = int(os.environ.get("KANBAN_REQUEST_COOLDOWN_SECS"
 import re, os
 _DRIVE_NAME_CACHE: dict[tuple[str,str], dict] = {}
 
+def _build_full_scan_payload(order_row: dict) -> dict:
+    """
+    Creates the exact scan payload format currently returned by /order-summary,
+    including normalized images (always [{src, label}]).
+    """
+
+    if not order_row:
+        return None
+
+    # ----- Basic fields -----
+    oid = str(order_row.get("Order #", "")).strip()
+    
+    payload = {
+        "order": oid,
+        "company": order_row.get("Company Name", "") or "",
+        "title": order_row.get("Design", "") or "",
+        "product": order_row.get("Product", "") or "",
+        "stage": order_row.get("Stage", "") or "",
+        "dueDate": order_row.get("Due Date", "") or "",
+        "furColor": order_row.get("Fur Color", "") or "",
+        "quantity": order_row.get("Quantity", "") or "",
+        "thumbnailUrl": None,
+        "images": [],
+        "imagesLabeled": []
+    }
+
+    # ----- IMAGE RESOLUTION LOGIC -----
+    # (Mirrors Scan long load behavior)
+
+    # 1) Try labeled images if already collected in the row
+    images_labeled = order_row.get("imagesLabeled", [])
+    if isinstance(images_labeled, list) and images_labeled:
+        payload["imagesLabeled"] = [
+            {"src": img.get("src") if isinstance(img, dict) else img, 
+             "label": img.get("label", "") if isinstance(img, dict) else ""}
+            for img in images_labeled
+        ]
+        payload["images"] = payload["imagesLabeled"].copy()
+
+    else:
+        # 2) Try generic images array
+        imgs = order_row.get("images", []) or order_row.get("imageUrls", [])
+
+        if isinstance(imgs, list) and imgs:
+            normalized = []
+            for u in imgs:
+                if isinstance(u, dict):
+                    src = u.get("src")
+                    label = u.get("label", "")
+                else:
+                    src = str(u)
+                    label = ""
+
+                if src:
+                    normalized.append({"src": src, "label": label})
+
+            payload["images"] = normalized
+
+        # 3) Fallback: single preview URL field
+        elif order_row.get("imageUrl"):
+            payload["images"] = [
+                {"src": order_row.get("imageUrl"), "label": ""}
+            ]
+
+    # ----- Thumbnail selection -----
+    if payload["images"]:
+        payload["thumbnailUrl"] = payload["images"][0]["src"]
+    elif order_row.get("thumbnailUrl"):
+        payload["thumbnailUrl"] = order_row.get("thumbnailUrl")
+
+    return payload
+
+
 def _public_thumb(file_id: str | None, sz: str = "w640", ver: str | None = None) -> str | None:
     if not file_id:
         return None
@@ -1748,48 +1821,41 @@ def api_order_single():
         current_app.logger.exception("api_order failed: %s", e)
         return jsonify({"error": "order fetch failed"}), 500
 
-@app.route("/api/order_fast", methods=["GET"])
-@login_required_session
+@app.route("/order_fast")
 def api_order_fast():
     global _orders_index
 
-    ensure_orders_cache()  # <-- this is the missing link
+    ensure_orders_cache()
 
     order_number = request.args.get("orderNumber", "").strip()
     if not order_number:
-        return jsonify({"error": "missing order number"}), 400
+        return jsonify({"error": "missing orderNumber"}), 400
 
-    # -----------------------------
-    #  Fast cache lookup
-    # -----------------------------
-    row = _orders_index["by_id"].get(order_number)
+    now = time.time()
+    cached = _orders_index["by_id"].get(order_number)
 
-    if row:
-        try:
-            # Normalize product name
-            product = (
-                row.get("Product")
-                or row.get("product")
-                or row.get("Product Name")
-                or row.get("Design")
-                or None
-            )
+    # Use cache if younger than 60s
+    if cached and isinstance(cached, dict):
+        ts = cached.get("_ts", 0)
+        if now - ts < 60:
+            return jsonify({"order": cached, "cached": True}), 200
 
-            # 🔥 Pull images JUST LIKE full order summary does
-            thumbnail, images_raw, labeled = get_drive_images_for_product(product)
+    # Build fresh payload
+    base_row = _orders_get_by_id_cached(order_number)
+    if not base_row:
+        return jsonify({"error": "Order not found"}), 404
 
-            hydrated = dict(row)
-            hydrated["thumbnailUrl"] = thumbnail
-            hydrated["images"] = images_raw or []
-            hydrated["imagesLabeled"] = labeled or []
-            hydrated["cached"] = True
+    # 🆕 THIS IS THE IMPORTANT MISSING STEP:
+    # ensures labeled images, drive thumbnails, DXF previews, etc. get attached
+    hydrate_drive_images(base_row)
 
-            return jsonify({"order": hydrated}), 200
+    full_payload = _build_full_scan_payload(base_row)
+    full_payload["_ts"] = now
 
-        except Exception as e:
-            print("[FAST] hydrate error:", e)
+    _orders_index["by_id"][order_number] = full_payload
 
-    return jsonify({"order": None, "cached": False}), 404
+    return jsonify({"order": full_payload, "cached": False}), 200
+
 
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
