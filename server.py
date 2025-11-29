@@ -1823,50 +1823,39 @@ def api_order_single():
 
 @app.route("/api/order_fast")
 def api_order_fast():
-    global _orders_index
-
+    """
+    Fast load endpoint for Scan.jsx.
+    Returns the same payload format as /order-summary,
+    using cached sheets + same image logic as full load.
+    """
     ensure_orders_cache()
 
     order_number = request.args.get("orderNumber", "").strip()
     if not order_number:
         return jsonify({"error": "missing orderNumber"}), 400
 
+    # ---- check cached
     now = time.time()
     cached = _orders_index["by_id"].get(order_number)
+    if cached and (now - cached.get("_ts", 0)) < 60:
+        return jsonify({"order": cached, "cached": True}), 200
 
-    # return cached version if fresh (<60s)
-    if cached and isinstance(cached, dict):
-        ts = cached.get("_ts", 0)
-        if now - ts < 60:
-            cached["cached"] = True
-            return jsonify({"order": cached}), 200
-
-    # rebuild payload
+    # ---- lookup order quickly from cached sheet rows
     row = _orders_get_by_id_cached(order_number)
     if not row:
         return jsonify({"error": "Order not found"}), 404
 
-    # 🔥 THIS is your real working image resolver
-    thumbnail, labeled, images_raw = build_order_image_bundle(order_number)
+    # ---- use SAME IMAGE + formatting logic as slow load
+    hydrated = _build_full_scan_payload(row)
+    if not hydrated:
+        return jsonify({"error": "failed to hydrate"}), 500
 
-    hydrated = dict(row)
-
-    # required fields for Scan.jsx
-    hydrated["thumbnailUrl"] = thumbnail or None
-    hydrated["imagesLabeled"] = labeled or []
-    hydrated["images"] = images_raw or []
-
-    # legacy fallback compatibility
-    hydrated["imageUrls"] = images_raw or []
-    hydrated["imageUrl"] = thumbnail or None
-    hydrated["hasImages"] = bool(thumbnail or images_raw or labeled)
-
-    # store in cache
+    # ---- store in cache
     hydrated["_ts"] = now
-    hydrated["cached"] = False
     _orders_index["by_id"][order_number] = hydrated
 
-    return jsonify({"order": hydrated}), 200
+    return jsonify({"order": hydrated, "cached": False}), 200
+
 
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
