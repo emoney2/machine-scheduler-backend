@@ -9453,7 +9453,17 @@ def order_fast():
     if row:
         # ---- hydrate images like order-summary does ----
         try:
-            product = row.get("Product") or row.get("product") or ""
+            # Normalize and enforce correct schema key casing
+            prod = (
+                row.get("Product")
+                or row.get("product")
+                or row.get("Product Name")
+                or row.get("Design")
+                or None
+            )
+
+            row["Product"] = prod  # <-- enforce canonical field
+
             thumbnail, images_raw, labeled = get_drive_images_for_product(product)
 
             row = dict(row)  # avoid mutating cache
