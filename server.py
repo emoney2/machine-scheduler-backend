@@ -1743,14 +1743,15 @@ def api_order_fast():
     if not order_number:
         return jsonify({"error": "missing order number"}), 400
 
+    # -----------------------------
+    #  Fast cache lookup
+    # -----------------------------
     row = _orders_index["by_id"].get(order_number)
 
     if row:
         try:
-            print(f"[FAST DEBUG] Keys for {order_number}: {list(row.keys())}")
-            print(f"[FAST DEBUG] Raw row: {row}")
-
-            prod = (
+            # Normalize product name
+            product = (
                 row.get("Product")
                 or row.get("product")
                 or row.get("Product Name")
@@ -1758,30 +1759,21 @@ def api_order_fast():
                 or None
             )
 
-            image_id = (
-                row.get("Image")
-                or row.get("Image ID")
-                or row.get("Image Link")
-                or row.get("thumbnailUrl")
-                or row.get("Preview")
-                or None
-            )
+            # 🔥 Pull images JUST LIKE full order summary does
+            thumbnail, images_raw, labeled = get_drive_images_for_product(product)
 
-            row = dict(row)
-            row["Product"] = prod
+            hydrated = dict(row)
+            hydrated["thumbnailUrl"] = thumbnail
+            hydrated["images"] = images_raw or []
+            hydrated["imagesLabeled"] = labeled or []
+            hydrated["cached"] = True
 
-            thumbnail, images_raw, labeled = get_drive_images_for_product(prod, image_id)
-
-            row["thumbnailUrl"] = thumbnail
-            row["images"] = images_raw or []
-            row["imagesLabeled"] = labeled or []
+            return jsonify({"order": hydrated}), 200
 
         except Exception as e:
             print("[FAST] hydrate error:", e)
 
-        return jsonify({"order": row, "cached": True}), 200
-
-    return jsonify({"error": "order not found"}), 404
+    return jsonify({"order": None, "cached": False}), 404
 
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
