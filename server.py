@@ -9441,65 +9441,56 @@ def print_handler():
 @app.route("/api/order_fast")
 @login_required_session
 def order_fast():
-    """Ultra-fast enriched lookup for scanning."""
     global _orders_index
-
     order_number = request.args.get("orderNumber", "").strip()
     if not order_number:
         return jsonify({"error": "missing order number"}), 400
 
-    # --- FAST LOCAL LOOKUP ---
+    # ---------------------------------------
+    # 1) FAST in-memory lookup
+    # ---------------------------------------
     row = _orders_index["by_id"].get(order_number)
-
-    # --- Pull expanded metadata from combined cache ---
-    combined_orders = COMBINED_CACHE.get("orders_by_id", {})
-    current_app.logger.info(f"[FAST] COMBINED KEYS → {list(combined_orders.keys())[:10]}")
-    current_app.logger.info(f"[FAST] COMBINED SAMPLE → {json.dumps(combined_orders.get(order_number, {}), indent=2)}")
-
-
-    full = combined_orders.get(order_number, {})
-
     if row:
-        enriched = {
-            **row,
-            "thumbnailUrl": full.get("thumbnailUrl"),
-            "title": full.get("title"),
-            "images": full.get("images") or [],
-            "imagesLabeled": full.get("imagesLabeled") or [],
-            "imageUrls": full.get("images") or [],  # 👈 REQUIRED FOR QUADRANTS
-            "furColor": full.get("furColor"),
-            "dueDate": full.get("dueDate"),
-        }
+        # ---- hydrate images like order-summary does ----
+        try:
+            product = row.get("Product") or row.get("product") or ""
+            thumbnail, images_raw, labeled = get_drive_images_for_product(product)
 
+            row = dict(row)  # avoid mutating cache
+            row["thumbnailUrl"] = thumbnail
+            row["images"] = images_raw or []
+            row["imagesLabeled"] = labeled or []
+        except Exception as e:
+            print("[FAST] hydrate error:", e)
 
-        current_app.logger.info(f"[FAST] HIT enriched → {order_number}")
-        current_app.logger.info(f"[FAST] RETURN DATA → {json.dumps(enriched, indent=2)}")
-        return jsonify({"order": enriched, "cached": True}), 200
+        return jsonify({"order": row, "cached": True}), 200
 
-    # --- cache stale? rebuild if older than 30s ---
+    # ---------------------------------------
+    # 2) Cache stale? Rebuild
+    # ---------------------------------------
     now = time.time()
     if now - _orders_index["ts"] > 30:
         rows, by = _orders_rows_snapshot()
         _orders_index = {"by_id": by, "ts": now}
 
         row = by.get(order_number)
-        full = combined_orders.get(order_number, {})
         if row:
-            enriched = {
-                **row,
-                "thumbnailUrl": full.get("thumbnailUrl"),
-                "title": full.get("title"),
-                "images": full.get("images") or [],
-                "imagesLabeled": full.get("imagesLabeled") or [],
-                "furColor": full.get("furColor"),
-                "dueDate": full.get("dueDate"),
-            }
+            # hydrate again after rebuild
+            try:
+                product = row.get("Product") or row.get("product") or ""
+                thumbnail, images_raw, labeled = get_drive_images_for_product(product)
 
-            current_app.logger.info(f"[FAST] COLD HIT enriched → {order_number}")
-            return jsonify({"order": enriched, "cached": False}), 200
+                row = dict(row)
+                row["thumbnailUrl"] = thumbnail
+                row["images"] = images_raw or []
+                row["imagesLabeled"] = labeled or []
+            except Exception as e:
+                print("[FAST] hydrate error (cold):", e)
 
-    current_app.logger.warning(f"[FAST] MISS → {order_number}")
+            return jsonify({"order": row, "cached": False}), 200
+
     return jsonify({"error": "order not found"}), 404
+
 
 
 # ─── Run ────────────────────────────────────────────────────────────────────────
