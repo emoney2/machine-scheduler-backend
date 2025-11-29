@@ -109,6 +109,9 @@ from flask import send_file  # ADD if not present
 # Stores the lookup table used by /api/order_fast
 _orders_index = {"by_id": {}, "ts": 0}
 
+# GLOBAL in-memory cache store
+_cache = {}
+
 # --- BOM folder & Drive helpers ------------------------------------------------
 BOM_FOLDER_ID = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
 
@@ -1005,9 +1008,15 @@ def _cache_get(key):
 
 def _cache_set(key, payload_bytes, ttl):
     """
-    Safe setter for cache.
-    Ensures any code called in here runs inside Flask context.
+    Safe setter for the in-memory cache.
+    Ensures Flask context exists and initializes cache if missing.
     """
+    global _cache
+
+    # Ensure cache dict exists
+    if "_cache" not in globals() or not isinstance(_cache, dict):
+        _cache = {}
+
     try:
         with app.app_context():
             _cache[key] = {
@@ -1016,13 +1025,19 @@ def _cache_set(key, payload_bytes, ttl):
                 "ttl": ttl
             }
     except Exception as e:
-        # Fallback if app context not available
+        # Fallback (still store data even if no context)
         _cache[key] = {
             "data": payload_bytes,
             "time": time.time(),
             "ttl": ttl
         }
-        current_app.logger.warning(f"_cache_set stored without app_context: {e}")
+        try:
+            current_app.logger.warning(f"_cache_set fallback without Flask context: {e}")
+        except:
+            print(f"[WARN] _cache_set fallback without Flask context: {e}")
+
+    return _cache[key]  # return stored entry so callers can use it
+
 
 
 def _cache_peek(key):
