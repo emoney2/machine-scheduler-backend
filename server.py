@@ -9454,7 +9454,6 @@ def order_fast():
 
     if row:
         try:
-            # Normalize product field naming
             prod = (
                 row.get("Product")
                 or row.get("product")
@@ -9463,16 +9462,18 @@ def order_fast():
                 or None
             )
 
-            # enforce canonical schema
+            image_id = (
+                row.get("Image")
+                or row.get("Image ID")
+                or row.get("Image Link")
+                or None
+            )
+
             row = dict(row)
             row["Product"] = prod
 
-            # ⭐ FIXED — use prod instead of undefined "product"
-            thumbnail, images_raw, labeled = get_drive_images_for_product(
-                prod,
-                row.get("Image") or row.get("Image ID") or row.get("Image Link")
-            )
-
+            # 🔥 FIXED VARIABLE NAME HERE
+            thumbnail, images_raw, labeled = get_drive_images_for_product(prod, image_id)
 
             row["thumbnailUrl"] = thumbnail
             row["images"] = images_raw or []
@@ -9484,7 +9485,7 @@ def order_fast():
         return jsonify({"order": row, "cached": True}), 200
 
     # ---------------------------------------
-    # 2) Cache stale? Rebuild
+    # 2) Cache rebuild if stale
     # ---------------------------------------
     now = time.time()
     if now - _orders_index["ts"] > 30:
@@ -9502,11 +9503,18 @@ def order_fast():
                     or None
                 )
 
+                image_id = (
+                    row.get("Image")
+                    or row.get("Image ID")
+                    or row.get("Image Link")
+                    or None
+                )
+
                 row = dict(row)
                 row["Product"] = prod
 
-                # ⭐ FIXED here too
-                thumbnail, images_raw, labeled = get_drive_images_for_product(prod)
+                # 🔥 FIXED HERE ALSO
+                thumbnail, images_raw, labeled = get_drive_images_for_product(prod, image_id)
 
                 row["thumbnailUrl"] = thumbnail
                 row["images"] = images_raw or []
@@ -9518,8 +9526,6 @@ def order_fast():
             return jsonify({"order": row, "cached": False}), 200
 
     return jsonify({"error": "order not found"}), 404
-
-
 
 # ─── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
