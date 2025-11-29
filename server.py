@@ -109,6 +109,23 @@ from flask import send_file  # ADD if not present
 # Stores the lookup table used by /api/order_fast
 _orders_index = {"by_id": {}, "ts": 0}
 
+def ensure_orders_cache():
+    global _orders_index
+    now = time.time()
+
+    # Only rebuild if older than 30 seconds
+    if now - _orders_index.get("ts", 0) > 30:
+        print("[CACHE] Rebuilding _orders_index...")
+        rows, by = _orders_rows_snapshot()
+        _orders_index = {"by_id": by, "ts": now}
+    else:
+        print("[CACHE] Using existing cache (fresh)")
+
+
+# 🚀 Run once at server startup
+ensure_orders_cache()
+
+
 # GLOBAL in-memory cache store
 _cache = {}
 
@@ -1738,6 +1755,8 @@ def api_order_single():
 @login_required_session
 def api_order_fast():
     global _orders_index
+
+    ensure_orders_cache()  # <-- this is the missing link
 
     order_number = request.args.get("orderNumber", "").strip()
     if not order_number:
