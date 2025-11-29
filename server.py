@@ -1702,42 +1702,42 @@ def api_order_fast():
     """
     Fast single-order lookup:
       GET /api/order_fast?orderNumber=123
-    Returns: { order: {...}, cached: true|false }
+
+    Uses ONLY the in-memory cache (_orders_index["by_id"]).
+    - Never triggers a slow sheet scan
+    - Never returns 500
+    Returns:
+      200 + { order: {...}, cached: true } if found
+      404 + { error, cached: false }      if not in cache
     """
     order_number = str(request.args.get("orderNumber", "")).strip()
     if not order_number:
         return jsonify({"error": "orderNumber required"}), 400
 
     try:
-        # 1) Try cache directly (do NOT trigger a rebuild here)
-        o = _orders_index.get("by_id", {}).get(order_number)
+        by_id = _orders_index.get("by_id", {}) or {}
+        o = by_id.get(order_number)
+
         if o:
-            return jsonify({"order": o, "cached": True})
+            # Fast path: found in cache
+            return jsonify({"order": o, "cached": True}), 200
+
+        # Not in cache → fast endpoint does NOT do a sheet scan
+        return jsonify({
+            "error": f"Order {order_number} not found in fast cache",
+            "cached": False,
+            "order": None
+        }), 404
+
     except Exception as e:
         current_app.logger.warning("order_fast cache read failed: %s", e)
+        # Fail soft: never 500, just return a not-found style response
+        return jsonify({
+            "error": "order_fast cache access failed",
+            "cached": False,
+            "order": None
+        }), 200
 
-    try:
-        # 2) Single pass through the sheet; stop immediately when we find it
-        rows = _orders_list_for_changes()
-        for r in rows:
-            try:
-                if str(r.get("Order #", "")).strip() == order_number:
-                    # Warm cache just for this order (no full rebuild)
-                    _orders_index.setdefault("by_id", {})[order_number] = r
-                    _orders_index["ts"] = time.time()
-                    return jsonify({"order": r, "cached": False})
-            except Exception:
-                # If one row is malformed, keep scanning
-                continue
-
-        # 3) Not found
-        return jsonify({"error": f"Order {order_number} not found"}), 404
-
-    except Exception as e:
-        current_app.logger.exception(
-            "api_order_fast failed during sheet scan for %s: %s", order_number, e
-        )
-        return jsonify({"error": "order fetch failed"}), 500
 
 
 
@@ -9328,6 +9328,20 @@ def print_handler():
             return jsonify({"status": "sheet_update_failed"})
 
     return jsonify({"status": "ok"})
+
+@app.route("/api/order_fast")
+def order_fast_alias():
+    """
+    Fix for frontend expecting /api/order_fast while the real route lives under /api/api/order_fast.
+    This simply forwards the call so the Scan page responds instantly instead of hitting the slow fallback.
+    """
+    from flask import request
+    return fast_order_lookup() if 'fast_order_lookup' in globals() else jsonify({
+        "ok": False,
+        "error": "fast lookup function not found",
+        "order": request.args.get("orderNumber", "")
+    }), 200
+
 
 # ─── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
