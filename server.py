@@ -110,20 +110,17 @@ from flask import send_file  # ADD if not present
 _orders_index = {"by_id": {}, "ts": 0}
 
 def ensure_orders_cache():
+    """
+    Backwards-compatible stub.
+
+    We no longer call _orders_rows_snapshot() at import time (it wasn't defined yet
+    and caused a NameError). The real population of _orders_index now happens
+    lazily from other code paths (e.g. /api/combined) and inside /api/order_fast.
+    """
     global _orders_index
-    now = time.time()
+    if not isinstance(_orders_index, dict):
+        _orders_index = {"by_id": {}, "ts": 0}
 
-    # Only rebuild if older than 30 seconds
-    if now - _orders_index.get("ts", 0) > 30:
-        print("[CACHE] Rebuilding _orders_index...")
-        rows, by = _orders_rows_snapshot()
-        _orders_index = {"by_id": by, "ts": now}
-    else:
-        print("[CACHE] Using existing cache (fresh)")
-
-
-# 🚀 Run once at server startup
-ensure_orders_cache()
 
 
 # GLOBAL in-memory cache store
