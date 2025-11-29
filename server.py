@@ -1706,9 +1706,8 @@ def api_order_fast():
     """
     Fast single-order lookup:
       GET /api/order_fast?orderNumber=123
-    Uses in-memory cache. If cache is empty, build it automatically.
+    Returns immediately using in-memory cache. Never scans sheets.
     """
-
     order_number = str(request.args.get("orderNumber", "")).strip()
     if not order_number:
         return jsonify({"error": "orderNumber required"}), 400
@@ -1716,60 +1715,40 @@ def api_order_fast():
     global _orders_index
 
     try:
-        # Ensure _orders_index exists and is a dict
+        # Ensure structure exists
         if not isinstance(_orders_index, dict):
-            current_app.logger.warning("[FAST] _orders_index missing — initializing empty.")
             _orders_index = {}
 
-        # If cache is EMPTY, build it now
-        if not _orders_index.get("by_id"):
-            current_app.logger.warning("[FAST] Cache empty — building now...")
+        by_id = _orders_index.get("by_id", {}) or {}
 
-            try:
-                from server_cache import rebuild_fast_cache  # adjust if file path differs
-                _orders_index = rebuild_fast_cache()
-                current_app.logger.info(f"[FAST] Cache built → {len(_orders_index.get('by_id', {}))} orders")
-
-            except Exception as e:
-                current_app.logger.exception(f"[FAST] Cache build failed: {e}")
-                return jsonify({
-                    "order": None,
-                    "cached": False,
-                    "error": "cache_build_failed"
-                }), 200
-
-        # Debug log: show lookup attempt
+        # 🔍 DEBUG LOGGING (shows what is actually inside cache)
         current_app.logger.info(f"[FAST] lookup → {order_number}")
-        current_cache = _orders_index.get("by_id", {})
-        current_app.logger.info(f"[FAST] available IDs: {list(current_cache.keys())[:20]}... (total {len(current_cache)})")
+        current_app.logger.info(
+            f"[FAST] available IDs: {list(by_id.keys())[:20]}... (total {len(by_id)})"
+        )
 
-        # Lookup row
-        row = current_cache.get(order_number)
+        # Actual fast lookup
+        row = by_id.get(order_number)
 
         if row:
             current_app.logger.info(f"[FAST] HIT → {order_number}")
             return jsonify({"order": row, "cached": True}), 200
 
-        # MISS but do NOT return 404 — we soften it because user expects UI fallback
-        current_app.logger.warning(f"[FAST] MISS → {order_number} not in cache")
-
+        # MISS but no exception (frontend will fallback gracefully)
+        current_app.logger.warning(f"[FAST] MISS → {order_number} not found in cache")
         return jsonify({
             "order": None,
             "cached": False,
-            "message": "not_in_fast_cache_but_sheet_may_have_it"
-        }), 200
+            "error": f"{order_number} not found in fast cache"
+        }), 404
 
     except Exception as e:
         current_app.logger.exception("order_fast exception:")
-
         return jsonify({
             "order": None,
             "cached": False,
             "error": f"order_fast failed: {e}"
         }), 200
-
-
-
 
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
