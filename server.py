@@ -1845,10 +1845,6 @@ def api_order_fast():
     if not base_row:
         return jsonify({"error": "Order not found"}), 404
 
-    # 🆕 THIS IS THE IMPORTANT MISSING STEP:
-    # ensures labeled images, drive thumbnails, DXF previews, etc. get attached
-    hydrate_drive_images(base_row)
-
     full_payload = _build_full_scan_payload(base_row)
     full_payload["_ts"] = now
 
