@@ -1006,38 +1006,22 @@ def _cache_get(key):
             return ent
         return None
 
-def _cache_set(key, payload_bytes, ttl):
-    """
-    Safe setter for the in-memory cache.
-    Ensures Flask context exists and initializes cache if missing.
-    """
+def _cache_set(key, data, ttl=30):
     global _cache
-
-    # Ensure cache dict exists
-    if "_cache" not in globals() or not isinstance(_cache, dict):
-        _cache = {}
+    ts = int(time.time())
 
     try:
-        with app.app_context():
-            _cache[key] = {
-                "data": payload_bytes,
-                "time": time.time(),
-                "ttl": ttl
-            }
-    except Exception as e:
-        # Fallback (still store data even if no context)
         _cache[key] = {
-            "data": payload_bytes,
-            "time": time.time(),
-            "ttl": ttl
+            "data": data,
+            "exp": ts + ttl,
+            "etag": f"{key}-{ts}"
         }
-        try:
-            current_app.logger.warning(f"_cache_set fallback without Flask context: {e}")
-        except:
-            print(f"[WARN] _cache_set fallback without Flask context: {e}")
+    except Exception as e:
+        current_app.logger.error(f"cache_set failed: {e}")
+        return None
 
-    return _cache[key]  # return stored entry so callers can use it
-
+    # Always return a valid quoted ETag so Werkzeug doesn't reject it
+    return f"\"{key}-{ts}\""
 
 
 def _cache_peek(key):
@@ -1055,11 +1039,25 @@ def send_cached_json(key, ttl, payload_obj_builder):
     Otherwise build payload, cache, and send with ETag.
     """
     ent = _cache_get(key)
-    if ent and _maybe_304(ent['etag']):
-        resp = make_response("", 304)
-        resp.headers["ETag"] = ent['etag']
-        resp.headers["Cache-Control"] = f"public, max-age={ttl}, stale-while-revalidate=300"
+    if ent and (now - ent["ts"] < ttl):
+        etag = ent.get("etag")
+
+        # If client already has the same ETag → return 304 Not Modified
+        if etag and _maybe_304(etag):
+            return make_response("", 304)
+
+        resp = Response(ent["data"], mimetype="application/json")
+
+        # Safely apply ETag (avoid crashes if malformed)
+        if etag:
+            try:
+                resp.set_etag(etag)
+            except Exception as e:
+                current_app.logger.warning(f"[CHANGES] Skipped invalid cached ETag: {etag} ({e})")
+
+        resp.headers["Cache-Control"] = f"public, max-age={ttl}"
         return resp
+
 
     if ent:
         # Serve hot cache quickly
@@ -1108,7 +1106,12 @@ def send_cached_json(key, ttl, payload_obj_builder):
 
     etag = _cache_set(key, payload_bytes, ttl)
     resp = Response(payload_bytes, mimetype="application/json")
-    resp.headers["ETag"] = etag
+    if etag:
+        try:
+            resp.set_etag(etag)
+        except Exception as e:
+            current_app.logger.warning(f"[CHANGES] Skipped invalid generated ETag: {etag} ({e})")
+
     resp.headers["Cache-Control"] = f"public, max-age={ttl}, stale-while-revalidate=300"
     resp.headers["X-Debug-BuildMs"] = str(int((time.time()-started)*1000))
     return resp
