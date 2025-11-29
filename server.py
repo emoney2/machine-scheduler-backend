@@ -9430,15 +9430,16 @@ def order_fast():
 
     if row:
         enriched = {
-            **row,  # base row (company, qty, product, stage)
-            # merge in UI fields if they exist
+            **row,
             "thumbnailUrl": full.get("thumbnailUrl"),
             "title": full.get("title"),
             "images": full.get("images") or [],
             "imagesLabeled": full.get("imagesLabeled") or [],
+            "imageUrls": full.get("images") or [],  # 👈 REQUIRED FOR QUADRANTS
             "furColor": full.get("furColor"),
             "dueDate": full.get("dueDate"),
         }
+
 
         current_app.logger.info(f"[FAST] HIT enriched → {order_number}")
         return jsonify({"order": enriched, "cached": True}), 200
