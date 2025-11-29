@@ -9438,9 +9438,9 @@ def print_handler():
 
     return jsonify({"status": "ok"})
 
-@app.route("/api/order_fast")
+@app.route("/api/order_fast", methods=["GET"])
 @login_required_session
-def order_fast():
+def api_order_fast():
     global _orders_index
 
     order_number = request.args.get("orderNumber", "").strip()
