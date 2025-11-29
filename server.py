@@ -1821,7 +1821,7 @@ def api_order_single():
         current_app.logger.exception("api_order failed: %s", e)
         return jsonify({"error": "order fetch failed"}), 500
 
-@app.route("/order_fast")
+@app.route("/api/order_fast")
 def api_order_fast():
     global _orders_index
 
