@@ -9288,6 +9288,47 @@ def util_shorten():
         return jsonify({"error": "shorten_failed"}), 502
     except Exception as e:
         return jsonify({"error": "shorten_exception", "detail": str(e)}), 500
+
+@app.route('/print', methods=['POST'])
+def print_handler():
+    data = request.json
+    order = str(data.get("order"))
+    mode = data.get("mode")
+    should_update = data.get("requiresProcessSheetUpdate", False)
+
+    print(f"PRINT REQUEST → Order {order}, Mode={mode}, UpdateAllowed={should_update}")
+
+    # TODO: (Later) Add silent printing logic here
+
+    # ---- Update Google Sheet if process sheet printed ----
+    if should_update:
+        try:
+            sheet = client.open_by_key(SPREADSHEET_ID).worksheet("Production Orders")
+            records = sheet.get_all_records()
+
+            # Find matching row (skip header row)
+            for row_index, row in enumerate(records, start=2):
+                if str(row.get("Order #")) == order:
+
+                    # If blank → write timestamp (first print only)
+                    if not row.get("Process Sheet Printed"):
+                        from datetime import datetime
+                        timestamp = datetime.now().strftime("%m/%d/%Y %I:%M %p")
+
+                        # AO = column 41
+                        sheet.update_cell(row_index, 41, timestamp)
+                        print(f"✔ Updated 'Process Sheet Printed' for Order {order} → {timestamp}")
+                    else:
+                        print(f"➡ Already printed → no update for Order {order}")
+
+                    break
+
+        except Exception as e:
+            print("❌ Sheet update error:", e)
+            return jsonify({"status": "sheet_update_failed"})
+
+    return jsonify({"status": "ok"})
+
 # ─── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     # --- Startup banner ---
