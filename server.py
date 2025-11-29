@@ -9468,7 +9468,11 @@ def order_fast():
             row["Product"] = prod
 
             # ⭐ FIXED — use prod instead of undefined "product"
-            thumbnail, images_raw, labeled = get_drive_images_for_product(prod)
+            thumbnail, images_raw, labeled = get_drive_images_for_product(
+                prod,
+                row.get("Image") or row.get("Image ID") or row.get("Image Link")
+            )
+
 
             row["thumbnailUrl"] = thumbnail
             row["images"] = images_raw or []
