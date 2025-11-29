@@ -9425,6 +9425,9 @@ def order_fast():
 
     # --- Pull expanded metadata from combined cache ---
     combined_orders = COMBINED_CACHE.get("orders_by_id", {})
+    current_app.logger.info(f"[FAST] COMBINED KEYS → {list(combined_orders.keys())[:10]}")
+    current_app.logger.info(f"[FAST] COMBINED SAMPLE → {json.dumps(combined_orders.get(order_number, {}), indent=2)}")
+
 
     full = combined_orders.get(order_number, {})
 
