@@ -105,6 +105,10 @@ from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
+# ---- GLOBAL ORDER CACHE ----
+# Stores the lookup table used by /api/order_fast
+_orders_index = {"by_id": {}, "ts": 0}
+
 # --- BOM folder & Drive helpers ------------------------------------------------
 BOM_FOLDER_ID = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
 
