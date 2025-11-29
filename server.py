@@ -1737,80 +1737,51 @@ def api_order_single():
 @app.route("/api/order_fast", methods=["GET"])
 @login_required_session
 def api_order_fast():
-    """
-    Fast single-order lookup:
-      GET /api/order_fast?orderNumber=123
-    Returns immediately using in-memory cache. Never scans sheets.
-    """
-    order_number = str(request.args.get("orderNumber", "")).strip()
-    if not order_number:
-        return jsonify({"error": "orderNumber required"}), 400
-
     global _orders_index
 
-    try:
-        # Ensure structure exists
-        if not isinstance(_orders_index, dict):
-            _orders_index = {}
+    order_number = request.args.get("orderNumber", "").strip()
+    if not order_number:
+        return jsonify({"error": "missing order number"}), 400
 
-        by_id = _orders_index.get("by_id", {}) or {}
+    row = _orders_index["by_id"].get(order_number)
 
-        # 🔍 DEBUG LOGGING (shows what is actually inside cache)
-        current_app.logger.info(f"[FAST] lookup → {order_number}")
-        current_app.logger.info(
-            f"[FAST] available IDs: {list(by_id.keys())[:20]}... (total {len(by_id)})"
-        )
+    if row:
+        try:
+            print(f"[FAST DEBUG] Keys for {order_number}: {list(row.keys())}")
+            print(f"[FAST DEBUG] Raw row: {row}")
 
-        # Actual fast lookup
-        row = by_id.get(order_number)
+            prod = (
+                row.get("Product")
+                or row.get("product")
+                or row.get("Product Name")
+                or row.get("Design")
+                or None
+            )
 
-        if row:
-            current_app.logger.info(f"[FAST] HIT → {order_number}")
-            # ----------- FAST in-memory lookup ----------- 
-            row = _orders_index["by_id"].get(order_number)
-            if row:
-                try:
-                    # Pull image fields if they exist
-                    thumb = row.get("thumbnailUrl") or row.get("Preview") or None
-        
-                    images = []
-                    # These fields may vary — normalize any image-related fields:
-                    for key in ("images", "Images", "Image URLs", "imagesLabeled"):
-                        val = row.get(key)
-                        if isinstance(val, list) and len(val):
-                            images.extend(val)
+            image_id = (
+                row.get("Image")
+                or row.get("Image ID")
+                or row.get("Image Link")
+                or row.get("thumbnailUrl")
+                or row.get("Preview")
+                or None
+            )
 
-                    # Attach normalized fast image data
-                    row = {
-                        **row,
-                        "thumbnailUrl": thumb,
-                        "images": images,
-                        "cached": True
-                    }
-        
-                    print(f"[FAST] ► Attached images → {len(images)} / thumb={bool(thumb)}")
-    
-                except Exception as e:
-                    print(f"[FAST ERROR] while attaching images: {e}")
+            row = dict(row)
+            row["Product"] = prod
 
-                return jsonify({"order": row}), 200
+            thumbnail, images_raw, labeled = get_drive_images_for_product(prod, image_id)
 
+            row["thumbnailUrl"] = thumbnail
+            row["images"] = images_raw or []
+            row["imagesLabeled"] = labeled or []
 
-        # MISS but no exception (frontend will fallback gracefully)
-        current_app.logger.warning(f"[FAST] MISS → {order_number} not found in cache")
-        return jsonify({
-            "order": None,
-            "cached": False,
-            "error": f"{order_number} not found in fast cache"
-        }), 404
+        except Exception as e:
+            print("[FAST] hydrate error:", e)
 
-    except Exception as e:
-        current_app.logger.exception("order_fast exception:")
-        return jsonify({
-            "order": None,
-            "cached": False,
-            "error": f"order_fast failed: {e}"
-        }), 200
+        return jsonify({"order": row, "cached": True}), 200
+
+    return jsonify({"error": "order not found"}), 404
 
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
