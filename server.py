@@ -9413,27 +9413,59 @@ def print_handler():
 @app.route("/api/order_fast")
 @login_required_session
 def order_fast():
+    """Ultra-fast enriched lookup for scanning."""
     global _orders_index
+
     order_number = request.args.get("orderNumber", "").strip()
     if not order_number:
         return jsonify({"error": "missing order number"}), 400
 
-    # ----------- FAST in-memory lookup -----------
+    # --- FAST LOCAL LOOKUP ---
     row = _orders_index["by_id"].get(order_number)
-    if row:
-        return jsonify({"order": row, "cached": True}), 200
 
-    # ----------- Cache cold? Build it ONCE -----------
-    # Only refresh if older than 30 seconds
+    # --- Pull expanded metadata from combined cache ---
+    combined_orders = COMBINED_CACHE.get("orders_by_id", {})
+
+    full = combined_orders.get(order_number, {})
+
+    if row:
+        enriched = {
+            **row,  # base row (company, qty, product, stage)
+            # merge in UI fields if they exist
+            "thumbnailUrl": full.get("thumbnailUrl"),
+            "title": full.get("title"),
+            "images": full.get("images") or [],
+            "imagesLabeled": full.get("imagesLabeled") or [],
+            "furColor": full.get("furColor"),
+            "dueDate": full.get("dueDate"),
+        }
+
+        current_app.logger.info(f"[FAST] HIT enriched → {order_number}")
+        return jsonify({"order": enriched, "cached": True}), 200
+
+    # --- cache stale? rebuild if older than 30s ---
     now = time.time()
     if now - _orders_index["ts"] > 30:
         rows, by = _orders_rows_snapshot()
         _orders_index = {"by_id": by, "ts": now}
 
         row = by.get(order_number)
+        full = combined_orders.get(order_number, {})
         if row:
-            return jsonify({"order": row, "cached": False}), 200
+            enriched = {
+                **row,
+                "thumbnailUrl": full.get("thumbnailUrl"),
+                "title": full.get("title"),
+                "images": full.get("images") or [],
+                "imagesLabeled": full.get("imagesLabeled") or [],
+                "furColor": full.get("furColor"),
+                "dueDate": full.get("dueDate"),
+            }
 
+            current_app.logger.info(f"[FAST] COLD HIT enriched → {order_number}")
+            return jsonify({"order": enriched, "cached": False}), 200
+
+    current_app.logger.warning(f"[FAST] MISS → {order_number}")
     return jsonify({"error": "order not found"}), 404
 
 
