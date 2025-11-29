@@ -1824,9 +1824,9 @@ def api_order_single():
 @app.route("/api/order_fast")
 def api_order_fast():
     """
-    Fast load endpoint for Scan.jsx.
-    Returns the same payload format as /order-summary,
-    using cached sheets + same image logic as full load.
+    Fast endpoint for Scan.jsx.
+    First request builds full payload (same as heavy /order-summary).
+    Then cached for instant reuse.
     """
     ensure_orders_cache()
 
@@ -1834,23 +1834,31 @@ def api_order_fast():
     if not order_number:
         return jsonify({"error": "missing orderNumber"}), 400
 
-    # ---- check cached
     now = time.time()
+
+    # ---- return if cached and fresh (< 2 minutes)
     cached = _orders_index["by_id"].get(order_number)
-    if cached and (now - cached.get("_ts", 0)) < 60:
+    if cached and (now - cached.get("_ts", 0)) < 120:
         return jsonify({"order": cached, "cached": True}), 200
 
-    # ---- lookup order quickly from cached sheet rows
+    # ---- lookup order metadata fast from cached sheet
     row = _orders_get_by_id_cached(order_number)
     if not row:
         return jsonify({"error": "Order not found"}), 404
 
-    # ---- use SAME IMAGE + formatting logic as slow load
+    # ---- hydrate with SAME logic used in slow load
     hydrated = _build_full_scan_payload(row)
-    if not hydrated:
-        return jsonify({"error": "failed to hydrate"}), 500
 
-    # ---- store in cache
+    # Fallback protection — Scan.jsx will choke if these fields are missing
+    hydrated.setdefault("images", [])
+    hydrated.setdefault("imagesLabeled", [])
+    hydrated.setdefault("imageUrls", [])
+    hydrated.setdefault("thumbnailUrl", None)
+    hydrated["hasImages"] = bool(
+        hydrated["images"] or hydrated["imagesLabeled"] or hydrated["thumbnailUrl"]
+    )
+
+    # ---- cache for fast repeat scans
     hydrated["_ts"] = now
     _orders_index["by_id"][order_number] = hydrated
 
