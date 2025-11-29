@@ -1703,35 +1703,39 @@ def api_order_fast():
     Fast single-order lookup:
       GET /api/order_fast?orderNumber=123
 
-    Uses ONLY the in-memory cache (_orders_index["by_id"]).
-    - Never triggers a slow sheet scan
-    - Never returns 500
-    Returns:
-      200 + { order: {...}, cached: true } if found
-      404 + { error, cached: false }      if not in cache
+    Always safe:
+    - Never triggers slow sheet scan
+    - Never internal-server-errors if cache missing
     """
+    global _orders_index
+
+    # ---- NEW: guarantee cache structure exists ----
+    if not isinstance(_orders_index, dict):
+        _orders_index = {}
+
+    _orders_index.setdefault("by_id", {})
+    _orders_index.setdefault("ts", 0)
+    # ------------------------------------------------
+
     order_number = str(request.args.get("orderNumber", "")).strip()
     if not order_number:
         return jsonify({"error": "orderNumber required"}), 400
 
     try:
-        by_id = _orders_index.get("by_id", {}) or {}
-        o = by_id.get(order_number)
+        o = _orders_index["by_id"].get(order_number)
 
         if o:
-            # Fast path: found in cache
             return jsonify({"order": o, "cached": True}), 200
 
-        # Not in cache → fast endpoint does NOT do a sheet scan
+        # Safe "not found" — no crashes
         return jsonify({
-            "error": f"Order {order_number} not found in fast cache",
+            "error": f"Order {order_number} not in fast-cache yet",
             "cached": False,
             "order": None
         }), 404
 
     except Exception as e:
         current_app.logger.warning("order_fast cache read failed: %s", e)
-        # Fail soft: never 500, just return a not-found style response
         return jsonify({
             "error": "order_fast cache access failed",
             "cached": False,
@@ -5385,7 +5389,34 @@ def get_orders():
             out.append(obj)
         return out
 
-    return send_cached_json("combined", TTL, build_payload)
+    # --- NEW WRAPPER: populate fast lookup after cache returns ---
+    result = send_cached_json("combined", TTL, build_payload)
+
+    try:
+        # parse JSON (result.data may be bytes or str depending on environment)
+        data = json.loads(result.get_data(as_text=True))
+
+        orders = data.get("orders", [])
+        by_id = {}
+
+        for row in orders:
+            oid = str(row.get("Order #", "")).strip()
+            if oid:
+                by_id[oid] = row
+
+        # Store to global cache for /order_fast
+        global _orders_index
+        if not isinstance(_orders_index, dict):
+            _orders_index = {}
+
+        _orders_index["by_id"] = by_id
+        _orders_index["ts"] = time.time()
+
+    except Exception as e:
+        current_app.logger.warning("Failed to build fast order cache: %s", e)
+
+    return result
+
 
 
 
