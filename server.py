@@ -1004,10 +1004,26 @@ def _cache_get(key):
         return None
 
 def _cache_set(key, payload_bytes, ttl):
-    etag = 'W/"%s"' % hashlib.sha1(payload_bytes).hexdigest()
-    with _cache_lock:
-        _json_cache[key] = {'ts': time.time(), 'ttl': ttl, 'etag': etag, 'data': payload_bytes}
-    return etag
+    """
+    Safe setter for cache.
+    Ensures any code called in here runs inside Flask context.
+    """
+    try:
+        with app.app_context():
+            _cache[key] = {
+                "data": payload_bytes,
+                "time": time.time(),
+                "ttl": ttl
+            }
+    except Exception as e:
+        # Fallback if app context not available
+        _cache[key] = {
+            "data": payload_bytes,
+            "time": time.time(),
+            "ttl": ttl
+        }
+        current_app.logger.warning(f"_cache_set stored without app_context: {e}")
+
 
 def _cache_peek(key):
     with _cache_lock:
