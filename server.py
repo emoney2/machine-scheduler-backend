@@ -9442,6 +9442,7 @@ def print_handler():
 @login_required_session
 def order_fast():
     global _orders_index
+
     order_number = request.args.get("orderNumber", "").strip()
     if not order_number:
         return jsonify({"error": "missing order number"}), 400
@@ -9450,10 +9451,10 @@ def order_fast():
     # 1) FAST in-memory lookup
     # ---------------------------------------
     row = _orders_index["by_id"].get(order_number)
+
     if row:
-        # ---- hydrate images like order-summary does ----
         try:
-            # Normalize and enforce correct schema key casing
+            # Normalize product field naming
             prod = (
                 row.get("Product")
                 or row.get("product")
@@ -9462,14 +9463,17 @@ def order_fast():
                 or None
             )
 
-            row["Product"] = prod  # <-- enforce canonical field
+            # enforce canonical schema
+            row = dict(row)
+            row["Product"] = prod
 
-            thumbnail, images_raw, labeled = get_drive_images_for_product(product)
+            # ⭐ FIXED — use prod instead of undefined "product"
+            thumbnail, images_raw, labeled = get_drive_images_for_product(prod)
 
-            row = dict(row)  # avoid mutating cache
             row["thumbnailUrl"] = thumbnail
             row["images"] = images_raw or []
             row["imagesLabeled"] = labeled or []
+
         except Exception as e:
             print("[FAST] hydrate error:", e)
 
@@ -9485,15 +9489,25 @@ def order_fast():
 
         row = by.get(order_number)
         if row:
-            # hydrate again after rebuild
             try:
-                product = row.get("Product") or row.get("product") or ""
-                thumbnail, images_raw, labeled = get_drive_images_for_product(product)
+                prod = (
+                    row.get("Product")
+                    or row.get("product")
+                    or row.get("Product Name")
+                    or row.get("Design")
+                    or None
+                )
 
                 row = dict(row)
+                row["Product"] = prod
+
+                # ⭐ FIXED here too
+                thumbnail, images_raw, labeled = get_drive_images_for_product(prod)
+
                 row["thumbnailUrl"] = thumbnail
                 row["images"] = images_raw or []
                 row["imagesLabeled"] = labeled or []
+
             except Exception as e:
                 print("[FAST] hydrate error (cold):", e)
 
