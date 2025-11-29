@@ -1823,11 +1823,6 @@ def api_order_single():
 
 @app.route("/api/order_fast")
 def api_order_fast():
-    """
-    Fast load endpoint for Scan.jsx.
-    Returns a full normalized payload (same image structure as slow load),
-    but cached for speed. Auto expires cache after 60 seconds.
-    """
     global _orders_index
 
     ensure_orders_cache()
@@ -1839,52 +1834,39 @@ def api_order_fast():
     now = time.time()
     cached = _orders_index["by_id"].get(order_number)
 
-    # ---- Return cached version if fresh (<60s)
+    # return cached version if fresh (<60s)
     if cached and isinstance(cached, dict):
         ts = cached.get("_ts", 0)
         if now - ts < 60:
             cached["cached"] = True
             return jsonify({"order": cached}), 200
 
-    # ---- Rebuild payload if cache expired or missing
+    # rebuild payload
     row = _orders_get_by_id_cached(order_number)
     if not row:
         return jsonify({"error": "Order not found"}), 404
 
-    # Get images using your real resolver (this was already in your existing code)
-    product = (
-        row.get("Product")
-        or row.get("product")
-        or row.get("Product Name")
-        or row.get("Design")
-        or None
-    )
+    # 🔥 THIS is your real working image resolver
+    thumbnail, labeled, images_raw = build_order_image_bundle(order_number)
 
-    thumbnail, images_raw, labeled = get_drive_images_for_order(order_number)
-
-
-    # ---- Build normalized order object
     hydrated = dict(row)
 
-    # Primary UI fields needed by Scan.jsx
-    hydrated["thumbnailUrl"] = thumbnail or None               # preview
-    hydrated["imagesLabeled"] = labeled or []                 # preferred
-    hydrated["images"] = images_raw or []                     # fallback array
+    # required fields for Scan.jsx
+    hydrated["thumbnailUrl"] = thumbnail or None
+    hydrated["imagesLabeled"] = labeled or []
+    hydrated["images"] = images_raw or []
 
-    # ---- Legacy compatibility fields Scan.jsx looks for
-    hydrated["imageUrls"] = images_raw or []                  # array fallback
-    hydrated["imageUrl"] = thumbnail or None                  # single fallback
+    # legacy fallback compatibility
+    hydrated["imageUrls"] = images_raw or []
+    hydrated["imageUrl"] = thumbnail or None
     hydrated["hasImages"] = bool(thumbnail or images_raw or labeled)
 
-    # ---- Cache it
+    # store in cache
     hydrated["_ts"] = now
     hydrated["cached"] = False
-
     _orders_index["by_id"][order_number] = hydrated
 
     return jsonify({"order": hydrated}), 200
-
-
 
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
