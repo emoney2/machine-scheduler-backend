@@ -6019,6 +6019,18 @@ def get_combined():
         fur_full    = rows_to_dicts(fur_rows)
         cut_full    = rows_to_dicts(cut_rows)
 
+        # 🔥 FAST CACHE: build lookup by order number
+        try:
+            _orders_index["by_id"] = {
+                str(o.get("Order #", "")).strip(): o 
+                for o in orders_full 
+                if str(o.get("Order #", "")).strip()
+            }
+            current_app.logger.info(f"[FAST] Cache loaded with {len(_orders_index['by_id'])} orders")
+        except Exception as e:
+            current_app.logger.warning(f"[FAST] Failed to build cache: {e}")
+
+
         # Build lookups by Order #
         fur_map = { str(r.get("Order #", "")).strip(): r
                     for r in fur_full if str(r.get("Order #", "")).strip() }
