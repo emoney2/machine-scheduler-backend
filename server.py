@@ -6173,7 +6173,7 @@ def get_manual_state():
         result = {"machineColumns": [m1_clean, m2_clean], "placeholders": phs}
         _manual_state_cache = result
         _manual_state_ts    = now
-        return jsonify(result), 200
+        return send_cached_json(f"summary:{order}:{dept}", 60, lambda: result), 200
 
 
     except Exception:
@@ -9412,17 +9412,30 @@ def print_handler():
     return jsonify({"status": "ok"})
 
 @app.route("/api/order_fast")
-def order_fast_alias():
-    """
-    Fix for frontend expecting /api/order_fast while the real route lives under /api/api/order_fast.
-    This simply forwards the call so the Scan page responds instantly instead of hitting the slow fallback.
-    """
-    from flask import request
-    return fast_order_lookup() if 'fast_order_lookup' in globals() else jsonify({
-        "ok": False,
-        "error": "fast lookup function not found",
-        "order": request.args.get("orderNumber", "")
-    }), 200
+@login_required_session
+def order_fast():
+    global _orders_index
+    order_number = request.args.get("orderNumber", "").strip()
+    if not order_number:
+        return jsonify({"error": "missing order number"}), 400
+
+    # ----------- FAST in-memory lookup -----------
+    row = _orders_index["by_id"].get(order_number)
+    if row:
+        return jsonify({"order": row, "cached": True}), 200
+
+    # ----------- Cache cold? Build it ONCE -----------
+    # Only refresh if older than 30 seconds
+    now = time.time()
+    if now - _orders_index["ts"] > 30:
+        rows, by = _orders_rows_snapshot()
+        _orders_index = {"by_id": by, "ts": now}
+
+        row = by.get(order_number)
+        if row:
+            return jsonify({"order": row, "cached": False}), 200
+
+    return jsonify({"error": "order not found"}), 404
 
 
 # ─── Run ────────────────────────────────────────────────────────────────────────
