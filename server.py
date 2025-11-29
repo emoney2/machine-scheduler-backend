@@ -1860,7 +1860,8 @@ def api_order_fast():
         or None
     )
 
-    thumbnail, images_raw, labeled = get_drive_images_for_product(product)
+    thumbnail, images_raw, labeled = get_drive_images_for_order(order_number)
+
 
     # ---- Build normalized order object
     hydrated = dict(row)
