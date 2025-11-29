@@ -1702,44 +1702,44 @@ def api_order_fast():
     """
     Fast single-order lookup:
       GET /api/order_fast?orderNumber=123
-
-    Always safe:
-    - Never triggers slow sheet scan
-    - Never internal-server-errors if cache missing
+    Returns immediately using in-memory cache. Never scans sheets.
     """
-    global _orders_index
-
-    # ---- NEW: guarantee cache structure exists ----
-    if not isinstance(_orders_index, dict):
-        _orders_index = {}
-
-    _orders_index.setdefault("by_id", {})
-    _orders_index.setdefault("ts", 0)
-    # ------------------------------------------------
 
     order_number = str(request.args.get("orderNumber", "")).strip()
     if not order_number:
         return jsonify({"error": "orderNumber required"}), 400
 
+    global _orders_index
     try:
-        o = _orders_index["by_id"].get(order_number)
+        if not isinstance(_orders_index, dict):
+            _orders_index = {}
 
-        if o:
-            return jsonify({"order": o, "cached": True}), 200
+        # Debug print to confirm cache keys
+        current_app.logger.info(f"[FAST] order_fast lookup for {order_number}")
+        current_app.logger.info(f"[FAST] cache keys: {list(_orders_index.get('by_id', {}).keys())}")
 
-        # Safe "not found" — no crashes
+        by_id = _orders_index.get("by_id", {}) or {}
+        row = by_id.get(order_number)
+
+        if row:
+            current_app.logger.info(f"[FAST] HIT → {order_number}")
+            return jsonify({"order": row, "cached": True}), 200
+
+        # MISS (but not a failure)
+        current_app.logger.warning(f"[FAST] MISS → {order_number} not found in fast cache.")
         return jsonify({
-            "error": f"Order {order_number} not in fast-cache yet",
+            "order": None,
             "cached": False,
-            "order": None
+            "error": f"{order_number} not found in fast cache"
         }), 404
 
     except Exception as e:
-        current_app.logger.warning("order_fast cache read failed: %s", e)
+        current_app.logger.exception("order_fast exception:")
+        # Never allow fast endpoint to crash – return soft fail
         return jsonify({
-            "error": "order_fast cache access failed",
+            "order": None,
             "cached": False,
-            "order": None
+            "error": f"order_fast failed: {e}"
         }), 200
 
 
