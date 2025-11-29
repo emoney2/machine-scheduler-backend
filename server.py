@@ -6173,8 +6173,7 @@ def get_manual_state():
         result = {"machineColumns": [m1_clean, m2_clean], "placeholders": phs}
         _manual_state_cache = result
         _manual_state_ts    = now
-        return send_cached_json(f"summary:{order}:{dept}", 60, lambda: result), 200
-
+        return jsonify(result), 200
 
     except Exception:
         logger.exception("Error reading manual state")
