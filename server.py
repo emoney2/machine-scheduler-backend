@@ -1766,7 +1766,35 @@ def api_order_fast():
 
         if row:
             current_app.logger.info(f"[FAST] HIT → {order_number}")
-            return jsonify({"order": row, "cached": True}), 200
+            # ----------- FAST in-memory lookup ----------- 
+            row = _orders_index["by_id"].get(order_number)
+            if row:
+                try:
+                    # Pull image fields if they exist
+                    thumb = row.get("thumbnailUrl") or row.get("Preview") or None
+        
+                    images = []
+                    # These fields may vary — normalize any image-related fields:
+                    for key in ("images", "Images", "Image URLs", "imagesLabeled"):
+                        val = row.get(key)
+                        if isinstance(val, list) and len(val):
+                            images.extend(val)
+
+                    # Attach normalized fast image data
+                    row = {
+                        **row,
+                        "thumbnailUrl": thumb,
+                        "images": images,
+                        "cached": True
+                    }
+        
+                    print(f"[FAST] ► Attached images → {len(images)} / thumb={bool(thumb)}")
+    
+                except Exception as e:
+                    print(f"[FAST ERROR] while attaching images: {e}")
+
+                return jsonify({"order": row}), 200
+
 
         # MISS but no exception (frontend will fallback gracefully)
         current_app.logger.warning(f"[FAST] MISS → {order_number} not found in cache")
