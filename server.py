@@ -9442,6 +9442,7 @@ def order_fast():
 
 
         current_app.logger.info(f"[FAST] HIT enriched → {order_number}")
+        current_app.logger.info(f"[FAST] RETURN DATA → {json.dumps(enriched, indent=2)}")
         return jsonify({"order": enriched, "cached": True}), 200
 
     # --- cache stale? rebuild if older than 30s ---
