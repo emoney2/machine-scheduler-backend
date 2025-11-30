@@ -8848,26 +8848,7 @@ def _find_best_file(vendor_dir: str, name_raw: str) -> tuple[str, str] | None:
         return vendor_dir, best
     return None
 
-@app.route("/api/material-image", methods=["GET"], endpoint="api_material_image")
-@app.route("/material-image", methods=["GET"], endpoint="plain_material_image")
-@login_required_session
-def material_image():
-    vendor_raw = request.args.get("vendor", "")
-    name_raw   = request.args.get("name", "")
-    if not vendor_raw or not name_raw:
-        return "", 404
 
-    vendor_dir = _pick_vendor_dir(vendor_raw)
-    hit = _find_best_file(vendor_dir, name_raw) if vendor_dir else None
-    if not hit:
-        # Helpful log once in a while; return clean 404
-        app.logger.info("material-image miss vendor=%r name=%r dir=%r", vendor_raw, name_raw, vendor_dir)
-        return "", 404
-
-    vdir, filename = hit
-    resp = send_from_directory(vdir, filename)
-    resp.headers["Cache-Control"] = "public, max-age=86400"
-    return resp
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Set Preview formula for an order (writes to Production Orders sheet) ─────
@@ -9712,7 +9693,7 @@ def print_handler():
     return jsonify({"status": "ok"})
 
 @app.route("/api/material_image")
-def api_material_image():
+def api_material_image_local():
     """
     Serves local material images from DepartmentMaterialPictures
     for use in quadrants (foam / fur).
