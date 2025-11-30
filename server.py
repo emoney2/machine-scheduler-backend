@@ -2044,13 +2044,25 @@ def api_order_fast():
             },
         ]
 
-        row["imagesNormalized"] = quadrants
+        # 🧩 Build normalized image list for Scan.jsx quadrant display
         row["thumbnailUrl"] = thumb_url
+        row["foamImg"] = materials.get("foam")
+        row["furImg"] = materials.get("fur")
+        row["imagesNormalized"] = [
+            {"label": "Thumbnail", "src": thumb_url},
+            {"label": "Foam", "src": materials.get("foam")},
+            {"label": "Fur", "src": materials.get("fur")},
+        ]
+        row["imagesNormalized"] = [img for img in row["imagesNormalized"] if img.get("src")]
         row["hasImages"] = True
+
+        current_app.logger.info(
+            f"[FAST] quadrant build success → foam={materials.get('foam')}, fur={materials.get('fur')}"
+        )
 
     except Exception as e:
         current_app.logger.warning(
-            f"[FAST] quadrant build inputs → thumb={thumb_url}, materials={materials}"
+            f"[FAST] quadrant build inputs → product={product}, fur_color={fur_color}"
         )
         current_app.logger.warning(f"[FAST] material quadrant build failed → {e}")
         row["imagesNormalized"] = []
@@ -2083,7 +2095,9 @@ def api_order_fast():
             f"order_fast: failed to cache payload for {order_number}: {e}"
         )
 
-    current_app.logger.info(f"[FAST] built {order_number} in {duration} ms")
+    current_app.logger.info(
+        f"[FAST] built {order_number} in {duration} ms with {len(row.get('imagesNormalized', []))} quadrant images"
+    )
 
     return jsonify({"order": full_payload, "cached": False}), 200
 
