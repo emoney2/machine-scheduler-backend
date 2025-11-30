@@ -109,6 +109,30 @@ from flask import send_file  # ADD if not present
 # Stores the lookup table used by /api/order_fast
 _orders_index = {"by_id": {}, "ts": 0}
 
+from google.oauth2.credentials import Credentials
+import json
+import os
+
+def _get_google_creds():
+    """
+    Returns a valid google.oauth2.credentials.Credentials object.
+    Uses token.json or GOOGLE_TOKEN_JSON from env.
+    """
+    token_path = os.path.join(os.path.dirname(__file__), "token.json")
+    creds = None
+
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path)
+    elif os.getenv("GOOGLE_TOKEN_JSON"):
+        creds = Credentials.from_authorized_user_info(
+            json.loads(os.getenv("GOOGLE_TOKEN_JSON"))
+        )
+    else:
+        raise RuntimeError("No Google token.json or GOOGLE_TOKEN_JSON found")
+
+    return creds
+
+
 def _get_material_quadrant_images(product_name: str, fur_color: str):
     """
     Build inside-material image set for the quadrant view using Google Drive.
