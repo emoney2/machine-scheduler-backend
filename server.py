@@ -9180,6 +9180,11 @@ def order_summary_lite():
             "images": [],
             "imagesLabeled": [],
         }
+        # ✅ Include matched material quadrant images if available
+        if foam_img:
+            order_data["foamImg"] = foam_img
+        if fur_img:
+            order_data["furImg"] = fur_img
         return jsonify(data)
     except Exception as e:
         current_app.logger.exception("order_summary_lite failed: %s", e)
