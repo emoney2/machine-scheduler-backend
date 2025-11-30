@@ -1912,9 +1912,24 @@ def api_order_fast():
         product = (row.get("Product") or "").strip()
         fur_color = (row.get("Fur Color") or "").strip()
         labeled, raw, thumb = _resolve_drive_images_and_boms(product, fur_color)
-        row["imagesLabeled"] = labeled or []
-        row["images"] = raw or []
-        row["thumbnailUrl"] = thumb or row.get("thumbnailUrl") or row.get("Image")
+
+        # Normalize any Google Drive links into public thumbnails
+        try:
+            if thumb:
+                thumb_id = _safe_drive_id(thumb)
+                if thumb_id:
+                    thumb = _public_thumb(thumb_id, "w640")
+            row["imagesLabeled"] = labeled or []
+            row["images"] = []
+            for img in (raw or []):
+                fid = _safe_drive_id(img)
+                if fid:
+                    row["images"].append(_public_thumb(fid, "w640"))
+            row["thumbnailUrl"] = thumb or row.get("thumbnailUrl") or row.get("Image")
+            row["hasImages"] = bool(row.get("thumbnailUrl") or row.get("images"))
+        except Exception as e:
+            current_app.logger.warning(f"[FAST] drive link normalization failed → {e}")
+
     except Exception as e:
         current_app.logger.warning(f"[FAST] BOM hydration failed → {e}")
 
@@ -1932,6 +1947,7 @@ def api_order_fast():
                 file_id = _safe_drive_id(img_raw)
                 if file_id:
                     row["thumbnailUrl"] = _public_thumb(file_id, "w640")
+                    row["hasImages"] = True
             except Exception as e:
                 current_app.logger.warning(
                     f"order_fast: image hydrate fallback failed for {order_number}: {e}"
@@ -1958,10 +1974,11 @@ def api_order_fast():
             _orders_index["by_id"] = {}
         _orders_index["by_id"][order_number] = full_payload
     except Exception as e:
-        current_app.logger.warning(f"order_fast: failed to cache payload for {order_number}: {e}")
+        current_app.logger.warning(
+            f"order_fast: failed to cache payload for {order_number}: {e}"
+        )
 
     return jsonify({"order": full_payload, "cached": False}), 200
-
 
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
