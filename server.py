@@ -135,85 +135,87 @@ def _get_google_creds():
 
 def _get_material_quadrant_images(product_name: str, fur_color: str):
     """
-    Build inside-material image set for the quadrant view using Google Drive.
+    Build inside-material image set for the quadrant view.
 
-    - Lists files inside DepartmentMaterialPictures folder on Drive
-      (folder ID: 1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu)
-    - Finds <ProductName>InsideFoam and <ProductName>Fur
-    - Ignores the word "Back" in product names
-    - Recolors the fur image to match the fur_color value
+    - Reads from the Google Drive folder 'DepartmentMaterialPictures'
+    - Finds <ProductName>InsideFoam and <ProductName>Fur (ignoring 'Back')
+    - Returns public view URLs (https://drive.google.com/uc?export=view&id=...)
+    - Applies light grey tint to Fur image if color specified
     """
     from googleapiclient.discovery import build
-    from googleapiclient.errors import HttpError
-    from PIL import Image
-    import io
+    from google.oauth2.credentials import Credentials
+    from PIL import Image, ImageEnhance
+    import tempfile, os, io
     import requests
-    import tempfile
+
+    creds = _get_google_creds()
+    service = build("drive", "v3", credentials=creds)
 
     safe_name = (product_name or "").replace("Back", "").strip()
     folder_id = "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu"
-    service = build("drive", "v3", credentials=_get_google_creds())
+
+    query = f"'{folder_id}' in parents and trashed = false"
+    results = (
+        service.files()
+        .list(q=query, fields="files(id, name, mimeType, thumbnailLink, webContentLink)")
+        .execute()
+    )
+    files = results.get("files", [])
+    current_app.logger.info(f"[MATERIAL IMG] Found {len(files)} files in DepartmentMaterialPictures")
+    for f in files:
+        current_app.logger.info(f"  - {f['name']} ({f['id']})")
+
+    foam_id = None
+    fur_id = None
+
+    for f in files:
+        fname = f["name"].lower()
+        if fname.startswith(safe_name.lower() + "insidefoam"):
+            foam_id = f["id"]
+        elif fname.startswith(safe_name.lower() + "fur"):
+            fur_id = f["id"]
 
     foam_img = None
     fur_img = None
 
-    try:
-        query = f"'{folder_id}' in parents and trashed = false"
-        results = (
-            service.files()
-            .list(q=query, fields="files(id, name, mimeType, thumbnailLink, webContentLink)")
-            .execute()
-        )
-        files = results.get("files", [])
-        current_app.logger.info(f"[MATERIAL IMG] Found {len(files)} files in DepartmentMaterialPictures:")
-        for f in files:
-            current_app.logger.info(f"  - {f['name']} ({f['id']})")
+    if foam_id:
+        foam_img = f"https://drive.google.com/uc?export=view&id={foam_id}"
+    if fur_id:
+        fur_img = f"https://drive.google.com/uc?export=view&id={fur_id}"
 
-
-        for f in files:
-            name = f["name"].lower()
-            if name.startswith(safe_name.lower() + "insidefoam"):
-                foam_img = f"https://drive.google.com/uc?id={f['id']}"
-            elif name.startswith(safe_name.lower() + "fur"):
-                fur_img = f"https://drive.google.com/uc?id={f['id']}"
-
-    except HttpError as e:
-        current_app.logger.warning(f"[MATERIAL IMG] Drive list failed: {e}")
-
-    def tint_image_from_url(img_url, color_hex):
-        try:
-            resp = requests.get(img_url)
-            img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-            gray = img.convert("L")
-            mask = gray.point(lambda p: 255 if p > 240 else 0)
-            color_img = Image.new("RGBA", img.size, color_hex)
-            result = Image.composite(color_img, img, mask)
-            temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-            result.save(temp.name)
-            return temp.name
-        except Exception as e:
-            current_app.logger.warning(f"[MATERIAL IMG] tint_image_from_url failed: {e}")
-            return img_url
-
+    # --- Optional: tint the Fur image (light grey, etc.) -------------------
     if fur_img and fur_color:
         color_map = {
-            "light grey": "#D3D3D3",
-            "grey": "#A9A9A9",
-            "gray": "#A9A9A9",
-            "white": "#FFFFFF",
-            "navy": "#000080",
-            "navy blue": "#000080",
+            "light grey": "#d3d3d3",
+            "grey": "#a9a9a9",
+            "gray": "#a9a9a9",
+            "white": "#ffffff",
             "black": "#000000",
-            "red": "#FF0000",
-            "blue": "#0000FF",
+            "navy": "#000080",
+            "blue": "#0000ff",
+            "red": "#ff0000",
         }
-        hex_color = color_map.get(fur_color.lower(), "#D3D3D3")
-        fur_img = tint_image_from_url(fur_img, hex_color)
+        tint_color = color_map.get(fur_color.lower(), "#d3d3d3")
+
+        # quick brightness hack for white → light grey
+        try:
+            resp = requests.get(fur_img)
+            if resp.status_code == 200:
+                img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                enhancer = ImageEnhance.Brightness(img)
+                img = enhancer.enhance(0.85)  # darken slightly
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                img.save(temp_file.name, "PNG")
+                fur_img = f"data:image/png;base64,{base64.b64encode(open(temp_file.name, 'rb').read()).decode()}"
+                temp_file.close()
+        except Exception as e:
+            current_app.logger.warning(f"[MATERIAL IMG] Tint failed: {e}")
 
     return {
         "foam": foam_img,
         "fur": fur_img,
     }
+
 
 def ensure_orders_cache():
     """
