@@ -137,79 +137,58 @@ def _get_material_quadrant_images(product_name: str, fur_color: str):
     """
     Build inside-material image set for the quadrant view.
 
-    - Reads from the Google Drive folder 'DepartmentMaterialPictures'
-    - Finds <ProductName>InsideFoam and <ProductName>Fur (ignoring 'Back')
-    - Returns public view URLs (https://drive.google.com/uc?export=view&id=...)
-    - Applies light grey tint to Fur image if color specified
+    - Reads from Google Drive folder 'DepartmentMaterialPictures'
+    - Finds closest match for "<Product>InsideFoam" and "<Product>Fur"
+      (ignores "Back", "Full", etc.)
+    - Returns Drive view URLs
     """
     from googleapiclient.discovery import build
     from google.oauth2.credentials import Credentials
-    from PIL import Image, ImageEnhance
-    import tempfile, os, io
-    import requests
+    import re
 
     creds = _get_google_creds()
     service = build("drive", "v3", credentials=creds)
 
-    safe_name = (product_name or "").replace("Back", "").strip()
     folder_id = "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu"
-
     query = f"'{folder_id}' in parents and trashed = false"
     results = (
         service.files()
-        .list(q=query, fields="files(id, name, mimeType, thumbnailLink, webContentLink)")
+        .list(q=query, fields="files(id, name, mimeType)")
         .execute()
     )
     files = results.get("files", [])
     current_app.logger.info(f"[MATERIAL IMG] Found {len(files)} files in DepartmentMaterialPictures")
-    for f in files:
-        current_app.logger.info(f"  - {f['name']} ({f['id']})")
+
+    # Normalize product name
+    safe_name = (
+        product_name.replace("Back", "")
+        .replace("Full", "")
+        .replace("Front", "")
+        .strip()
+    ).lower()
+
+    # Prepare flexible regex patterns
+    foam_pattern = re.compile(rf"^{safe_name}.*insidefoam", re.IGNORECASE)
+    fur_pattern = re.compile(rf"^{safe_name}.*fur", re.IGNORECASE)
 
     foam_id = None
     fur_id = None
 
     for f in files:
         fname = f["name"].lower()
-        if fname.startswith(safe_name.lower() + "insidefoam"):
+        if foam_pattern.search(fname):
             foam_id = f["id"]
-        elif fname.startswith(safe_name.lower() + "fur"):
+        elif fur_pattern.search(fname):
             fur_id = f["id"]
 
     foam_img = None
     fur_img = None
-
     if foam_id:
         foam_img = f"https://drive.google.com/uc?export=view&id={foam_id}"
     if fur_id:
         fur_img = f"https://drive.google.com/uc?export=view&id={fur_id}"
 
-    # --- Optional: tint the Fur image (light grey, etc.) -------------------
-    if fur_img and fur_color:
-        color_map = {
-            "light grey": "#d3d3d3",
-            "grey": "#a9a9a9",
-            "gray": "#a9a9a9",
-            "white": "#ffffff",
-            "black": "#000000",
-            "navy": "#000080",
-            "blue": "#0000ff",
-            "red": "#ff0000",
-        }
-        tint_color = color_map.get(fur_color.lower(), "#d3d3d3")
-
-        # quick brightness hack for white → light grey
-        try:
-            resp = requests.get(fur_img)
-            if resp.status_code == 200:
-                img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-                enhancer = ImageEnhance.Brightness(img)
-                img = enhancer.enhance(0.85)  # darken slightly
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-                img.save(temp_file.name, "PNG")
-                fur_img = f"data:image/png;base64,{base64.b64encode(open(temp_file.name, 'rb').read()).decode()}"
-                temp_file.close()
-        except Exception as e:
-            current_app.logger.warning(f"[MATERIAL IMG] Tint failed: {e}")
+    current_app.logger.info(f"[MATERIAL IMG] Matched foam={foam_img} fur={fur_img} for product={product_name}")
 
     return {
         "foam": foam_img,
