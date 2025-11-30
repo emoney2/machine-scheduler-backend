@@ -184,7 +184,10 @@ def _get_material_quadrant_images(product_name: str, fur_color: str):
     if fur_id:
         fur_img = f"https://drive.google.com/uc?export=view&id={fur_id}"
 
-    current_app.logger.info(f"[MATERIAL IMG] Matched foam={foam_img} fur={fur_img} for product={product_name}")
+    current_app.logger.info(
+        f"[MATERIAL IMG] Matched foam={foam_img} fur={fur_img} "
+        f"for product={product_name!r} (safe_name={safe_name!r})"
+    )
 
     return {
         "foam": foam_img,
