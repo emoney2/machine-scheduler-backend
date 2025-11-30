@@ -1820,51 +1820,55 @@ def api_order_single():
     except Exception as e:
         current_app.logger.exception("api_order failed: %s", e)
         return jsonify({"error": "order fetch failed"}), 500
+def _hydrate_images_for_fast(row):
+    """
+    Forces image hydration using the same logic as the slow Scan load.
+    Pulls thumbnail, labeled images, and BOM images from Google Drive.
+    """
+
+    product = row.get("Product", "").strip()
+    fur_color = (
+        row.get("Fur Color")
+        or row.get("FurColor")
+        or row.get("Fur")
+        or ""
+    ).strip()
+
+    try:
+        # Existing function used by slow scan load
+        labeled, raw, thumb = _resolve_drive_images_and_boms(product, fur_color)
+        return labeled or [], raw or [], thumb or None
+
+    except Exception as e:
+        print(f"[FAST_IMG] Drive hydration failed → {e}")
+        # fallback to ANY existing values instead of failing
+        return (
+            row.get("imagesLabeled", []) or [],
+            row.get("images", []) or [],
+            row.get("thumbnailUrl") or None,
+        )
+
 
 @app.route("/api/order_fast")
 def api_order_fast():
-    """
-    Fast endpoint for Scan.jsx.
-    First request builds full payload (same as heavy /order-summary).
-    Then cached for instant reuse.
-    """
-    ensure_orders_cache()
-
     order_number = request.args.get("orderNumber", "").strip()
     if not order_number:
         return jsonify({"error": "missing orderNumber"}), 400
 
-    now = time.time()
-
-    # ---- return if cached and fresh (< 2 minutes)
-    cached = _orders_index["by_id"].get(order_number)
-    if cached and (now - cached.get("_ts", 0)) < 120:
-        return jsonify({"order": cached, "cached": True}), 200
-
-    # ---- lookup order metadata fast from cached sheet
     row = _orders_get_by_id_cached(order_number)
     if not row:
         return jsonify({"error": "Order not found"}), 404
 
-    # ---- hydrate with SAME logic used in slow load
-    hydrated = _build_full_scan_payload(row)
+    # 🔥 Force Google Drive hydration (critical)
+    labeled, raw, thumb = _hydrate_images_for_fast(row)
 
-    # Fallback protection — Scan.jsx will choke if these fields are missing
-    hydrated.setdefault("images", [])
-    hydrated.setdefault("imagesLabeled", [])
-    hydrated.setdefault("imageUrls", [])
-    hydrated.setdefault("thumbnailUrl", None)
-    hydrated["hasImages"] = bool(
-        hydrated["images"] or hydrated["imagesLabeled"] or hydrated["thumbnailUrl"]
-    )
+    payload = dict(row)
+    payload["imagesLabeled"] = labeled
+    payload["images"] = raw
+    payload["thumbnailUrl"] = thumb
+    payload["hasImages"] = bool(labeled or raw or thumb)
 
-    # ---- cache for fast repeat scans
-    hydrated["_ts"] = now
-    _orders_index["by_id"][order_number] = hydrated
-
-    return jsonify({"order": hydrated, "cached": False}), 200
-
-
+    return jsonify({"order": payload, "cached": False}), 200
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
 def drive_thumbnail():
