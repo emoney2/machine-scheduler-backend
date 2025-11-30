@@ -2039,21 +2039,13 @@ def api_order_fast():
                 or "https://upload.wikimedia.org/wikipedia/commons/8/89/HD_transparent_picture.png",
             },
             {
-                "label": "",
+                "label": "Extra",
                 "src": "https://upload.wikimedia.org/wikipedia/commons/8/89/HD_transparent_picture.png",
             },
         ]
 
-        # 🧩 Build normalized image list for Scan.jsx quadrant display
+        row["imagesNormalized"] = quadrants
         row["thumbnailUrl"] = thumb_url
-        row["foamImg"] = materials.get("foam")
-        row["furImg"] = materials.get("fur")
-        row["imagesNormalized"] = [
-            {"label": "Thumbnail", "src": thumb_url},
-            {"label": "Foam", "src": materials.get("foam")},
-            {"label": "Fur", "src": materials.get("fur")},
-        ]
-        row["imagesNormalized"] = [img for img in row["imagesNormalized"] if img.get("src")]
         row["hasImages"] = True
 
         current_app.logger.info(
@@ -2062,30 +2054,52 @@ def api_order_fast():
 
     except Exception as e:
         current_app.logger.warning(
-            f"[FAST] quadrant build inputs → product={product}, fur_color={fur_color}"
+            f"[FAST] quadrant build failed for order {order_number}: {e}"
         )
-        current_app.logger.warning(f"[FAST] material quadrant build failed → {e}")
         row["imagesNormalized"] = []
 
     # --- Normalize into full Scan payload -----------------------------------
     try:
         full_payload = _build_full_scan_payload(row)
-        # include normalized quadrants for frontend
-        if row.get("imagesNormalized"):
-            full_payload["imagesNormalized"] = row["imagesNormalized"]
-            full_payload["hasImages"] = True
     except Exception as e:
         current_app.logger.exception(
             f"order_fast: _build_full_scan_payload failed for {order_number}: {e}"
         )
         return jsonify({"error": "build failed"}), 500
 
+    if not isinstance(full_payload, dict):
+        return jsonify({"error": "empty payload"}), 500
 
     # --- Cache + return with timing -----------------------------------------
     duration = round((time.time() - start_time) * 1000, 1)
     full_payload["_ts"] = time.time()
     full_payload["_duration_ms"] = duration
 
+    # ✅ Force include quadrants in final payload
+    if "imagesNormalized" not in full_payload and row.get("imagesNormalized"):
+        full_payload["imagesNormalized"] = row["imagesNormalized"]
+        full_payload["hasImages"] = True
+        current_app.logger.info(f"[FAST] injected quadrants → {len(row['imagesNormalized'])} items")
+
+    # --- Debug logging -------------------------------------------------------
+    current_app.logger.info(f"[FAST DEBUG] row keys → {list(row.keys())}")
+    current_app.logger.info(f"[FAST DEBUG] full_payload keys → {list(full_payload.keys())}")
+
+    if "imagesNormalized" in row:
+        current_app.logger.info(
+            f"[FAST DEBUG] row['imagesNormalized'] len={len(row['imagesNormalized'])}"
+        )
+    else:
+        current_app.logger.info("[FAST DEBUG] row missing imagesNormalized")
+
+    if "imagesNormalized" in full_payload:
+        current_app.logger.info(
+            f"[FAST DEBUG] full_payload['imagesNormalized'] len={len(full_payload['imagesNormalized'])}"
+        )
+    else:
+        current_app.logger.info("[FAST DEBUG] full_payload missing imagesNormalized")
+
+    # --- Cache update --------------------------------------------------------
     try:
         if not isinstance(_orders_index, dict):
             _orders_index = {"by_id": {}, "ts": 0}
@@ -2098,10 +2112,12 @@ def api_order_fast():
         )
 
     current_app.logger.info(
-        f"[FAST] built {order_number} in {duration} ms with {len(row.get('imagesNormalized', []))} quadrant images"
+        f"[FAST] built {order_number} in {duration} ms → "
+        f"{len(full_payload.get('imagesNormalized', []))} quadrants"
     )
 
     return jsonify({"order": full_payload, "cached": False}), 200
+
 
 
 # --- ADD alongside your other routes ---
