@@ -2049,6 +2049,9 @@ def api_order_fast():
         row["hasImages"] = True
 
     except Exception as e:
+        current_app.logger.warning(
+            f"[FAST] quadrant build inputs → thumb={thumb_url}, materials={materials}"
+        )
         current_app.logger.warning(f"[FAST] material quadrant build failed → {e}")
         row["imagesNormalized"] = []
 
