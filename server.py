@@ -109,6 +109,92 @@ from flask import send_file  # ADD if not present
 # Stores the lookup table used by /api/order_fast
 _orders_index = {"by_id": {}, "ts": 0}
 
+def _get_material_quadrant_images(product_name: str, fur_color: str):
+    """
+    Build inside-material image set for the quadrant view.
+
+    - Searches "G:\\My Drive\\DepartmentMaterialPictures"
+    - Finds <ProductName>InsideFoam and <ProductName>Fur
+    - Ignores "Back" in product names
+    - Caches tinted fur images so recolor runs only once
+    - Returns web-accessible URLs via /api/material_image
+    """
+    import os
+    from PIL import Image
+    from flask import current_app
+
+    base_dir = r"G:\My Drive\DepartmentMaterialPictures"
+    safe_name = (product_name or "").replace("Back", "").strip()
+
+    foam_img = None
+    fur_img = None
+
+    try:
+        for f in os.listdir(base_dir):
+            fname = f.lower()
+            if fname.startswith(safe_name.lower() + "insidefoam"):
+                foam_img = os.path.join(base_dir, f)
+            elif fname.startswith(safe_name.lower() + "fur"):
+                fur_img = os.path.join(base_dir, f)
+    except Exception as e:
+        current_app.logger.warning(f"[MATERIAL IMG] Failed listing dir: {e}")
+
+    # Color-mapping for tint
+    color_map = {
+        "light grey": "#D3D3D3",
+        "grey": "#A9A9A9",
+        "gray": "#A9A9A9",
+        "white": "#FFFFFF",
+        "navy": "#000080",
+        "navy blue": "#000080",
+        "black": "#000000",
+        "red": "#FF0000",
+        "blue": "#0000FF",
+    }
+
+    def tint_image(img_path, color_hex):
+        try:
+            img = Image.open(img_path).convert("RGBA")
+            gray = img.convert("L")
+            mask = Image.eval(gray, lambda p: 255 if p > 240 else 0)
+
+            color_img = Image.new("RGBA", img.size, color_hex)
+            result = Image.composite(color_img, img, mask)
+            return result
+        except Exception as e:
+            current_app.logger.warning(f"[MATERIAL IMG] Tint failed: {e}")
+            return None
+
+    # Apply tint and cache it
+    if fur_img and fur_color:
+        hex_color = color_map.get(fur_color.lower(), "#D3D3D3")
+        try:
+            name_part = os.path.splitext(os.path.basename(fur_img))[0]
+            cached_name = f"{name_part}_{fur_color.replace(' ', '_')}.png"
+            cached_path = os.path.join(base_dir, cached_name)
+
+            if not os.path.exists(cached_path):
+                tinted = tint_image(fur_img, hex_color)
+                if tinted:
+                    tinted.save(cached_path)
+
+            fur_img = cached_path
+        except Exception as e:
+            current_app.logger.warning(f"[MATERIAL IMG] Cache save failed: {e}")
+
+    # Convert to API URLs
+    def _to_api_url(local_path):
+        if not local_path:
+            return ""
+        filename = os.path.basename(local_path)
+        return f"https://machine-scheduler-backend.onrender.com/api/material_image?name={filename}"
+
+    return {
+        "foam": _to_api_url(foam_img) if foam_img else "",
+        "fur": _to_api_url(fur_img) if fur_img else "",
+    }
+
+
 def ensure_orders_cache():
     """
     Backwards-compatible stub.
@@ -1878,18 +1964,22 @@ def api_order_fast():
     """
     Fast load endpoint for Scan.jsx.
 
-    Loads a single order row and builds a full quadrant payload identical to
-    the slow load, including BOM/labeled images and normalized fields.
-    Caches result for 60 seconds.
+    Builds a complete 4-quadrant payload:
+    [Outside, Inside Foam, Inside Fur, Placeholder].
+
+    - Always returns 4 image slots (no blanks)
+    - Uses /api/material_image for foam/fur textures
+    - Caches tinted fur variants for speed
+    - Converts Drive links to public thumbnails
+    - Caches each payload for 60 seconds
     """
+    start_time = time.time()
     ensure_orders_cache()
+
     order_number = (request.args.get("orderNumber") or "").strip()
     if not order_number:
         return jsonify({"error": "missing orderNumber"}), 400
 
-    now = time.time()
-
-    # --- Return cached payload if fresh (<60s) -------------------------------
     global _orders_index
     cached = None
     if isinstance(_orders_index, dict):
@@ -1897,7 +1987,10 @@ def api_order_fast():
 
     if isinstance(cached, dict):
         ts = cached.get("_ts", 0)
-        if now - ts < 60:
+        if time.time() - ts < 60:
+            duration = round((time.time() - start_time) * 1000, 1)
+            current_app.logger.info(f"[FAST] cache hit {order_number} ({duration} ms)")
+            cached["_duration_ms"] = duration
             return jsonify({"order": cached, "cached": True}), 200
 
     # --- Lookup base row -----------------------------------------------------
@@ -1907,57 +2000,13 @@ def api_order_fast():
 
     row = dict(base_row)
 
-    # --- Hydrate full BOM + images (same as slow load) -----------------------
+    # --- Build material quadrant images -------------------------------------
     try:
         product = (row.get("Product") or "").strip()
         fur_color = (row.get("Fur Color") or "").strip()
-        labeled, raw, thumb = _resolve_drive_images_and_boms(product, fur_color)
+        materials = _get_material_quadrant_images(product, fur_color)
 
-        # Normalize any Google Drive links into public thumbnails
-        try:
-            # --- Normalize Google Drive URLs to real thumbnails ---------------
-            # --- Normalize Google Drive URLs to real thumbnails and ensure 4 quadrants ---
-            normalized_images = []
-
-            # Convert BOM or raw images to valid Drive thumbnails
-            for img in (raw or []):
-                fid = _safe_drive_id(str(img).strip())
-                if fid:
-                    normalized_images.append({
-                        "label": "",
-                        "src": _public_thumb(fid, "w640")
-                    })
-                else:
-                    current_app.logger.warning(f"[FAST] Could not extract file ID from {img}")
-
-            # Always ensure we have a thumbnail (even if it's the only image)
-            thumb_id = _safe_drive_id(str(thumb or row.get("Image") or "").strip())
-            thumb_final = _public_thumb(thumb_id, "w640") if thumb_id else None
-            if thumb_final and not any(i["src"] == thumb_final for i in normalized_images):
-                normalized_images.insert(0, {"label": "", "src": thumb_final})
-
-            # --- Guarantee 4 quadrant slots (fill with placeholders if missing) ----------
-            while len(normalized_images) < 4:
-                normalized_images.append({
-                    "label": "",
-                    "src": "https://upload.wikimedia.org/wikipedia/commons/8/89/HD_transparent_picture.png"  # transparent placeholder
-                })
-
-            row["imagesLabeled"] = labeled or []
-            row["images"] = normalized_images
-            row["imagesNormalized"] = normalized_images  # explicit for Scan.jsx
-            row["thumbnailUrl"] = thumb_final
-            row["hasImages"] = True
-
-
-        except Exception as e:
-            current_app.logger.warning(f"[FAST] drive link normalization failed → {e}")
-
-    except Exception as e:
-        current_app.logger.warning(f"[FAST] BOM hydration failed → {e}")
-
-    # --- Fallback preview if no images found ---------------------------------
-    if not row.get("thumbnailUrl"):
+        # --- Normalize main thumbnail (Outside) ------------------------------
         img_raw = (
             row.get("Image")
             or row.get("Preview")
@@ -1965,18 +2014,45 @@ def api_order_fast():
             or row.get("Image Link")
             or ""
         )
-        if img_raw:
-            try:
-                file_id = _safe_drive_id(img_raw)
-                if file_id:
-                    row["thumbnailUrl"] = _public_thumb(file_id, "w640")
-                    row["hasImages"] = True
-            except Exception as e:
-                current_app.logger.warning(
-                    f"order_fast: image hydrate fallback failed for {order_number}: {e}"
-                )
 
-    # --- Normalize into full Scan payload ------------------------------------
+        thumb_url = ""
+        if img_raw:
+            fid = _safe_drive_id(img_raw)
+            if fid:
+                thumb_url = _public_thumb(fid, "w640")
+            else:
+                thumb_url = img_raw  # fallback raw link
+        else:
+            thumb_url = "https://upload.wikimedia.org/wikipedia/commons/8/89/HD_transparent_picture.png"
+
+        # --- Build the 4-quadrant layout ------------------------------------
+        quadrants = [
+            {"label": "Outside", "src": thumb_url},
+            {
+                "label": "Inside Foam",
+                "src": materials.get("foam")
+                or "https://upload.wikimedia.org/wikipedia/commons/8/89/HD_transparent_picture.png",
+            },
+            {
+                "label": "Inside Fur",
+                "src": materials.get("fur")
+                or "https://upload.wikimedia.org/wikipedia/commons/8/89/HD_transparent_picture.png",
+            },
+            {
+                "label": "",
+                "src": "https://upload.wikimedia.org/wikipedia/commons/8/89/HD_transparent_picture.png",
+            },
+        ]
+
+        row["imagesNormalized"] = quadrants
+        row["thumbnailUrl"] = thumb_url
+        row["hasImages"] = True
+
+    except Exception as e:
+        current_app.logger.warning(f"[FAST] material quadrant build failed → {e}")
+        row["imagesNormalized"] = []
+
+    # --- Normalize into full Scan payload -----------------------------------
     try:
         full_payload = _build_full_scan_payload(row)
     except Exception as e:
@@ -1988,8 +2064,11 @@ def api_order_fast():
     if not isinstance(full_payload, dict):
         return jsonify({"error": "empty payload"}), 500
 
-    # --- Cache + return ------------------------------------------------------
-    full_payload["_ts"] = now
+    # --- Cache + return with timing -----------------------------------------
+    duration = round((time.time() - start_time) * 1000, 1)
+    full_payload["_ts"] = time.time()
+    full_payload["_duration_ms"] = duration
+
     try:
         if not isinstance(_orders_index, dict):
             _orders_index = {"by_id": {}, "ts": 0}
@@ -2001,7 +2080,10 @@ def api_order_fast():
             f"order_fast: failed to cache payload for {order_number}: {e}"
         )
 
+    current_app.logger.info(f"[FAST] built {order_number} in {duration} ms")
+
     return jsonify({"order": full_payload, "cached": False}), 200
+
 
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
@@ -9628,6 +9710,27 @@ def print_handler():
             return jsonify({"status": "sheet_update_failed"})
 
     return jsonify({"status": "ok"})
+
+@app.route("/api/material_image")
+def api_material_image():
+    """
+    Serves local material images from DepartmentMaterialPictures
+    for use in quadrants (foam / fur).
+    Example: /api/material_image?name=BladeInsideFoam.png
+    """
+    base_dir = r"G:\My Drive\DepartmentMaterialPictures"
+    name = (request.args.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "missing name"}), 400
+
+    safe_name = os.path.basename(name)
+    file_path = os.path.join(base_dir, safe_name)
+
+    if not os.path.exists(file_path):
+        return jsonify({"error": "not found"}), 404
+
+    return send_file(file_path)
+
 
 # ─── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
