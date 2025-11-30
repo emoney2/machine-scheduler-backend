@@ -1878,86 +1878,79 @@ def api_order_fast():
     """
     Fast load endpoint for Scan.jsx.
 
-    - Looks up a single order row from the Production Orders sheet
-      (using the same cache as /api/combined).
-    - Hydrates a basic preview image from the Image/Preview/Image URL column.
-    - Normalizes into the same payload shape as /api/order-summary
-      via _build_full_scan_payload().
-    - Caches the normalized payload for 60 seconds in _orders_index["by_id"].
+    Loads a single order row and builds a full quadrant payload identical to
+    the slow load, including BOM/labeled images and normalized fields.
+    Caches result for 60 seconds.
     """
     ensure_orders_cache()
-
     order_number = (request.args.get("orderNumber") or "").strip()
     if not order_number:
         return jsonify({"error": "missing orderNumber"}), 400
 
     now = time.time()
 
-    # --- Return cached fast payload if fresh (<60s) --------------------------
+    # --- Return cached payload if fresh (<60s) -------------------------------
     global _orders_index
+    cached = None
     if isinstance(_orders_index, dict):
         cached = _orders_index.get("by_id", {}).get(order_number)
-    else:
-        cached = None
 
     if isinstance(cached, dict):
         ts = cached.get("_ts", 0)
         if now - ts < 60:
-            # Already a normalized fast payload
             return jsonify({"order": cached, "cached": True}), 200
 
-    # --- Build from sheet row ------------------------------------------------
+    # --- Lookup base row -----------------------------------------------------
     base_row = _orders_get_by_id_cached(order_number)
     if not base_row:
         return jsonify({"error": "Order not found"}), 404
 
-    # Work on a copy so we don't mutate the raw orders cache
     row = dict(base_row)
 
-    # --- Hydrate a single preview image from the row -------------------------
-    # Prefer the same columns you use elsewhere: Image / Preview / Image URL.
-    img_raw = (
-        row.get("Image")
-        or row.get("Preview")
-        or row.get("Image URL")
-        or row.get("Image Link")
-        or ""
-    )
+    # --- Hydrate full BOM + images (same as slow load) -----------------------
+    try:
+        product = (row.get("Product") or "").strip()
+        fur_color = (row.get("Fur Color") or "").strip()
+        labeled, raw, thumb = _resolve_drive_images_and_boms(product, fur_color)
+        row["imagesLabeled"] = labeled or []
+        row["images"] = raw or []
+        row["thumbnailUrl"] = thumb or row.get("thumbnailUrl") or row.get("Image")
+    except Exception as e:
+        current_app.logger.warning(f"[FAST] BOM hydration failed → {e}")
 
-    if img_raw:
-        try:
-            # _safe_drive_id is already defined near the /api/order-summary helpers
-            file_id = _safe_drive_id(img_raw)
-            if file_id:
-                # _public_thumb is defined above; this will go through your
-                # /api/drive/thumbnail proxy and respect tinting/versions.
-                thumb = _public_thumb(file_id, "w640")
+    # --- Fallback preview if no images found ---------------------------------
+    if not row.get("thumbnailUrl"):
+        img_raw = (
+            row.get("Image")
+            or row.get("Preview")
+            or row.get("Image URL")
+            or row.get("Image Link")
+            or ""
+        )
+        if img_raw:
+            try:
+                file_id = _safe_drive_id(img_raw)
+                if file_id:
+                    row["thumbnailUrl"] = _public_thumb(file_id, "w640")
+            except Exception as e:
+                current_app.logger.warning(
+                    f"order_fast: image hydrate fallback failed for {order_number}: {e}"
+                )
 
-                # These are what _build_full_scan_payload falls back to
-                row["imageUrl"] = thumb
-                row["thumbnailUrl"] = thumb
-        except Exception as e:
-            current_app.logger.warning(
-                "order_fast: image hydrate failed for %s: %s", order_number, e
-            )
-
-    # --- Normalize to the Scan payload shape ---------------------------------
+    # --- Normalize into full Scan payload ------------------------------------
     try:
         full_payload = _build_full_scan_payload(row)
     except Exception as e:
         current_app.logger.exception(
-            "order_fast: _build_full_scan_payload failed for %s: %s",
-            order_number,
-            e,
+            f"order_fast: _build_full_scan_payload failed for {order_number}: {e}"
         )
         return jsonify({"error": "build failed"}), 500
 
     if not isinstance(full_payload, dict):
         return jsonify({"error": "empty payload"}), 500
 
-    # Attach timestamp and cache as the canonical fast payload
+    # --- Cache + return ------------------------------------------------------
     full_payload["_ts"] = now
-
     try:
         if not isinstance(_orders_index, dict):
             _orders_index = {"by_id": {}, "ts": 0}
@@ -1965,11 +1958,10 @@ def api_order_fast():
             _orders_index["by_id"] = {}
         _orders_index["by_id"][order_number] = full_payload
     except Exception as e:
-        current_app.logger.warning(
-            "order_fast: failed to cache payload for %s: %s", order_number, e
-        )
+        current_app.logger.warning(f"order_fast: failed to cache payload for {order_number}: {e}")
 
     return jsonify({"order": full_payload, "cached": False}), 200
+
 
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
