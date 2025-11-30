@@ -1916,21 +1916,39 @@ def api_order_fast():
         # Normalize any Google Drive links into public thumbnails
         try:
             # --- Normalize Google Drive URLs to real thumbnails ---------------
+            # --- Normalize Google Drive URLs to real thumbnails and ensure 4 quadrants ---
             normalized_images = []
+
+            # Convert BOM or raw images to valid Drive thumbnails
             for img in (raw or []):
                 fid = _safe_drive_id(str(img).strip())
                 if fid:
-                    normalized_images.append(_public_thumb(fid, "w640"))
+                    normalized_images.append({
+                        "label": "",
+                        "src": _public_thumb(fid, "w640")
+                    })
                 else:
                     current_app.logger.warning(f"[FAST] Could not extract file ID from {img}")
 
+            # Always ensure we have a thumbnail (even if it's the only image)
             thumb_id = _safe_drive_id(str(thumb or row.get("Image") or "").strip())
             thumb_final = _public_thumb(thumb_id, "w640") if thumb_id else None
+            if thumb_final and not any(i["src"] == thumb_final for i in normalized_images):
+                normalized_images.insert(0, {"label": "", "src": thumb_final})
+
+            # --- Guarantee 4 quadrant slots (fill with placeholders if missing) ----------
+            while len(normalized_images) < 4:
+                normalized_images.append({
+                    "label": "",
+                    "src": "https://upload.wikimedia.org/wikipedia/commons/8/89/HD_transparent_picture.png"  # transparent placeholder
+                })
 
             row["imagesLabeled"] = labeled or []
             row["images"] = normalized_images
+            row["imagesNormalized"] = normalized_images  # explicit for Scan.jsx
             row["thumbnailUrl"] = thumb_final
-            row["hasImages"] = bool(thumb_final or normalized_images)
+            row["hasImages"] = True
+
 
         except Exception as e:
             current_app.logger.warning(f"[FAST] drive link normalization failed → {e}")
