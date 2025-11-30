@@ -1915,18 +1915,23 @@ def api_order_fast():
 
         # Normalize any Google Drive links into public thumbnails
         try:
-            if thumb:
-                thumb_id = _safe_drive_id(thumb)
-                if thumb_id:
-                    thumb = _public_thumb(thumb_id, "w640")
-            row["imagesLabeled"] = labeled or []
-            row["images"] = []
+            # --- Normalize Google Drive URLs to real thumbnails ---------------
+            normalized_images = []
             for img in (raw or []):
-                fid = _safe_drive_id(img)
+                fid = _safe_drive_id(str(img).strip())
                 if fid:
-                    row["images"].append(_public_thumb(fid, "w640"))
-            row["thumbnailUrl"] = thumb or row.get("thumbnailUrl") or row.get("Image")
-            row["hasImages"] = bool(row.get("thumbnailUrl") or row.get("images"))
+                    normalized_images.append(_public_thumb(fid, "w640"))
+                else:
+                    current_app.logger.warning(f"[FAST] Could not extract file ID from {img}")
+
+            thumb_id = _safe_drive_id(str(thumb or row.get("Image") or "").strip())
+            thumb_final = _public_thumb(thumb_id, "w640") if thumb_id else None
+
+            row["imagesLabeled"] = labeled or []
+            row["images"] = normalized_images
+            row["thumbnailUrl"] = thumb_final
+            row["hasImages"] = bool(thumb_final or normalized_images)
+
         except Exception as e:
             current_app.logger.warning(f"[FAST] drive link normalization failed → {e}")
 
