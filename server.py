@@ -159,6 +159,9 @@ def _build_full_scan_payload(order_row: dict) -> dict:
     """
     Creates the exact scan payload format currently returned by /order-summary,
     including normalized images (always [{src, label}]).
+
+    Fast path will now also look at the 'Image' column used in your Production Orders
+    tab (Google Drive link) and build a Drive thumbnail from it.
     """
 
     if not order_row:
@@ -166,7 +169,7 @@ def _build_full_scan_payload(order_row: dict) -> dict:
 
     # ----- Basic fields -----
     oid = str(order_row.get("Order #", "")).strip()
-    
+
     payload = {
         "order": oid,
         "company": order_row.get("Company Name", "") or "",
@@ -178,18 +181,20 @@ def _build_full_scan_payload(order_row: dict) -> dict:
         "quantity": order_row.get("Quantity", "") or "",
         "thumbnailUrl": None,
         "images": [],
-        "imagesLabeled": []
+        "imagesLabeled": [],
     }
 
     # ----- IMAGE RESOLUTION LOGIC -----
-    # (Mirrors Scan long load behavior)
+    # (Mirrors Scan long load behavior as much as possible)
 
     # 1) Try labeled images if already collected in the row
     images_labeled = order_row.get("imagesLabeled", [])
     if isinstance(images_labeled, list) and images_labeled:
         payload["imagesLabeled"] = [
-            {"src": img.get("src") if isinstance(img, dict) else img, 
-             "label": img.get("label", "") if isinstance(img, dict) else ""}
+            {
+                "src": img.get("src") if isinstance(img, dict) else img,
+                "label": img.get("label", "") if isinstance(img, dict) else "",
+            }
             for img in images_labeled
         ]
         payload["images"] = payload["imagesLabeled"].copy()
@@ -218,6 +223,24 @@ def _build_full_scan_payload(order_row: dict) -> dict:
             payload["images"] = [
                 {"src": order_row.get("imageUrl"), "label": ""}
             ]
+
+        else:
+            # 4) NEW: Fallback to 'Image' column (your Drive link in Production Orders)
+            raw = order_row.get("Image") or order_row.get("image")
+            if raw:
+                try:
+                    fid = _extract_drive_id(raw)
+                except NameError:
+                    fid = None
+
+                if fid:
+                    # Use your existing helper to build a public thumbnail URL
+                    thumb = _public_thumb(fid, "w640")
+                    src = thumb or raw
+                else:
+                    src = raw
+
+                payload["images"] = [{"src": src, "label": ""}]
 
     # ----- Thumbnail selection -----
     if payload["images"]:
@@ -1849,26 +1872,105 @@ def _hydrate_images_for_fast(row):
         )
 
 
-@app.route("/api/order_fast")
+@app.route("/api/order_fast", methods=["GET"])
+@login_required_session
 def api_order_fast():
-    order_number = request.args.get("orderNumber", "").strip()
+    """
+    Fast load endpoint for Scan.jsx.
+
+    - Looks up a single order row from the Production Orders sheet
+      (using the same cache as /api/combined).
+    - Hydrates a basic preview image from the Image/Preview/Image URL column.
+    - Normalizes into the same payload shape as /api/order-summary
+      via _build_full_scan_payload().
+    - Caches the normalized payload for 60 seconds in _orders_index["by_id"].
+    """
+    ensure_orders_cache()
+
+    order_number = (request.args.get("orderNumber") or "").strip()
     if not order_number:
         return jsonify({"error": "missing orderNumber"}), 400
 
-    row = _orders_get_by_id_cached(order_number)
-    if not row:
+    now = time.time()
+
+    # --- Return cached fast payload if fresh (<60s) --------------------------
+    global _orders_index
+    if isinstance(_orders_index, dict):
+        cached = _orders_index.get("by_id", {}).get(order_number)
+    else:
+        cached = None
+
+    if isinstance(cached, dict):
+        ts = cached.get("_ts", 0)
+        if now - ts < 60:
+            # Already a normalized fast payload
+            return jsonify({"order": cached, "cached": True}), 200
+
+    # --- Build from sheet row ------------------------------------------------
+    base_row = _orders_get_by_id_cached(order_number)
+    if not base_row:
         return jsonify({"error": "Order not found"}), 404
 
-    # 🔥 Force Google Drive hydration (critical)
-    labeled, raw, thumb = _hydrate_images_for_fast(row)
+    # Work on a copy so we don't mutate the raw orders cache
+    row = dict(base_row)
 
-    payload = dict(row)
-    payload["imagesLabeled"] = labeled
-    payload["images"] = raw
-    payload["thumbnailUrl"] = thumb
-    payload["hasImages"] = bool(labeled or raw or thumb)
+    # --- Hydrate a single preview image from the row -------------------------
+    # Prefer the same columns you use elsewhere: Image / Preview / Image URL.
+    img_raw = (
+        row.get("Image")
+        or row.get("Preview")
+        or row.get("Image URL")
+        or row.get("Image Link")
+        or ""
+    )
 
-    return jsonify({"order": payload, "cached": False}), 200
+    if img_raw:
+        try:
+            # _safe_drive_id is already defined near the /api/order-summary helpers
+            file_id = _safe_drive_id(img_raw)
+            if file_id:
+                # _public_thumb is defined above; this will go through your
+                # /api/drive/thumbnail proxy and respect tinting/versions.
+                thumb = _public_thumb(file_id, "w640")
+
+                # These are what _build_full_scan_payload falls back to
+                row["imageUrl"] = thumb
+                row["thumbnailUrl"] = thumb
+        except Exception as e:
+            current_app.logger.warning(
+                "order_fast: image hydrate failed for %s: %s", order_number, e
+            )
+
+    # --- Normalize to the Scan payload shape ---------------------------------
+    try:
+        full_payload = _build_full_scan_payload(row)
+    except Exception as e:
+        current_app.logger.exception(
+            "order_fast: _build_full_scan_payload failed for %s: %s",
+            order_number,
+            e,
+        )
+        return jsonify({"error": "build failed"}), 500
+
+    if not isinstance(full_payload, dict):
+        return jsonify({"error": "empty payload"}), 500
+
+    # Attach timestamp and cache as the canonical fast payload
+    full_payload["_ts"] = now
+
+    try:
+        if not isinstance(_orders_index, dict):
+            _orders_index = {"by_id": {}, "ts": 0}
+        if "by_id" not in _orders_index or not isinstance(_orders_index["by_id"], dict):
+            _orders_index["by_id"] = {}
+        _orders_index["by_id"][order_number] = full_payload
+    except Exception as e:
+        current_app.logger.warning(
+            "order_fast: failed to cache payload for %s: %s", order_number, e
+        )
+
+    return jsonify({"order": full_payload, "cached": False}), 200
+
 # --- ADD alongside your other routes ---
 @app.route("/api/drive/thumbnail", methods=["GET"])
 def drive_thumbnail():
