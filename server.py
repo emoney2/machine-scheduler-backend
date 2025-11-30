@@ -111,89 +111,85 @@ _orders_index = {"by_id": {}, "ts": 0}
 
 def _get_material_quadrant_images(product_name: str, fur_color: str):
     """
-    Build inside-material image set for the quadrant view.
+    Build inside-material image set for the quadrant view using Google Drive.
 
-    - Searches "G:\\My Drive\\DepartmentMaterialPictures"
+    - Lists files inside DepartmentMaterialPictures folder on Drive
+      (folder ID: 1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu)
     - Finds <ProductName>InsideFoam and <ProductName>Fur
-    - Ignores "Back" in product names
-    - Caches tinted fur images so recolor runs only once
-    - Returns web-accessible URLs via /api/material_image
+    - Ignores the word "Back" in product names
+    - Recolors the fur image to match the fur_color value
     """
-    import os
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
     from PIL import Image
-    from flask import current_app
+    import io
+    import requests
+    import tempfile
 
-    base_dir = r"G:\My Drive\DepartmentMaterialPictures"
     safe_name = (product_name or "").replace("Back", "").strip()
+    folder_id = "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu"
+    service = build("drive", "v3", credentials=_get_google_creds())
 
     foam_img = None
     fur_img = None
 
     try:
-        for f in os.listdir(base_dir):
-            fname = f.lower()
-            if fname.startswith(safe_name.lower() + "insidefoam"):
-                foam_img = os.path.join(base_dir, f)
-            elif fname.startswith(safe_name.lower() + "fur"):
-                fur_img = os.path.join(base_dir, f)
-    except Exception as e:
-        current_app.logger.warning(f"[MATERIAL IMG] Failed listing dir: {e}")
+        query = f"'{folder_id}' in parents and trashed = false"
+        results = (
+            service.files()
+            .list(q=query, fields="files(id, name, mimeType, thumbnailLink, webContentLink)")
+            .execute()
+        )
+        files = results.get("files", [])
+        current_app.logger.info(f"[MATERIAL IMG] Found {len(files)} files in DepartmentMaterialPictures:")
+        for f in files:
+            current_app.logger.info(f"  - {f['name']} ({f['id']})")
 
-    # Color-mapping for tint
-    color_map = {
-        "light grey": "#D3D3D3",
-        "grey": "#A9A9A9",
-        "gray": "#A9A9A9",
-        "white": "#FFFFFF",
-        "navy": "#000080",
-        "navy blue": "#000080",
-        "black": "#000000",
-        "red": "#FF0000",
-        "blue": "#0000FF",
-    }
 
-    def tint_image(img_path, color_hex):
+        for f in files:
+            name = f["name"].lower()
+            if name.startswith(safe_name.lower() + "insidefoam"):
+                foam_img = f"https://drive.google.com/uc?id={f['id']}"
+            elif name.startswith(safe_name.lower() + "fur"):
+                fur_img = f"https://drive.google.com/uc?id={f['id']}"
+
+    except HttpError as e:
+        current_app.logger.warning(f"[MATERIAL IMG] Drive list failed: {e}")
+
+    def tint_image_from_url(img_url, color_hex):
         try:
-            img = Image.open(img_path).convert("RGBA")
+            resp = requests.get(img_url)
+            img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
             gray = img.convert("L")
-            mask = Image.eval(gray, lambda p: 255 if p > 240 else 0)
-
+            mask = gray.point(lambda p: 255 if p > 240 else 0)
             color_img = Image.new("RGBA", img.size, color_hex)
             result = Image.composite(color_img, img, mask)
-            return result
+            temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            result.save(temp.name)
+            return temp.name
         except Exception as e:
-            current_app.logger.warning(f"[MATERIAL IMG] Tint failed: {e}")
-            return None
+            current_app.logger.warning(f"[MATERIAL IMG] tint_image_from_url failed: {e}")
+            return img_url
 
-    # Apply tint and cache it
     if fur_img and fur_color:
+        color_map = {
+            "light grey": "#D3D3D3",
+            "grey": "#A9A9A9",
+            "gray": "#A9A9A9",
+            "white": "#FFFFFF",
+            "navy": "#000080",
+            "navy blue": "#000080",
+            "black": "#000000",
+            "red": "#FF0000",
+            "blue": "#0000FF",
+        }
         hex_color = color_map.get(fur_color.lower(), "#D3D3D3")
-        try:
-            name_part = os.path.splitext(os.path.basename(fur_img))[0]
-            cached_name = f"{name_part}_{fur_color.replace(' ', '_')}.png"
-            cached_path = os.path.join(base_dir, cached_name)
-
-            if not os.path.exists(cached_path):
-                tinted = tint_image(fur_img, hex_color)
-                if tinted:
-                    tinted.save(cached_path)
-
-            fur_img = cached_path
-        except Exception as e:
-            current_app.logger.warning(f"[MATERIAL IMG] Cache save failed: {e}")
-
-    # Convert to API URLs
-    def _to_api_url(local_path):
-        if not local_path:
-            return ""
-        filename = os.path.basename(local_path)
-        return f"https://machine-scheduler-backend.onrender.com/api/material_image?name={filename}"
+        fur_img = tint_image_from_url(fur_img, hex_color)
 
     return {
-        "foam": _to_api_url(foam_img) if foam_img else "",
-        "fur": _to_api_url(fur_img) if fur_img else "",
+        "foam": foam_img,
+        "fur": fur_img,
     }
-
 
 def ensure_orders_cache():
     """
