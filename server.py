@@ -2070,14 +2070,16 @@ def api_order_fast():
     # --- Normalize into full Scan payload -----------------------------------
     try:
         full_payload = _build_full_scan_payload(row)
+        # include normalized quadrants for frontend
+        if row.get("imagesNormalized"):
+            full_payload["imagesNormalized"] = row["imagesNormalized"]
+            full_payload["hasImages"] = True
     except Exception as e:
         current_app.logger.exception(
             f"order_fast: _build_full_scan_payload failed for {order_number}: {e}"
         )
         return jsonify({"error": "build failed"}), 500
 
-    if not isinstance(full_payload, dict):
-        return jsonify({"error": "empty payload"}), 500
 
     # --- Cache + return with timing -----------------------------------------
     duration = round((time.time() - start_time) * 1000, 1)
