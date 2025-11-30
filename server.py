@@ -138,9 +138,9 @@ def _get_material_quadrant_images(product_name: str, fur_color: str):
     Build inside-material image set for the quadrant view.
 
     - Reads from Google Drive folder 'DepartmentMaterialPictures'
-    - Finds closest match for "<Product>InsideFoam" and "<Product>Fur"
-      (ignores "Back", "Full", etc.)
-    - Returns Drive view URLs
+    - Finds <Product>InsideFoam and <Product>Fur
+    - Strips 'Back', 'Full', and 'Front' from the product name
+    - Returns viewable Google Drive URLs
     """
     from googleapiclient.discovery import build
     from google.oauth2.credentials import Credentials
@@ -159,7 +159,7 @@ def _get_material_quadrant_images(product_name: str, fur_color: str):
     files = results.get("files", [])
     current_app.logger.info(f"[MATERIAL IMG] Found {len(files)} files in DepartmentMaterialPictures")
 
-    # Normalize product name
+    # --- Clean up product name before matching ---
     safe_name = (
         product_name.replace("Back", "")
         .replace("Full", "")
@@ -167,18 +167,14 @@ def _get_material_quadrant_images(product_name: str, fur_color: str):
         .strip()
     ).lower()
 
-    # Prepare flexible regex patterns
-    foam_pattern = re.compile(rf"^{safe_name}.*insidefoam", re.IGNORECASE)
-    fur_pattern = re.compile(rf"^{safe_name}.*fur", re.IGNORECASE)
-
     foam_id = None
     fur_id = None
 
     for f in files:
         fname = f["name"].lower()
-        if foam_pattern.search(fname):
+        if fname.startswith(safe_name + "insidefoam"):
             foam_id = f["id"]
-        elif fur_pattern.search(fname):
+        elif fname.startswith(safe_name + "fur"):
             fur_id = f["id"]
 
     foam_img = None
