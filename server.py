@@ -9752,6 +9752,34 @@ def api_material_image_local():
 
     return send_file(file_path)
 
+from googleapiclient.discovery import build
+
+FUR_FOLDER_ID = "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu"
+FUR_CACHE = None  # keep it in memory so we don't re-query every request
+
+@app.route("/api/fur_files", methods=["GET"])
+def api_fur_files():
+    global FUR_CACHE
+
+    # return cached list if already loaded
+    if FUR_CACHE:
+        return jsonify({"ok": True, "files": FUR_CACHE})
+
+    try:
+        creds = get_credentials()  # <-- this uses your existing OAuth logic
+        service = build("drive", "v3", credentials=creds)
+
+        results = service.files().list(
+            q=f"'{FUR_FOLDER_ID}' in parents and trashed = false and mimeType contains 'image'",
+            fields="files(name,id)"
+        ).execute()
+
+        FUR_CACHE = {file["name"]: file["id"] for file in results.get("files", [])}
+        return jsonify({"ok": True, "files": FUR_CACHE})
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
 
 # ─── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
