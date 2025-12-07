@@ -4843,6 +4843,66 @@ def overview_combined():
     resp.headers["Cache-Control"] = f"public, max-age={TTL}"
     return resp
 
+@app.route("/api/upcoming_jobs")
+@login_required_session
+def api_upcoming_jobs():
+    """
+    Returns upcoming and overdue (not complete) jobs directly from Supabase.
+    Clean new version — skips Overview logic.
+    """
+    import traceback
+    try:
+        app.logger.info("🔍 Fetching upcoming jobs directly from Supabase")
+
+        query = """
+        SELECT
+          "Order #",
+          "Company Name",
+          "Design",
+          "Quantity",
+          "Product",
+          "Stage",
+          "Due Date",
+          "Ship Date",
+          "Hard Date/Soft Date"
+        FROM "Production Orders TEST"
+        WHERE
+          (
+            to_date("Due Date", 'YYYY-MM-DD') >= CURRENT_DATE
+            OR ("Stage" IS DISTINCT FROM 'Complete' AND to_date("Due Date", 'YYYY-MM-DD') < CURRENT_DATE)
+          )
+        ORDER BY "Due Date";
+        """
+
+        # 🔧 Run query through Supabase RPC
+        resp = supabase.rpc("exec_sql", {"sql": query}).execute()
+        rows = resp.data or []
+        app.logger.info("📦 Retrieved %d upcoming jobs", len(rows))
+
+        # 🧩 Format output
+        jobs = [
+            {
+                "Order #": r.get("Order #"),
+                "Company Name": r.get("Company Name"),
+                "Design": r.get("Design"),
+                "Qty": r.get("Quantity"),
+                "Product": r.get("Product"),
+                "Stage": r.get("Stage"),
+                "Due": r.get("Due Date"),
+                "Ship": r.get("Ship Date"),
+                "Hard/Soft": r.get("Hard Date/Soft Date"),
+            }
+            for r in rows
+        ]
+
+        return jsonify({"jobs": jobs, "count": len(jobs)})
+
+    except Exception as e:
+        app.logger.error("❌ api_upcoming_jobs failed: %s", e)
+        app.logger.error(traceback.format_exc())
+        return jsonify({"error": str(e), "jobs": []}), 500
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/api/overview/upcoming")
