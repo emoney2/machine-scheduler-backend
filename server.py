@@ -1288,7 +1288,8 @@ def send_cached_json(key, ttl, payload_obj_builder):
                 )
 
         resp.headers["Cache-Control"] = "public, max-age=5, stale-while-revalidate=300"
-        resp.headers["Warning"] = '110 - "stale response
+        resp.headers["Warning"] = '110 - "stale response served while refreshing"'
+
 
 
 
