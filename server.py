@@ -4726,13 +4726,14 @@ def _extract_file_id(s: str) -> str:
 
 # ── OVERVIEW payload builder (NO ROUTES HERE) ───────────────────────────────
 from datetime import date, timedelta
+import json
 
 def build_overview_payload():
     """
-    Returns upcoming job data from Supabase (only jobs with Due Date >= today).
+    Returns upcoming job data from Supabase, includes overdue incomplete jobs.
+    Adds debugging logs to verify Supabase results.
     """
     try:
-        # Supabase query with explicit date filter
         query = """
         SELECT
           "Order #",
@@ -4748,13 +4749,23 @@ def build_overview_payload():
         FROM "Production Orders TEST"
         WHERE
           ("Due Date" >= CURRENT_DATE OR ("Stage" IS DISTINCT FROM 'Complete' AND "Due Date" < CURRENT_DATE))
-        ORDER BY "Due Date"
-
-
+        ORDER BY "Due Date";
         """
 
+        app.logger.info("🔍 [Overview] Running Supabase query:")
+        app.logger.info(query)
+
         resp = supabase.rpc("exec_sql", {"sql": query}).execute()
+        app.logger.info(f"✅ [Overview] Raw Supabase response keys: {list(resp.__dict__.keys())}")
+
         rows = resp.data or []
+        app.logger.info(f"📦 [Overview] Retrieved {len(rows)} rows from Supabase")
+
+        # Log first 3 sample rows for debugging
+        if rows:
+            app.logger.info(f"🧾 [Overview] Sample row: {json.dumps(rows[0], indent=2, default=str)}")
+        else:
+            app.logger.warning("⚠️ [Overview] No rows returned from Supabase query")
 
         upcoming = [
             {
@@ -4772,6 +4783,8 @@ def build_overview_payload():
             for r in rows
         ]
 
+        app.logger.info(f"🧮 [Overview] Processed {len(upcoming)} upcoming jobs")
+
         resp_data = {"upcoming": upcoming, "materials": [], "daysWindow": "7"}
 
         # Cache results
@@ -4781,8 +4794,8 @@ def build_overview_payload():
 
         return resp_data
 
-    except Exception:
-        app.logger.exception("build_overview_payload failed (Supabase API)")
+    except Exception as e:
+        app.logger.exception("💥 build_overview_payload failed (Supabase API)")
         if _overview_cache is not None:
             return _overview_cache
 
@@ -4790,6 +4803,7 @@ def build_overview_payload():
         _overview_cache = fallback
         _overview_ts = time.time()
         return fallback
+
 
 
 
