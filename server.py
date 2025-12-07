@@ -4728,7 +4728,6 @@ def _extract_file_id(s: str) -> str:
 def build_overview_payload():
     """
     Returns: { upcoming: [.], materials: [.], daysWindow: "7" }
-    Pure payload builder. NO Flask response logic.
     """
     try:
         # --- Query Supabase for upcoming jobs ---
@@ -4737,9 +4736,13 @@ def build_overview_payload():
             "Order #",
             "Company Name",
             "Design",
-            "Quantity",
-            "Due Date",
-            "Stage"
+            "Quantity" as "Qty",
+            "Product",
+            "Stage",
+            "Due Date" as "Due",
+            "Print Date" as "Print",
+            "Ship Date" as "Ship",
+            "Hard Date/Soft Date" as "Hard/Soft"
         from "Production Orders TEST"
         where "Stage" != 'Complete'
         order by "Due Date" asc
@@ -4754,17 +4757,21 @@ def build_overview_payload():
                 "Order #": r.get("Order #"),
                 "Company Name": r.get("Company Name"),
                 "Design": r.get("Design"),
-                "Quantity": r.get("Quantity"),
-                "Due Date": r.get("Due Date"),
+                "Qty": r.get("Qty"),
+                "Product": r.get("Product"),
                 "Stage": r.get("Stage"),
+                "Due": r.get("Due"),
+                "Print": r.get("Print"),
+                "Ship": r.get("Ship"),
+                "Hard/Soft": r.get("Hard/Soft"),
             }
             for r in rows
         ]
 
-        # Materials are currently skipped until Supabase migration complete
         materials = []
-
         resp_data = {"upcoming": upcoming, "materials": materials, "daysWindow": "7"}
+
+        # cache results
         global _overview_cache, _overview_ts
         _overview_cache = resp_data
         _overview_ts = time.time()
