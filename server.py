@@ -5016,10 +5016,10 @@ def overview_materials_needed():
 @app.route("/overview/metrics", methods=["GET"])
 @login_required_session
 def overview_metrics():
-    """Pull live performance metrics directly from Supabase."""
+    """Fetch pre-calculated performance metrics from Supabase view."""
     now = time.time()
 
-    # Return cached copy if it's still fresh (2 minutes default)
+    # ✅ Return cached copy if still fresh
     if (
         _OVERVIEW_METRICS_CACHE["data"]
         and now - _OVERVIEW_METRICS_CACHE["ts"] < OVERVIEW_METRICS_TTL
@@ -5027,31 +5027,32 @@ def overview_metrics():
         return jsonify(_OVERVIEW_METRICS_CACHE["data"])
 
     try:
-        # ✅ Query Supabase table for Quantity + Price columns
-        resp = supabase.table("Production Orders TEST").select("Quantity, Price").execute()
-        rows = resp.data or []
+        # ✅ Query the 'metrics' view directly
+        resp = supabase.table("metrics").select("*").execute()
+        data = resp.data or []
+        if not data:
+            return jsonify({"error": "No metrics found"}), 404
+
+        # Use first row of the metrics view
+        metrics_row = data[0]
+
+        # Match your frontend naming
+        metrics = {
+            "headcovers_sold": round(float(metrics_row.get("headcovers_sold_per_day") or 0), 2),
+            "goal": float(metrics_row.get("goal") or 0),
+            "average_price": round(float(metrics_row.get("average_price_per_cover") or 0), 2),
+        }
+
+        # Cache it
+        _OVERVIEW_METRICS_CACHE["data"] = metrics
+        _OVERVIEW_METRICS_CACHE["ts"] = now
+
+        return jsonify(metrics)
+
     except Exception as e:
-        app.logger.exception("Failed to fetch metrics from Supabase")
-        return jsonify({"error": str(e)}), 500
+        app.logger.exception("❌ Failed to fetch metrics from Supabase view")
+        return jsonify({"
 
-    # Calculate totals
-    total_qty = sum(float(r.get("Quantity") or 0) for r in rows)
-    total_revenue = sum(
-        float(r.get("Quantity") or 0) * float(r.get("Price") or 0) for r in rows
-    )
-
-    # Build the metrics object
-    metrics = {
-        "headcovers_sold": round(total_qty / 30, 1) if total_qty else 0,
-        "goal": 75,
-        "average_price": round(total_revenue / total_qty, 2) if total_qty else 0,
-    }
-
-    # Cache results
-    _OVERVIEW_METRICS_CACHE["data"] = metrics
-    _OVERVIEW_METRICS_CACHE["ts"] = now
-
-    return jsonify(metrics)
 
 
 @app.route("/api/fur/complete", methods=["POST", "OPTIONS"])
