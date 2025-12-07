@@ -4725,11 +4725,17 @@ def _extract_file_id(s: str) -> str:
 
 
 # ── OVERVIEW payload builder (NO ROUTES HERE) ───────────────────────────────
+from datetime import date, timedelta
+
 def build_overview_payload():
     """
     Returns upcoming job data from Supabase (no SQL strings).
+    Filters for jobs due within the next 7 days and not complete/cancelled.
     """
     try:
+        today = date.today()
+        seven_days_ahead = today + timedelta(days=7)
+
         # Query Supabase table directly
         resp = (
             supabase.table("Production Orders TEST")
@@ -4738,6 +4744,8 @@ def build_overview_payload():
             )
             .neq("Stage", "Complete")
             .neq("Stage", "Cancelled")
+            .gte("Due Date", today.isoformat())
+            .lte("Due Date", seven_days_ahead.isoformat())
             .order("Due Date", desc=False)
             .limit(50)
             .execute()
@@ -4745,7 +4753,7 @@ def build_overview_payload():
 
         rows = resp.data or []
 
-        # Format the rows for the frontend
+        # Format for frontend
         upcoming = [
             {
                 "Order #": r.get("Order #"),
@@ -4760,7 +4768,7 @@ def build_overview_payload():
                 "Hard/Soft": r.get("Hard Date/Soft Date"),
             }
             for r in rows
-            if r.get("Due Date")  # Skip missing due dates
+            if r.get("Due Date")  # Skip rows with missing due date
         ]
 
         resp_data = {"upcoming": upcoming, "materials": [], "daysWindow": "7"}
