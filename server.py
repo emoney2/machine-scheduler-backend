@@ -1192,41 +1192,49 @@ logout_all_ts = int(os.environ.get("LOGOUT_ALL_TS", "0"))
 # === Tiny TTL cache & ETag helper ============================================
 import hashlib, threading
 _cache_lock = threading.Lock()
-_json_cache = {}  # key -> {'ts': float, 'ttl': int, 'etag': str, 'data': bytes}
+# key -> {'ts': float, 'ttl': int, 'etag': str, 'data': bytes}
+_json_cache = {}
 
 def _cache_get(key):
+    """
+    Return a fresh cache entry or None.
+    Freshness is handled here based on ts + ttl.
+    """
     now = time.time()
     with _cache_lock:
         ent = _json_cache.get(key)
-        if ent and (now - ent['ts'] < ent['ttl']):
-            return ent
-        return None
+        if not ent:
+            return None
+        if (now - ent["ts"]) >= ent["ttl"]:
+            # expired – treat as missing
+            return None
+        return ent
 
 def _cache_set(key, data, ttl=30):
-    global _cache
-    ts = int(time.time())
-
-    try:
-        _cache[key] = {
+    """
+    Store bytes in _json_cache with a TTL and return a safe, quoted ETag.
+    """
+    ts = time.time()
+    etag = f'"{key}-{int(ts)}"'
+    with _cache_lock:
+        _json_cache[key] = {
             "data": data,
-            "exp": ts + ttl,
-            "etag": f"{key}-{ts}"
+            "ts": ts,
+            "ttl": ttl,
+            "etag": etag,
         }
-    except Exception as e:
-        current_app.logger.error(f"cache_set failed: {e}")
-        return None
-
-    # Always return a valid quoted ETag so Werkzeug doesn't reject it
-    return f"\"{key}-{ts}\""
-
+    return etag
 
 def _cache_peek(key):
+    """
+    Return cache entry regardless of TTL (used for 'stale-while-revalidate').
+    """
     with _cache_lock:
         return _json_cache.get(key)
 
 def _maybe_304(etag):
     inm = request.headers.get("If-None-Match", "")
-    return (etag and inm and etag in inm)
+    return bool(etag and inm and etag in inm)
 
 def send_cached_json(key, ttl, payload_obj_builder):
     """
@@ -1234,8 +1242,9 @@ def send_cached_json(key, ttl, payload_obj_builder):
     If cached but stale, return stale immediately and refresh in background.
     Otherwise build payload, cache, and send with ETag.
     """
+    # 1) Try fresh cache
     ent = _cache_get(key)
-    if ent and (now - ent["ts"] < ttl):
+    if ent:
         etag = ent.get("etag")
 
         # If client already has the same ETag → return 304 Not Modified
@@ -1244,28 +1253,20 @@ def send_cached_json(key, ttl, payload_obj_builder):
 
         resp = Response(ent["data"], mimetype="application/json")
 
-        # Safely apply ETag (avoid crashes if malformed)
         if etag:
             try:
                 resp.set_etag(etag)
             except Exception as e:
-                current_app.logger.warning(f"[CHANGES] Skipped invalid cached ETag: {etag} ({e})")
+                current_app.logger.warning(
+                    f"[CACHE] Skipped invalid cached ETag: {etag} ({e})"
+                )
 
         resp.headers["Cache-Control"] = f"public, max-age={ttl}"
         return resp
 
-
-    if ent:
-        # Serve hot cache quickly
-        resp = Response(ent['data'], mimetype="application/json")
-        resp.headers["ETag"] = ent['etag']
-        resp.headers["Cache-Control"] = f"public, max-age={ttl}, stale-while-revalidate=300"
-        return resp
-
-    # If we have a stale cache entry, serve it immediately and refresh in background
+    # 2) Serve stale immediately and refresh in background
     stale = _cache_peek(key)
     if stale:
-        # Kick off a background refresh (Eventlet green thread)
         def _bg_refresh():
             try:
                 payload_obj = payload_obj_builder()
@@ -1273,44 +1274,22 @@ def send_cached_json(key, ttl, payload_obj_builder):
                 _cache_set(key, payload_bytes, ttl)
             except Exception as e:
                 app.logger.warning("Background refresh failed for %s: %s", key, e)
+
         eventlet.spawn_n(_bg_refresh)
 
-        # Serve stale immediately
-        resp = Response(stale['data'], mimetype="application/json")
-        resp.headers["ETag"] = stale['etag']
-        resp.headers["Cache-Control"] = f"public, max-age=5, stale-while-revalidate=300"
-        resp.headers["Warning"] = '110 - "stale response served while refreshing"'
-        return resp
+        resp = Response(stale["data"], mimetype="application/json")
+        etag = stale.get("etag")
+        if etag:
+            try:
+                resp.set_etag(etag)
+            except Exception as e:
+                current_app.logger.warning(
+                    f"[CACHE] Skipped invalid stale ETag: {etag} ({e})"
+                )
 
-    # Build fresh payload (resilient on cold-miss)
-    started = time.time()
-    try:
-        payload_obj = payload_obj_builder()
-        payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
-    except Exception as e:
-        app.logger.warning("Fresh build failed for %s: %s", key, e)
-        stale = _cache_peek(key)
-        if stale:
-            # Serve stale immediately
-            resp = Response(stale['data'], mimetype="application/json")
-            resp.headers["ETag"] = stale['etag']
-            resp.headers["Cache-Control"] = "public, max-age=5, stale-while-revalidate=300"
-            resp.headers["Warning"] = '110 - "stale response served while refreshing"'
-            return resp
-        # Last resort: small empty payload to keep UI up
-        payload_bytes = b"{}"
+        resp.headers["Cache-Control"] = "public, max-age=5, stale-while-revalidate=300"
+        resp.headers["Warning"] = '110 - "stale response
 
-    etag = _cache_set(key, payload_bytes, ttl)
-    resp = Response(payload_bytes, mimetype="application/json")
-    if etag:
-        try:
-            resp.set_etag(etag)
-        except Exception as e:
-            current_app.logger.warning(f"[CHANGES] Skipped invalid generated ETag: {etag} ({e})")
-
-    resp.headers["Cache-Control"] = f"public, max-age={ttl}, stale-while-revalidate=300"
-    resp.headers["X-Debug-BuildMs"] = str(int((time.time()-started)*1000))
-    return resp
 
 
 def login_required_session(f):
@@ -4735,16 +4714,12 @@ def _drive_id_from_link(s: str) -> str:
 
 
 
-# ── OVERVIEW endpoint available at /overview AND /api/overview ──────────────
-@app.route("/overview", methods=["GET"], endpoint="overview_plain")
-@app.route("/api/overview", methods=["GET"], endpoint="overview_api")
-@login_required_session
-def overview_combined():
+# ── OVERVIEW payload builder (NO ROUTES HERE) ───────────────────────────────
+def build_overview_payload():
+
     """
     Returns: { upcoming: [...], materials: [...], daysWindow: "7" }
-    - 15s micro-cache + ETag/304
-    - On error: logs and returns last-good or empty payload (never 500s)
-    Requires: get_sheets_service(), sheet_lock, SPREADSHEET_ID, _json_etag()
+    Pure payload builder. NO Flask response logic.
     """
 
     # ---------- helpers ----------
@@ -4752,14 +4727,11 @@ def overview_combined():
         if not val:
             return None
         s = str(val).strip()
-        # quick bare-id check
         if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
             return s
-        # id=... param
         m = re.search(r"[?&]id=([A-Za-z0-9_-]{10,})", s)
         if m:
             return m.group(1)
-        # /file/d/<id>/...
         m = re.search(r"/(?:file/)?d/([A-Za-z0-9_-]{10,})", s)
         if m:
             return m.group(1)
@@ -4769,33 +4741,11 @@ def overview_combined():
         if not fid:
             return None
         backend_root = request.url_root.rstrip("/")
-        # use your proxy so auth/caching stays consistent
         return f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
-
-    # ---------- 15s micro-cache ----------
-    global _overview_cache, _overview_ts
-    now = time.time()
-    TTL = 30  # seconds, increase cache window
-
-    if _overview_cache is not None and _overview_ts and (now - _overview_ts) < TTL:
-        payload_bytes = json.dumps(_overview_cache, separators=(",", ":")).encode("utf-8")
-        etag = _json_etag(payload_bytes)
-        inm = request.headers.get("If-None-Match", "")
-        if etag and inm and etag in inm:
-            resp = make_response("", 304)
-            resp.headers["ETag"] = etag
-            resp.headers["Cache-Control"] = f"public, max-age={TTL}"
-            return resp
-        resp = Response(payload_bytes, mimetype="application/json")
-        resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = f"public, max-age={TTL}"
-        return resp
-
 
     try:
         svc = get_sheets_service().spreadsheets().values()
 
-        # read Overview ranges
         resp = None
         for attempt in (1, 2):
             try:
@@ -4815,174 +4765,99 @@ def overview_combined():
 
         vrs = resp.get("valueRanges", []) if resp else []
 
-        # ---------- UPCOMING (Overview!A:K) ----------
         TARGET_HEADERS = [
             "Order #", "Preview", "Company Name", "Design", "Quantity",
             "Product", "Stage", "Due Date", "Print", "Ship Date", "Hard Date/Soft Date"
         ]
-        up_vals = (vrs[0].get("values") if len(vrs) > 0 and isinstance(vrs[0].get("values"), list) else []) or []
+        up_vals = (vrs[0].get("values") if len(vrs) > 0 else []) or []
 
-        # drop header if present
         if up_vals:
             first_row = [str(x or "").strip() for x in up_vals[0]]
             if [h.lower() for h in first_row] == [h.lower() for h in TARGET_HEADERS]:
                 up_vals = up_vals[1:]
 
-        # Y column (raw drive links)
-        y_vals = (vrs[3].get("values") if len(vrs) > 3 and isinstance(vrs[3].get("values"), list) else []) or []
+        y_vals = (vrs[3].get("values") if len(vrs) > 3 else []) or []
 
-        upcoming: list[dict] = []
+        upcoming = []
         for i, r in enumerate(up_vals):
             r = (r or []) + [""] * (len(TARGET_HEADERS) - len(r))
             row = dict(zip(TARGET_HEADERS, r))
 
-            # Primary: Overview!Y for the same row index
-            # derive imageUrl from Y; fallback to Preview, then scan row for any Drive link/id
-            link = ""
-            if i < len(y_vals) and y_vals[i]:
-                link = y_vals[i][0] if len(y_vals[i]) else ""
-            fid = _drive_id_from_link(link)
+            link = y_vals[i][0] if i < len(y_vals) and y_vals[i] else ""
+            fid = _extract_file_id(link) or _extract_file_id(row.get("Preview", ""))
 
-            # Fallback 1: try the Preview column in A:K
             if not fid:
-                fid = _drive_id_from_link(row.get("Preview", ""))
-
-            # Fallback 2: scan all visible fields in the row for any Drive link/id
-            if not fid:
-                for _v in row.values():
-                    fid = _drive_id_from_link(_v)
+                for v in row.values():
+                    fid = _extract_file_id(v)
                     if fid:
                         break
 
             if fid:
-                backend_root = request.url_root.rstrip("/")
-                row["imageUrl"] = f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
-                row["thumbnailUrl"] = row["imageUrl"]
+                url = _thumb_url_from_id(fid)
+                row["imageUrl"] = url
+                row["thumbnailUrl"] = url
 
             upcoming.append(row)
 
+        mat_vals = (vrs[1].get("values") if len(vrs) > 1 else []) or []
+        grouped = {}
 
-        # ---------- MATERIALS (Overview!M3:M) ----------
-        mat_vals = (vrs[1].get("values") if len(vrs) > 1 and isinstance(vrs[1].get("values"), list) else []) or []
-        grouped: dict[str, list] = {}
         for mrow in mat_vals:
-            s = str((mrow[0] if mrow else "") or "").strip()
+            s = str(mrow[0] if mrow else "").strip()
             if not s:
                 continue
 
             vendor = "Misc."
-            left = s
             if " - " in s:
-                left, vendor = s.rsplit(" - ", 1)
-                vendor = (vendor or "Misc.").strip() or "Misc."
+                s, vendor = s.rsplit(" - ", 1)
 
-            toks = left.split()
-            name, qty, unit = left, 0, ""
+            toks = s.split()
+            name, qty, unit = s, 0, ""
             if len(toks) >= 3:
                 unit = toks[-1]
-                qty_str = toks[-2]
-                name = " ".join(toks[:-2]).strip()
                 try:
-                    qty = int(round(float(qty_str)))
+                    qty = int(round(float(toks[-2])))
+                    name = " ".join(toks[:-2])
                 except Exception:
-                    qty = 0
+                    pass
 
             typ = "Thread" if unit.lower().startswith("cone") else "Material"
-            if name:
-                grouped.setdefault(vendor, []).append({
-                    "name": name, "qty": qty, "unit": unit, "type": typ
-                })
+            grouped.setdefault(vendor.strip() or "Misc.", []).append(
+                {"name": name, "qty": qty, "unit": unit, "type": typ}
+            )
 
         materials = [{"vendor": v, "items": items} for v, items in grouped.items()]
 
-        days_window = None  # no time filtering on materials/threads
-       
-
-        # ---------- Final fallback: use Production Orders "Image" by Order # ----------
-        missing_orders = [str(j.get("Order #")).strip() for j in upcoming if not j.get("imageUrl") and j.get("Order #")]
-        if missing_orders:
-            try:
-                svc_vals = get_sheets_service().spreadsheets().values()
-                # read header row to find columns
-                po_hdr = svc_vals.get(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range="Production Orders!A1:AE1",
-                    valueRenderOption="UNFORMATTED_VALUE",
-                ).execute().get("values", [[]])[0]
-
-                def _idx(name: str) -> int:
-                    try:
-                        return [h.strip() for h in po_hdr].index(name)
-                    except Exception:
-                        return -1
-
-                i_order = _idx("Order #")
-
-                i_image = -1
-                for _name in ["Image", "Images", "Image Link", "Art", "Art Link", "Design Image", "Preview", "Preview Link"]:
-                    i_image = _idx(_name)
-                    if i_image >= 0:
-                        break
-
-                if i_order >= 0 and i_image >= 0:
-                    po_rows = svc_vals.get(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range="Production Orders!A2:AE",
-                        valueRenderOption="UNFORMATTED_VALUE",
-                    ).execute().get("values", [])
-
-                    image_map: dict[str, str] = {}
-                    for prow in po_rows:
-                        prow = (prow or []) + [""] * (max(i_order, i_image) + 1 - len(prow))
-                        oid = str(prow[i_order]).strip() if len(prow) > i_order else ""
-                        img = prow[i_image] if len(prow) > i_image else ""
-                        fid = _extract_file_id(img)
-                        if oid and fid:
-                            image_map[oid] = _thumb_url_from_id(fid)
-
-                    for j in upcoming:
-                        if not j.get("imageUrl"):
-                            oid = str(j.get("Order #") or "").strip()
-                            url = image_map.get(oid)
-                            if url:
-                                j["imageUrl"] = url
-            except Exception as e:
-                app.logger.warning(f"overview: Production Orders image fallback failed: {e}")
-
-        # ---------- cache + return ----------
         resp_data = {"upcoming": upcoming, "materials": materials}
+        global _overview_cache, _overview_ts
         _overview_cache = resp_data
-        _overview_ts = now
-
-        payload_bytes = json.dumps(resp_data, separators=(",", ":")).encode("utf-8")
-        etag = _json_etag(payload_bytes)
-        resp = Response(payload_bytes, mimetype="application/json")
-        resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "public, max-age=15"
-        return resp
-
-    except Exception:
-        app.logger.exception("overview_combined failed")
-        if _overview_cache is not None:
-            payload_bytes = json.dumps(_overview_cache, separators=(",", ":")).encode("utf-8")
-            etag = _json_etag(payload_bytes)
-            resp = Response(payload_bytes, mimetype="application/json")
-            resp.headers["ETag"] = etag
-            resp.headers["Cache-Control"] = "public, max-age=15"
-            return resp
-        fallback = {"upcoming": [], "materials": [], "daysWindow": "7"}
-
-
-        # --- cache rebuilt payload for reuse ---
-        _overview_cache = payload
         _overview_ts = time.time()
 
-        payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
-        etag = _json_etag(payload_bytes)
-        resp = Response(payload_bytes, mimetype="application/json")
-        resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "public, max-age=15"
-        return resp
+        return resp_data
+
+    except Exception:
+        app.logger.exception("build_overview_payload failed")
+
+        if _overview_cache is not None:
+            return _overview_cache
+
+        fallback = {"upcoming": [], "materials": [], "daysWindow": "7"}
+        _overview_cache = fallback
+        _overview_ts = time.time()
+        return fallback
+
+
+# ── OVERVIEW ROUTE WRAPPER (THIS is the endpoint) ───────────────────────────
+@app.route("/overview", methods=["GET"], endpoint="overview_plain")
+@app.route("/api/overview", methods=["GET"], endpoint="overview_api")
+@login_required_session
+def overview_api_handler():
+    return send_cached_json(
+        key="overview",
+        ttl=15,
+        payload_obj_builder=build_overview_payload
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -9757,28 +9632,22 @@ from googleapiclient.discovery import build
 FUR_FOLDER_ID = "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu"
 FUR_CACHE = None  # keep it in memory so we don't re-query every request
 
-@app.route("/api/fur_files", methods=["GET"])
+@app.route("/api/fur_files")
 def api_fur_files():
-    global FUR_CACHE
-
-    # return cached list if already loaded
-    if FUR_CACHE:
-        return jsonify({"ok": True, "files": FUR_CACHE})
-
     try:
-        creds = get_credentials()  # <-- this uses your existing OAuth logic
-        service = build("drive", "v3", credentials=creds)
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        lookup_path = os.path.join(base_dir, "fur_files.json")
 
-        results = service.files().list(
-            q=f"'{FUR_FOLDER_ID}' in parents and trashed = false and mimeType contains 'image'",
-            fields="files(name,id)"
-        ).execute()
+        if not os.path.exists(lookup_path):
+            return {"error": "fur_files.json missing"}, 404
 
-        FUR_CACHE = {file["name"]: file["id"] for file in results.get("files", [])}
-        return jsonify({"ok": True, "files": FUR_CACHE})
+        with open(lookup_path, "r") as f:
+            data = json.load(f)
+
+        return data
 
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+        return {"error": str(e)}, 500
 
 
 # ─── Run ────────────────────────────────────────────────────────────────────────
