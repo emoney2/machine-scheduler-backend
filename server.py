@@ -5051,7 +5051,7 @@ def overview_metrics():
 
     except Exception as e:
         app.logger.exception("❌ Failed to fetch metrics from Supabase view")
-        return jsonify({"
+        return jsonify({"error": str(e)}), 500
 
 
 
