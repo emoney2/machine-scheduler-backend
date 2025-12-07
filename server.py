@@ -4727,51 +4727,45 @@ def _extract_file_id(s: str) -> str:
 # ── OVERVIEW payload builder (NO ROUTES HERE) ───────────────────────────────
 def build_overview_payload():
     """
-    Returns: { upcoming: [.], materials: [.], daysWindow: "7" }
+    Returns upcoming job data from Supabase (no SQL strings).
     """
     try:
-        # --- Query Supabase for upcoming jobs ---
-        query = """
-        select
-            "Order #",
-            "Company Name",
-            "Design",
-            "Quantity" as "Qty",
-            "Product",
-            "Stage",
-            "Due Date" as "Due",
-            "Print Date" as "Print",
-            "Ship Date" as "Ship",
-            "Hard Date/Soft Date" as "Hard/Soft"
-        from "Production Orders TEST"
-        where "Stage" != 'Complete'
-        order by "Due Date" asc
-        limit 20;
-        """
+        # Query Supabase table directly
+        resp = (
+            supabase.table("Production Orders TEST")
+            .select(
+                'Order #, Company Name, Design, Quantity, Product, Stage, "Due Date", "Print Date", "Ship Date", "Hard Date/Soft Date"'
+            )
+            .neq("Stage", "Complete")
+            .neq("Stage", "Cancelled")
+            .order("Due Date", desc=False)
+            .limit(50)
+            .execute()
+        )
 
-        resp = supabase.rpc("execute_sql", {"query": query}).execute()
         rows = resp.data or []
 
+        # Format the rows for the frontend
         upcoming = [
             {
                 "Order #": r.get("Order #"),
                 "Company Name": r.get("Company Name"),
                 "Design": r.get("Design"),
-                "Qty": r.get("Qty"),
+                "Qty": r.get("Quantity"),
                 "Product": r.get("Product"),
                 "Stage": r.get("Stage"),
-                "Due": r.get("Due"),
-                "Print": r.get("Print"),
-                "Ship": r.get("Ship"),
-                "Hard/Soft": r.get("Hard/Soft"),
+                "Due": r.get("Due Date"),
+                "Print": r.get("Print Date"),
+                "Ship": r.get("Ship Date"),
+                "Hard/Soft": r.get("Hard Date/Soft Date"),
             }
             for r in rows
+            if r.get("Due Date")  # Skip missing due dates
         ]
 
-        materials = []
-        resp_data = {"upcoming": upcoming, "materials": materials, "daysWindow": "7"}
+        resp_data = {"upcoming": upcoming, "materials": [], "daysWindow": "7"}
 
-        # cache results
+        # Cache results
         global _overview_cache, _overview_ts
         _overview_cache = resp_data
         _overview_ts = time.time()
@@ -4779,8 +4773,7 @@ def build_overview_payload():
         return resp_data
 
     except Exception:
-        app.logger.exception("build_overview_payload failed (Supabase)")
-
+        app.logger.exception("build_overview_payload failed (Supabase API)")
         if _overview_cache is not None:
             return _overview_cache
 
