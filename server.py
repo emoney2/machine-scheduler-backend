@@ -4743,7 +4743,6 @@ def build_overview_payload():
           "Product",
           "Stage",
           "Due Date",
-          "Print Date",
           "Ship Date",
           "Hard Date/Soft Date"
         FROM "Production Orders TEST"
@@ -4776,7 +4775,6 @@ def build_overview_payload():
                 "Product": r.get("Product"),
                 "Stage": r.get("Stage"),
                 "Due": r.get("Due Date"),
-                "Print": r.get("Print Date"),
                 "Ship": r.get("Ship Date"),
                 "Hard/Soft": r.get("Hard Date/Soft Date"),
             }
