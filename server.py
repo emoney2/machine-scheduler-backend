@@ -5012,90 +5012,46 @@ def overview_materials_needed():
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
         return jsonify({"error": "materials-needed failed"}), 500
 
-@app.route("/api/overview/metrics", methods=["GET"])
+
+@app.route("/overview/metrics", methods=["GET"])
 @login_required_session
 def overview_metrics():
-    """
-    Reads Overview!V1:X2 for:
-      - Headcovers Sold
-      - Business Days
-      - Goal
-    And Overview!Y2 for:
-      - Average Price per Cover
-    Caches the result for 60 seconds to speed up the UI.
-    """
-    # Serve from cache if fresh
+    """Pull live performance metrics directly from Supabase."""
     now = time.time()
-    if _METRICS_CACHE["payload"] is not None and (now - _METRICS_CACHE["ts"] < _METRICS_TTL_SECONDS):
-        return jsonify(deepcopy(_METRICS_CACHE["payload"]))
+
+    # Return cached copy if it's still fresh (2 minutes default)
+    if (
+        _OVERVIEW_METRICS_CACHE["data"]
+        and now - _OVERVIEW_METRICS_CACHE["ts"] < OVERVIEW_METRICS_TTL
+    ):
+        return jsonify(_OVERVIEW_METRICS_CACHE["data"])
 
     try:
-        rows = fetch_sheet(SPREADSHEET_ID, "Overview!V1:X2") or []
-        headers = rows[0] if len(rows) > 0 else []
-        values  = rows[1] if len(rows) > 1 else []
-
-        def idx(name):
-            try:
-                return [str(h or "").strip().lower() for h in headers].index(str(name).strip().lower())
-            except Exception:
-                return None
-
-        def first_not_none(*vals):
-            for v in vals:
-                if v is not None:
-                    return v
-            return None
-
-        ix_sold = first_not_none(idx("Headcovers Sold"), idx("Headcovers"), idx("Sold"))
-        ix_days = first_not_none(idx("Business Days"), idx("Days"))
-        ix_goal = first_not_none(idx("Goal"), idx("Target"))
-
-        def val_at(ix):
-            if ix is None or ix >= len(values):
-                return None
-            return values[ix]
-
-        headcovers_sold = val_at(ix_sold)
-        # Coerce numeric where useful
-        def to_float(v):
-            try:
-                return float(str(v).replace(",", "").strip())
-            except Exception:
-                return None
-
-        business_days = to_float(val_at(ix_days))
-        goal          = to_float(val_at(ix_goal))
-
-        sold_per_day = None
-        try:
-            if headcovers_sold not in (None, "") and business_days and business_days > 0:
-                sold_per_day = float(headcovers_sold) / float(business_days)
-        except Exception:
-            sold_per_day = None
-
-        # Average Price per Cover from Overview!Y2
-        try:
-            avg_rows = fetch_sheet(SPREADSHEET_ID, "Overview!Y2:Y2") or []
-            average_price = (avg_rows[0][0] if avg_rows and avg_rows[0] else None)
-        except Exception:
-            average_price = None
-
-        payload = {
-            "headcovers_sold": headcovers_sold,
-            "business_days": business_days,
-            "goal": goal,
-            "sold_per_day": sold_per_day,
-            "average_price": average_price,
-        }
-
-        # Update cache
-        _METRICS_CACHE["payload"] = deepcopy(payload)
-        _METRICS_CACHE["ts"] = now
-
-        return jsonify(payload)
+        # ✅ Query Supabase table for Quantity + Price columns
+        resp = supabase.table("Production Orders TEST").select("Quantity, Price").execute()
+        rows = resp.data or []
     except Exception as e:
-        app.logger.exception("overview_metrics failed")
+        app.logger.exception("Failed to fetch metrics from Supabase")
         return jsonify({"error": str(e)}), 500
+
+    # Calculate totals
+    total_qty = sum(float(r.get("Quantity") or 0) for r in rows)
+    total_revenue = sum(
+        float(r.get("Quantity") or 0) * float(r.get("Price") or 0) for r in rows
+    )
+
+    # Build the metrics object
+    metrics = {
+        "headcovers_sold": round(total_qty / 30, 1) if total_qty else 0,
+        "goal": 75,
+        "average_price": round(total_revenue / total_qty, 2) if total_qty else 0,
+    }
+
+    # Cache results
+    _OVERVIEW_METRICS_CACHE["data"] = metrics
+    _OVERVIEW_METRICS_CACHE["ts"] = now
+
+    return jsonify(metrics)
 
 
 @app.route("/api/fur/complete", methods=["POST", "OPTIONS"])
