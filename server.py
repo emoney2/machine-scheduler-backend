@@ -4883,7 +4883,7 @@ def api_upcoming_jobs():
         # 🔧 Run query through Supabase RPC
         app.logger.info("🧠 Running Supabase exec_sql query...")
         resp = supabase.rpc("exec_sql", {"sql": query}).execute()
-        app.logger.info("🧠 Supabase response object: %s", resp)
+        app.logger.info("🧠 Supabase exec_sql response: %s", resp)
 
         rows = getattr(resp, "data", None) or []
         app.logger.info("📦 Retrieved %d rows", len(rows))
@@ -4904,7 +4904,6 @@ def api_upcoming_jobs():
             for r in rows
         ]
 
-        # 🌐 Also log in response so you can see it in the browser Network tab
         return jsonify({
             "debug": {
                 "query": query,
@@ -4919,7 +4918,6 @@ def api_upcoming_jobs():
         app.logger.error("❌ api_upcoming_jobs failed: %s", e)
         app.logger.error(traceback.format_exc())
         return jsonify({"error": str(e), "jobs": []}), 500
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
