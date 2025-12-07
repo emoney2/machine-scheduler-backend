@@ -50,7 +50,15 @@ from requests.exceptions import ConnectionError as ReqConnError, Timeout as ReqT
 import hashlib, json, time
 from flask import request, jsonify, Response, make_response, redirect
 
+from supabase import create_client
+import os
 
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 from flask import g
 import psutil, tracemalloc, gc
@@ -1100,30 +1108,6 @@ def _orders_list_for_changes():
     ).execute()
     rows = resp.get("values", []) or []
     return _rows_to_dicts(rows)
-
-# ---- Orders snapshot cache (REQUIRED FOR OVERVIEW) ----
-_orders_rows_cache = {"ts": 0.0, "ttl": 15.0, "rows": None, "by_id": {}}
-
-def _orders_rows_snapshot():
-    import time
-    now = time.time()
-    c = _orders_rows_cache
-
-    if (now - c["ts"]) > c["ttl"] or not c["rows"]:
-        rows = _orders_list_for_changes()
-        by = {}
-
-        for r in rows:
-            oid = str(r.get("Order #", "")).strip()
-            if oid:
-                by[oid] = r
-
-        c["rows"] = rows
-        c["by_id"] = by
-        c["ts"] = now
-
-    return c["rows"], c["by_id"]
-
 
 # Fields that define a "meaningful change" for the Scheduler
 _HASH_FIELDS = [
@@ -6298,6 +6282,23 @@ def get_combined():
     Returns: { orders: [...], links: {...} }
     Uses 20s micro-cache and ETag/304.
     """
+    import os
+
+    # ✅ LOCAL DEV OVERRIDE — DO NOT TOUCH GOOGLE SHEETS
+    if os.getenv("LOCAL_DEV") == "true":
+        payload_obj = {
+            "mode": "local_dev",
+            "orders": [],
+            "links": {}
+        }
+        payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+        etag = _json_etag(payload_bytes)
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    # 🔽 PRODUCTION / NORMAL PATH (UNCHANGED)
     TTL = 20
 
     def build_payload():
@@ -6330,26 +6331,20 @@ def get_combined():
         fur_full    = rows_to_dicts(fur_rows)
         cut_full    = rows_to_dicts(cut_rows)
 
-        # 🔥 FAST CACHE: build lookup by order number
         try:
             _orders_index["by_id"] = {
-                str(o.get("Order #", "")).strip(): o 
+                str(o.get("Order #", "")).strip(): o
                 for o in (orders_full or [])
                 if isinstance(o, dict) and str(o.get("Order #", "")).strip()
             }
-
-            current_app.logger.info(f"[FAST] Cache loaded with {len(_orders_index['by_id'])} orders")
         except Exception as e:
             current_app.logger.warning(f"[FAST] Failed to build cache: {e}")
 
-
-        # Build lookups by Order #
         fur_map = { str(r.get("Order #", "")).strip(): r
                     for r in fur_full if str(r.get("Order #", "")).strip() }
         cut_map = { str(r.get("Order #", "")).strip(): r
                     for r in cut_full if str(r.get("Order #", "")).strip() }
 
-        # Merge statuses into the Production Orders objects
         for o in orders_full:
             oid = str(o.get("Order #", "")).strip()
             if not oid:
@@ -6357,13 +6352,11 @@ def get_combined():
 
             fr = fur_map.get(oid)
             if fr and "Status" in fr:
-                # keep generic Status (used by Fur tab) and also label it explicitly
                 o["Status"] = fr.get("Status", "")
                 o["Fur Status"] = fr.get("Status", "")
 
             cr = cut_map.get(oid)
             if cr and "Status" in cr:
-                # used by Cut tab filtering
                 o["Cut Status"] = cr.get("Status", "")
 
         return {
@@ -6371,8 +6364,6 @@ def get_combined():
             "links": _links_store if isinstance(_links_store, dict) else {}
         }
 
-
-    # Allow client to force rebuild right after writes
     if request.args.get("refresh") == "1":
         payload_obj   = build_payload()
         payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
@@ -6689,6 +6680,35 @@ def submit_order():
             valueInputOption="USER_ENTERED",
             body={"values": [row]}
         ).execute()
+
+        # ─── SHADOW WRITE TO SUPABASE (NON-BLOCKING) ─────────────────────────
+        if supabase:
+            try:
+                supabase_payload = {
+                    "order_number": new_order,
+                    "created_at": ts,
+                    "company_name": data.get("company"),
+                    "design": data.get("designName"),
+                    "quantity": int(data.get("quantity") or 0),
+                    "product": data.get("product"),
+                    "price": float(data.get("price") or 0),
+                    "due_date": data.get("dueDate"),
+                    "stage": "New",
+                    "materials": materials,
+                    "material_percents": material_percents,
+                    "back_material": data.get("backMaterial"),
+                    "fur_color": data.get("furColor"),
+                    "notes": data.get("notes"),
+                    "drive_folder_id": order_folder_id,
+                    "production_files": prod_links,
+                    "print_files_link": print_links,
+                }
+
+                supabase.table("Production Orders TEST").insert(supabase_payload).execute()
+
+            except Exception as e:
+                logger.error(f"[SUPABASE] Order insert failed for #{new_order}: {e}")
+
 
         # ─── COPY AF2 FORMULA DOWN ─────────────────────────────────────────
         resp = sheets.values().get(
