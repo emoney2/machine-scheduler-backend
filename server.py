@@ -4729,31 +4729,32 @@ from datetime import date, timedelta
 
 def build_overview_payload():
     """
-    Returns upcoming job data from Supabase (no SQL strings).
-    Filters for jobs due within the next 7 days and not complete/cancelled.
+    Returns upcoming job data from Supabase (only jobs with Due Date >= today).
     """
     try:
-        today = date.today()
-        seven_days_ahead = today + timedelta(days=7)
+        # Supabase query with explicit date filter
+        query = """
+        SELECT
+          "Order #",
+          "Company Name",
+          "Design",
+          "Quantity",
+          "Product",
+          "Stage",
+          "Due Date",
+          "Print Date",
+          "Ship Date",
+          "Hard Date/Soft Date"
+        FROM "Production Orders TEST"
+        WHERE
+          to_date("Due Date"::text, 'MM/DD/YYYY') >= CURRENT_DATE
+        ORDER BY to_date("Due Date"::text, 'MM/DD/YYYY')
+        LIMIT 20;
+        """
 
-        # Query Supabase table directly
-        resp = (
-            supabase.table("Production Orders TEST")
-            .select(
-                'Order #, Company Name, Design, Quantity, Product, Stage, "Due Date", "Print Date", "Ship Date", "Hard Date/Soft Date"'
-            )
-            .neq("Stage", "Complete")
-            .neq("Stage", "Cancelled")
-            .gte("Due Date", today.isoformat())
-            .lte("Due Date", seven_days_ahead.isoformat())
-            .order("Due Date", desc=False)
-            .limit(50)
-            .execute()
-        )
-
+        resp = supabase.rpc("exec_sql", {"sql": query}).execute()
         rows = resp.data or []
 
-        # Format for frontend
         upcoming = [
             {
                 "Order #": r.get("Order #"),
@@ -4768,7 +4769,6 @@ def build_overview_payload():
                 "Hard/Soft": r.get("Hard Date/Soft Date"),
             }
             for r in rows
-            if r.get("Due Date")  # Skip rows with missing due date
         ]
 
         resp_data = {"upcoming": upcoming, "materials": [], "daysWindow": "7"}
