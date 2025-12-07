@@ -54,11 +54,15 @@ from supabase import create_client
 import os
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # use service_role key for backend
 
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("✅ Supabase client initialized with service key")
+else:
+    print("❌ Missing Supabase credentials (SUPABASE_URL or SUPABASE_SERVICE_KEY)")
+
 
 from flask import g
 import psutil, tracemalloc, gc
