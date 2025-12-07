@@ -4889,8 +4889,9 @@ def api_upcoming_jobs():
         app.logger.info("📦 Retrieved %d rows", len(rows))
 
         # 🧩 Format output
-        jobs = [
-            {
+        jobs = []
+        for r in rows:
+            jobs.append({
                 "Order #": r.get("Order #"),
                 "Company Name": r.get("Company Name"),
                 "Design": r.get("Design"),
@@ -4899,10 +4900,8 @@ def api_upcoming_jobs():
                 "Stage": r.get("Stage"),
                 "Due": r.get("Due Date"),
                 "Ship": r.get("Ship Date"),
-                "Hard/Soft": r.get("Hard Date/Soft Date"),
-            }
-            for r in rows
-        ]
+                "Hard/Soft": r.get("Hard Date/Soft Date")
+            })
 
         return jsonify({
             "debug": {
