@@ -4763,6 +4763,8 @@ def overview_combined_overview():
 
         app.logger.info("🧾 SQL QUERY:\n%s", query)
         resp = supabase.rpc("exec_sql", {"sql": query}).execute()
+   print("🧠 Supabase exec_sql response:", resp)
+
         app.logger.info("✅ Supabase response keys: %s", list(resp.__dict__.keys()))
 
         rows = resp.data or []
@@ -4852,11 +4854,11 @@ def overview_combined():
 def api_upcoming_jobs():
     """
     Returns upcoming and overdue (not complete) jobs directly from Supabase.
-    Clean new version — skips Overview logic.
+    Adds detailed console + network logging.
     """
     import traceback
     try:
-        app.logger.info("🔍 Fetching upcoming jobs directly from Supabase")
+        app.logger.info("⚡️ /api/upcoming_jobs called from frontend")
 
         query = """
         SELECT
@@ -4879,9 +4881,12 @@ def api_upcoming_jobs():
         """
 
         # 🔧 Run query through Supabase RPC
+        app.logger.info("🧠 Running Supabase exec_sql query...")
         resp = supabase.rpc("exec_sql", {"sql": query}).execute()
-        rows = resp.data or []
-        app.logger.info("📦 Retrieved %d upcoming jobs", len(rows))
+        app.logger.info("🧠 Supabase response object: %s", resp)
+
+        rows = getattr(resp, "data", None) or []
+        app.logger.info("📦 Retrieved %d rows", len(rows))
 
         # 🧩 Format output
         jobs = [
@@ -4899,7 +4904,16 @@ def api_upcoming_jobs():
             for r in rows
         ]
 
-        return jsonify({"jobs": jobs, "count": len(jobs)})
+        # 🌐 Also log in response so you can see it in the browser Network tab
+        return jsonify({
+            "debug": {
+                "query": query,
+                "row_count": len(rows),
+                "raw_response": str(resp)
+            },
+            "jobs": jobs,
+            "count": len(jobs)
+        })
 
     except Exception as e:
         app.logger.error("❌ api_upcoming_jobs failed: %s", e)
