@@ -4729,7 +4729,7 @@ from datetime import date, timedelta
 
 @app.route("/api/overview")
 @login_required_session
-def overview_upcoming():
+def overview_combined_overview():
     """
     Returns upcoming + overdue job data from Supabase, including incomplete jobs.
     """
