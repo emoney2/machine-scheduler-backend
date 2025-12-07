@@ -4726,14 +4726,17 @@ def _extract_file_id(s: str) -> str:
 
 # ── OVERVIEW payload builder (NO ROUTES HERE) ───────────────────────────────
 from datetime import date, timedelta
-import json
 
-def build_overview_payload():
+@app.route("/api/overview")
+@login_required_session
+def overview_upcoming():
     """
-    Returns upcoming job data from Supabase, includes overdue incomplete jobs.
-    Adds debugging logs to verify Supabase results.
+    Returns upcoming + overdue job data from Supabase, including incomplete jobs.
     """
+    import traceback
     try:
+        app.logger.info("🔍 Running build_overview_payload() — fetching jobs from Supabase")
+
         query = """
         SELECT
           "Order #",
@@ -4747,24 +4750,19 @@ def build_overview_payload():
           "Hard Date/Soft Date"
         FROM "Production Orders TEST"
         WHERE
-          ("Due Date" >= CURRENT_DATE OR ("Stage" IS DISTINCT FROM 'Complete' AND "Due Date" < CURRENT_DATE))
+          (
+            to_date("Due Date", 'YYYY-MM-DD') >= CURRENT_DATE
+            OR ("Stage" IS DISTINCT FROM 'Complete' AND to_date("Due Date", 'YYYY-MM-DD') < CURRENT_DATE)
+          )
         ORDER BY "Due Date";
         """
 
-        app.logger.info("🔍 [Overview] Running Supabase query:")
-        app.logger.info(query)
-
+        app.logger.info("🧾 SQL QUERY:\n%s", query)
         resp = supabase.rpc("exec_sql", {"sql": query}).execute()
-        app.logger.info(f"✅ [Overview] Raw Supabase response keys: {list(resp.__dict__.keys())}")
+        app.logger.info("✅ Supabase response keys: %s", list(resp.__dict__.keys()))
 
         rows = resp.data or []
-        app.logger.info(f"📦 [Overview] Retrieved {len(rows)} rows from Supabase")
-
-        # Log first 3 sample rows for debugging
-        if rows:
-            app.logger.info(f"🧾 [Overview] Sample row: {json.dumps(rows[0], indent=2, default=str)}")
-        else:
-            app.logger.warning("⚠️ [Overview] No rows returned from Supabase query")
+        app.logger.info("📦 Retrieved %d rows from Supabase", len(rows))
 
         upcoming = [
             {
@@ -4781,29 +4779,19 @@ def build_overview_payload():
             for r in rows
         ]
 
-        app.logger.info(f"🧮 [Overview] Processed {len(upcoming)} upcoming jobs")
-
         resp_data = {"upcoming": upcoming, "materials": [], "daysWindow": "7"}
 
-        # Cache results
         global _overview_cache, _overview_ts
         _overview_cache = resp_data
         _overview_ts = time.time()
 
-        return resp_data
+        return jsonify(resp_data)
 
     except Exception as e:
-        app.logger.exception("💥 build_overview_payload failed (Supabase API)")
-        if _overview_cache is not None:
-            return _overview_cache
-
+        app.logger.error("❌ build_overview_payload failed: %s", e)
+        app.logger.error(traceback.format_exc())
         fallback = {"upcoming": [], "materials": [], "daysWindow": "7"}
-        _overview_cache = fallback
-        _overview_ts = time.time()
-        return fallback
-
-
-
+        return jsonify(fallback), 500
 
 # ── OVERVIEW ROUTE WRAPPER (THIS is the endpoint) ───────────────────────────
 _overview_cache = None
