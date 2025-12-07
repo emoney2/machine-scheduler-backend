@@ -1289,6 +1289,8 @@ def send_cached_json(key, ttl, payload_obj_builder):
 
         resp.headers["Cache-Control"] = "public, max-age=5, stale-while-revalidate=300"
         resp.headers["Warning"] = '110 - "stale response served while refreshing"'
+        return resp
+
 
 
 
@@ -4496,7 +4498,7 @@ def _safe_drive_id(link_or_id: str) -> str:
     """Accept a Drive link or a raw file ID; return just the file ID or ''."""
     try:
         if "_drive_id_from_link" in globals():
-            fid = _drive_id_from_link(link_or_id)
+            fid = _extract_file_id(link_or_id)
             if fid:
                 return fid
     except Exception:
@@ -4703,7 +4705,7 @@ def logout():
 import traceback
 from googleapiclient.errors import HttpError
 
-def _drive_id_from_link(s: str) -> str:
+def _extract_file_id(s: str) -> str:
     s = str(s or "")
     m = re.search(r'[?&]id=([A-Za-z0-9_-]+)', s)
     if m:
@@ -9506,7 +9508,7 @@ def _fmt_date_mdy(s):
 
 def _safe_drive_id(link_or_id):
     """
-    Prefer your existing _drive_id_from_link(); fall back to regex.
+    Prefer your existing _extract_file_id(); fall back to regex.
     Supports:
       - https://drive.google.com/file/d/<id>/view
       - https://drive.google.com/open?id=<id>
@@ -9515,7 +9517,7 @@ def _safe_drive_id(link_or_id):
     """
     try:
         if "_drive_id_from_link" in globals():
-            fid = _drive_id_from_link(link_or_id)
+            fid = _extract_file_id(link_or_id)
             if fid:
                 return fid
     except Exception:
