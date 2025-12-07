@@ -4747,8 +4747,8 @@ def build_overview_payload():
           "Hard Date/Soft Date"
         FROM "Production Orders TEST"
         WHERE
-          to_date("Due Date"::text, 'MM/DD/YYYY') >= CURRENT_DATE
-        ORDER BY to_date("Due Date"::text, 'MM/DD/YYYY')
+          to_date("Due Date"::text, 'YYYY-MM-DD') >= CURRENT_DATE
+        ORDER BY to_date("Due Date"::text, 'YYYY-MM-DD')
         LIMIT 20;
         """
 
