@@ -4747,9 +4747,9 @@ def build_overview_payload():
           "Hard Date/Soft Date"
         FROM "Production Orders TEST"
         WHERE
-          to_date("Due Date"::text, 'YYYY-MM-DD') >= CURRENT_DATE
-        ORDER BY to_date("Due Date"::text, 'YYYY-MM-DD')
-        LIMIT 20;
+          ("Due Date" >= CURRENT_DATE OR "Stage" != 'Complete')
+        ORDER BY "Due Date"
+
         """
 
         resp = supabase.rpc("exec_sql", {"sql": query}).execute()
