@@ -4726,119 +4726,45 @@ def _extract_file_id(s: str) -> str:
 
 # ── OVERVIEW payload builder (NO ROUTES HERE) ───────────────────────────────
 def build_overview_payload():
-
     """
-    Returns: { upcoming: [...], materials: [...], daysWindow: "7" }
+    Returns: { upcoming: [.], materials: [.], daysWindow: "7" }
     Pure payload builder. NO Flask response logic.
     """
-
-    # ---------- helpers ----------
-    def _extract_file_id(val) -> str | None:
-        if not val:
-            return None
-        s = str(val).strip()
-        if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
-            return s
-        m = re.search(r"[?&]id=([A-Za-z0-9_-]{10,})", s)
-        if m:
-            return m.group(1)
-        m = re.search(r"/(?:file/)?d/([A-Za-z0-9_-]{10,})", s)
-        if m:
-            return m.group(1)
-        return None
-
-    def _thumb_url_from_id(fid: str | None) -> str | None:
-        if not fid:
-            return None
-        backend_root = request.url_root.rstrip("/")
-        return f"{backend_root}/api/drive/proxy/{fid}?sz=w160"
-
     try:
-        svc = get_sheets_service().spreadsheets().values()
+        # --- Query Supabase for upcoming jobs ---
+        query = """
+        select
+            "Order #",
+            "Company Name",
+            "Design",
+            "Quantity",
+            "Due Date",
+            "Stage"
+        from "Production Orders TEST"
+        where "Stage" != 'Complete'
+        order by "Due Date" asc
+        limit 20;
+        """
 
-        resp = None
-        for attempt in (1, 2):
-            try:
-                with sheet_lock:
-                    resp = svc.batchGet(
-                        spreadsheetId=SPREADSHEET_ID,
-                        ranges=["Overview!A3:K", "Overview!M3:M", "Overview!B1", "Overview!Y3:Y"],
-                        valueRenderOption="UNFORMATTED_VALUE",
-                        fields="valueRanges(values)"
-                    ).execute()
-                break
-            except Exception as e:
-                app.logger.warning("Sheets batchGet failed (attempt %d): %s", attempt, e)
-                if attempt == 2:
-                    raise
-                time.sleep(0.6)
+        resp = supabase.rpc("execute_sql", {"query": query}).execute()
+        rows = resp.data or []
 
-        vrs = resp.get("valueRanges", []) if resp else []
-
-        TARGET_HEADERS = [
-            "Order #", "Preview", "Company Name", "Design", "Quantity",
-            "Product", "Stage", "Due Date", "Print", "Ship Date", "Hard Date/Soft Date"
+        upcoming = [
+            {
+                "Order #": r.get("Order #"),
+                "Company Name": r.get("Company Name"),
+                "Design": r.get("Design"),
+                "Quantity": r.get("Quantity"),
+                "Due Date": r.get("Due Date"),
+                "Stage": r.get("Stage"),
+            }
+            for r in rows
         ]
-        up_vals = (vrs[0].get("values") if len(vrs) > 0 else []) or []
 
-        if up_vals:
-            first_row = [str(x or "").strip() for x in up_vals[0]]
-            if [h.lower() for h in first_row] == [h.lower() for h in TARGET_HEADERS]:
-                up_vals = up_vals[1:]
+        # Materials are currently skipped until Supabase migration complete
+        materials = []
 
-        y_vals = (vrs[3].get("values") if len(vrs) > 3 else []) or []
-
-        upcoming = []
-        for i, r in enumerate(up_vals):
-            r = (r or []) + [""] * (len(TARGET_HEADERS) - len(r))
-            row = dict(zip(TARGET_HEADERS, r))
-
-            link = y_vals[i][0] if i < len(y_vals) and y_vals[i] else ""
-            fid = _extract_file_id(link) or _extract_file_id(row.get("Preview", ""))
-
-            if not fid:
-                for v in row.values():
-                    fid = _extract_file_id(v)
-                    if fid:
-                        break
-
-            if fid:
-                url = _thumb_url_from_id(fid)
-                row["imageUrl"] = url
-                row["thumbnailUrl"] = url
-
-            upcoming.append(row)
-
-        mat_vals = (vrs[1].get("values") if len(vrs) > 1 else []) or []
-        grouped = {}
-
-        for mrow in mat_vals:
-            s = str(mrow[0] if mrow else "").strip()
-            if not s:
-                continue
-
-            vendor = "Misc."
-            if " - " in s:
-                s, vendor = s.rsplit(" - ", 1)
-
-            toks = s.split()
-            name, qty, unit = s, 0, ""
-            if len(toks) >= 3:
-                unit = toks[-1]
-                try:
-                    qty = int(round(float(toks[-2])))
-                    name = " ".join(toks[:-2])
-                except Exception:
-                    pass
-
-            typ = "Thread" if unit.lower().startswith("cone") else "Material"
-            grouped.setdefault(vendor.strip() or "Misc.", []).append(
-                {"name": name, "qty": qty, "unit": unit, "type": typ}
-            )
-
-        materials = [{"vendor": v, "items": items} for v, items in grouped.items()]
-
-        resp_data = {"upcoming": upcoming, "materials": materials}
+        resp_data = {"upcoming": upcoming, "materials": materials, "daysWindow": "7"}
         global _overview_cache, _overview_ts
         _overview_cache = resp_data
         _overview_ts = time.time()
@@ -4846,7 +4772,7 @@ def build_overview_payload():
         return resp_data
 
     except Exception:
-        app.logger.exception("build_overview_payload failed")
+        app.logger.exception("build_overview_payload failed (Supabase)")
 
         if _overview_cache is not None:
             return _overview_cache
@@ -4855,6 +4781,7 @@ def build_overview_payload():
         _overview_cache = fallback
         _overview_ts = time.time()
         return fallback
+
 
 
 # ── OVERVIEW ROUTE WRAPPER (THIS is the endpoint) ───────────────────────────
@@ -4909,38 +4836,52 @@ def overview_combined():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-
-
 @app.route("/api/overview/upcoming")
 @login_required_session
 def overview_upcoming():
     debug = request.args.get("debug") == "1"
     try:
-        svc = get_sheets_service().spreadsheets().values()
-        vals = svc.get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Overview!A3:K",
-            valueRenderOption="UNFORMATTED_VALUE"
-        ).execute().get("values", [])
+        # Pull from Supabase instead of Google Sheets
+        query = """
+        select
+            "Order #",
+            "Company Name",
+            "Design",
+            "Quantity",
+            "Due Date",
+            "Stage"
+        from "Production Orders TEST"
+        where "Stage" != 'Complete'
+        order by "Due Date" asc
+        limit 10;
+        """
+        resp = supabase.rpc("execute_sql", {"query": query}).execute()
+        data = resp.data or []
 
-        # optional cache
-        if CACHE_TTL:
-            import time as _t
-            global _overview_upcoming_cache, _overview_upcoming_ts
-            _overview_upcoming_cache[7] = {"jobs": jobs}
-            _overview_upcoming_ts = _t.time()
-            return jsonify(_overview_upcoming_cache[7])
+        jobs = [
+            {
+                "Order #": row.get("Order #"),
+                "Company Name": row.get("Company Name"),
+                "Design": row.get("Design"),
+                "Quantity": row.get("Quantity"),
+                "Due Date": row.get("Due Date"),
+                "Stage": row.get("Stage"),
+            }
+            for row in data
+        ]
 
         if debug:
             return jsonify({"count": len(jobs), "first": jobs[0] if jobs else None})
+
         return jsonify({"jobs": jobs})
 
     except Exception as e:
-        app.logger.exception("overview_upcoming failed")
+        app.logger.exception("overview_upcoming failed (Supabase)")
         if debug:
             import traceback
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
         return jsonify({"error": "overview_upcoming failed"}), 500
+
 
 
 from math import ceil
