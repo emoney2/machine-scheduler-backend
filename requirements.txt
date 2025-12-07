@@ -18,3 +18,4 @@ psutil==5.9.8
 requests
 beautifulsoup4
 lxml
+supabase>=2.5.0
