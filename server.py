@@ -63,7 +63,6 @@ from copy import deepcopy
 _METRICS_CACHE = {"ts": 0.0, "payload": None}
 _METRICS_TTL_SECONDS = 60
 
-
 # ─── Global “logout everyone” timestamp ─────────────────────────────────
 logout_all_ts = 0.0
 from io import BytesIO
@@ -1101,6 +1100,30 @@ def _orders_list_for_changes():
     ).execute()
     rows = resp.get("values", []) or []
     return _rows_to_dicts(rows)
+
+# ---- Orders snapshot cache (REQUIRED FOR OVERVIEW) ----
+_orders_rows_cache = {"ts": 0.0, "ttl": 15.0, "rows": None, "by_id": {}}
+
+def _orders_rows_snapshot():
+    import time
+    now = time.time()
+    c = _orders_rows_cache
+
+    if (now - c["ts"]) > c["ttl"] or not c["rows"]:
+        rows = _orders_list_for_changes()
+        by = {}
+
+        for r in rows:
+            oid = str(r.get("Order #", "")).strip()
+            if oid:
+                by[oid] = r
+
+        c["rows"] = rows
+        c["by_id"] = by
+        c["ts"] = now
+
+    return c["rows"], c["by_id"]
+
 
 # Fields that define a "meaningful change" for the Scheduler
 _HASH_FIELDS = [
@@ -4851,15 +4874,54 @@ def build_overview_payload():
 
 
 # ── OVERVIEW ROUTE WRAPPER (THIS is the endpoint) ───────────────────────────
+_overview_cache = None
+_overview_ts = 0.0
+
 @app.route("/overview", methods=["GET"], endpoint="overview_plain")
 @app.route("/api/overview", methods=["GET"], endpoint="overview_api")
 @login_required_session
-def overview_api_handler():
-    return send_cached_json(
-        key="overview",
-        ttl=15,
-        payload_obj_builder=build_overview_payload
-    )
+def overview_combined():
+    global _overview_cache, _overview_ts
+
+    now = time.time()
+    TTL = 30
+
+    # ✅ Serve cache
+    if _overview_cache and (now - _overview_ts) < TTL:
+        payload_bytes = json.dumps(_overview_cache).encode("utf-8")
+        etag = _json_etag(payload_bytes)
+
+        if request.headers.get("If-None-Match") == etag:
+            return make_response("", 304)
+
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = f"public, max-age={TTL}"
+        return resp
+
+    # ✅ Build fresh
+    try:
+        payload = build_overview_payload()
+        _overview_cache = payload
+        _overview_ts = now
+
+    except Exception as e:
+        app.logger.exception("overview_combined failed")
+
+        # ✅ ALWAYS return valid structure
+        payload = {
+            "upcoming": [],
+            "materials": [],
+            "daysWindow": "7",
+            "error": str(e),
+        }
+
+
+    payload_bytes = json.dumps(payload).encode("utf-8")
+    resp = Response(payload_bytes, mimetype="application/json")
+    resp.headers["ETag"] = _json_etag(payload_bytes)
+    resp.headers["Cache-Control"] = f"public, max-age={TTL}"
+    return resp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6272,9 +6334,10 @@ def get_combined():
         try:
             _orders_index["by_id"] = {
                 str(o.get("Order #", "")).strip(): o 
-                for o in orders_full 
-                if str(o.get("Order #", "")).strip()
+                for o in (orders_full or [])
+                if isinstance(o, dict) and str(o.get("Order #", "")).strip()
             }
+
             current_app.logger.info(f"[FAST] Cache loaded with {len(_orders_index['by_id'])} orders")
         except Exception as e:
             current_app.logger.warning(f"[FAST] Failed to build cache: {e}")
@@ -6303,7 +6366,11 @@ def get_combined():
                 # used by Cut tab filtering
                 o["Cut Status"] = cr.get("Status", "")
 
-        return {"orders": orders_full, "links": _links_store}
+        return {
+            "orders": orders_full,
+            "links": _links_store if isinstance(_links_store, dict) else {}
+        }
+
 
     # Allow client to force rebuild right after writes
     if request.args.get("refresh") == "1":
