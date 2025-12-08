@@ -8192,7 +8192,7 @@ def add_materials():
             try:
                 for r in inv_rows:
                     supabase_payload = {
-                        "Material": r[0],
+                        "Materials": r[0],
                         "Unit": r[3],
                         "Min. Inv.": r[4],
                         "Reorder": r[5],
