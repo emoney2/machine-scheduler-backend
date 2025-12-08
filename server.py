@@ -5611,10 +5611,12 @@ def api_upcoming_jobs():
         WHERE
           LOWER("Stage") <> 'complete'
           AND (
-            "Due Date" < CURRENT_DATE
+            "Due Date" IS NULL
+            OR "Due Date" < CURRENT_DATE
             OR "Due Date" <= CURRENT_DATE + INTERVAL '7 days'
           )
-        ORDER BY "Due Date";
+        ORDER BY
+          "Due Date" NULLS FIRST
         """
         # 🔧 Run query through Supabase RPC
         app.logger.info("🧠 Running Supabase exec_sql query...")
