@@ -7636,12 +7636,23 @@ def submit_order():
                     "print_files_link": print_links,
                 }
 
-                supabase.table("Production Orders TEST").insert(
+                # 🔍 LOG THE EXACT SUPABASE PAYLOAD
+                logger.info(
+                    "[SUPABASE] Payload:\n%s",
+                    json.dumps(supabase_payload, indent=2)
+                )
+
+                # ⬇️ ATTEMPT INSERT
+                resp = supabase.table("Production Orders TEST").insert(
                     supabase_payload
                 ).execute()
 
+                # ✅ LOG SUPABASE RESPONSE
+                logger.info("[SUPABASE] Insert response: %s", resp)
+
             except Exception as e:
                 logger.error(f"[SUPABASE] Order insert failed for #{new_order}: {e}")
+                raise
 
         # ─── COPY AF2 FORMULA DOWN ─────────────────────────────────────────
         resp = (
