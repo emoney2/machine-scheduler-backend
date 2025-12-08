@@ -5558,13 +5558,7 @@ def api_upcoming_jobs():
           "Ship Date",
           "Hard Date/Soft Date"
         FROM "Production Orders TEST"
-        WHERE
-          (
-            to_date("Due Date", 'YYYY-MM-DD') >= CURRENT_DATE
-            OR ("Stage" IS DISTINCT FROM 'Complete'
-               AND to_date("Due Date", 'YYYY-MM-DD') < CURRENT_DATE)
-          )
-        ORDER BY "Due Date";
+        ORDER BY "Due Date" NULLS LAST;
         """
 
         # 🔧 Run query through Supabase RPC
