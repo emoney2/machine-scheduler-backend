@@ -5408,81 +5408,131 @@ def _extract_file_id(s: str) -> str:
 from datetime import date, timedelta
 
 
-@app.route("/api/overview")
-@login_required_session
-def overview_combined_overview():
+def build_overview_payload():
     """
-    Returns upcoming + overdue job data from Supabase, including incomplete jobs.
+    Returns upcoming + overdue job data from Supabase (incomplete + future)
+    AND materials-to-order grouped by vendor from the Overview sheet.
+
+    This returns a plain dict; HTTP + caching is handled by overview_combined().
     """
     import traceback
 
+    # ── 1) Upcoming jobs from Supabase ───────────────────────────────────────
+    app.logger.info("🔍 build_overview_payload() — fetching jobs from Supabase")
+
+    query = """
+    SELECT
+      "Order #",
+      "Company Name",
+      "Design",
+      "Quantity",
+      "Product",
+      "Stage",
+      "Due Date",
+      "Ship Date",
+      "Hard Date/Soft Date"
+    FROM "Production Orders TEST"
+    WHERE
+      (
+        "Due Date" >= CURRENT_DATE
+        OR ("Stage" IS DISTINCT FROM 'Complete' AND "Due Date" < CURRENT_DATE)
+      )
+    ORDER BY "Due Date";
+    """
+
+    app.logger.info("🧾 SQL QUERY:\n%s", query)
+
+    rows = []
     try:
-        app.logger.info(
-            "🔍 Running build_overview_payload() — fetching jobs from Supabase"
+        resp = supabase.rpc("exec_sql", {"sql": query}).execute()
+        app.logger.info("✅ Supabase response keys: %s", list(resp.__dict__.keys()))
+        app.logger.info("🧠 Supabase exec_sql raw data: %r", resp.data)
+
+        # exec_sql returns the JSON array inside resp.data[0] (same as /api/upcoming_jobs)
+        if resp.data:
+            if isinstance(resp.data, list) and len(resp.data) > 0:
+                raw = resp.data[0]
+                if isinstance(raw, str):
+                    rows = json.loads(raw)
+                elif isinstance(raw, dict):
+                    rows = [raw]
+            else:
+                app.logger.warning(
+                    "⚠️ Unexpected Supabase exec_sql return type: %s", type(resp.data)
+                )
+    except Exception as rpc_error:
+        app.logger.exception("⚠️ exec_sql RPC call failed in build_overview_payload")
+        rows = []
+
+    upcoming = [
+        {
+            "Order #": r.get("Order #"),
+            "Company Name": r.get("Company Name"),
+            "Design": r.get("Design"),
+            "Qty": r.get("Quantity"),
+            "Product": r.get("Product"),
+            "Stage": r.get("Stage"),
+            "Due": r.get("Due Date"),
+            "Ship": r.get("Ship Date"),
+            "Hard/Soft": r.get("Hard Date/Soft Date"),
+        }
+        for r in (rows or [])
+    ]
+
+    # ── 2) Materials-to-order grouped by vendor (Overview!M3:M) ──────────────
+    vendor_list = []
+    try:
+        svc = get_sheets_service().spreadsheets().values()
+        resp = svc.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Overview!M3:M",
+            valueRenderOption="FORMATTED_VALUE",
+        ).execute()
+        vals = resp.get("values", [])
+        lines = [str(r[0]).strip() for r in vals if r and str(r[0]).strip()]
+
+        grouped = {}
+        for s in lines:
+            # Split "Item Qty Unit - Vendor"
+            vendor = "Misc."
+            left = s
+            if " - " in s:
+                left, vendor = s.rsplit(" - ", 1)
+                vendor = vendor.strip() or "Misc."
+
+            tokens = left.split()
+            # Expect "... <qty> <unit>" at the end
+            if len(tokens) >= 3:
+                unit = tokens[-1]
+                qty_str = tokens[-2]
+                name = " ".join(tokens[:-2]).strip()
+                try:
+                    qty = int(round(float(qty_str)))
+                except Exception:
+                    qty = 0
+            else:
+                name, qty, unit = left, 0, ""
+
+            if not name:
+                continue
+
+            typ = "Thread" if unit.lower().startswith("cone") else "Material"
+            grouped.setdefault(vendor, []).append(
+                {"name": name, "qty": qty, "unit": unit, "type": typ}
+            )
+
+        vendor_list = [{"vendor": v, "items": items} for v, items in grouped.items()]
+    except Exception:
+        app.logger.exception(
+            "materials-needed section inside build_overview_payload failed"
         )
+        # leave vendor_list empty if it fails
 
-        query = """
-        SELECT
-          "Order #",
-          "Company Name",
-          "Design",
-          "Quantity",
-          "Product",
-          "Stage",
-          "Due Date",
-          "Ship Date",
-          "Hard Date/Soft Date"
-        FROM "Production Orders TEST"
-        WHERE
-          (
-            "Due Date" >= CURRENT_DATE
-            OR ("Stage" IS DISTINCT FROM 'Complete' AND "Due Date" < CURRENT_DATE)
-          )
-        ORDER BY "Due Date";
-        """
-
-        app.logger.info("🧾 SQL QUERY:\n%s", query)
-
-        # Run the raw SQL query via Supabase RPC function (requires exec_sql in DB)
-        try:
-            resp = supabase.rpc("exec_sql", {"sql": query}).execute()
-            print("🧠 Supabase exec_sql response:", resp)
-            app.logger.info("✅ Supabase response keys: %s", list(resp.__dict__.keys()))
-            rows = resp.data or []
-            app.logger.info("📦 Retrieved %d rows from Supabase", len(rows))
-        except Exception as rpc_error:
-            app.logger.error(f"⚠️ exec_sql RPC call failed: {rpc_error}")
-            rows = []
-
-
-        upcoming = [
-            {
-                "Order #": r.get("Order #"),
-                "Company Name": r.get("Company Name"),
-                "Design": r.get("Design"),
-                "Qty": r.get("Quantity"),
-                "Product": r.get("Product"),
-                "Stage": r.get("Stage"),
-                "Due": r.get("Due Date"),
-                "Ship": r.get("Ship Date"),
-                "Hard/Soft": r.get("Hard Date/Soft Date"),
-            }
-            for r in rows
-        ]
-
-        resp_data = {"upcoming": upcoming, "materials": [], "daysWindow": "7"}
-
-        global _overview_cache, _overview_ts
-        _overview_cache = resp_data
-        _overview_ts = time.time()
-
-        return jsonify(resp_data)
-
-    except Exception as e:
-        app.logger.error("❌ build_overview_payload failed: %s", e)
-        app.logger.error(traceback.format_exc())
-        fallback = {"upcoming": [], "materials": [], "daysWindow": "7"}
-        return jsonify(fallback), 500
+    return {
+        "upcoming": upcoming,
+        "materials": vendor_list,
+        "daysWindow": "7",
+    }
 
 
 # ── OVERVIEW ROUTE WRAPPER (THIS is the endpoint) ───────────────────────────
@@ -5517,10 +5567,8 @@ def overview_combined():
         payload = build_overview_payload()
         _overview_cache = payload
         _overview_ts = now
-
     except Exception as e:
         app.logger.exception("overview_combined failed")
-
         # ✅ ALWAYS return valid structure
         payload = {
             "upcoming": [],
