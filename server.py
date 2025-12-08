@@ -7513,16 +7513,21 @@ def write_material_log_for_order(order_number):
         def log(material, usage):
             log_rows.append({
                 "Date": datetime.utcnow().isoformat(),
-                "Order #": order_number,
+
+                # ✅ FORCE BIGINT-COMPATIBLE TYPES
+                "Order #": int(order_number),
                 "Company Name": company,
-                "Quantity": qty,
+                "Quantity": int(float(qty)) if qty not in ("", None) else None,
+
                 "Shape": product,
                 "Material": material,
-                "QTY": round(usage, 4),
+                "QTY": round(float(usage), 4),
+
                 "IN/OUT": "OUT",
                 "O/R": "ORDERED",
                 "Recut": "",
             })
+
 
 
         # ───────────────────────────────────────────────────────────
@@ -7610,6 +7615,7 @@ def write_material_log_for_order(order_number):
         # ───────────────────────────────────────────────────────────
         # 9) Insert rows into Supabase Material Log
         for r in log_rows:
+            logger.info("[MATLOG] Inserting row:\n%s", json.dumps(r, indent=2))
             supabase.table("Material Log").insert(r).execute()
 
         logger.info("[MATLOG] Inserted %s rows for order %s", len(log_rows), order_number)
