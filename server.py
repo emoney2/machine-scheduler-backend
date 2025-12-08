@@ -7526,10 +7526,30 @@ def write_material_log_for_order(order_number):
             })
 
         # ───────────────────────────────────────────────────────────
+        # Debug once per order
+        logger.debug(
+            "[MATLOG] Row length=%s | Header cols=%s",
+            len(row),
+            len(h),
+        )
+
         # 5) Front materials with % logic
         for i in range(5):
-            mat = row[h.get(f"Material{i+1}", -1)] if f"Material{i+1}" in h else ""
-            pct_raw = row[h.get(f"Material{i+1}%", -1)] if f"Material{i+1}%" in h else ""
+            mat = ""
+            pct_raw = ""
+
+            mat_key = f"Material{i+1}"
+            pct_key = f"Material{i+1}%"
+
+            if mat_key in h:
+                idx = h[mat_key]
+                if idx < len(row):
+                    mat = row[idx] or ""
+
+            if pct_key in h:
+                idx = h[pct_key]
+                if idx < len(row):
+                    pct_raw = row[idx] or ""
 
             if not mat:
                 continue
