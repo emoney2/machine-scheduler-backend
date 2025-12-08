@@ -5445,24 +5445,19 @@ def build_overview_payload():
     rows = []
     try:
         resp = supabase.rpc("exec_sql", {"sql": query}).execute()
-        app.logger.info("✅ Supabase response keys: %s", list(resp.__dict__.keys()))
-        app.logger.info("🧠 Supabase exec_sql raw data: %r", resp.data)
 
-        # exec_sql returns the JSON array inside resp.data[0] (same as /api/upcoming_jobs)
         if resp.data:
-            if isinstance(resp.data, list) and len(resp.data) > 0:
-                raw = resp.data[0]
-                if isinstance(raw, str):
-                    rows = json.loads(raw)
-                elif isinstance(raw, dict):
-                    rows = [raw]
-            else:
-                app.logger.warning(
-                    "⚠️ Unexpected Supabase exec_sql return type: %s", type(resp.data)
-                )
-    except Exception as rpc_error:
-        app.logger.exception("⚠️ exec_sql RPC call failed in build_overview_payload")
+            if isinstance(resp.data, list):
+                # ✅ exec_sql returns list[dict] — use it directly
+                if len(resp.data) > 0 and isinstance(resp.data[0], dict):
+                    rows = resp.data
+                # ✅ rare fallback if it ever returns JSON text
+                elif len(resp.data) == 1 and isinstance(resp.data[0], str):
+                    rows = json.loads(resp.data[0])
+    except Exception:
+        app.logger.exception("Failed to parse Supabase exec_sql result")
         rows = []
+
 
     upcoming = [
         {
