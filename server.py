@@ -5435,9 +5435,8 @@ def overview_combined_overview():
         FROM "Production Orders TEST"
         WHERE
           (
-            to_date("Due Date", 'YYYY-MM-DD') >= CURRENT_DATE
-            OR ("Stage" IS DISTINCT FROM 'Complete'
-               AND to_date("Due Date", 'YYYY-MM-DD') < CURRENT_DATE)
+            "Due Date" >= CURRENT_DATE
+            OR ("Stage" IS DISTINCT FROM 'Complete' AND "Due Date" < CURRENT_DATE)
           )
         ORDER BY "Due Date";
         """
