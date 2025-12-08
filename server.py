@@ -5544,11 +5544,11 @@ def overview_combined():
     now = time.time()
     TTL = 30
 
-    # ✅ Serve cache
-   use_cache = request.args.get("nocache") != "1"
+    # allow cache bypass for debugging
+    use_cache = request.args.get("nocache") != "1"
 
-   if use_cache and _overview_cache and (now - _overview_ts) < TTL:
-
+    # Serve cache
+    if use_cache and _overview_cache and (now - _overview_ts) < TTL:
         payload_bytes = json.dumps(_overview_cache).encode("utf-8")
         etag = _json_etag(payload_bytes)
 
@@ -5560,14 +5560,13 @@ def overview_combined():
         resp.headers["Cache-Control"] = f"public, max-age={TTL}"
         return resp
 
-    # ✅ Build fresh
+    # Build fresh
     try:
         payload = build_overview_payload()
         _overview_cache = payload
         _overview_ts = now
     except Exception as e:
         app.logger.exception("overview_combined failed")
-        # ✅ ALWAYS return valid structure
         payload = {
             "upcoming": [],
             "materials": [],
@@ -5580,6 +5579,7 @@ def overview_combined():
     resp.headers["ETag"] = _json_etag(payload_bytes)
     resp.headers["Cache-Control"] = f"public, max-age={TTL}"
     return resp
+
 
 
 @app.route("/api/upcoming_jobs")
