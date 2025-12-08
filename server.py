@@ -8224,6 +8224,8 @@ def add_materials():
 
         invalidate_upcoming_cache()
 
+        return jsonify({"status": "ok"}), 200
+
 
 
 # ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
