@@ -5444,14 +5444,17 @@ def overview_combined_overview():
 
         app.logger.info("🧾 SQL QUERY:\n%s", query)
 
-        # Execute the Supabase SQL RPC function
-        resp = supabase.rpc("exec_sql", {"sql": query}).execute()
-        print("🧠 Supabase exec_sql response:", resp)
+        # Run the raw SQL query via Supabase RPC function (requires exec_sql in DB)
+        try:
+            resp = supabase.rpc("exec_sql", {"sql": query}).execute()
+            print("🧠 Supabase exec_sql response:", resp)
+            app.logger.info("✅ Supabase response keys: %s", list(resp.__dict__.keys()))
+            rows = resp.data or []
+            app.logger.info("📦 Retrieved %d rows from Supabase", len(rows))
+        except Exception as rpc_error:
+            app.logger.error(f"⚠️ exec_sql RPC call failed: {rpc_error}")
+            rows = []
 
-        app.logger.info("✅ Supabase response keys: %s", list(resp.__dict__.keys()))
-
-        rows = resp.data or []
-        app.logger.info("📦 Retrieved %d rows from Supabase", len(rows))
 
         upcoming = [
             {
