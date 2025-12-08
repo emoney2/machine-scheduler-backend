@@ -7625,7 +7625,7 @@ def submit_order():
                     "Product": data.get("product"),
                     "Price": float(data.get("price") or 0),
                     "Due Date": data.get("dueDate"),
-                    "Stage": "New",
+                    "Stage": "ORDERED",
 
                     # Materials
                     "Material1": materials[0] if len(materials) > 0 else "",
@@ -7751,28 +7751,19 @@ def get_directory():
 @login_required_session
 def add_directory_entry():
     """
-    Appends a new row to the Directory sheet.
-    Expects JSON with keys:
-      companyName,
-      contactFirstName,
-      contactLastName,
-      contactEmailAddress,
-      streetAddress1,
-      streetAddress2,
-      city,
-      state,
-      zipCode,
-      phoneNumber
+    Appends a new row to the Directory sheet
+    AND mirrors it into Supabase Directory table.
     """
     try:
         data = request.get_json(force=True)
     except Exception as e:
-        print("❌ Failed to parse JSON:", e)
+        logger.error("❌ Failed to parse JSON: %s", e)
         return jsonify({"error": "Invalid JSON"}), 400
 
-    print("📥 Incoming /api/reorder payload:", data)
+    logger.info("📥 Incoming /api/directory payload: %s", data)
+
     try:
-        # build the row in the same order as your sheet columns A→J
+        # ─── Build row for GOOGLE SHEETS (A→J) ───────────────────
         row = [
             data.get("companyName", ""),
             data.get("contactFirstName", ""),
@@ -7785,6 +7776,8 @@ def add_directory_entry():
             data.get("zipCode", ""),
             data.get("phoneNumber", ""),
         ]
+
+        # ✅ Write to Google Sheets
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Directory!A2:J",
@@ -7792,10 +7785,39 @@ def add_directory_entry():
             insertDataOption="INSERT_ROWS",
             body={"values": [row]},
         ).execute()
+
+        # ─── Mirror into SUPABASE Directory table ────────────────
+        if supabase:
+            supabase_payload = {
+                "Company Name": data.get("companyName"),
+                "Contact First Name": data.get("contactFirstName"),
+                "Contact Last Name": data.get("contactLastName"),
+                "Contact Email Address": data.get("contactEmailAddress"),
+                "Street Address 1": data.get("streetAddress1"),
+                "Street Address 2": data.get("streetAddress2"),
+                "City": data.get("city"),
+                "State": data.get("state"),
+                "Zip Code": data.get("zipCode"),
+                "Phone Number": data.get("phoneNumber"),
+            }
+
+            logger.info(
+                "[SUPABASE] Directory payload:\n%s",
+                json.dumps(supabase_payload, indent=2)
+            )
+
+            resp = supabase.table("Directory").insert(
+                supabase_payload
+            ).execute()
+
+            logger.info("[SUPABASE] Directory insert response: %s", resp)
+
         return jsonify({"status": "ok"}), 200
-    except Exception:
-        logger.exception("Error adding new company")
+
+    except Exception as e:
+        logger.exception("❌ Error adding new company")
         return jsonify({"error": "Failed to add company"}), 500
+
 
 
 @app.route("/api/fur-colors", methods=["GET"])
@@ -8075,9 +8097,38 @@ def add_materials():
             insertDataOption="INSERT_ROWS",
             body={"values": inv_rows},
         ).execute()
+
+        # ─── Mirror into Supabase Material Inventory ───────────────
+        if supabase:
+            try:
+                for r in inv_rows:
+                    supabase_payload = {
+                        "Material": r[0],
+                        "Unit": r[3],
+                        "Min. Inv.": r[4],
+                        "Reorder": r[5],
+                        "Cost": r[6],
+                    }
+
+                    logger.info(
+                        "[SUPABASE] Material Inventory payload:\n%s",
+                        json.dumps(supabase_payload, indent=2),
+                    )
+
+                    resp = supabase.table("Material Inventory").insert(
+                        supabase_payload
+                    ).execute()
+
+                    logger.info(
+                        "[SUPABASE] Material Inventory insert response: %s", resp
+                    )
+
+            except Exception as e:
+                logger.error("[SUPABASE] Material Inventory insert failed: %s", e)
+                raise
+
         invalidate_upcoming_cache()
 
-    return jsonify({"status": "submitted"}), 200
 
 
 # ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
