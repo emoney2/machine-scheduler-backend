@@ -7617,23 +7617,36 @@ def submit_order():
         if supabase:
             try:
                 supabase_payload = {
-                    "order_number": new_order,
-                    "created_at": ts,
-                    "company_name": data.get("company"),
-                    "design": data.get("designName"),
-                    "quantity": int(data.get("quantity") or 0),
-                    "product": data.get("product"),
-                    "price": float(data.get("price") or 0),
-                    "due_date": data.get("dueDate"),
-                    "stage": "New",
-                    "materials": materials,
-                    "material_percents": material_percents,
-                    "back_material": data.get("backMaterial"),
-                    "fur_color": data.get("furColor"),
-                    "notes": data.get("notes"),
-                    "drive_folder_id": order_folder_id,
-                    "production_files": prod_links,
-                    "print_files_link": print_links,
+                    "Order #": new_order,
+                    "Date": ts,
+                    "Company Name": data.get("company"),
+                    "Design": data.get("designName"),
+                    "Quantity": int(data.get("quantity") or 0),
+                    "Product": data.get("product"),
+                    "Price": float(data.get("price") or 0),
+                    "Due Date": data.get("dueDate"),
+                    "Stage": "New",
+
+                    # Materials
+                    "Material1": materials[0] if len(materials) > 0 else "",
+                    "Material2": materials[1] if len(materials) > 1 else "",
+                    "Material3": materials[2] if len(materials) > 2 else "",
+                    "Material4": materials[3] if len(materials) > 3 else "",
+                    "Material5": materials[4] if len(materials) > 4 else "",
+
+                    # Material %
+                    "Material1%": material_percents[0] if len(material_percents) > 0 else "",
+                    "Material2%": material_percents[1] if len(material_percents) > 1 else "",
+                    "Material3%": material_percents[2] if len(material_percents) > 2 else "",
+                    "Material4%": material_percents[3] if len(material_percents) > 3 else "",
+                    "Material5%": material_percents[4] if len(material_percents) > 4 else "",
+
+                    "Back Material": data.get("backMaterial"),
+                    "Fur Color": data.get("furColor"),
+                    "Notes": data.get("notes"),
+
+                    "Image": prod_links[0] if prod_links else "",
+                    "Print Files": print_links,
                 }
 
                 # 🔍 LOG THE EXACT SUPABASE PAYLOAD
@@ -7653,6 +7666,7 @@ def submit_order():
             except Exception as e:
                 logger.error(f"[SUPABASE] Order insert failed for #{new_order}: {e}")
                 raise
+
 
         # ─── COPY AF2 FORMULA DOWN ─────────────────────────────────────────
         resp = (
