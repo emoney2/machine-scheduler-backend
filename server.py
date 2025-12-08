@@ -5611,7 +5611,7 @@ def api_upcoming_jobs():
         WHERE
           (
             "Due Date" >= CURRENT_DATE
-            OR ("Stage" IS DISTINCT FROM 'Complete' AND "Due Date" < CURRENT_DATE)
+            OR (LOWER("Stage") <> 'complete' AND "Due Date" < CURRENT_DATE)
           )
         ORDER BY "Due Date";
         """
