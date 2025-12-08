@@ -5437,7 +5437,7 @@ def build_overview_payload():
         "Due Date" >= CURRENT_DATE
         OR ("Stage" IS DISTINCT FROM 'Complete' AND "Due Date" < CURRENT_DATE)
       )
-    ORDER BY "Due Date";
+    ORDER BY "Due Date"
     """
 
     app.logger.info("🧾 SQL QUERY:\n%s", query)
