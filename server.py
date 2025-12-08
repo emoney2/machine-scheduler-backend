@@ -5572,10 +5572,24 @@ def api_upcoming_jobs():
         # 🔧 Run query through Supabase RPC
         app.logger.info("🧠 Running Supabase exec_sql query...")
         resp = supabase.rpc("exec_sql", {"sql": query}).execute()
-        app.logger.info("🧠 Supabase exec_sql response: %s", resp)
+        print("🧠 Supabase exec_sql response:", resp)
 
-        rows = getattr(resp, "data", None) or []
-        app.logger.info("📦 Retrieved %d rows", len(rows))
+        # The exec_sql RPC returns a JSON array inside resp.data[0]
+        rows = []
+        if resp.data:
+            if isinstance(resp.data, list) and len(resp.data) > 0:
+                raw = resp.data[0]
+                if isinstance(raw, str):
+                    import json
+                    rows = json.loads(raw)
+                elif isinstance(raw, dict):
+                    # If the result is already a dict (JSON parsed)
+                    rows = [raw]
+            else:
+                app.logger.warning("⚠️ Unexpected Supabase exec_sql return type: %s", type(resp.data))
+
+        app.logger.info("📦 Retrieved %d rows from Supabase", len(rows))
+
 
         jobs = [
             {
