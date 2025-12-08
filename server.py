@@ -1,8 +1,10 @@
 import eventlet
 import os, eventlet
+
 os.environ.setdefault("EVENTLET_NO_GREENDNS", "yes")
 eventlet.monkey_patch()
 from eventlet import debug
+
 debug.hub_prevent_multiple_readers(False)
 
 # ─── Imports & Logger Setup ─────────────────────────────────────────────────
@@ -15,7 +17,7 @@ import re
 import requests
 import traceback
 import gspread
-import logging 
+import logging
 import urllib.parse
 import secrets
 import io
@@ -45,7 +47,11 @@ import time
 from zoneinfo import ZoneInfo
 
 import socket
-from requests.exceptions import ConnectionError as ReqConnError, Timeout as ReqTimeout, RequestException
+from requests.exceptions import (
+    ConnectionError as ReqConnError,
+    Timeout as ReqTimeout,
+    RequestException,
+)
 
 import hashlib, json, time
 from flask import request, jsonify, Response, make_response, redirect
@@ -66,6 +72,7 @@ else:
 
 from flask import g
 import psutil, tracemalloc, gc
+
 tracemalloc.start()
 _process = psutil.Process(os.getpid())
 
@@ -87,7 +94,18 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from eventlet.semaphore import Semaphore
-from flask import Flask, jsonify, request, session, redirect, url_for, render_template_string, url_for, send_from_directory, abort
+from flask import (
+    Flask,
+    jsonify,
+    request,
+    session,
+    redirect,
+    url_for,
+    render_template_string,
+    url_for,
+    send_from_directory,
+    abort,
+)
 from flask import make_response
 from flask_cors import CORS
 from flask_cors import CORS, cross_origin
@@ -102,14 +120,21 @@ from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from datetime                      import datetime
+from datetime import datetime
 from requests_oauthlib import OAuth2Session
 from urllib.parse import urlencode
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    Image,
+)
 from reportlab.lib.utils import ImageReader
 from uuid import uuid4
 from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_shipment
@@ -123,6 +148,7 @@ _orders_index = {"by_id": {}, "ts": 0}
 from google.oauth2.credentials import Credentials
 import json
 import os
+
 
 def _get_google_creds():
     """
@@ -163,12 +189,12 @@ def _get_material_quadrant_images(product_name: str, fur_color: str):
     folder_id = "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu"
     query = f"'{folder_id}' in parents and trashed = false"
     results = (
-        service.files()
-        .list(q=query, fields="files(id, name, mimeType)")
-        .execute()
+        service.files().list(q=query, fields="files(id, name, mimeType)").execute()
     )
     files = results.get("files", [])
-    current_app.logger.info(f"[MATERIAL IMG] Found {len(files)} files in DepartmentMaterialPictures")
+    current_app.logger.info(
+        f"[MATERIAL IMG] Found {len(files)} files in DepartmentMaterialPictures"
+    )
 
     # --- Clean up product name before matching ---
     safe_name = (
@@ -219,7 +245,6 @@ def ensure_orders_cache():
         _orders_index = {"by_id": {}, "ts": 0}
 
 
-
 # GLOBAL in-memory cache store
 _cache = {}
 
@@ -228,17 +253,45 @@ BOM_FOLDER_ID = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
 
 # === Kanban config (one-tab model) ============================================
 KANBAN_SHEET_TAB = os.environ.get("KANBAN_SHEET_TAB", "Kanban").strip() or "Kanban"
-KANBAN_PHOTOS_FOLDER_ID = (os.environ.get("KANBAN_PHOTOS_FOLDER_ID") or "").strip() or None
+KANBAN_PHOTOS_FOLDER_ID = (
+    os.environ.get("KANBAN_PHOTOS_FOLDER_ID") or ""
+).strip() or None
 
 # Single-tab headers (exact order for A1 row)
 KANBAN_HEADERS = [
-    "Type", "Kanban ID", "Item Name", "SKU", "Dept", "Category", "Location",
-    "Package Size", "Bin Qty (units)", "Case Multiple", "Reorder Qty (basis)",
-    "Units Basis (units/cases)", "Lead Time (days)", "Order Method (Email/Online)",
-    "Order Email", "Order URL", "Supplier", "Supplier SKU", "Cost (per pkg)",
-    "Substitutes (Y/N)", "Notes", "Photo URL", "Usage Driver",
-    "Usage Coefficient (cases/100 units)", "Event ID", "Event Qty", "Event Status",
-    "Requested By", "Approved By", "Ordered By", "Received By", "PO #", "Timestamp",
+    "Type",
+    "Kanban ID",
+    "Item Name",
+    "SKU",
+    "Dept",
+    "Category",
+    "Location",
+    "Package Size",
+    "Bin Qty (units)",
+    "Case Multiple",
+    "Reorder Qty (basis)",
+    "Units Basis (units/cases)",
+    "Lead Time (days)",
+    "Order Method (Email/Online)",
+    "Order Email",
+    "Order URL",
+    "Supplier",
+    "Supplier SKU",
+    "Cost (per pkg)",
+    "Substitutes (Y/N)",
+    "Notes",
+    "Photo URL",
+    "Usage Driver",
+    "Usage Coefficient (cases/100 units)",
+    "Event ID",
+    "Event Qty",
+    "Event Status",
+    "Requested By",
+    "Approved By",
+    "Ordered By",
+    "Received By",
+    "PO #",
+    "Timestamp",
 ]
 KANBAN_ITEM_TYPE = "ITEM"
 KANBAN_REQUEST_TYPE = "REQUEST"
@@ -246,11 +299,15 @@ KANBAN_ORDERED_TYPE = "ORDERED"
 KANBAN_RECEIVED_TYPE = "RECEIVED"
 
 # Dedupe window for duplicate scan requests
-KANBAN_REQUEST_COOLDOWN_SECS = int(os.environ.get("KANBAN_REQUEST_COOLDOWN_SECS", "7200"))  # 2h
+KANBAN_REQUEST_COOLDOWN_SECS = int(
+    os.environ.get("KANBAN_REQUEST_COOLDOWN_SECS", "7200")
+)  # 2h
 
 
 import re, os
-_DRIVE_NAME_CACHE: dict[tuple[str,str], dict] = {}
+
+_DRIVE_NAME_CACHE: dict[tuple[str, str], dict] = {}
+
 
 def _build_full_scan_payload(order_row: dict) -> dict:
     """
@@ -317,9 +374,7 @@ def _build_full_scan_payload(order_row: dict) -> dict:
 
         # 3) Fallback: single preview URL field
         elif order_row.get("imageUrl"):
-            payload["images"] = [
-                {"src": order_row.get("imageUrl"), "label": ""}
-            ]
+            payload["images"] = [{"src": order_row.get("imageUrl"), "label": ""}]
 
         else:
             # 4) NEW: Fallback to 'Image' column (your Drive link in Production Orders)
@@ -348,7 +403,9 @@ def _build_full_scan_payload(order_row: dict) -> dict:
     return payload
 
 
-def _public_thumb(file_id: str | None, sz: str = "w640", ver: str | None = None) -> str | None:
+def _public_thumb(
+    file_id: str | None, sz: str = "w640", ver: str | None = None
+) -> str | None:
     if not file_id:
         return None
     url = f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
@@ -389,15 +446,31 @@ def _drive_find_first_in_folder_by_name(folder_id: str, name_hint: str):
         return None
 
     # Try exact matches with common extensions first (case variants included)
-    exts = ["", ".pdf", ".PDF", ".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG", ".webp", ".WEBP"]
+    exts = [
+        "",
+        ".pdf",
+        ".PDF",
+        ".png",
+        ".PNG",
+        ".jpg",
+        ".JPG",
+        ".jpeg",
+        ".JPEG",
+        ".webp",
+        ".WEBP",
+    ]
     for ext in exts:
         qname = f"{base}{ext}"
-        safe_qname = qname.replace("'", "\\'")  # precompute to avoid backslashes inside {}
+        safe_qname = qname.replace(
+            "'", "\\'"
+        )  # precompute to avoid backslashes inside {}
         q = f"'{folder_id}' in parents and name = '{safe_qname}' and trashed = false"
         try:
-            resp = svc.files().list(
-                q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=1
-            ).execute()
+            resp = (
+                svc.files()
+                .list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=1)
+                .execute()
+            )
             files = resp.get("files", [])
             if files:
                 _DRIVE_NAME_CACHE[cache_key] = files[0]
@@ -409,11 +482,16 @@ def _drive_find_first_in_folder_by_name(folder_id: str, name_hint: str):
     safe_base = base.replace("'", "\\'")
     q = f"'{folder_id}' in parents and name contains '{safe_base}' and trashed = false"
     try:
-        resp = svc.files().list(
-            q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10
-        ).execute()
+        resp = (
+            svc.files()
+            .list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10)
+            .execute()
+        )
         files = resp.get("files", []) or []
-        def _noext_lower(n): return os.path.splitext(n)[0].lower()
+
+        def _noext_lower(n):
+            return os.path.splitext(n)[0].lower()
+
         for f in files:
             if _noext_lower(f.get("name", "")) == base.lower():
                 _DRIVE_NAME_CACHE[cache_key] = f
@@ -427,20 +505,20 @@ def _drive_find_first_in_folder_by_name(folder_id: str, name_hint: str):
     return None
 
 
-
 # ---- Disk cache for thumbnails ----
 THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_cache")
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
 # --- Tiny in-process cache for Drive thumbnails ---
 _drive_thumb_cache = {}  # key: f"{file_id}:{modified_time}" -> bytes
-_drive_thumb_ttl   = 600  # seconds (10 min)
+_drive_thumb_ttl = 600  # seconds (10 min)
 
-_matlog_cache = None          # {"by_order": {"123": [items...]}, "ts": float}
-_matlog_cache_ttl = 60.0      # seconds
+_matlog_cache = None  # {"by_order": {"123": [items...]}, "ts": float}
+_matlog_cache_ttl = 60.0  # seconds
 
 _last_directory = {"data": [], "ts": 0}
-_last_products  = {"data": [], "ts": 0}
+_last_products = {"data": [], "ts": 0}
+
 
 def _norm_key(s: str) -> str:
     """Normalize header/label for matching (lowercase, trim, unify quotes, collapse spaces)."""
@@ -460,14 +538,16 @@ def _resize_thumbnail_link(link: str, sz: str) -> str:
     Replace that suffix with requested width (e.g., 'w640').
     """
     import re
+
     width = "".join(ch for ch in str(sz) if ch.isdigit()) or "640"
     # replace '=sNNN' or '=wNNN'
     if re.search(r"=(s|w)\d+$", link):
         return re.sub(r"=(s|w)\d+$", f"=w{width}", link)
     return link  # if unexpected form, just return as-is
 
+
 def _thumb_cache_path(file_id: str, size: str, version: str) -> str:
-    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f"{file_id}_{size}_{version or 'nov'}.jpg")
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{file_id}_{size}_{version or 'nov'}.jpg")
     return os.path.join(THUMB_CACHE_DIR, safe)
 
 
@@ -483,16 +563,19 @@ def clamp_iso_to_next_830_et(iso_str: str) -> str:
             dt = dt.replace(tzinfo=ZoneInfo("UTC"))
         et = dt.astimezone(ZoneInfo("America/New_York"))
 
-        after_end   = (et.hour > 16) or (et.hour == 16 and et.minute >= 30)
-        before_start= (et.hour < 8)  or (et.hour == 8  and et.minute < 30)
+        after_end = (et.hour > 16) or (et.hour == 16 and et.minute >= 30)
+        before_start = (et.hour < 8) or (et.hour == 8 and et.minute < 30)
         if after_end or before_start:
             # "following time": always move to *next* work morning
-            et = (et + timedelta(days=1)).replace(hour=8, minute=30, second=0, microsecond=0)
+            et = (et + timedelta(days=1)).replace(
+                hour=8, minute=30, second=0, microsecond=0
+            )
 
-        out = et.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00","Z")
+        out = et.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
         return out
     except Exception:
         return iso_str
+
 
 def _hdr_idx(headers):
     d = {}
@@ -501,12 +584,14 @@ def _hdr_idx(headers):
         d[k] = i
     return d
 
+
 def _find_col(headers, name):
     name = (name or "").strip().lower()
     for i, h in enumerate(headers or []):
         if str(h or "").strip().lower() == name:
             return i
     return None
+
 
 def _get_material_units_lookup():
     """Material Inventory → { MaterialName (exact): Unit (case-sensitive 'Yards'|'Sqft') }."""
@@ -520,13 +605,14 @@ def _get_material_units_lookup():
     u_ix = hi.get("unit")
     out = {}
     for r in rows[1:]:
-        mat = (r[m_ix] if m_ix is not None and m_ix < len(r) else "")
-        unit = (r[u_ix] if u_ix is not None and u_ix < len(r) else "")
+        mat = r[m_ix] if m_ix is not None and m_ix < len(r) else ""
+        unit = r[u_ix] if u_ix is not None and u_ix < len(r) else ""
         mat = str(mat).strip()
         unit = str(unit).strip()
         if mat:
             out[mat] = unit  # keep exact case: "Yards" or "Sqft"
     return out
+
 
 def _get_ppy_lookup():
     """Table sheet → { product.lower(): PPY } matching your Apps Script (column A product, col 6 PPY)."""
@@ -555,7 +641,10 @@ def _get_ppy_lookup():
             pass
     return out
 
-def _compute_usage_units(material_name, unit_str, product, width_in, length_in, qty, ppy_lookup):
+
+def _compute_usage_units(
+    material_name, unit_str, product, width_in, length_in, qty, ppy_lookup
+):
     """
     Mirrors your Apps Script rules (36×54 for a yard → 13.5 sqft/yd), using existing 54" width.
 
@@ -594,22 +683,29 @@ def _compute_usage_units(material_name, unit_str, product, width_in, length_in, 
     # Unknown unit (blocked upstream)
     return 0.0
 
+
 def get_vendor_directory():
     """Reads Vendors!A1:E → { vendor_name: {method,email,cc,website} }"""
     svc = get_sheets_service().spreadsheets().values()
-    vals = svc.get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Vendors!A1:E",
-        valueRenderOption="FORMATTED_VALUE"
-    ).execute().get("values", [])
+    vals = (
+        svc.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Vendors!A1:E",
+            valueRenderOption="FORMATTED_VALUE",
+        )
+        .execute()
+        .get("values", [])
+    )
     if not vals:
         return {}
     hdr = _hdr_idx(vals[0])
     out = {}
     for r in vals[1:]:
+
         def gv(key):
             i = hdr.get(key, None)
             return (r[i] if i is not None and i < len(r) else "").strip()
+
         vname = gv("vendor")
         if not vname:
             continue
@@ -620,6 +716,7 @@ def get_vendor_directory():
             "website": gv("website"),
         }
     return out
+
 
 # put this near your other helpers
 def _iso_to_eastern_display(iso_str: str) -> str:
@@ -642,11 +739,14 @@ def _iso_to_eastern_display(iso_str: str) -> str:
 
 
 # Cache the Drive thumbnail URL + version for 10 minutes to avoid refetching metadata every image
-THUMB_META_CACHE = {}  # key: (file_id, size) -> {"thumb": str, "etag": str, "ts": float}
-THUMB_META_TTL = 600   # seconds
+THUMB_META_CACHE = (
+    {}
+)  # key: (file_id, size) -> {"thumb": str, "etag": str, "ts": float}
+THUMB_META_TTL = 600  # seconds
 
 THUMB_META_MAX_ENTRIES = 2000
 _THUMB_META_INSERTS = 0
+
 
 def _get_thumb_meta(file_id: str, size: str, headers: dict):
     """Return {'thumb': url, 'etag': str} using a short-lived cache."""
@@ -709,16 +809,17 @@ BOX_TYPES = [
     {"size": "20x20x20", "dims": (20, 20, 20)},
 ]
 
+
 def can_fit(product_dims, box_dims):
     p = sorted(product_dims)
     b = sorted(box_dims)
     return all(pi <= bi for pi, bi in zip(p, b))
 
+
 def choose_box_for_item(length, width, height, volume):
     # 1) Filter out boxes that are too small in any orientation
     eligible = [
-        box for box in BOX_TYPES
-        if can_fit((length, width, height), box["dims"])
+        box for box in BOX_TYPES if can_fit((length, width, height), box["dims"])
     ]
     # 2) Sort by smallest volume
     eligible.sort(key=lambda b: b["dims"][0] * b["dims"][1] * b["dims"][2])
@@ -729,6 +830,7 @@ def choose_box_for_item(length, width, height, volume):
             return box["size"]
     # Fallback to largest box
     return BOX_TYPES[-1]["size"]
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
@@ -749,6 +851,7 @@ GOOGLE_TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from google.auth.transport.requests import Request as GoogleRequest
 
+
 def get_google_credentials():
     """
     Returns OAuthCredentials using:
@@ -759,7 +862,9 @@ def get_google_credentials():
     # Prefer the same loader your Drive code uses
     creds = _load_google_creds()
     if not creds:
-        raise RuntimeError("No Google OAuth credentials found. Set GOOGLE_TOKEN_JSON or provide token.json")
+        raise RuntimeError(
+            "No Google OAuth credentials found. Set GOOGLE_TOKEN_JSON or provide token.json"
+        )
 
     # If token is expired but refresh_token exists, google-auth refreshes on first request;
     # we can optionally preemptively refresh:
@@ -772,9 +877,11 @@ def get_google_credentials():
 
     return creds
 
+
 # ✅ Back-compat alias: some endpoints still call the old name
 def get_google_creds():
     return get_google_credentials()
+
 
 # -----------------------------------------------------------------------------
 
@@ -816,8 +923,8 @@ def _bootstrap_token_from_env():
         print("⚠️ Failed to write token.json from env:", e)
         return False
 
-_bootstrap_token_from_env()
 
+_bootstrap_token_from_env()
 
 
 def _ensure_token_json():
@@ -834,17 +941,19 @@ def _ensure_token_json():
     except Exception:
         return False
 
+
 START_TIME_COL_INDEX = 27
 
 from google.oauth2.credentials import Credentials as OAuthCredentials
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/spreadsheets"
+    "https://www.googleapis.com/auth/spreadsheets",
 ]
 
 QBO_SCOPE = ["com.intuit.quickbooks.accounting"]
 QBO_AUTH_BASE_URL = "https://appcenter.intuit.com/connect/oauth2"
+
 
 def get_oauth_credentials():
     # Uses the env-aware loader you added earlier, which checks:
@@ -852,16 +961,22 @@ def get_oauth_credentials():
     creds = _load_google_creds()
     if creds:
         return creds
-    raise Exception("🔑 Google Drive credentials not available. Set GOOGLE_TOKEN_JSON or provide token.json.")
+    raise Exception(
+        "🔑 Google Drive credentials not available. Set GOOGLE_TOKEN_JSON or provide token.json."
+    )
+
 
 import httplib2
 from googleapiclient.discovery import build
 
+
 def get_sheets_service():
     from googleapiclient.discovery import build
+
     creds = get_google_credentials()
     # Pass credentials directly; no httplib2/authorize dance needed
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
 
 # === Kanban helpers ============================================================
 # ---- Kanban URL scrape helpers ----
@@ -878,11 +993,13 @@ def _kanban_safe_url(url: str) -> str:
         return ""
     return url
 
+
 def _kanban_http_get(url: str, timeout=10):
     headers = {
         "User-Agent": "JRCO-Kanban-Scraper/1.0 (+https://machineschedule.netlify.app)"
     }
     return requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+
 
 def _kanban_scrape_url(url: str):
     """
@@ -943,6 +1060,7 @@ def _kanban_scrape_url(url: str):
     if not price:
         # look in text for $X or $X.XX (take first reasonable)
         import re
+
         text = soup.get_text(" ", strip=True)
         m = re.search(r"\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?", text)
         if m:
@@ -960,17 +1078,20 @@ def _kanban_scrape_url(url: str):
 def _kanban_values_api():
     return get_sheets_service().spreadsheets().values()
 
+
 def _kanban_read_all():
     v = _kanban_values_api()
     resp = v.get(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{KANBAN_SHEET_TAB}!A1:ZZ",
-        valueRenderOption="UNFORMATTED_VALUE"
+        valueRenderOption="UNFORMATTED_VALUE",
     ).execute()
     return resp.get("values", []) or []
 
+
 def _kanban_headers_index(headers):
     return {str(h).strip(): i for i, h in enumerate(headers or [])}
+
 
 def _kanban_find_item_row(rows, kanban_id):
     """Return (row_index, row_dict) for ITEM with Kanban ID; headers row is rows[0]."""
@@ -981,16 +1102,20 @@ def _kanban_find_item_row(rows, kanban_id):
     id_ix = hix.get("Kanban ID")
     type_ix = hix.get("Type")
     for ridx, r in enumerate(rows[1:], start=2):  # 1-based + header
-        if not r: 
+        if not r:
             continue
-        t = (r[type_ix] if type_ix is not None and type_ix < len(r) else "")
-        kid = (r[id_ix] if id_ix is not None and id_ix < len(r) else "")
-        if str(t).strip().upper() == KANBAN_ITEM_TYPE and str(kid).strip() == str(kanban_id).strip():
+        t = r[type_ix] if type_ix is not None and type_ix < len(r) else ""
+        kid = r[id_ix] if id_ix is not None and id_ix < len(r) else ""
+        if (
+            str(t).strip().upper() == KANBAN_ITEM_TYPE
+            and str(kid).strip() == str(kanban_id).strip()
+        ):
             # pad to headers width
             if len(r) < len(hdr):
                 r = r + [""] * (len(hdr) - len(r))
             return ridx, dict(zip(hdr, r))
     return None, None
+
 
 def _kanban_upsert_item(item_obj):
     """
@@ -1006,7 +1131,7 @@ def _kanban_upsert_item(item_obj):
             spreadsheetId=SPREADSHEET_ID,
             range=f"{KANBAN_SHEET_TAB}!A1",
             valueInputOption="RAW",
-            body={"values": [KANBAN_HEADERS]}
+            body={"values": [KANBAN_HEADERS]},
         ).execute()
         headers = KANBAN_HEADERS
         rows = [headers]
@@ -1032,7 +1157,7 @@ def _kanban_upsert_item(item_obj):
             spreadsheetId=SPREADSHEET_ID,
             range=f"{KANBAN_SHEET_TAB}!A{row_index}",
             valueInputOption="USER_ENTERED",
-            body={"values": [out]}
+            body={"values": [out]},
         ).execute()
         return {"updated": True, "row": row_index}
     else:
@@ -1042,9 +1167,10 @@ def _kanban_upsert_item(item_obj):
             range=f"{KANBAN_SHEET_TAB}!A2",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": [out]}
+            body={"values": [out]},
         ).execute()
         return {"updated": False, "row": None}
+
 
 def _drive_upload_image_jpeg(file_stream, filename, folder_id=None):
     """Upload image/jpeg to Drive; returns (fileId, publicish URL via your thumbnail proxy)."""
@@ -1054,27 +1180,39 @@ def _drive_upload_image_jpeg(file_stream, filename, folder_id=None):
     svc = get_drive_service()
     file_metadata = {"name": filename, "parents": [folder_id]}
     media = MediaIoBaseUpload(file_stream, mimetype="image/jpeg", resumable=False)
-    created = svc.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    created = (
+        svc.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    )
     fid = created.get("id")
     # Use your fast thumbnail proxy (already in server): /api/drive/thumbnail
     photo_url = f"/api/drive/thumbnail?fileId={fid}&sz=w640"
     return fid, photo_url
 
+
 def _now_iso_utc():
-    return datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).isoformat().replace("+00:00","Z")
+    return (
+        datetime.utcnow()
+        .replace(tzinfo=ZoneInfo("UTC"))
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
 
 def _within_seconds(iso_ts, seconds):
     try:
-        t = datetime.fromisoformat(iso_ts.replace("Z","+00:00"))
+        t = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
         if t.tzinfo is None:
             t = t.replace(tzinfo=ZoneInfo("UTC"))
-        return (datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")) - t).total_seconds() <= seconds
+        return (
+            datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")) - t
+        ).total_seconds() <= seconds
     except Exception:
         return False
 
 
 def get_drive_service():
     import time as _t
+
     global _drive_service, _service_ts
     if _drive_service and (_t.time() - _service_ts) < SERVICE_TTL:
         return _drive_service
@@ -1083,7 +1221,9 @@ def get_drive_service():
     _service_ts = _t.time()
     return _drive_service
 
+
 # === Delta hashing helpers (place near other helpers) ===
+
 
 def _rows_to_dicts(rows):
     """Convert a Sheets A1 range into a list of dicts using row 1 as headers."""
@@ -1097,6 +1237,7 @@ def _rows_to_dicts(rows):
             r += [""] * (len(headers) - len(r))
         out.append(dict(zip(headers, r)))
     return out
+
 
 def _orders_list_for_changes():
     """
@@ -1113,24 +1254,37 @@ def _orders_list_for_changes():
     rows = resp.get("values", []) or []
     return _rows_to_dicts(rows)
 
+
 # Fields that define a "meaningful change" for the Scheduler
 _HASH_FIELDS = [
-    "Order #", "Company Name", "Design", "Quantity", "Product",
-    "Stage", "Due Date", "Hard Date/Soft Date",
-    "Embroidery Start Time", "Stitch Count", "Threads",
+    "Order #",
+    "Company Name",
+    "Design",
+    "Quantity",
+    "Product",
+    "Stage",
+    "Due Date",
+    "Hard Date/Soft Date",
+    "Embroidery Start Time",
+    "Stitch Count",
+    "Threads",
 ]
+
 
 def _order_hash(obj: dict) -> str:
     """Stable SHA1 over selected fields (missing keys treated as empty)."""
     payload = {k: str(obj.get(k, "")) for k in _HASH_FIELDS}
     s = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     import hashlib  # local import ok; hashlib is already imported elsewhere too
+
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
 
 # ------------------------------------------------------------------------------
 # Cached snapshot of Production Orders (rows + by_id) with short TTL
 # ------------------------------------------------------------------------------
 _orders_rows_cache = {"ts": 0.0, "ttl": 15.0, "rows": None, "by_id": {}}
+
 
 def _orders_rows_snapshot():
     """
@@ -1154,14 +1308,13 @@ def _orders_rows_snapshot():
         c["ts"] = now
     return c["rows"], c["by_id"]
 
+
 def _orders_get_by_id_cached(order_number: str):
     """
     O(1) lookup from the cached snapshot.
     """
     _, by = _orders_rows_snapshot()
     return by.get(order_number)
-
-
 
 
 # ─── Load .env & Logger ─────────────────────────────────────────────────────
@@ -1185,26 +1338,34 @@ app = Flask(__name__)
 # Optional GZIP compression (safe if package missing)
 try:
     from flask_compress import Compress
+
     Compress(app)
 except Exception:
     # gzip not available; continue without it
     pass
 
-CORS(app, resources={r"/*": {"origins": [
-    "https://machineschedule.netlify.app",
-    "http://localhost:3000"
-]}}, supports_credentials=True, expose_headers=["ETag", "Content-Type"])
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": ["https://machineschedule.netlify.app", "http://localhost:3000"]
+        }
+    },
+    supports_credentials=True,
+    expose_headers=["ETag", "Content-Type"],
+)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 
 logout_all_ts = int(os.environ.get("LOGOUT_ALL_TS", "0"))
 
 
-
 # === Tiny TTL cache & ETag helper ============================================
 import hashlib, threading
+
 _cache_lock = threading.Lock()
 # key -> {'ts': float, 'ttl': int, 'etag': str, 'data': bytes}
 _json_cache = {}
+
 
 def _cache_get(key):
     """
@@ -1221,6 +1382,7 @@ def _cache_get(key):
             return None
         return ent
 
+
 def _cache_set(key, data, ttl=30):
     """
     Store bytes in _json_cache with a TTL and return a safe, quoted ETag.
@@ -1236,6 +1398,7 @@ def _cache_set(key, data, ttl=30):
         }
     return etag
 
+
 def _cache_peek(key):
     """
     Return cache entry regardless of TTL (used for 'stale-while-revalidate').
@@ -1243,9 +1406,11 @@ def _cache_peek(key):
     with _cache_lock:
         return _json_cache.get(key)
 
+
 def _maybe_304(etag):
     inm = request.headers.get("If-None-Match", "")
     return bool(etag and inm and etag in inm)
+
 
 def send_cached_json(key, ttl, payload_obj_builder):
     """
@@ -1278,10 +1443,13 @@ def send_cached_json(key, ttl, payload_obj_builder):
     # 2) Serve stale immediately and refresh in background
     stale = _cache_peek(key)
     if stale:
+
         def _bg_refresh():
             try:
                 payload_obj = payload_obj_builder()
-                payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+                payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode(
+                    "utf-8"
+                )
                 _cache_set(key, payload_bytes, ttl)
             except Exception as e:
                 app.logger.warning("Background refresh failed for %s: %s", key, e)
@@ -1303,34 +1471,45 @@ def send_cached_json(key, ttl, payload_obj_builder):
         return resp
 
 
-
-
-
 def login_required_session(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         # 1) OPTIONS are always allowed (CORS preflight)
         if request.method == "OPTIONS":
-                    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-                    # Env-driven allow-list + safe defaults
-                    allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
-                    allowed = {o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()}
-                    allowed.update({
-                        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-                        "https://machineschedule.netlify.app",
-                        "http://localhost:3000",
-                        "http://127.0.0.1:3000",
-                        "http://localhost:5173",
-                        "http://127.0.0.1:5173",
-                    })
+            origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+            # Env-driven allow-list + safe defaults
+            allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
+            allowed = {
+                o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()
+            }
+            allowed.update(
+                {
+                    (
+                        os.environ.get(
+                            "FRONTEND_URL", "https://machineschedule.netlify.app"
+                        )
+                        .strip()
+                        .rstrip("/")
+                    ),
+                    "https://machineschedule.netlify.app",
+                    "http://localhost:3000",
+                    "http://127.0.0.1:3000",
+                    "http://localhost:5173",
+                    "http://127.0.0.1:5173",
+                }
+            )
 
-                    response = make_response("", 204)
-                    if origin in allowed:
-                        response.headers["Access-Control-Allow-Origin"] = origin
-                        response.headers["Access-Control-Allow-Credentials"] = "true"
-                        response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-                        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,OPTIONS"
-                    return response
+            response = make_response("", 204)
+            if origin in allowed:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+                response.headers["Access-Control-Allow-Headers"] = (
+                    "Content-Type,Authorization"
+                )
+                response.headers["Access-Control-Allow-Methods"] = (
+                    "GET,POST,PUT,PATCH,OPTIONS"
+                )
+            return response
 
         # 2) Must be logged in at all
         if not session.get("user"):
@@ -1339,9 +1518,14 @@ def login_required_session(f):
             return redirect(url_for("login", next=request.path))
 
         # 3) Token‐match check
-        ADMIN_TOKEN   = os.environ.get("ADMIN_TOKEN", "")
+        ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
         token_at_login = session.get("token_at_login", "")
-        print("🔐 Comparing tokens — token_at_login =", token_at_login, "vs ADMIN_TOKEN =", ADMIN_TOKEN)
+        print(
+            "🔐 Comparing tokens — token_at_login =",
+            token_at_login,
+            "vs ADMIN_TOKEN =",
+            ADMIN_TOKEN,
+        )
         if token_at_login != ADMIN_TOKEN:
             session.clear()
             if request.path.startswith("/api/"):
@@ -1385,10 +1569,13 @@ def login_required_session(f):
 
     return decorated
 
+
 # Materialize token.json from env once at import time
 _bootstrap_ok = _ensure_token_json()
 try:
-    app.logger.info("BOOTSTRAP token.json from env: %s", "OK" if _bootstrap_ok else "SKIPPED")
+    app.logger.info(
+        "BOOTSTRAP token.json from env: %s", "OK" if _bootstrap_ok else "SKIPPED"
+    )
 except Exception:
     # logger may not be ready in some environments; fall back to print
     print(f"BOOTSTRAP token.json from env: {'OK' if _bootstrap_ok else 'SKIPPED'}")
@@ -1397,14 +1584,16 @@ except Exception:
 # ✅ Allow session cookies to be sent cross-site (Netlify → Render)
 app.config.update(
     SESSION_COOKIE_SAMESITE="None",  # Required for cross-domain cookies
-    SESSION_COOKIE_SECURE=True       # Required when using SAMESITE=None
+    SESSION_COOKIE_SECURE=True,  # Required when using SAMESITE=None
 )
 
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 # app.config["SESSION_COOKIE_DOMAIN"] = "machine-scheduler-backend.onrender.com"
 
 from werkzeug.middleware.proxy_fix import ProxyFix
+
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
 
 # --- Quick session check ---
 def fetch_company_info(headers, realm_id, env_override=None):
@@ -1418,14 +1607,18 @@ def fetch_company_info(headers, realm_id, env_override=None):
     info = res.json().get("CompanyInfo", {})
     return {
         "CompanyName": info.get("CompanyName", ""),
-        "AddrLine1":   info.get("CompanyAddr", {}).get("Line1", ""),
-        "City":        info.get("CompanyAddr", {}).get("City", ""),
-        "CountrySubDivisionCode": info.get("CompanyAddr", {}).get("CountrySubDivisionCode", ""),
-        "PostalCode":  info.get("CompanyAddr", {}).get("PostalCode", ""),
-        "Phone":       info.get("PrimaryPhone", {}).get("FreeFormNumber", ""),
+        "AddrLine1": info.get("CompanyAddr", {}).get("Line1", ""),
+        "City": info.get("CompanyAddr", {}).get("City", ""),
+        "CountrySubDivisionCode": info.get("CompanyAddr", {}).get(
+            "CountrySubDivisionCode", ""
+        ),
+        "PostalCode": info.get("CompanyAddr", {}).get("PostalCode", ""),
+        "Phone": info.get("PrimaryPhone", {}).get("FreeFormNumber", ""),
     }
 
+
 MADEIRA_BASE = "https://www.madeirausa.com"
+
 
 async def madeira_login_and_cart(items):
     """
@@ -1453,7 +1646,9 @@ async def madeira_login_and_cart(items):
             try:
                 await page.goto(MADEIRA_BASE + "/", wait_until="domcontentloaded")
                 html = (await page.content()).lower()
-                return ("logout" in html) or ("my account" in html) or ("sign out" in html)
+                return (
+                    ("logout" in html) or ("my account" in html) or ("sign out" in html)
+                )
             except:
                 return False
 
@@ -1478,7 +1673,9 @@ async def madeira_login_and_cart(items):
             if "password" not in (await page.content()).lower():
                 try:
                     await page.goto(MADEIRA_BASE + "/", wait_until="domcontentloaded")
-                    btn = await page.query_selector('a:has-text("Login"), a:has-text("Sign In"), a[href*="login" i]')
+                    btn = await page.query_selector(
+                        'a:has-text("Login"), a:has-text("Sign In"), a[href*="login" i]'
+                    )
                     if btn:
                         await btn.click()
                         await page.wait_for_load_state("domcontentloaded")
@@ -1486,17 +1683,28 @@ async def madeira_login_and_cart(items):
                     pass
 
             # Fill in credentials
-            email_sel = ['input[type="email"]','input[name*="email" i]','input[id*="email" i]','input[name*="user" i]']
-            pass_sel  = ['input[type="password"]','input[name*="pass" i]','input[id*="pass" i]']
+            email_sel = [
+                'input[type="email"]',
+                'input[name*="email" i]',
+                'input[id*="email" i]',
+                'input[name*="user" i]',
+            ]
+            pass_sel = [
+                'input[type="password"]',
+                'input[name*="pass" i]',
+                'input[id*="pass" i]',
+            ]
 
             email_el = None
             for s in email_sel:
                 email_el = await page.query_selector(s)
-                if email_el: break
+                if email_el:
+                    break
             pass_el = None
             for s in pass_sel:
                 pass_el = await page.query_selector(s)
-                if pass_el: break
+                if pass_el:
+                    break
 
             if not email_el or not pass_el:
                 raise RuntimeError("Could not find login fields on Madeira")
@@ -1505,7 +1713,9 @@ async def madeira_login_and_cart(items):
             await pass_el.fill(password)
 
             # Try click a submit/login button
-            submit = await page.query_selector('button:has-text("Log In"), button:has-text("Sign In"), input[type="submit"], button[type="submit"]')
+            submit = await page.query_selector(
+                'button:has-text("Log In"), button:has-text("Sign In"), input[type="submit"], button[type="submit"]'
+            )
             if submit:
                 await submit.click()
             else:
@@ -1532,7 +1742,13 @@ async def madeira_login_and_cart(items):
 
             # Try to set quantity if an input is present
             qty_set = False
-            for s in ['input[name*="qty" i]','input[id*="qty" i]','input[name*="quant" i]','input[id*="quant" i]','input[type="number"]']:
+            for s in [
+                'input[name*="qty" i]',
+                'input[id*="qty" i]',
+                'input[name*="quant" i]',
+                'input[id*="quant" i]',
+                'input[type="number"]',
+            ]:
                 el = await page.query_selector(s)
                 if el:
                     await el.fill(str(qty))
@@ -1577,7 +1793,9 @@ async def madeira_login_and_cart(items):
                     except:
                         pass
                 if not clicked_once:
-                    raise RuntimeError("Could not find 'Add to Cart' button on product page")
+                    raise RuntimeError(
+                        "Could not find 'Add to Cart' button on product page"
+                    )
 
             # give time for mini-cart / server update
             try:
@@ -1587,7 +1805,7 @@ async def madeira_login_and_cart(items):
 
         # Add each item
         for it in items:
-            await add_one(it.get("url",""), int(it.get("qty") or 1))
+            await add_one(it.get("url", ""), int(it.get("qty") or 1))
 
         # Load cart page at the end
         cart_url = MADEIRA_BASE + "/shoppingcart.aspx"
@@ -1595,7 +1813,9 @@ async def madeira_login_and_cart(items):
             await page.goto(cart_url, wait_until="domcontentloaded")
         except:
             try:
-                await page.goto(MADEIRA_BASE + "/ShoppingCart.aspx", wait_until="domcontentloaded")
+                await page.goto(
+                    MADEIRA_BASE + "/ShoppingCart.aspx", wait_until="domcontentloaded"
+                )
                 cart_url = MADEIRA_BASE + "/ShoppingCart.aspx"
             except:
                 pass
@@ -1604,11 +1824,15 @@ async def madeira_login_and_cart(items):
         html = (await page.content()).lower()
         loginish = ("login" in html) and ("password" in html)
         if loginish:
-            raise RuntimeError("Ended on login page — account not logged in; check MADEIRA_EMAIL/MADEIRA_PASSWORD")
+            raise RuntimeError(
+                "Ended on login page — account not logged in; check MADEIRA_EMAIL/MADEIRA_PASSWORD"
+            )
 
         # Persist session
         try:
-            await ctx.storage_state(path=os.path.join(user_data_dir, "storage_state.json"))
+            await ctx.storage_state(
+                path=os.path.join(user_data_dir, "storage_state.json")
+            )
         except:
             pass
 
@@ -1622,7 +1846,11 @@ def handle_preflight():
     if request.method == "OPTIONS":
         origin = (request.headers.get("Origin") or "").strip().rstrip("/")
         allowed = {
-            (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
+            (
+                os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+                .strip()
+                .rstrip("/")
+            ),
             "https://machineschedule.netlify.app",
             "http://localhost:3000",
             "http://127.0.0.1:3000",
@@ -1635,8 +1863,11 @@ def handle_preflight():
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+            resp.headers["Access-Control-Allow-Methods"] = (
+                "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+            )
         return resp  # short-circuit OPTIONS
+
 
 @app.after_request
 def apply_cors(response):
@@ -1644,21 +1875,29 @@ def apply_cors(response):
     # Env-driven allow-list + safe defaults
     allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
     allowed = {o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()}
-    allowed.update({
-        (os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")),
-        "https://machineschedule.netlify.app",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    })
+    allowed.update(
+        {
+            (
+                os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+                .strip()
+                .rstrip("/")
+            ),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        }
+    )
 
     if origin in allowed:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Vary"] = "Origin"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+    )
     return response
 
 
@@ -1670,6 +1909,7 @@ def _mem_before():
     except Exception:
         g._rss_before = None
 
+
 # NEW: log RSS delta after each request and trigger opportunistic GC
 @app.after_request
 def _mem_after(resp):
@@ -1678,26 +1918,35 @@ def _mem_after(resp):
         rss_before = getattr(g, "_rss_before", None)
         if rss_before is not None:
             delta_mb = (rss_now - rss_before) / (1024 * 1024)
-            app.logger.info(f"[MEM] {request.method} {request.path} Δ={delta_mb:.2f}MB rss={rss_now/1024/1024:.2f}MB")
+            app.logger.info(
+                f"[MEM] {request.method} {request.path} Δ={delta_mb:.2f}MB rss={rss_now/1024/1024:.2f}MB"
+            )
         # Opportunistic GC to curb fragmentation during bursts
         gc.collect()
     except Exception:
         pass
     return resp
 
+
 # --- Upload Kanban Card PDF to Google Drive ---
 @app.post("/api/kanban/upload-card")
 def kanban_upload_card():
     try:
         from werkzeug.utils import secure_filename
+
         file = request.files.get("file")
         filename = (request.form.get("filename") or "").strip()
-        folder_name = (request.form.get("folderName") or os.environ.get("KANBAN_CARDS_FOLDER", "Kanban Cards")).strip()
+        folder_name = (
+            request.form.get("folderName")
+            or os.environ.get("KANBAN_CARDS_FOLDER", "Kanban Cards")
+        ).strip()
 
         if not file:
             return jsonify({"ok": False, "error": "missing file"}), 400
 
-        fname = secure_filename(filename or file.filename or f"kanban_{int(time.time())}.pdf")
+        fname = secure_filename(
+            filename or file.filename or f"kanban_{int(time.time())}.pdf"
+        )
 
         # Build Drive service from your existing creds
         # (assumes you already have token.json + googleapiclient in this project)
@@ -1706,10 +1955,13 @@ def kanban_upload_card():
         from googleapiclient.http import MediaIoBaseUpload
         import io
 
-        creds = Credentials.from_authorized_user_file("token.json", [
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/spreadsheets",
-        ])
+        creds = Credentials.from_authorized_user_file(
+            "token.json",
+            [
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/spreadsheets",
+            ],
+        )
         drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
         # Ensure folder exists (by name under My Drive); create if missing
@@ -1725,19 +1977,37 @@ def kanban_upload_card():
         if files:
             folder_id = files[0]["id"]
         else:
-            meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
+            meta = {
+                "name": folder_name,
+                "mimeType": "application/vnd.google-apps.folder",
+            }
             created = drive.files().create(body=meta, fields="id").execute()
             folder_id = created["id"]
 
-
         # Upload the PDF
-        media = MediaIoBaseUpload(io.BytesIO(file.read()), mimetype="application/pdf", resumable=False)
+        media = MediaIoBaseUpload(
+            io.BytesIO(file.read()), mimetype="application/pdf", resumable=False
+        )
         metadata = {"name": fname, "parents": [folder_id]}
-        up = drive.files().create(body=metadata, media_body=media, fields="id,webViewLink,webContentLink").execute()
+        up = (
+            drive.files()
+            .create(
+                body=metadata, media_body=media, fields="id,webViewLink,webContentLink"
+            )
+            .execute()
+        )
 
-        return jsonify({"ok": True, "id": up.get("id"), "webViewLink": up.get("webViewLink"), "webContentLink": up.get("webContentLink")})
+        return jsonify(
+            {
+                "ok": True,
+                "id": up.get("id"),
+                "webViewLink": up.get("webViewLink"),
+                "webContentLink": up.get("webContentLink"),
+            }
+        )
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.route("/kanban/scan", methods=["GET"])
 def kanban_scan():
@@ -1784,6 +2054,7 @@ def kanban_scan():
         payload = {ENTRY_KANBAN: kanban_id, ENTRY_QTY: qty, "submit": "Submit"}
 
         import requests
+
         r = requests.post(form_url, data=payload)
         if r.status_code not in (200, 302):
             return f"<h3>⚠️ Error submitting form ({r.status_code})</h3>", 500
@@ -1800,7 +2071,6 @@ def kanban_scan():
         """
     except Exception as e:
         return f"<h3>❌ Server error: {e}</h3>", 500
-
 
 
 # === Kanban order status update ===
@@ -1844,14 +2114,31 @@ def api_kanban_mark_ordered():
             return jsonify({"error": f"request for {kid} not found"}), 404
 
         # Update Event Status, Ordered By, and Timestamp
-        now_str = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+        now_str = (
+            datetime.utcnow()
+            .replace(tzinfo=ZoneInfo("UTC"))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
         updates = [
-            {"range": f"{KANBAN_SHEET_TAB}!{chr(65+status_ix)}{found_row}", "values": [["Ordered"]]},
-            {"range": f"{KANBAN_SHEET_TAB}!{chr(65+ordered_ix)}{found_row}", "values": [[ordered_by]]},
-            {"range": f"{KANBAN_SHEET_TAB}!{chr(65+ts_ix)}{found_row}", "values": [[now_str]]},
+            {
+                "range": f"{KANBAN_SHEET_TAB}!{chr(65+status_ix)}{found_row}",
+                "values": [["Ordered"]],
+            },
+            {
+                "range": f"{KANBAN_SHEET_TAB}!{chr(65+ordered_ix)}{found_row}",
+                "values": [[ordered_by]],
+            },
+            {
+                "range": f"{KANBAN_SHEET_TAB}!{chr(65+ts_ix)}{found_row}",
+                "values": [[now_str]],
+            },
         ]
         body = {"valueInputOption": "USER_ENTERED", "data": updates}
-        svc.batchUpdate(spreadsheetId=SPREADSHEET_ID, body={"valueInputOption": "USER_ENTERED", "data": updates}).execute()
+        svc.batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": updates},
+        ).execute()
 
         return jsonify({"ok": True, "row": found_row})
     except Exception as e:
@@ -1922,6 +2209,8 @@ def api_order_single():
     except Exception as e:
         current_app.logger.exception("api_order failed: %s", e)
         return jsonify({"error": "order fetch failed"}), 500
+
+
 def _hydrate_images_for_fast(row):
     """
     Forces image hydration using the same logic as the slow Scan load.
@@ -1930,10 +2219,7 @@ def _hydrate_images_for_fast(row):
 
     product = row.get("Product", "").strip()
     fur_color = (
-        row.get("Fur Color")
-        or row.get("FurColor")
-        or row.get("Fur")
-        or ""
+        row.get("Fur Color") or row.get("FurColor") or row.get("Fur") or ""
     ).strip()
 
     try:
@@ -2072,11 +2358,15 @@ def api_order_fast():
     if "imagesNormalized" not in full_payload and row.get("imagesNormalized"):
         full_payload["imagesNormalized"] = row["imagesNormalized"]
         full_payload["hasImages"] = True
-        current_app.logger.info(f"[FAST] injected quadrants → {len(row['imagesNormalized'])} items")
+        current_app.logger.info(
+            f"[FAST] injected quadrants → {len(row['imagesNormalized'])} items"
+        )
 
     # --- Debug logging -------------------------------------------------------
     current_app.logger.info(f"[FAST DEBUG] row keys → {list(row.keys())}")
-    current_app.logger.info(f"[FAST DEBUG] full_payload keys → {list(full_payload.keys())}")
+    current_app.logger.info(
+        f"[FAST DEBUG] full_payload keys → {list(full_payload.keys())}"
+    )
 
     if "imagesNormalized" in row:
         current_app.logger.info(
@@ -2110,7 +2400,6 @@ def api_order_fast():
     )
 
     return jsonify({"order": full_payload, "cached": False}), 200
-
 
 
 # --- ADD alongside your other routes ---
@@ -2152,7 +2441,9 @@ def drive_thumbnail():
     try:
         _drive_meta_cache
     except NameError:
-        _drive_meta_cache = {}  # file_id -> {'thumb_url': str, 'mime': str, 'etag': str, 'modified': str, 'ts': float}
+        _drive_meta_cache = (
+            {}
+        )  # file_id -> {'thumb_url': str, 'mime': str, 'etag': str, 'modified': str, 'ts': float}
     try:
         _drive_meta_ttl
     except NameError:
@@ -2162,16 +2453,18 @@ def drive_thumbnail():
         _http
     except NameError:
         _http = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=2)
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=64, pool_maxsize=64, max_retries=2
+        )
         _http.mount("https://", adapter)
         _http.mount("http://", adapter)
 
     def _looks_like_image(b: bytes) -> bool:
         return (
-            (len(b) > 3 and b[:3] == b"\xFF\xD8\xFF") or                     # JPEG
-            (len(b) > 8 and b[:8] == b"\x89PNG\r\n\x1a\n") or                # PNG
-            (len(b) > 6 and b[:6] in (b"GIF87a", b"GIF89a")) or              # GIF
-            (len(b) > 12 and b[:4] == b"RIFF" and b[8:12] == b"WEBP")        # WEBP
+            (len(b) > 3 and b[:3] == b"\xff\xd8\xff")  # JPEG
+            or (len(b) > 8 and b[:8] == b"\x89PNG\r\n\x1a\n")  # PNG
+            or (len(b) > 6 and b[:6] in (b"GIF87a", b"GIF89a"))  # GIF
+            or (len(b) > 12 and b[:4] == b"RIFF" and b[8:12] == b"WEBP")  # WEBP
         )
 
     now = time.time()
@@ -2197,8 +2490,11 @@ def drive_thumbnail():
         # return tinted if we already have it
         tinted_hit = _drive_thumb_cache.get(tinted_key)
         if tinted_hit and (now - tinted_hit["ts"] < _drive_thumb_ttl):
-            return Response(tinted_hit["bytes"], mimetype="image/png",
-                            headers={"Cache-Control": "public, max-age=86400"})
+            return Response(
+                tinted_hit["bytes"],
+                mimetype="image/png",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
         # keep raw to tint without re-downloading
         raw_hit = _drive_thumb_cache.get(base_key)
         if raw_hit and (now - raw_hit["ts"] < _drive_thumb_ttl):
@@ -2207,27 +2503,44 @@ def drive_thumbnail():
             try:
                 from io import BytesIO
                 from PIL import Image, ImageChops
+
                 base = Image.open(BytesIO(raw_bytes)).convert("RGBA")
                 r, g, b, a = base.split()
                 thr = 255 - tol
-                def _mask_band(band): return band.point(lambda v: 255 if v >= thr else 0, mode="L")
-                mask = ImageChops.multiply(ImageChops.multiply(_mask_band(r), _mask_band(g)), _mask_band(b))
+
+                def _mask_band(band):
+                    return band.point(lambda v: 255 if v >= thr else 0, mode="L")
+
+                mask = ImageChops.multiply(
+                    ImageChops.multiply(_mask_band(r), _mask_band(g)), _mask_band(b)
+                )
                 # coverage log
                 try:
                     hist = mask.histogram()
                     white_px = hist[255] if len(hist) >= 256 else 0
                     total = mask.size[0] * mask.size[1]
                     pct = 100.0 * white_px / max(1, total)
-                    app.logger.info("🎨 cache tint hex=%s tol=%d coverage=%.1f%%", hex_clean, tol, pct)
+                    app.logger.info(
+                        "🎨 cache tint hex=%s tol=%d coverage=%.1f%%",
+                        hex_clean,
+                        tol,
+                        pct,
+                    )
                 except Exception:
                     pass
-                tgt = tuple(int(hex_clean[i:i+2], 16) for i in (0, 2, 4))
+                tgt = tuple(int(hex_clean[i : i + 2], 16) for i in (0, 2, 4))
                 fill = Image.new("RGBA", base.size, (*tgt, 255))
-                out_img = Image.composite(fill, base, mask); out_img.putalpha(a)
-                buf = BytesIO(); out_img.save(buf, format="PNG", optimize=True)
+                out_img = Image.composite(fill, base, mask)
+                out_img.putalpha(a)
+                buf = BytesIO()
+                out_img.save(buf, format="PNG", optimize=True)
                 out = buf.getvalue()
                 _drive_thumb_cache[tinted_key] = {"bytes": out, "ts": time.time()}
-                return Response(out, mimetype="image/png", headers={"Cache-Control": "public, max-age=86400"})
+                return Response(
+                    out,
+                    mimetype="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
             except Exception as e:
                 app.logger.info("🎨 cache tint failed: %s", e)
                 # fall through to fetch new bytes
@@ -2236,16 +2549,30 @@ def drive_thumbnail():
         # Untinted: return raw cache if present
         raw_hit = _drive_thumb_cache.get(base_key)
         if raw_hit and (now - raw_hit["ts"] < _drive_thumb_ttl):
-            return Response(raw_hit["bytes"], mimetype="image/jpeg",
-                            headers={"Cache-Control": "public, max-age=86400"})
+            return Response(
+                raw_hit["bytes"],
+                mimetype="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
 
     # --- 1) Network: classic first (fast) ------------------------------------
     def _classic(fid: str):
         try:
             u = f"https://drive.google.com/thumbnail?id={fid}&sz=w{size_num}"
-            r = _http.get(u, timeout=(3, 5), allow_redirects=True, headers={"Accept": "image/*"})
-            app.logger.info("📸 classic %s → %s %s", fid, r.status_code, r.headers.get("Content-Type",""))
-            return r if (r.status_code == 200 and r.content and _looks_like_image(r.content)) else None
+            r = _http.get(
+                u, timeout=(3, 5), allow_redirects=True, headers={"Accept": "image/*"}
+            )
+            app.logger.info(
+                "📸 classic %s → %s %s",
+                fid,
+                r.status_code,
+                r.headers.get("Content-Type", ""),
+            )
+            return (
+                r
+                if (r.status_code == 200 and r.content and _looks_like_image(r.content))
+                else None
+            )
         except requests.RequestException as e:
             app.logger.info("📸 classic error %s: %s", fid, e)
             return None
@@ -2258,51 +2585,82 @@ def drive_thumbnail():
             try:
                 from io import BytesIO
                 from PIL import Image, ImageChops
+
                 base = Image.open(BytesIO(raw_bytes)).convert("RGBA")
                 cr, cg, cb, ca = base.split()
                 thr = 255 - tol
-                def _mask_band(band): return band.point(lambda v: 255 if v >= thr else 0, mode="L")
-                mask = ImageChops.multiply(ImageChops.multiply(_mask_band(cr), _mask_band(cg)), _mask_band(cb))
+
+                def _mask_band(band):
+                    return band.point(lambda v: 255 if v >= thr else 0, mode="L")
+
+                mask = ImageChops.multiply(
+                    ImageChops.multiply(_mask_band(cr), _mask_band(cg)), _mask_band(cb)
+                )
                 try:
                     hist = mask.histogram()
                     white_px = hist[255] if len(hist) >= 256 else 0
                     total = mask.size[0] * mask.size[1]
-                    app.logger.info("🎨 tint hex=%s tol=%d coverage=%.1f%%", hex_clean, tol,
-                                    100.0 * white_px / max(1, total))
+                    app.logger.info(
+                        "🎨 tint hex=%s tol=%d coverage=%.1f%%",
+                        hex_clean,
+                        tol,
+                        100.0 * white_px / max(1, total),
+                    )
                 except Exception:
                     pass
-                tgt = tuple(int(hex_clean[i:i+2], 16) for i in (0, 2, 4))
+                tgt = tuple(int(hex_clean[i : i + 2], 16) for i in (0, 2, 4))
                 fill = Image.new("RGBA", base.size, (*tgt, 255))
-                out_img = Image.composite(fill, base, mask); out_img.putalpha(ca)
+                out_img = Image.composite(fill, base, mask)
+                out_img.putalpha(ca)
                 from io import BytesIO
-                buf = BytesIO(); out_img.save(buf, format="PNG", optimize=True)
+
+                buf = BytesIO()
+                out_img.save(buf, format="PNG", optimize=True)
                 out = buf.getvalue()
                 _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
                 _drive_thumb_cache[tinted_key] = {"bytes": out, "ts": time.time()}
-                return Response(out, mimetype="image/png", headers={"Cache-Control": "public, max-age=86400"})
+                return Response(
+                    out,
+                    mimetype="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
             except Exception as e:
                 app.logger.info("🎨 tint failed: %s", e)
                 _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
-                return Response(raw_bytes, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+                return Response(
+                    raw_bytes,
+                    mimetype="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
         else:
             _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
-            return Response(raw_bytes, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+            return Response(
+                raw_bytes,
+                mimetype="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
 
     # --- 2) Metadata (cached) → lh3 (fast) -----------------------------------
-    thumb_url = ""; mime = ""; etag = ""; modified = ""
+    thumb_url = ""
+    mime = ""
+    etag = ""
+    modified = ""
     meta_hit = _drive_meta_cache.get(file_id)
     if meta_hit and (now - meta_hit["ts"] < _drive_meta_ttl):
         thumb_url = meta_hit.get("thumb_url") or ""
-        mime      = meta_hit.get("mime") or ""
-        etag      = meta_hit.get("etag") or ""
-        modified  = meta_hit.get("modified") or ""
+        mime = meta_hit.get("mime") or ""
+        etag = meta_hit.get("etag") or ""
+        modified = meta_hit.get("modified") or ""
     else:
         try:
             # requests-based metadata (faster than httplib2)
             creds = get_oauth_credentials()
-            if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+            if getattr(creds, "expired", False) and getattr(
+                creds, "refresh_token", None
+            ):
                 creds.refresh(GoogleRequest())
             from google.auth.transport.requests import AuthorizedSession as _AuthSess
+
             asess = _AuthSess(creds)
             meta_r = asess.get(
                 f"https://www.googleapis.com/drive/v3/files/{file_id}"
@@ -2312,12 +2670,15 @@ def drive_thumbnail():
             if meta_r.status_code == 200:
                 meta = meta_r.json()
                 thumb_url = meta.get("thumbnailLink") or ""
-                etag      = meta.get("md5Checksum") or ""
-                modified  = meta.get("modifiedTime") or ""
-                mime      = meta.get("mimeType") or ""
+                etag = meta.get("md5Checksum") or ""
+                modified = meta.get("modifiedTime") or ""
+                mime = meta.get("mimeType") or ""
                 _drive_meta_cache[file_id] = {
-                    "thumb_url": thumb_url, "mime": mime,
-                    "etag": etag, "modified": modified, "ts": time.time()
+                    "thumb_url": thumb_url,
+                    "mime": mime,
+                    "etag": etag,
+                    "modified": modified,
+                    "ts": time.time(),
                 }
             else:
                 app.logger.info("📸 meta status %s for %s", meta_r.status_code, file_id)
@@ -2332,9 +2693,24 @@ def drive_thumbnail():
                 u = re.sub(r"=(s|w)\d+$", f"=s{size_num}", u)
             else:
                 u = f"{u}=s{size_num}"
-            rr = _http.get(u, timeout=(3, 5), allow_redirects=True, headers={"Accept": "image/*"})
-            app.logger.info("📸 lh3 %s → %s %s", file_id, rr.status_code, rr.headers.get("Content-Type",""))
-            return rr if (rr.status_code == 200 and rr.content and _looks_like_image(rr.content)) else None
+            rr = _http.get(
+                u, timeout=(3, 5), allow_redirects=True, headers={"Accept": "image/*"}
+            )
+            app.logger.info(
+                "📸 lh3 %s → %s %s",
+                file_id,
+                rr.status_code,
+                rr.headers.get("Content-Type", ""),
+            )
+            return (
+                rr
+                if (
+                    rr.status_code == 200
+                    and rr.content
+                    and _looks_like_image(rr.content)
+                )
+                else None
+            )
         except requests.RequestException as e:
             app.logger.info("📸 lh3 error %s: %s", file_id, e)
             return None
@@ -2347,73 +2723,148 @@ def drive_thumbnail():
             try:
                 from io import BytesIO
                 from PIL import Image, ImageChops
+
                 base = Image.open(BytesIO(raw_bytes)).convert("RGBA")
                 cr, cg, cb, ca = base.split()
                 thr = 255 - tol
-                def _mask_band(band): return band.point(lambda v: 255 if v >= thr else 0, mode="L")
-                mask = ImageChops.multiply(ImageChops.multiply(_mask_band(cr), _mask_band(cg)), _mask_band(cb))
+
+                def _mask_band(band):
+                    return band.point(lambda v: 255 if v >= thr else 0, mode="L")
+
+                mask = ImageChops.multiply(
+                    ImageChops.multiply(_mask_band(cr), _mask_band(cg)), _mask_band(cb)
+                )
                 try:
                     hist = mask.histogram()
                     white_px = hist[255] if len(hist) >= 256 else 0
                     total = mask.size[0] * mask.size[1]
-                    app.logger.info("🎨 tint(lh3) hex=%s tol=%d coverage=%.1f%%", hex_clean, tol,
-                                    100.0 * white_px / max(1, total))
+                    app.logger.info(
+                        "🎨 tint(lh3) hex=%s tol=%d coverage=%.1f%%",
+                        hex_clean,
+                        tol,
+                        100.0 * white_px / max(1, total),
+                    )
                 except Exception:
                     pass
-                tgt = tuple(int(hex_clean[i:i+2], 16) for i in (0, 2, 4))
+                tgt = tuple(int(hex_clean[i : i + 2], 16) for i in (0, 2, 4))
                 fill = Image.new("RGBA", base.size, (*tgt, 255))
-                out_img = Image.composite(fill, base, mask); out_img.putalpha(ca)
+                out_img = Image.composite(fill, base, mask)
+                out_img.putalpha(ca)
                 from io import BytesIO
-                buf = BytesIO(); out_img.save(buf, format="PNG", optimize=True)
+
+                buf = BytesIO()
+                out_img.save(buf, format="PNG", optimize=True)
                 out = buf.getvalue()
                 _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
                 _drive_thumb_cache[tinted_key] = {"bytes": out, "ts": time.time()}
-                return Response(out, mimetype="image/png", headers={"Cache-Control": "public, max-age=86400"})
+                return Response(
+                    out,
+                    mimetype="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
             except Exception as e:
                 app.logger.info("🎨 tint(lh3) failed: %s", e)
                 _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
-                return Response(raw_bytes, mimetype="image/png", headers={"Cache-Control": "public, max-age=86400"})
+                return Response(
+                    raw_bytes,
+                    mimetype="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
         else:
             _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
-            return Response(raw_bytes, mimetype="image/png", headers={"Cache-Control": "public, max-age=86400"})
+            return Response(
+                raw_bytes,
+                mimetype="image/png",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
 
     # --- 3) Raw media (images only) ------------------------------------------
     if mime.startswith("image/"):
         try:
             creds = get_oauth_credentials()
-            if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+            if getattr(creds, "expired", False) and getattr(
+                creds, "refresh_token", None
+            ):
                 creds.refresh(GoogleRequest())
             from google.auth.transport.requests import AuthorizedSession as _AuthSess
+
             asess = _AuthSess(creds)
-            media = asess.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=(3, 6))
-            app.logger.info("📸 raw media → %s %s", media.status_code, media.headers.get("Content-Type",""))
-            if media.status_code == 200 and media.content and _looks_like_image(media.content):
+            media = asess.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+                timeout=(3, 6),
+            )
+            app.logger.info(
+                "📸 raw media → %s %s",
+                media.status_code,
+                media.headers.get("Content-Type", ""),
+            )
+            if (
+                media.status_code == 200
+                and media.content
+                and _looks_like_image(media.content)
+            ):
                 raw_bytes = media.content
                 if hex_clean:
                     try:
                         from io import BytesIO
                         from PIL import Image, ImageChops
+
                         base = Image.open(BytesIO(raw_bytes)).convert("RGBA")
                         cr, cg, cb, ca = base.split()
                         thr = 255 - tol
-                        def _mask_band(band): return band.point(lambda v: 255 if v >= thr else 0, mode="L")
-                        mask = ImageChops.multiply(ImageChops.multiply(_mask_band(cr), _mask_band(cg)), _mask_band(cb))
-                        tgt = tuple(int(hex_clean[i:i+2], 16) for i in (0, 2, 4))
+
+                        def _mask_band(band):
+                            return band.point(
+                                lambda v: 255 if v >= thr else 0, mode="L"
+                            )
+
+                        mask = ImageChops.multiply(
+                            ImageChops.multiply(_mask_band(cr), _mask_band(cg)),
+                            _mask_band(cb),
+                        )
+                        tgt = tuple(int(hex_clean[i : i + 2], 16) for i in (0, 2, 4))
                         fill = Image.new("RGBA", base.size, (*tgt, 255))
-                        out_img = Image.composite(fill, base, mask); out_img.putalpha(ca)
+                        out_img = Image.composite(fill, base, mask)
+                        out_img.putalpha(ca)
                         from io import BytesIO
-                        buf = BytesIO(); out_img.save(buf, format="PNG", optimize=True)
+
+                        buf = BytesIO()
+                        out_img.save(buf, format="PNG", optimize=True)
                         out = buf.getvalue()
-                        _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
-                        _drive_thumb_cache[tinted_key] = {"bytes": out, "ts": time.time()}
-                        return Response(out, mimetype="image/png", headers={"Cache-Control": "public, max-age=86400"})
+                        _drive_thumb_cache[base_key] = {
+                            "bytes": raw_bytes,
+                            "ts": time.time(),
+                        }
+                        _drive_thumb_cache[tinted_key] = {
+                            "bytes": out,
+                            "ts": time.time(),
+                        }
+                        return Response(
+                            out,
+                            mimetype="image/png",
+                            headers={"Cache-Control": "public, max-age=86400"},
+                        )
                     except Exception as e:
                         app.logger.info("🎨 tint(raw) failed: %s", e)
-                        _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
-                        return Response(raw_bytes, mimetype=mime, headers={"Cache-Control": "public, max-age=86400"})
+                        _drive_thumb_cache[base_key] = {
+                            "bytes": raw_bytes,
+                            "ts": time.time(),
+                        }
+                        return Response(
+                            raw_bytes,
+                            mimetype=mime,
+                            headers={"Cache-Control": "public, max-age=86400"},
+                        )
                 else:
-                    _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
-                    return Response(raw_bytes, mimetype=mime, headers={"Cache-Control": "public, max-age=86400"})
+                    _drive_thumb_cache[base_key] = {
+                        "bytes": raw_bytes,
+                        "ts": time.time(),
+                    }
+                    return Response(
+                        raw_bytes,
+                        mimetype=mime,
+                        headers={"Cache-Control": "public, max-age=86400"},
+                    )
         except requests.RequestException as e:
             app.logger.info("📸 raw media error %s: %s", file_id, e)
 
@@ -2436,7 +2887,9 @@ def drive_dxf():
     if not name:
         return jsonify({"error": "Missing name"}), 400
 
-    dxf_folder_id = (os.environ.get("DXF_FOLDER_ID") or "").strip() or (os.environ.get("BOM_FOLDER_ID") or "").strip()
+    dxf_folder_id = (os.environ.get("DXF_FOLDER_ID") or "").strip() or (
+        os.environ.get("BOM_FOLDER_ID") or ""
+    ).strip()
     if not dxf_folder_id:
         return jsonify({"error": "DXF folder is not configured"}), 500
 
@@ -2456,7 +2909,16 @@ def drive_dxf():
             safe = qname.replace("'", "\\'")
             q = f"'{folder_id}' in parents and name = '{safe}' and trashed = false"
             try:
-                resp = svc.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=1).execute()
+                resp = (
+                    svc.files()
+                    .list(
+                        q=q,
+                        spaces="drive",
+                        fields="files(id,name,mimeType)",
+                        pageSize=1,
+                    )
+                    .execute()
+                )
                 files = resp.get("files", [])
                 if files:
                     f = files[0]
@@ -2468,7 +2930,13 @@ def drive_dxf():
         safe_like = base_name.replace("'", "\\'")
         q = f"'{folder_id}' in parents and name contains '{safe_like}' and trashed = false"
         try:
-            resp = svc.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=50).execute()
+            resp = (
+                svc.files()
+                .list(
+                    q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=50
+                )
+                .execute()
+            )
             files = resp.get("files", [])
             # Prefer names that end with .dxf (case insensitive)
             for f in files:
@@ -2493,11 +2961,17 @@ def drive_dxf():
     file_id, download_name = found
     try:
         creds = get_oauth_credentials()
-        if hasattr(creds, "expired") and creds.expired and hasattr(creds, "refresh_token"):
+        if (
+            hasattr(creds, "expired")
+            and creds.expired
+            and hasattr(creds, "refresh_token")
+        ):
             creds.refresh(GoogleRequest())
 
         sess = AuthorizedSession(creds)
-        r = sess.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=30)
+        r = sess.get(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", timeout=30
+        )
         if r.status_code != 200 or not r.content:
             return jsonify({"error": f"DXF fetch failed ({r.status_code})"}), 502
 
@@ -2511,6 +2985,8 @@ def drive_dxf():
     except Exception:
         app.logger.exception("drive_dxf: stream failure")
         return jsonify({"error": "DXF stream failed"}), 500
+
+
 # === END ADD =================================================================
 
 
@@ -2530,11 +3006,14 @@ def kanban_upload_photo():
         # Ensure JPEG; convert if needed (client sends jpeg from canvas, so OK)
         stream = io.BytesIO(f.read())
         stream.seek(0)
-        file_id, photo_url = _drive_upload_image_jpeg(stream, f"{kid}.jpg", KANBAN_PHOTOS_FOLDER_ID)
+        file_id, photo_url = _drive_upload_image_jpeg(
+            stream, f"{kid}.jpg", KANBAN_PHOTOS_FOLDER_ID
+        )
         return jsonify({"photoUrl": photo_url, "fileId": file_id})
     except Exception as e:
         app.logger.exception("kanban_upload_photo failed")
         return jsonify({"error": str(e)}), 500
+
 
 # === KANBAN: upsert item (manager) ============================================
 @app.route("/api/kanban/upsert-item", methods=["POST"])
@@ -2550,53 +3029,66 @@ def kanban_upsert_item():
     """
     data = request.get_json(silent=True) or {}
     try:
-        def val(x): return "" if x is None else str(x).strip()
+
+        def val(x):
+            return "" if x is None else str(x).strip()
 
         # Basic required checks
-        kid   = val(data.get("kanbanId"))
-        name  = val(data.get("itemName"))
-        om    = val(data.get("orderMethod"))
-        oUrl  = val(data.get("orderUrl"))
+        kid = val(data.get("kanbanId"))
+        name = val(data.get("itemName"))
+        om = val(data.get("orderMethod"))
+        oUrl = val(data.get("orderUrl"))
         oMail = val(data.get("orderEmail"))
-        pkg   = val(data.get("packageSize"))
-        cost  = val(data.get("costPerPkg"))
+        pkg = val(data.get("packageSize"))
+        cost = val(data.get("costPerPkg"))
         photo = val(data.get("photoUrl"))
 
-        if not kid:   return jsonify({"ok": False, "error": "Kanban ID required"}), 400
-        if not name:  return jsonify({"ok": False, "error": "Item Name required"}), 400
-        if not pkg:   return jsonify({"ok": False, "error": "Package Size required"}), 400
-        if not cost:  return jsonify({"ok": False, "error": "Cost (per pkg) required"}), 400
-        if not photo: return jsonify({"ok": False, "error": "Photo URL required"}), 400
+        if not kid:
+            return jsonify({"ok": False, "error": "Kanban ID required"}), 400
+        if not name:
+            return jsonify({"ok": False, "error": "Item Name required"}), 400
+        if not pkg:
+            return jsonify({"ok": False, "error": "Package Size required"}), 400
+        if not cost:
+            return jsonify({"ok": False, "error": "Cost (per pkg) required"}), 400
+        if not photo:
+            return jsonify({"ok": False, "error": "Photo URL required"}), 400
         if om not in ("Online", "Email"):
-            return jsonify({"ok": False, "error": "Order Method must be Online or Email"}), 400
+            return (
+                jsonify({"ok": False, "error": "Order Method must be Online or Email"}),
+                400,
+            )
         if om == "Online" and not oUrl:
             return jsonify({"ok": False, "error": "Order URL required for Online"}), 400
         if om == "Email" and not oMail:
-            return jsonify({"ok": False, "error": "Order Email required for Email"}), 400
+            return (
+                jsonify({"ok": False, "error": "Order Email required for Email"}),
+                400,
+            )
 
         # Map to exact sheet headers; anything not passed stays blank
         item_obj = {
             "Kanban ID": kid,
             "Item Name": name,
-            "SKU":        val(data.get("sku")),  # optional
-            "Dept":       val(data.get("dept")),
-            "Category":   val(data.get("category")),
-            "Location":   val(data.get("location")),
+            "SKU": val(data.get("sku")),  # optional
+            "Dept": val(data.get("dept")),
+            "Category": val(data.get("category")),
+            "Location": val(data.get("location")),
             "Package Size": pkg,
             "Lead Time (days)": val(data.get("leadTimeDays")),
-            "Bin Qty (units)":  val(data.get("binQtyUnits")),
-            "Case Multiple":    val(data.get("caseMultiple")),
+            "Bin Qty (units)": val(data.get("binQtyUnits")),
+            "Case Multiple": val(data.get("caseMultiple")),
             "Reorder Qty (basis)": val(data.get("reorderQtyBasis")),
             "Units Basis (units/cases)": val(data.get("unitsBasis")),
             "Order Method (Email/Online)": om,
             "Order Email": oMail if om == "Email" else "",
-            "Order URL":   oUrl  if om == "Online" else "",
-            "Supplier":    val(data.get("supplier")),
+            "Order URL": oUrl if om == "Online" else "",
+            "Supplier": val(data.get("supplier")),
             "Supplier SKU": val(data.get("supplierSku")),
-            "Cost (per pkg)": cost,                 # <-- price
+            "Cost (per pkg)": cost,  # <-- price
             "Substitutes (Y/N)": val(data.get("substitutes")),
-            "Notes":      val(data.get("notes")),
-            "Photo URL":  photo,
+            "Notes": val(data.get("notes")),
+            "Photo URL": photo,
         }
 
         result = _kanban_upsert_item(item_obj)  # uses Kanban ID to update or append
@@ -2643,7 +3135,9 @@ def kanban_get_item_public():
     # convert units → cases if needed
     suggested_cases = 1
     if units_basis == "cases" and case_mult > 0:
-        suggested_cases = int((bin_units + case_mult - 1) // case_mult) if bin_units > 0 else 1
+        suggested_cases = (
+            int((bin_units + case_mult - 1) // case_mult) if bin_units > 0 else 1
+        )
         suggested_qty = suggested_cases
     else:
         suggested_qty = int(bin_units or 1)
@@ -2651,19 +3145,23 @@ def kanban_get_item_public():
     # Minimal history hint (last order time + avg between)
     now = datetime.utcnow()
     ordered_ts = []
-    type_ix = hix.get("Type"); id_ix = hix.get("Kanban ID"); ev_ix = hix.get("Event Status"); qty_ix = hix.get("Event Qty"); ts_ix = hix.get("Timestamp")
+    type_ix = hix.get("Type")
+    id_ix = hix.get("Kanban ID")
+    ev_ix = hix.get("Event Status")
+    qty_ix = hix.get("Event Qty")
+    ts_ix = hix.get("Timestamp")
     for r in rows[1:]:
-        if not r: 
+        if not r:
             continue
-        if type_ix is None or id_ix is None: 
+        if type_ix is None or id_ix is None:
             continue
-        t = (r[type_ix] if type_ix < len(r) else "")
-        i = (r[id_ix]   if id_ix   < len(r) else "")
+        t = r[type_ix] if type_ix < len(r) else ""
+        i = r[id_ix] if id_ix < len(r) else ""
         if str(t).strip().upper() == KANBAN_ORDERED_TYPE and str(i).strip() == kid:
-            ts = (r[ts_ix] if ts_ix is not None and ts_ix < len(r) else "")
+            ts = r[ts_ix] if ts_ix is not None and ts_ix < len(r) else ""
             if ts:
                 try:
-                    dt = datetime.fromisoformat(str(ts).replace("Z","+00:00"))
+                    dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
                 except Exception:
                     continue
                 ordered_ts.append(dt)
@@ -2679,12 +3177,11 @@ def kanban_get_item_public():
             hint = f"Last order {days_since} days ago."
 
     item_min = {
-        "itemName":    item_row.get("Item Name") or "",
-        "sku":         item_row.get("SKU") or "",
-        "dept":        item_row.get("Dept") or "",
-        "location":    item_row.get("Location") or "",
+        "itemName": item_row.get("Item Name") or "",
+        "sku": item_row.get("SKU") or "",
+        "dept": item_row.get("Dept") or "",
+        "location": item_row.get("Location") or "",
         "packageSize": item_row.get("Package Size") or "",
-
         # ✅ add these so the card shows real numbers instead of "—"
         "binQtyUnits": (
             item_row.get("Bin Qty (units)")
@@ -2700,24 +3197,26 @@ def kanban_get_item_public():
             or item_row.get("reorderQty")
             or ""
         ),
-
         # NEW: expose price for the preview
-        "costPerPkg": item_row.get("Cost (per pkg)") or item_row.get("costPerPkg") or "",
-
+        "costPerPkg": item_row.get("Cost (per pkg)")
+        or item_row.get("costPerPkg")
+        or "",
         "orderMethod": item_row.get("Order Method (Email/Online)") or "",
-        "orderEmail":  item_row.get("Order Email") or "",
-        "orderUrl":    item_row.get("Order URL") or "",
-        "supplier":    item_row.get("Supplier") or "",
-        "photoUrl":    item_row.get("Photo URL") or "",
+        "orderEmail": item_row.get("Order Email") or "",
+        "orderUrl": item_row.get("Order URL") or "",
+        "supplier": item_row.get("Supplier") or "",
+        "photoUrl": item_row.get("Photo URL") or "",
     }
 
+    return jsonify(
+        {
+            "item": item_min,
+            "suggestedQty": max(1, int(suggested_qty)),
+            "unitsBasis": units_basis or "cases",
+            "historyHint": hint,
+        }
+    )
 
-    return jsonify({
-        "item": item_min,
-        "suggestedQty": max(1, int(suggested_qty)),
-        "unitsBasis": units_basis or "cases",
-        "historyHint": hint
-    })
 
 # === KANBAN: public request (scan submit) =====================================
 @app.route("/api/kanban/request", methods=["POST"])
@@ -2740,18 +3239,28 @@ def kanban_request_public():
         _, item = _kanban_find_item_row(rows, kanban_id)
         if not item:
             print(f"⚠️ No match found for Kanban ID: {kanban_id}")
-            return jsonify({"ok": False, "error": f"Kanban ID {kanban_id} not found"}), 404
+            return (
+                jsonify({"ok": False, "error": f"Kanban ID {kanban_id} not found"}),
+                404,
+            )
 
         # === Build the request row ===
-        now_iso = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+        now_iso = (
+            datetime.utcnow()
+            .replace(tzinfo=ZoneInfo("UTC"))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
         row = dict(item)  # start with all existing item data
-        row.update({
-            "Type": "REQUEST",
-            "Event Qty": qty,
-            "Event Status": "Open",
-            "Requested By": requested_by,
-            "Timestamp": now_iso,
-        })
+        row.update(
+            {
+                "Type": "REQUEST",
+                "Event Qty": qty,
+                "Event Status": "Open",
+                "Requested By": requested_by,
+                "Timestamp": now_iso,
+            }
+        )
 
         # === Append to the Kanban sheet ===
         _kanban_values_api().append(
@@ -2766,6 +3275,7 @@ def kanban_request_public():
     except Exception as e:
         print(f"❌ Error in kanban_request_public: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # --- MARK ORDERED -------------------------------------------------------
 @app.route("/api/kanban/ordered", methods=["POST"])
@@ -2815,7 +3325,9 @@ def kanban_queue_manager():
             return jsonify({"rows": []})
 
         headers = rows[0]
-        print("🧾 Kanban headers:", headers[:10])  # show first 10 headers for verification
+        print(
+            "🧾 Kanban headers:", headers[:10]
+        )  # show first 10 headers for verification
         hix = _kanban_headers_index(headers)
         out = []
 
@@ -2830,21 +3342,23 @@ def kanban_queue_manager():
             row_type = (row.get("Type") or "").strip().upper()
 
             if row_type == KANBAN_REQUEST_TYPE and status in ("open", "ordered"):
-                out.append({
-                    "Event ID": row.get("Event ID"),
-                    "Kanban ID": row.get("Kanban ID"),
-                    "Item Name": row.get("Item Name"),
-                    "SKU": row.get("SKU"),
-                    "Supplier": row.get("Supplier"),
-                    "Order Method": row.get("Order Method (Email/Online)"),
-                    "Order Email": row.get("Order Email"),
-                    "Order URL": row.get("Order URL"),
-                    "Requested By": row.get("Requested By"),
-                    "Event Qty": row.get("Event Qty"),
-                    "Timestamp": row.get("Timestamp"),
-                    "Photo URL": row.get("Photo URL"),
-                    "Event Status": row.get("Event Status"),
-                })
+                out.append(
+                    {
+                        "Event ID": row.get("Event ID"),
+                        "Kanban ID": row.get("Kanban ID"),
+                        "Item Name": row.get("Item Name"),
+                        "SKU": row.get("SKU"),
+                        "Supplier": row.get("Supplier"),
+                        "Order Method": row.get("Order Method (Email/Online)"),
+                        "Order Email": row.get("Order Email"),
+                        "Order URL": row.get("Order URL"),
+                        "Requested By": row.get("Requested By"),
+                        "Event Qty": row.get("Event Qty"),
+                        "Timestamp": row.get("Timestamp"),
+                        "Photo URL": row.get("Photo URL"),
+                        "Event Status": row.get("Event Status"),
+                    }
+                )
 
         # ✅ FIXED: safely convert timestamps to strings before sorting
         out.sort(key=lambda x: str(x.get("Timestamp") or ""), reverse=True)
@@ -2884,27 +3398,39 @@ def kanban_mark_ordered_v2():
     # 1) Append ORDERED row (copy useful fields)
     body_row = [""] * len(headers)
     for i, h in enumerate(headers):
-        if h == "Type": body_row[i] = KANBAN_ORDERED_TYPE
-        elif h == "Kanban ID": body_row[i] = req.get("Kanban ID") or ""
-        elif h == "Item Name": body_row[i] = req.get("Item Name") or ""
-        elif h == "SKU": body_row[i] = req.get("SKU") or ""
-        elif h == "Supplier": body_row[i] = req.get("Supplier") or ""
-        elif h == "Units Basis (units/cases)": body_row[i] = req.get("Units Basis (units/cases)") or "cases"
-        elif h == "Event ID": body_row[i] = event_id
-        elif h == "Event Qty": body_row[i] = ordered_qty or (req.get("Event Qty") or "")
-        elif h == "Ordered By": body_row[i] = user_name
-        elif h == "PO #": body_row[i] = po
-        elif h == "Timestamp": body_row[i] = now_iso
+        if h == "Type":
+            body_row[i] = KANBAN_ORDERED_TYPE
+        elif h == "Kanban ID":
+            body_row[i] = req.get("Kanban ID") or ""
+        elif h == "Item Name":
+            body_row[i] = req.get("Item Name") or ""
+        elif h == "SKU":
+            body_row[i] = req.get("SKU") or ""
+        elif h == "Supplier":
+            body_row[i] = req.get("Supplier") or ""
+        elif h == "Units Basis (units/cases)":
+            body_row[i] = req.get("Units Basis (units/cases)") or "cases"
+        elif h == "Event ID":
+            body_row[i] = event_id
+        elif h == "Event Qty":
+            body_row[i] = ordered_qty or (req.get("Event Qty") or "")
+        elif h == "Ordered By":
+            body_row[i] = user_name
+        elif h == "PO #":
+            body_row[i] = po
+        elif h == "Timestamp":
+            body_row[i] = now_iso
     _kanban_values_api().append(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{KANBAN_SHEET_TAB}!A2",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
-        body={"values": [body_row]}
+        body={"values": [body_row]},
     ).execute()
 
     # 2) Flip REQUEST row status to Ordered + Approved By
-    status_ix = hix.get("Event Status"); ap_ix = hix.get("Approved By")
+    status_ix = hix.get("Event Status")
+    ap_ix = hix.get("Approved By")
     if status_ix is not None:
         # Read current row values, update in place
         cur = rows[req_row_index - 1]
@@ -2917,10 +3443,11 @@ def kanban_mark_ordered_v2():
             spreadsheetId=SPREADSHEET_ID,
             range=f"{KANBAN_SHEET_TAB}!A{req_row_index}",
             valueInputOption="USER_ENTERED",
-            body={"values": [cur[:len(headers)]]}
+            body={"values": [cur[: len(headers)]]},
         ).execute()
 
-    return jsonify({ "ok": True })
+    return jsonify({"ok": True})
+
 
 @app.route("/api/kanban/received", methods=["POST"])
 @login_required_session
@@ -2949,22 +3476,32 @@ def kanban_mark_received():
     # 1) Append RECEIVED row
     body_row = [""] * len(headers)
     for i, h in enumerate(headers):
-        if h == "Type": body_row[i] = KANBAN_RECEIVED_TYPE
-        elif h == "Kanban ID": body_row[i] = req.get("Kanban ID") or ""
-        elif h == "Item Name": body_row[i] = req.get("Item Name") or ""
-        elif h == "SKU": body_row[i] = req.get("SKU") or ""
-        elif h == "Supplier": body_row[i] = req.get("Supplier") or ""
-        elif h == "Units Basis (units/cases)": body_row[i] = req.get("Units Basis (units/cases)") or "cases"
-        elif h == "Event ID": body_row[i] = event_id
-        elif h == "Event Qty": body_row[i] = received_qty or (req.get("Event Qty") or "")
-        elif h == "Received By": body_row[i] = user_name
-        elif h == "Timestamp": body_row[i] = now_iso
+        if h == "Type":
+            body_row[i] = KANBAN_RECEIVED_TYPE
+        elif h == "Kanban ID":
+            body_row[i] = req.get("Kanban ID") or ""
+        elif h == "Item Name":
+            body_row[i] = req.get("Item Name") or ""
+        elif h == "SKU":
+            body_row[i] = req.get("SKU") or ""
+        elif h == "Supplier":
+            body_row[i] = req.get("Supplier") or ""
+        elif h == "Units Basis (units/cases)":
+            body_row[i] = req.get("Units Basis (units/cases)") or "cases"
+        elif h == "Event ID":
+            body_row[i] = event_id
+        elif h == "Event Qty":
+            body_row[i] = received_qty or (req.get("Event Qty") or "")
+        elif h == "Received By":
+            body_row[i] = user_name
+        elif h == "Timestamp":
+            body_row[i] = now_iso
     _kanban_values_api().append(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{KANBAN_SHEET_TAB}!A2",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
-        body={"values": [body_row]}
+        body={"values": [body_row]},
     ).execute()
 
     # 2) Flip REQUEST row status to Received (Closed)
@@ -2978,10 +3515,11 @@ def kanban_mark_received():
             spreadsheetId=SPREADSHEET_ID,
             range=f"{KANBAN_SHEET_TAB}!A{req_row_index}",
             valueInputOption="USER_ENTERED",
-            body={"values": [cur[:len(headers)]]}
+            body={"values": [cur[: len(headers)]]},
         ).execute()
 
-    return jsonify({ "ok": True })
+    return jsonify({"ok": True})
+
 
 @app.route("/api/kanban/scrape", methods=["GET"])
 @login_required_session
@@ -2996,6 +3534,7 @@ def api_kanban_scrape():
     data = _kanban_scrape_url(url)
     status = 200 if data.get("ok") else 400
     return jsonify(data), status
+
 
 @app.route("/api/kanban/log-card", methods=["POST"])
 @login_required_session
@@ -3026,8 +3565,6 @@ def api_kanban_log_card():
     return jsonify({"ok": True})
 
 
-
-
 @app.route("/api/drive/token-status", methods=["GET"])
 def token_status():
     env_present = bool(os.environ.get("GOOGLE_TOKEN_JSON", "").strip())
@@ -3047,9 +3584,13 @@ def token_status():
     # If not ok, include a short reason without leaking secrets
     if not info["ok"]:
         info["reason"] = (
-            "no creds" if not creds else
-            "expired without refresh_token" if creds and creds.expired and not creds.refresh_token else
-            "invalid"
+            "no creds"
+            if not creds
+            else (
+                "expired without refresh_token"
+                if creds and creds.expired and not creds.refresh_token
+                else "invalid"
+            )
         )
     return jsonify(info)
 
@@ -3058,6 +3599,7 @@ def token_status():
 from threading import Thread
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
 
 def _warm_thumb_async(file_id: str, sz: str, ver: str):
     """Background cache warm with retries; never raises to the request thread."""
@@ -3072,13 +3614,20 @@ def _warm_thumb_async(file_id: str, sz: str, ver: str):
             raise_on_status=False,
         )
         sess.mount("https://", HTTPAdapter(max_retries=retry))
-        r = sess.get(google_thumb, headers={"Accept": "image/*", "User-Agent": "Mozilla/5.0"}, timeout=10)
-        if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image/"):
+        r = sess.get(
+            google_thumb,
+            headers={"Accept": "image/*", "User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if r.status_code == 200 and r.headers.get("Content-Type", "").startswith(
+            "image/"
+        ):
             os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
             with open(_thumb_cache_path(file_id, sz, ver or "1"), "wb") as f:
                 f.write(r.content)
     except Exception:
         app.logger.exception("thumb warm failed for %s", file_id)
+
 
 @app.route("/api/drive/proxy/<file_id>")
 @login_required_session
@@ -3127,7 +3676,6 @@ def drive_proxy(file_id):
         resp.headers["Cache-Control"] = f"public, max-age={_drive_thumb_ttl}"
         return resp
 
-
     # Fetch (no streaming), short timeout; do NOT allow this to kill a worker
     try:
         r = requests.get(g_url, timeout=5)  # no stream=True
@@ -3139,7 +3687,6 @@ def drive_proxy(file_id):
         # Save to cache
         _drive_thumb_cache[key] = {"data": data, "ct": ct, "etag": etag, "ts": now}
 
-
         resp = Response(data, mimetype=ct)
         resp.headers["ETag"] = etag
         resp.headers["Cache-Control"] = f"public, max-age={_drive_thumb_ttl}"
@@ -3150,13 +3697,16 @@ def drive_proxy(file_id):
         if ent:
             resp = Response(ent["data"], mimetype=ent["ct"])
             resp.headers["ETag"] = ent["etag"]
-            resp.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=600"
-            resp.headers["Warning"] = '110 - "served stale thumbnail due to upstream error"'
+            resp.headers["Cache-Control"] = (
+                "public, max-age=60, stale-while-revalidate=600"
+            )
+            resp.headers["Warning"] = (
+                '110 - "served stale thumbnail due to upstream error"'
+            )
             return resp
         # No cache: return 204 so the UI shows a fallback, but do NOT crash the worker
         app.logger.warning("drive_proxy failed for %s (%s): %s", file_id, sz, e)
         return Response(status=204)
-
 
 
 @app.route("/api/ping", methods=["GET", "OPTIONS"])
@@ -3176,6 +3726,7 @@ def serve_label(filename):
         return abort(404)
     # Let browser open in a new tab for printing
     return send_from_directory(tmp, safe, as_attachment=False)
+
 
 @app.route("/slips/<path:filename>")
 def serve_slip(filename):
@@ -3201,6 +3752,7 @@ def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers, env_override=None):
     response.raise_for_status()
     return response.content
 
+
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
 def build_packing_slip_pdf(order_data_list, boxes, company_info):
     """
@@ -3219,18 +3771,15 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
     doc = SimpleDocTemplate(
         buffer,
         pagesize=LETTER,
-        leftMargin=0.5*inch,
-        rightMargin=0.5*inch,
-        topMargin=0.5*inch,
-        bottomMargin=0.5*inch,
+        leftMargin=0.5 * inch,
+        rightMargin=0.5 * inch,
+        topMargin=0.5 * inch,
+        bottomMargin=0.5 * inch,
     )
     styles = getSampleStyleSheet()
     normal = styles["Normal"]
     title_style = ParagraphStyle(
-        "TitleCenter",
-        parent=styles["Title"],
-        alignment=1,  # center
-        spaceAfter=12
+        "TitleCenter", parent=styles["Title"], alignment=1, spaceAfter=12  # center
     )
 
     elems = []
@@ -3244,7 +3793,7 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
         orig_w, orig_h = reader.getSize()
         max_w = 1.0 * inch
         scale = max_w / orig_w
-        logo = Image(logo_path, width=orig_w*scale, height=orig_h*scale)
+        logo = Image(logo_path, width=orig_w * scale, height=orig_h * scale)
     except Exception:
         logo = Paragraph("Your Logo", normal)
 
@@ -3253,32 +3802,36 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
         f"{company_info['AddrLine1']}<br/>"
         f"{company_info['City']}, {company_info['CountrySubDivisionCode']} {company_info['PostalCode']}<br/>"
         f"Phone: {company_info['Phone']}",
-        normal
+        normal,
     )
 
-    left_cell = [logo, Spacer(1, 0.1*inch), your_info]
+    left_cell = [logo, Spacer(1, 0.1 * inch), your_info]
 
     # Right cell: customer info from the first order
     cust = order_data_list[0]
     customer_info = Paragraph(
         f"<b>Ship To:</b><br/>{cust.get('Company Name','')}<br/>{cust.get('Address','')}<br/>{cust.get('Phone','')}",
-        normal
+        normal,
     )
 
     # shift customer info further right
     header_table = Table(
         [[left_cell, customer_info]],
         # Swap widths so customer info moves left
-        colWidths=[4.0*inch, 2.0*inch]
+        colWidths=[4.0 * inch, 2.0 * inch],
     )
-    header_table.setStyle(TableStyle([
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("ALIGN",  (1,0), (1,0), "RIGHT"),
-        ("LEFTPADDING",  (0,0), (-1,-1), 0),
-        ("RIGHTPADDING", (0,0), (-1,-1), 0),
-    ]))
+    header_table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
     elems.append(header_table)
-    elems.append(Spacer(1, 0.25*inch))
+    elems.append(Spacer(1, 0.25 * inch))
 
     # ─── Title ──────────────────────────────────────────────
     elems.append(Paragraph("PACKING SLIP", title_style))
@@ -3286,35 +3839,34 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
     # ─── Line Items ────────────────────────────────────────
     def _normalize_product_for_slip(name: str) -> str:
         # Remove the tokens front/full/back anywhere, collapse whitespace and trim
-        base = re.sub(r'(?i)\b(front|full|back)\b', '', name or '')
+        base = re.sub(r"(?i)\b(front|full|back)\b", "", name or "")
         # Clean separators like " - " or "/" that might leave double spaces
-        base = re.sub(r'[\(\)\[\]\-_/]+', ' ', base)
-        base = re.sub(r'\s+', ' ', base).strip()
-        return base or (name or '')
+        base = re.sub(r"[\(\)\[\]\-_/]+", " ", base)
+        base = re.sub(r"\s+", " ", base).strip()
+        return base or (name or "")
 
     data = [["Product", "Design", "Qty"]]
     for od in order_data_list:
         product_raw = od.get("Product", "")
         product_norm = _normalize_product_for_slip(product_raw)
-        data.append([
-            product_norm,
-            od.get("Design", ""),
-            str(od.get("ShippedQty", ""))
-        ])
-
+        data.append([product_norm, od.get("Design", ""), str(od.get("ShippedQty", ""))])
 
     # widen the table columns
-    table = Table(data, colWidths=[3.0*inch, 3.0*inch, 1.0*inch])
-    table.setStyle(TableStyle([
-        ("GRID",         (0,0), (-1,-1), 0.5, colors.grey),
-        ("BACKGROUND",   (0,0), (-1,0),   colors.lightgrey),
-        ("ALIGN",        (2,0), (2,0),    "CENTER"),  # center Qty **header** cell
-        ("ALIGN",        (2,1), (2,-1),   "CENTER"),  # center Qty column
-        ("VALIGN",       (0,0), (-1,-1),  "MIDDLE"),
-        ("FONTNAME",     (0,0), (-1,0),   "Helvetica-Bold"),
-        ("BOTTOMPADDING",(0,0),  (-1,0),   6),
-        ("TOPPADDING",   (0,0),  (-1,0),   6),
-    ]))
+    table = Table(data, colWidths=[3.0 * inch, 3.0 * inch, 1.0 * inch])
+    table.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("ALIGN", (2, 0), (2, 0), "CENTER"),  # center Qty **header** cell
+                ("ALIGN", (2, 1), (2, -1), "CENTER"),  # center Qty column
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+                ("TOPPADDING", (0, 0), (-1, 0), 6),
+            ]
+        )
+    )
     elems.append(table)
 
     # ─── Build PDF ──────────────────────────────────────────
@@ -3323,15 +3875,16 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
     buffer.close()
     return pdf_bytes
 
+
 def get_quickbooks_credentials():
     # 1) First, try the live session token in Flask session
     token_data = session.get("qbo_token")
     if token_data and "access_token" in token_data:
         realm_id = token_data.get("realmId")
         token = {
-            "access_token":  token_data["access_token"],
+            "access_token": token_data["access_token"],
             "refresh_token": token_data.get("refresh_token"),
-            "expires_at":    token_data.get("expires_at", 0)
+            "expires_at": token_data.get("expires_at", 0),
         }
 
         # → refresh if expired
@@ -3343,26 +3896,24 @@ def get_quickbooks_credentials():
                 client_id=client_id,
                 token=token,
                 auto_refresh_kwargs={
-                    "client_id":     client_id,
+                    "client_id": client_id,
                     "client_secret": client_secret,
                 },
                 auto_refresh_url=QBO_TOKEN_URL,
-                token_updater=lambda new_tok: None
+                token_updater=lambda new_tok: None,
             )
             new_token = oauth.refresh_token(
-                QBO_TOKEN_URL,
-                client_id=client_id,
-                client_secret=client_secret
+                QBO_TOKEN_URL, client_id=client_id, client_secret=client_secret
             )
 
             new_token["expires_at"] = time.time() + int(new_token["expires_in"])
 
             # persist refreshed token to session & disk
             session["qbo_token"] = {
-                "access_token":  new_token["access_token"],
+                "access_token": new_token["access_token"],
                 "refresh_token": new_token["refresh_token"],
-                "expires_at":    new_token["expires_at"],
-                "realmId":       realm_id
+                "expires_at": new_token["expires_at"],
+                "realmId": realm_id,
             }
             with open(TOKEN_PATH, "w") as f:
                 json.dump({**new_token, "realmId": realm_id}, f, indent=2)
@@ -3370,8 +3921,8 @@ def get_quickbooks_credentials():
 
         headers = {
             "Authorization": f"Bearer {token['access_token']}",
-            "Accept":        "application/json",
-            "Content-Type":  "application/json"
+            "Accept": "application/json",
+            "Content-Type": "application/json",
         }
         return headers, realm_id
 
@@ -3381,61 +3932,70 @@ def get_quickbooks_credentials():
             file_token = json.load(f)
         realm_id = file_token.get("realmId")
         token = {
-            "access_token":  file_token.get("access_token"),
+            "access_token": file_token.get("access_token"),
             "refresh_token": file_token.get("refresh_token"),
-            "expires_at":    file_token.get("expires_at", 0)
+            "expires_at": file_token.get("expires_at", 0),
         }
 
         if token["access_token"] and realm_id:
             # → refresh if expired
             if token["expires_at"] < time.time():
                 # Use env-aware credentials (production vs sandbox)
-                env_for_oauth = session.get("qboEnv", os.environ.get("QBO_ENV", "production")).lower()
+                env_for_oauth = session.get(
+                    "qboEnv", os.environ.get("QBO_ENV", "production")
+                ).lower()
                 try:
                     client_id, client_secret = get_qbo_oauth_credentials(env_for_oauth)
                 except NameError:
                     is_prod = env_for_oauth in ("prod", "production", "live")
-                    client_id     = os.environ.get("QBO_PROD_CLIENT_ID") if is_prod else os.environ.get("QBO_SANDBOX_CLIENT_ID")
-                    client_secret = os.environ.get("QBO_PROD_CLIENT_SECRET") if is_prod else os.environ.get("QBO_SANDBOX_CLIENT_SECRET")
+                    client_id = (
+                        os.environ.get("QBO_PROD_CLIENT_ID")
+                        if is_prod
+                        else os.environ.get("QBO_SANDBOX_CLIENT_ID")
+                    )
+                    client_secret = (
+                        os.environ.get("QBO_PROD_CLIENT_SECRET")
+                        if is_prod
+                        else os.environ.get("QBO_SANDBOX_CLIENT_SECRET")
+                    )
                     # Fallback to generic names if present
-                    client_id     = client_id or os.environ.get("QBO_CLIENT_ID")
+                    client_id = client_id or os.environ.get("QBO_CLIENT_ID")
                     client_secret = client_secret or os.environ.get("QBO_CLIENT_SECRET")
 
                 oauth = OAuth2Session(
                     client_id=client_id,
                     token=token,
                     auto_refresh_kwargs={
-                        "client_id":     client_id,
+                        "client_id": client_id,
                         "client_secret": client_secret,
                     },
                     auto_refresh_url=QBO_TOKEN_URL,
-                    token_updater=lambda new_tok: None
+                    token_updater=lambda new_tok: None,
                 )
                 new_token = oauth.refresh_token(
-                    QBO_TOKEN_URL,
-                    client_id=client_id,
-                    client_secret=client_secret
+                    QBO_TOKEN_URL, client_id=client_id, client_secret=client_secret
                 )
-                new_token["expires_at"] = time.time() + int(new_token.get("expires_in", 3600))
+                new_token["expires_at"] = time.time() + int(
+                    new_token.get("expires_in", 3600)
+                )
 
                 # persist refreshed token to disk & session
                 with open(TOKEN_PATH, "w") as f:
                     json.dump({**new_token, "realmId": realm_id}, f, indent=2)
                 session["qbo_token"] = {
-                    "access_token":  new_token.get("access_token"),
+                    "access_token": new_token.get("access_token"),
                     "refresh_token": new_token.get("refresh_token"),
-                    "expires_at":    new_token.get("expires_at"),
-                    "realmId":       realm_id
+                    "expires_at": new_token.get("expires_at"),
+                    "realmId": realm_id,
                 }
                 token = new_token
 
             headers = {
                 "Authorization": f"Bearer {token['access_token']}",
-                "Accept":        "application/json",
-                "Content-Type":  "application/json"
+                "Accept": "application/json",
+                "Content-Type": "application/json",
             }
             return headers, realm_id
-
 
     # 3) No valid token → restart OAuth
     env_qbo = os.environ.get("QBO_ENV", "production")
@@ -3444,7 +4004,7 @@ def get_quickbooks_credentials():
 
 def get_quickbooks_auth_url(redirect_uri, state=""):
     client_id = os.environ["QBO_CLIENT_ID"]
-    scope     = "com.intuit.quickbooks.accounting"
+    scope = "com.intuit.quickbooks.accounting"
     return (
         f"{QBO_AUTH_BASE_URL}?"
         f"client_id={client_id}"
@@ -3453,6 +4013,7 @@ def get_quickbooks_auth_url(redirect_uri, state=""):
         f"&scope={scope}"
         f"&state={urllib.parse.quote(state)}"
     )
+
 
 @app.route("/quickbooks-auth", methods=["GET"])
 def quickbooks_auth():
@@ -3472,10 +4033,10 @@ def quickbooks_auth():
     return redirect(auth_url)
 
 
-
 class RedirectException(Exception):
     def __init__(self, redirect_url):
         self.redirect_url = redirect_url
+
 
 def refresh_quickbooks_token():
     """
@@ -3492,16 +4053,13 @@ def refresh_quickbooks_token():
         disk_data = json.load(f)
 
     # ── 3) Rebuild the OAuth2Session with that token ─────────────
-    oauth = OAuth2Session(
-        client_id=client_id,
-        token=disk_data
-    )
+    oauth = OAuth2Session(client_id=client_id, token=disk_data)
 
     # ── 4) Refresh the token using matching client_secret ────────
     new_token = oauth.refresh_token(
         QBO_TOKEN_URL,
         client_secret=client_secret,
-        refresh_token=disk_data["refresh_token"]
+        refresh_token=disk_data["refresh_token"],
     )
 
     # ── 5) Persist refreshed token to disk ───────────────────────
@@ -3511,20 +4069,28 @@ def refresh_quickbooks_token():
 
     # ── 6) Update session so API calls see the new expiry ───────
     session["qbo_token"] = {
-        "access_token":  new_token["access_token"],
+        "access_token": new_token["access_token"],
         "refresh_token": new_token["refresh_token"],
-        "expires_at":    time.time() + int(new_token["expires_in"]),
-        "realmId":       disk_data["realmId"]
+        "expires_at": time.time() + int(new_token["expires_in"]),
+        "realmId": disk_data["realmId"],
     }
 
     print(f"🔁 Refreshed QBO token for env '{env_override}'")
 
-def update_sheet_cell(sheet_id, sheet_name, lookup_col, lookup_value, target_col, new_value):
+
+def update_sheet_cell(
+    sheet_id, sheet_name, lookup_col, lookup_value, target_col, new_value
+):
     service = get_sheets_service()
-    result = service.spreadsheets().values().get(
-        spreadsheetId=sheet_id,
-        range=f"{sheet_name}!A1:Z",
-    ).execute()
+    result = (
+        service.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=sheet_id,
+            range=f"{sheet_name}!A1:Z",
+        )
+        .execute()
+    )
     rows = result.get("values", [])
     headers = rows[0]
 
@@ -3536,19 +4102,23 @@ def update_sheet_cell(sheet_id, sheet_name, lookup_col, lookup_value, target_col
         return
 
     for i, row in enumerate(rows[1:], start=2):
-        if len(row) > lookup_index and str(row[lookup_index]).strip() == str(lookup_value):
+        if len(row) > lookup_index and str(row[lookup_index]).strip() == str(
+            lookup_value
+        ):
             range_to_update = f"{sheet_name}!{chr(65 + target_index)}{i}"
             service.spreadsheets().values().update(
                 spreadsheetId=sheet_id,
                 range=range_to_update,
                 valueInputOption="USER_ENTERED",
-                body={"values": [[str(new_value)]]}
+                body={"values": [[str(new_value)]]},
             ).execute()
             print(f"✅ Updated {target_col} for order {lookup_value} to {new_value}")
             break
 
 
-def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id, env_override=None):
+def get_or_create_customer_ref(
+    company_name, sheet, quickbooks_headers, realm_id, env_override=None
+):
     """
     Look up a customer in QuickBooks; create if missing.
     """
@@ -3560,7 +4130,9 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     base = get_base_qbo_url(env_override)
     query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
     query = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
-    response = requests.get(query_url, headers=quickbooks_headers, params={"query": query})
+    response = requests.get(
+        query_url, headers=quickbooks_headers, params={"query": query}
+    )
 
     if response.status_code == 200:
         customers = response.json().get("QueryResponse", {}).get("Customer", [])
@@ -3572,10 +4144,12 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
     if not SPREADSHEET_ID:
         raise Exception("🚨 Missing SPREADSHEET_ID environment variable")
-    resp = sheet.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Directory!A1:Z"
-    ).execute()
+    resp = (
+        sheet.spreadsheets()
+        .values()
+        .get(spreadsheetId=SPREADSHEET_ID, range="Directory!A1:Z")
+        .execute()
+    )
     rows = resp.get("values", [])
     if not rows or len(rows) < 2:
         directory = []
@@ -3584,27 +4158,33 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
         directory = [dict(zip(headers, row)) for row in rows[1:]]
 
     match = next(
-        (row for row in directory if row.get("Company Name", "").strip() == company_name.strip()),
-        None
+        (
+            row
+            for row in directory
+            if row.get("Company Name", "").strip() == company_name.strip()
+        ),
+        None,
     )
     if not match:
-        raise Exception(f"❌ Customer '{company_name}' not found in Google Sheets Directory")
+        raise Exception(
+            f"❌ Customer '{company_name}' not found in Google Sheets Directory"
+        )
 
     # ── 3) Build QuickBooks customer payload ───────────────────────
     payload = {
-        "DisplayName":      company_name,
-        "CompanyName":      company_name,
+        "DisplayName": company_name,
+        "CompanyName": company_name,
         "PrimaryEmailAddr": {"Address": match.get("Contact Email Address", "")},
-        "PrimaryPhone":     {"FreeFormNumber": match.get("Phone Number", "")},
+        "PrimaryPhone": {"FreeFormNumber": match.get("Phone Number", "")},
         "BillAddr": {
-            "Line1":                  match.get("Street Address 1", ""),
-            "Line2":                  match.get("Street Address 2", ""),
-            "City":                   match.get("City", ""),
+            "Line1": match.get("Street Address 1", ""),
+            "Line2": match.get("Street Address 2", ""),
+            "City": match.get("City", ""),
             "CountrySubDivisionCode": match.get("State", ""),
-            "PostalCode":             match.get("Zip Code", "")
+            "PostalCode": match.get("Zip Code", ""),
         },
-        "GivenName":  match.get("Contact First Name", ""),
-        "FamilyName": match.get("Contact Last Name", "")
+        "GivenName": match.get("Contact First Name", ""),
+        "FamilyName": match.get("Contact Last Name", ""),
     }
 
     # ── 4) Create customer in QuickBooks ──────────────────────────
@@ -3628,6 +4208,7 @@ def get_or_create_customer_ref(company_name, sheet, quickbooks_headers, realm_id
     # ── Final failure ──────────────────────────────────────────────
     raise Exception(f"❌ Failed to create customer in QuickBooks: {res.text}")
 
+
 def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
     base = get_base_qbo_url(env_override)
     query_url = f"{base}/v3/company/{realm_id}/query"
@@ -3638,10 +4219,7 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
     items = response.json().get("QueryResponse", {}).get("Item", [])
 
     if items:
-        return {
-            "value": items[0]["Id"],
-            "name": items[0]["Name"]
-        }
+        return {"value": items[0]["Id"], "name": items[0]["Name"]}
 
     print(f"⚠️ Item '{product_name}' not found. Attempting to create...")
 
@@ -3651,17 +4229,14 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
         "Type": "NonInventory",
         "IncomeAccountRef": {
             "name": "Sales of Product Income",
-            "value": "79"  # Use 79 for sandbox
-        }
+            "value": "79",  # Use 79 for sandbox
+        },
     }
 
     res = requests.post(create_url, headers=headers, json=payload)
     if res.status_code in [200, 201]:
         item = res.json().get("Item", {})
-        return {
-            "value": item["Id"],
-            "name": item["Name"]
-        }
+        return {"value": item["Id"], "name": item["Name"]}
 
     elif res.status_code == 400 and "Duplicate Name Exists Error" in res.text:
         print(f"🔁 Item '{product_name}' already exists, retrieving existing item...")
@@ -3673,20 +4248,21 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
 
         existing_items = lookup_res.json().get("QueryResponse", {}).get("Item", [])
         if existing_items:
-            return {
-                "value": existing_items[0]["Id"],
-                "name": existing_items[0]["Name"]
-            }
+            return {"value": existing_items[0]["Id"], "name": existing_items[0]["Name"]}
         else:
-            raise Exception(f"❌ Item '{product_name}' exists but could not be retrieved.")
+            raise Exception(
+                f"❌ Item '{product_name}' exists but could not be retrieved."
+            )
     else:
         raise Exception(f"❌ Failed to create item '{product_name}' in QBO: {res.text}")
+
 
 def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
     """
     Ensure a ShipMethod (e.g., 'UPS') exists in QBO and return {"value": Id, "name": Name}.
     """
     import requests
+
     base = get_base_qbo_url(env_override)
     query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
     create_url = f"{base}/v3/company/{realm_id}/shipmethod?minorversion=65"
@@ -3703,13 +4279,22 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
 
     # 2) Create if missing
     payload = {"Name": name}
-    r2 = requests.post(create_url, headers={**headers, "Content-Type": "application/json"}, json=payload)
+    r2 = requests.post(
+        create_url,
+        headers={**headers, "Content-Type": "application/json"},
+        json=payload,
+    )
     if r2.status_code in (200, 201):
         sm = r2.json().get("ShipMethod", {})
         return {"value": sm["Id"], "name": sm["Name"]}
 
     # 3) Fallback (name only) — QBO usually needs an Id, but we'll return name if creation fails
-    logging.warning("⚠️ Could not create/find ShipMethod '%s' (%s / %s). Falling back to name only.", name, r.status_code, r2.status_code if 'r2' in locals() else None)
+    logging.warning(
+        "⚠️ Could not create/find ShipMethod '%s' (%s / %s). Falling back to name only.",
+        name,
+        r.status_code,
+        r2.status_code if "r2" in locals() else None,
+    )
     return {"name": name}
 
 
@@ -3719,9 +4304,12 @@ def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start
     If none found or non-numeric, start at fallback_start.
     """
     import requests
+
     base = get_base_qbo_url(env_override)
     query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
-    query = "SELECT DocNumber FROM Invoice ORDER BY MetaData.CreateTime DESC MAXRESULTS 1"
+    query = (
+        "SELECT DocNumber FROM Invoice ORDER BY MetaData.CreateTime DESC MAXRESULTS 1"
+    )
     r = requests.get(query_url, headers=headers, params={"query": query})
     if r.status_code == 200:
         resp = r.json().get("QueryResponse", {})
@@ -3741,36 +4329,46 @@ def fetch_customer_email_from_directory(sheet_service, company_name):
     if not SPREADSHEET_ID:
         logging.warning("⚠️ Missing SPREADSHEET_ID; cannot read Directory for email.")
         return ""
-    resp = sheet_service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Directory!A1:Z"
-    ).execute()
+    resp = (
+        sheet_service.spreadsheets()
+        .values()
+        .get(spreadsheetId=SPREADSHEET_ID, range="Directory!A1:Z")
+        .execute()
+    )
     rows = resp.get("values", []) or []
     if len(rows) < 2:
         return ""
     headers = rows[0]
     try:
         idx_company = headers.index("Company Name")
-        idx_email   = headers.index("Contact Email Address")
+        idx_email = headers.index("Contact Email Address")
     except ValueError:
         return ""
     for row in rows[1:]:
-        if len(row) > idx_company and row[idx_company].strip() == (company_name or "").strip():
+        if (
+            len(row) > idx_company
+            and row[idx_company].strip() == (company_name or "").strip()
+        ):
             return row[idx_email] if len(row) > idx_email else ""
     return ""
 
 
-def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", tracking_list=None, base_shipping_cost=0.0, env_override=None):
+def create_invoice_in_quickbooks(
+    order_data,
+    shipping_method="UPS Ground",
+    tracking_list=None,
+    base_shipping_cost=0.0,
+    env_override=None,
+):
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
 
     token = session.get("qbo_token")
     print("🔑 QBO Token in session:", token)
     print("🏢 Realm ID in session:", token.get("realmId") if token else None)
     if not token or "access_token" not in token or "expires_at" not in token:
-      env_qbo = session.get("qboEnv", QBO_ENV)
-      next_url = f"/qbo/login?env={env_qbo}"
-      raise RedirectException(next_url)
-
+        env_qbo = session.get("qboEnv", QBO_ENV)
+        next_url = f"/qbo/login?env={env_qbo}"
+        raise RedirectException(next_url)
 
     # Refresh if token is expired
     if time.time() >= token["expires_at"]:
@@ -3784,16 +4382,15 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     if not access_token or not realm_id:
         raise Exception("❌ Missing QuickBooks access token or realm ID")
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
     # ── Pick sandbox vs prod for this run ────────────────────
     base = get_base_qbo_url(env_override)
 
     # Step 1: Get or create customer
     sheet = sh
-    customer_ref = get_or_create_customer_ref(order_data.get("Company Name", ""), sheet, headers, realm_id)
+    customer_ref = get_or_create_customer_ref(
+        order_data.get("Company Name", ""), sheet, headers, realm_id
+    )
 
     # Step 2: Get item reference from QBO (look up or create if missing)
     product_name = order_data.get("Product", "").strip()
@@ -3812,9 +4409,16 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     txn_date_str = datetime.now().strftime("%Y-%m-%d")
     # Directory email for this customer
     sheet_service = get_sheets_service()
-    bill_email = fetch_customer_email_from_directory(sheet_service, order_data.get("Company Name", "")) or ""
+    bill_email = (
+        fetch_customer_email_from_directory(
+            sheet_service, order_data.get("Company Name", "")
+        )
+        or ""
+    )
     # Force Ship Via = UPS
-    ship_method_ref = get_or_create_ship_method_ref("UPS", headers, realm_id, env_override)
+    ship_method_ref = get_or_create_ship_method_ref(
+        "UPS", headers, realm_id, env_override
+    )
     # Next DocNumber (+1)
     doc_number = get_next_invoice_number(headers, realm_id, env_override)
 
@@ -3826,29 +4430,32 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
                 "Amount": float(round(amount, 2)),
                 "Description": order_data.get("Design", ""),
                 "SalesItemLineDetail": {
-                    "ItemRef": { "value": item_ref["value"] },
+                    "ItemRef": {"value": item_ref["value"]},
                     "Qty": float(qty),
-                    "UnitPrice": float(round(unit_price, 2))
-                }
+                    "UnitPrice": float(round(unit_price, 2)),
+                },
             }
         ],
-        "TxnDate":       txn_date_str,
-        "ShipDate":      txn_date_str,
-        "DocNumber":     doc_number,
-        "TotalAmt":      float(round(amount, 2)),
-        "SalesTermRef":  { "value": "3" },
-        "BillEmail":     {"Address": bill_email} if bill_email else None,
-        "ShipMethodRef": ship_method_ref
+        "TxnDate": txn_date_str,
+        "ShipDate": txn_date_str,
+        "DocNumber": doc_number,
+        "TotalAmt": float(round(amount, 2)),
+        "SalesTermRef": {"value": "3"},
+        "BillEmail": {"Address": bill_email} if bill_email else None,
+        "ShipMethodRef": ship_method_ref,
     }
     # Remove any None values QBO might reject (e.g., missing BillEmail)
     invoice_payload = {k: v for k, v in invoice_payload.items() if v is not None}
-
 
     invoice_url = f"{base}/v3/company/{realm_id}/invoice"
     logging.info("📦 Invoice payload about to send to QuickBooks:")
     logging.info(json.dumps(invoice_payload, indent=2))
 
-    invoice_resp = requests.post(invoice_url, headers={**headers, "Content-Type": "application/json"}, json=invoice_payload)
+    invoice_resp = requests.post(
+        invoice_url,
+        headers={**headers, "Content-Type": "application/json"},
+        json=invoice_payload,
+    )
 
     if invoice_resp.status_code != 200:
         try:
@@ -3875,13 +4482,14 @@ def create_invoice_in_quickbooks(order_data, shipping_method="UPS Ground", track
     )
     return f"{app_url}/app/invoice?txnId={invoice['Id']}"
 
+
 def create_consolidated_invoice_in_quickbooks(
     order_data_list,
     shipping_method,
     tracking_list,
     base_shipping_cost,
     sheet,
-    env_override=None
+    env_override=None,
 ):
     """
     Builds a single consolidated invoice in QuickBooks (sandbox or production).
@@ -3894,32 +4502,28 @@ def create_consolidated_invoice_in_quickbooks(
     headers, realm_id = get_quickbooks_credentials()
 
     logging.info(
-        "📦 Incoming order_data_list:\n%s",
-        json.dumps(order_data_list, indent=2)
+        "📦 Incoming order_data_list:\n%s", json.dumps(order_data_list, indent=2)
     )
 
     # ── 2) Find or create the customer ──────────────────────────────
     first_order = order_data_list[0]
     customer_ref = get_or_create_customer_ref(
-        first_order.get("Company Name", ""),
-        sheet,
-        headers,
-        realm_id,
-        env_override
+        first_order.get("Company Name", ""), sheet, headers, realm_id, env_override
     )
 
     # ── 3) Build line items ─────────────────────────────────────────
     line_items = []
+
     def _is_back_item(name: str) -> bool:
         # treat ANY standalone "back" token as a back item
-        return bool(re.search(r'(?i)\bback\b', name or ''))
+        return bool(re.search(r"(?i)\bback\b", name or ""))
 
     def _product_base(name: str) -> str:
         # remove "front" and "full" tokens anywhere, and clean separators
-        base = re.sub(r'(?i)\b(front|full)\b', '', name or '')
-        base = re.sub(r'[\(\)\[\]\-_/]+', ' ', base)
-        base = re.sub(r'\s+', ' ', base).strip()
-        return base or (name or '')
+        base = re.sub(r"(?i)\b(front|full)\b", "", name or "")
+        base = re.sub(r"[\(\)\[\]\-_/]+", " ", base)
+        base = re.sub(r"\s+", " ", base).strip()
+        return base or (name or "")
 
     for order in order_data_list:
         raw_name = (order.get("Product") or "").strip()
@@ -3929,15 +4533,12 @@ def create_consolidated_invoice_in_quickbooks(
             continue
 
         product_base = _product_base(raw_name)
-        design_name  = (order.get("Design") or "").strip()
-
+        design_name = (order.get("Design") or "").strip()
 
         # Parse shipped quantity (fallback to other fields)
         try:
             raw_qty = (
-                order.get("ShippedQty")
-                or order.get("Shipped")
-                or order.get("Quantity")
+                order.get("ShippedQty") or order.get("Shipped") or order.get("Quantity")
             )
             shipped_qty = int(float(raw_qty))
             if shipped_qty <= 0:
@@ -3952,26 +4553,20 @@ def create_consolidated_invoice_in_quickbooks(
             price = 0.0
 
         # Lookup or create item, propagating override
-        item_ref = get_or_create_item_ref(
-            product_base,
-            headers,
-            realm_id,
-            env_override
-        )
+        item_ref = get_or_create_item_ref(product_base, headers, realm_id, env_override)
 
-        line_items.append({
-            "DetailType": "SalesItemLineDetail",
-            "Amount":     round(shipped_qty * price, 2),
-            "Description": design_name,
-            "SalesItemLineDetail": {
-                "ItemRef":  {
-                    "value": item_ref["value"],
-                    "name":  item_ref["name"]
+        line_items.append(
+            {
+                "DetailType": "SalesItemLineDetail",
+                "Amount": round(shipped_qty * price, 2),
+                "Description": design_name,
+                "SalesItemLineDetail": {
+                    "ItemRef": {"value": item_ref["value"], "name": item_ref["name"]},
+                    "Qty": shipped_qty,
+                    "UnitPrice": price,
                 },
-                "Qty":        shipped_qty,
-                "UnitPrice":  price
             }
-        })
+        )
 
     if not line_items:
         raise Exception("❌ No valid line items to invoice.")
@@ -3981,26 +4576,30 @@ def create_consolidated_invoice_in_quickbooks(
 
     # Directory email for this customer
     sheet_service = get_sheets_service()
-    bill_email = fetch_customer_email_from_directory(
-        sheet_service,
-        first_order.get("Company Name", "")
-    ) or ""
+    bill_email = (
+        fetch_customer_email_from_directory(
+            sheet_service, first_order.get("Company Name", "")
+        )
+        or ""
+    )
 
     # Force Ship Via = UPS
-    ship_method_ref = get_or_create_ship_method_ref("UPS", headers, realm_id, env_override)
+    ship_method_ref = get_or_create_ship_method_ref(
+        "UPS", headers, realm_id, env_override
+    )
 
     # Next DocNumber (+1 from last)
     doc_number = get_next_invoice_number(headers, realm_id, env_override)
 
     invoice_payload = {
-        "CustomerRef":  customer_ref,
-        "Line":         line_items,
-        "TxnDate":      txn_date_str,
-        "ShipDate":     txn_date_str,
-        "DocNumber":    doc_number,
-        "TotalAmt":     round(sum(item["Amount"] for item in line_items), 2),
+        "CustomerRef": customer_ref,
+        "Line": line_items,
+        "TxnDate": txn_date_str,
+        "ShipDate": txn_date_str,
+        "DocNumber": doc_number,
+        "TotalAmt": round(sum(item["Amount"] for item in line_items), 2),
         "SalesTermRef": {"value": "3"},
-        "BillEmail":    {"Address": bill_email} if bill_email else None,
+        "BillEmail": {"Address": bill_email} if bill_email else None,
         "ShipMethodRef": ship_method_ref,
     }
     # Drop any None values QBO might reject (e.g., missing BillEmail)
@@ -4008,15 +4607,12 @@ def create_consolidated_invoice_in_quickbooks(
 
     # ── 5) Send to QuickBooks ───────────────────────────────────────
     url = f"{base}/v3/company/{realm_id}/invoice"
-    logging.info(
-        "📦 Invoice payload:\n%s",
-        json.dumps(invoice_payload, indent=2)
-    )
+    logging.info("📦 Invoice payload:\n%s", json.dumps(invoice_payload, indent=2))
 
     res = requests.post(
         url,
         headers={**headers, "Content-Type": "application/json"},
-        json=invoice_payload
+        json=invoice_payload,
     )
     if res.status_code not in (200, 201):
         logging.error("❌ QBO invoice creation failed: %s", res.text)
@@ -4034,14 +4630,16 @@ def create_consolidated_invoice_in_quickbooks(
     return f"{app_url}/app/invoice?txnId={inv_id}"
 
 
-
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({"status": "ok", "message": "Backend is running"}), 200
 
+
 @app.before_request
 def _debug_session():
-     logger.info("🔑 Session data for %s → %s", request.path, dict(session))
+    logger.info("🔑 Session data for %s → %s", request.path, dict(session))
+
+
 # allow cross-site cookies
 app.config.update(
     SESSION_COOKIE_SAMESITE="None",
@@ -4052,30 +4650,34 @@ app.config.update(
 CORS(
     app,
     resources={
-        r"/":             {"origins": FRONTEND_URL},
-        r"/api/*":        {"origins": FRONTEND_URL},
-        r"/api/threads":  {"origins": FRONTEND_URL},
-        r"/submit":       {"origins": FRONTEND_URL},
+        r"/": {"origins": FRONTEND_URL},
+        r"/api/*": {"origins": FRONTEND_URL},
+        r"/api/threads": {"origins": FRONTEND_URL},
+        r"/submit": {"origins": FRONTEND_URL},
     },
-    supports_credentials=True
+    supports_credentials=True,
 )
 
 
 from flask import session  # (if not already imported)
+
 
 @app.before_request
 def _debug_session():
     logger.info("🔑 Session data for %s → %s", request.path, dict(session))
 
 
-
 # ─── Session & Auth Helpers ──────────────────────────────────────────────────
 
-ALLOWED_WS_ORIGINS = list({
-    os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/"),
-    "https://machineschedule.netlify.app",
-    "http://localhost:3000",
-})
+ALLOWED_WS_ORIGINS = list(
+    {
+        os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+        .strip()
+        .rstrip("/"),
+        "https://machineschedule.netlify.app",
+        "http://localhost:3000",
+    }
+)
 
 socketio = SocketIO(
     app,
@@ -4085,51 +4687,64 @@ socketio = SocketIO(
     ping_interval=25,
     ping_timeout=20,
     max_http_buffer_size=1_000_000,
-    logger=False,            # NEW: silence Socket.IO logs
-    engineio_logger=False,   # NEW: silence low-level engine logs
+    logger=False,  # NEW: silence Socket.IO logs
+    engineio_logger=False,  # NEW: silence low-level engine logs
 )
-
 
 
 # ─── Vendor Directory Cache ─────────────────────────────────────────────────
 _vendor_dir_cache = None
-_vendor_dir_ts    = 0
-VENDOR_TTL        = 600  # 10 minutes
+_vendor_dir_ts = 0
+VENDOR_TTL = 600  # 10 minutes
+
 
 def _hdr_index(headers):
     return {str(h or "").strip().lower(): i for i, h in enumerate(headers or [])}
 
+
 def read_vendor_directory_from_material_inventory():
     """Reads Material Inventory!K1:O as: Vendor | Method | Email | CC | Website"""
     import time as _t
+
     global _vendor_dir_cache, _vendor_dir_ts
     now = _t.time()
     if _vendor_dir_cache and (now - _vendor_dir_ts) < VENDOR_TTL:
         return _vendor_dir_cache
 
     svc = get_sheets_service().spreadsheets().values()
-    vals = svc.get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Material Inventory!K1:O",
-        valueRenderOption="FORMATTED_VALUE"
-    ).execute().get("values", []) or []
+    vals = (
+        svc.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Inventory!K1:O",
+            valueRenderOption="FORMATTED_VALUE",
+        )
+        .execute()
+        .get("values", [])
+        or []
+    )
 
     out = {}
     if vals:
         idx = _hdr_index(vals[0])
         for r in vals[1:]:
+
             def gv(key):
                 i = idx.get(key)
-                return (r[i].strip() if i is not None and i < len(r) and r[i] is not None else "")
+                return (
+                    r[i].strip()
+                    if i is not None and i < len(r) and r[i] is not None
+                    else ""
+                )
+
             vname = gv("vendor").strip()
             if not vname:
                 continue
             key = vname.lower()
             out[key] = {
-                "vendor":  vname,                          # keep original for display if needed
-                "method":  (gv("method") or "").lower(),
-                "email":   gv("email"),
-                "cc":      gv("cc"),
+                "vendor": vname,  # keep original for display if needed
+                "method": (gv("method") or "").lower(),
+                "email": gv("email"),
+                "cc": gv("cc"),
                 "website": gv("website"),
             }
 
@@ -4147,7 +4762,7 @@ def get_vendors():
         return jsonify({"vendors": [{"vendor": k, **v} for k, v in m.items()]})
     except Exception:
         app.logger.exception("vendors failed")
-        return jsonify({"error":"vendors failed"}), 500
+        return jsonify({"error": "vendors failed"}), 500
 
 
 # ─── Google Drive Token/Scopes Config ──────────────────────────────
@@ -4160,6 +4775,7 @@ GOOGLE_SCOPES = [
 
 # use the same path variable everywhere for Google token
 GOOGLE_TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
+
 
 def _load_google_creds():
     """
@@ -4175,23 +4791,29 @@ def _load_google_creds():
         try:
             info = json.loads(env_val)
             token_scopes = info.get("scopes")
-            creds = (OAuthCredentials.from_authorized_user_info(info)
-                     if token_scopes
-                     else OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES))
+            creds = (
+                OAuthCredentials.from_authorized_user_info(info)
+                if token_scopes
+                else OAuthCredentials.from_authorized_user_info(
+                    info, scopes=GOOGLE_SCOPES
+                )
+            )
             print("🔎 token (env) scopes:", token_scopes)
             # Try to refresh, but don't fail if Google is flaky
             try:
                 if not creds.valid and getattr(creds, "refresh_token", None):
                     from google.auth.transport.requests import Request as GoogleRequest
+
                     creds.refresh(GoogleRequest())
             except Exception as _e:
                 # Log once but still return the creds; API calls can retry refresh
-                print("⚠️ ENV token refresh failed (will return creds anyway):", repr(_e))
+                print(
+                    "⚠️ ENV token refresh failed (will return creds anyway):", repr(_e)
+                )
             return creds
         except Exception as e:
             print("❌ ENV token could not build OAuthCredentials:", repr(e))
             # fall through to file
-
 
     # 2) File next
     try:
@@ -4202,10 +4824,13 @@ def _load_google_creds():
             if token_scopes:
                 creds = OAuthCredentials.from_authorized_user_info(info)
             else:
-                creds = OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+                creds = OAuthCredentials.from_authorized_user_info(
+                    info, scopes=GOOGLE_SCOPES
+                )
             print("🔎 token (file) scopes:", token_scopes)
             if not creds.valid and creds.refresh_token:
                 from google.auth.transport.requests import Request as GoogleRequest
+
                 creds.refresh(GoogleRequest())
             return creds
     except Exception as e:
@@ -4213,8 +4838,6 @@ def _load_google_creds():
 
     # 3) Nothing worked
     return None
-
-
 
 
 # --- Drive: make file public (anyone with link → reader) ---------------------
@@ -4227,7 +4850,9 @@ def drive_make_public():
         resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = (
+            "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        )
         return resp
 
     data = request.get_json(silent=True) or {}
@@ -4238,21 +4863,21 @@ def drive_make_public():
     try:
         drive = get_drive_service()
         # Check existing permissions for 'anyone'
-        perms = drive.permissions().list(
-            fileId=file_id,
-            fields="permissions(id,type,role)"
-        ).execute()
+        perms = (
+            drive.permissions()
+            .list(fileId=file_id, fields="permissions(id,type,role)")
+            .execute()
+        )
         already_public = any(
-            p.get("type") == "anyone" and p.get("role") in ("reader", "commenter", "writer")
+            p.get("type") == "anyone"
+            and p.get("role") in ("reader", "commenter", "writer")
             for p in (perms.get("permissions") or [])
         )
 
         if not already_public:
             # Make it public (view-only)
             drive.permissions().create(
-                fileId=file_id,
-                body={"type": "anyone", "role": "reader"},
-                fields="id"
+                fileId=file_id, body={"type": "anyone", "role": "reader"}, fields="id"
             ).execute()
 
         return jsonify({"ok": True})
@@ -4261,36 +4886,34 @@ def drive_make_public():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-
 # ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
 sheet_lock = Semaphore(1)
-SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
-ORDERS_RANGE     = os.environ.get("ORDERS_RANGE",     "Production Orders!A1:AM")
-FUR_RANGE        = os.environ.get("FUR_RANGE",        "Fur List!A1:Z")
-CUT_RANGE    = os.environ.get("CUT_RANGE",    "Cut List!A1:Z")
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+ORDERS_RANGE = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AM")
+FUR_RANGE = os.environ.get("FUR_RANGE", "Fur List!A1:Z")
+CUT_RANGE = os.environ.get("CUT_RANGE", "Cut List!A1:Z")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
-MANUAL_RANGE       = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
+MANUAL_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 BOM_TABLE_RANGE = os.environ.get("BOM_TABLE_RANGE", "Table!A1:AF")
 
 # ── Legacy QuickBooks vars (still available if used elsewhere) ────
-QBO_CLIENT_ID     = os.environ.get("QBO_CLIENT_ID")
+QBO_CLIENT_ID = os.environ.get("QBO_CLIENT_ID")
 QBO_CLIENT_SECRET = os.environ.get("QBO_CLIENT_SECRET")
-QBO_REDIRECT_URI  = (os.environ.get("QBO_REDIRECT_URI") or "").strip()
-QBO_AUTH_URL      = "https://appcenter.intuit.com/connect/oauth2"
-QBO_TOKEN_URL     = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
-QBO_SCOPES        = ["com.intuit.quickbooks.accounting"]
+QBO_REDIRECT_URI = (os.environ.get("QBO_REDIRECT_URI") or "").strip()
+QBO_AUTH_URL = "https://appcenter.intuit.com/connect/oauth2"
+QBO_TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+QBO_SCOPES = ["com.intuit.quickbooks.accounting"]
 
 # ── QuickBooks environment configuration ────────────────────────
 QBO_SANDBOX_BASE_URL = os.environ.get(
-    "QBO_SANDBOX_BASE_URL",
-    "https://sandbox-quickbooks.api.intuit.com"
+    "QBO_SANDBOX_BASE_URL", "https://sandbox-quickbooks.api.intuit.com"
 )
 QBO_PROD_BASE_URL = os.environ.get(
-    "QBO_PROD_BASE_URL",
-    "https://quickbooks.api.intuit.com"
+    "QBO_PROD_BASE_URL", "https://quickbooks.api.intuit.com"
 )
 QBO_ENV = os.environ.get("QBO_ENV", "sandbox").lower()  # 'sandbox' or 'production'
+
 
 def get_base_qbo_url(env_override: str = None) -> str:
     """
@@ -4299,11 +4922,13 @@ def get_base_qbo_url(env_override: str = None) -> str:
     env = (env_override or QBO_ENV).lower()
     return QBO_PROD_BASE_URL if env == "production" else QBO_SANDBOX_BASE_URL
 
+
 # ── OAuth client credentials for sandbox vs. production ─────────
-QBO_SANDBOX_CLIENT_ID     = os.environ.get("QBO_SANDBOX_CLIENT_ID")
+QBO_SANDBOX_CLIENT_ID = os.environ.get("QBO_SANDBOX_CLIENT_ID")
 QBO_SANDBOX_CLIENT_SECRET = os.environ.get("QBO_SANDBOX_CLIENT_SECRET")
-QBO_PROD_CLIENT_ID        = os.environ.get("QBO_PROD_CLIENT_ID")
-QBO_PROD_CLIENT_SECRET    = os.environ.get("QBO_PROD_CLIENT_SECRET")
+QBO_PROD_CLIENT_ID = os.environ.get("QBO_PROD_CLIENT_ID")
+QBO_PROD_CLIENT_SECRET = os.environ.get("QBO_PROD_CLIENT_SECRET")
+
 
 def get_qbo_oauth_credentials(env_override: str = None):
     """
@@ -4313,6 +4938,8 @@ def get_qbo_oauth_credentials(env_override: str = None):
     if env == "production":
         return QBO_PROD_CLIENT_ID, QBO_PROD_CLIENT_SECRET
     return QBO_SANDBOX_CLIENT_ID, QBO_SANDBOX_CLIENT_SECRET
+
+
 # ─────────────────────────────────────────────────────────────────
 
 # Unified Google auth: always load from GOOGLE_TOKEN_JSON or token.json via _load_google_creds
@@ -4327,8 +4954,7 @@ if not creds:
 # Wire clients once, using the creds from _load_google_creds()
 sh = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
 service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-sheets  = service.spreadsheets()
-
+sheets = service.spreadsheets()
 
 
 @app.route("/rate", methods=["POST"])
@@ -4336,7 +4962,7 @@ sheets  = service.spreadsheets()
 def rate_all_services():
     """
     Accepts:
-      { 
+      {
         "to": { "name","phone","addr1","addr2","city","state","zip","country" },
         "packages": [ { "L":10,"W":10,"H":10,"weight":2 }, ... ]
       }
@@ -4350,16 +4976,19 @@ def rate_all_services():
         options = ups_get_rate(to, pkgs, ask_all_services=True)
         return jsonify(options)  # an array that your Ship.jsx already expects
     except Exception as e:
-        return jsonify([
-            { "method": "Manual Shipping", "rate": "N/A", "delivery": "TBD" }
-        ]), 200
+        return (
+            jsonify([{"method": "Manual Shipping", "rate": "N/A", "delivery": "TBD"}]),
+            200,
+        )
 
 
 # >>> REPLACE the entire /api/updateStartTime route with this <<<
 
 from flask import request, jsonify
 from datetime import datetime
+
 # Assuming: socketio, fetch_sheet, write_sheet, SPREADSHEET_ID already exist/imported
+
 
 @app.route("/api/updateStartTime", methods=["POST"])
 @login_required_session
@@ -4377,7 +5006,10 @@ def update_start_time():
     iso_start = str(data.get("startTime", "")).strip()
 
     if not order_number or not iso_start:
-        return jsonify({"ok": False, "error": "orderNumber and startTime required"}), 400
+        return (
+            jsonify({"ok": False, "error": "orderNumber and startTime required"}),
+            400,
+        )
 
     try:
         # Validate ISO
@@ -4387,14 +5019,19 @@ def update_start_time():
 
     # Read header + rows
     sheet_name = "Production Orders"
-    rows = fetch_sheet(SPREADSHEET_ID, f"{sheet_name}!A1:ZZ")  # full width, cheap for headers
+    rows = fetch_sheet(
+        SPREADSHEET_ID, f"{sheet_name}!A1:ZZ"
+    )  # full width, cheap for headers
     if not rows or not rows[0]:
         return jsonify({"ok": False, "error": "Sheet empty or unreadable"}), 500
 
     header = rows[0]
-    def col_idx(name): 
-        try: return header.index(name)
-        except ValueError: return -1
+
+    def col_idx(name):
+        try:
+            return header.index(name)
+        except ValueError:
+            return -1
 
     col_order = col_idx("Order #")
     col_start = col_idx("Embroidery Start Time")
@@ -4422,7 +5059,9 @@ def update_start_time():
     if not current_val:
         # Write start time (as-is) into the target cell
         # Convert zero-based row to 1-based, plus header: +1 for header row, +1 to switch to 1-based = +1
-        sheet_row_1_based = target_row_idx + 1 + 0  # rows[0] is header => target_row_idx already includes header offset
+        sheet_row_1_based = (
+            target_row_idx + 1 + 0
+        )  # rows[0] is header => target_row_idx already includes header offset
         # Note: target_row_idx is 1 for first data row; that is already 2 in UI. So:
         # rows index: 0=header, 1=data row 2 in UI. Therefore:
         sheet_row_1_based = target_row_idx + 1  # correct for A1 notation
@@ -4433,8 +5072,10 @@ def update_start_time():
             while True:
                 s = chr(n % 26 + 65) + s
                 n = n // 26 - 1
-                if n < 0: break
+                if n < 0:
+                    break
             return s
+
         a1_col = to_a1_col(col_start)
         a1_cell = f"{sheet_name}!{a1_col}{sheet_row_1_based}"
 
@@ -4443,59 +5084,68 @@ def update_start_time():
 
     # Nudge clients
     try:
-        socketio.emit("startTimeUpdated", {
-            "orderNumber": order_number,
-            "startTime": iso_start,
-            "wrote": wrote
-        })
+        socketio.emit(
+            "startTimeUpdated",
+            {"orderNumber": order_number, "startTime": iso_start, "wrote": wrote},
+        )
     except Exception:
         pass
 
-    return jsonify({"ok": True, "orderNumber": order_number, "startTime": iso_start, "wrote": wrote}), 200
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "orderNumber": order_number,
+                "startTime": iso_start,
+                "wrote": wrote,
+            }
+        ),
+        200,
+    )
 
 
 # ─── In-memory caches & settings ────────────────────────────────────────────
 # with CACHE_TTL = 0, every GET will hit Sheets directly
-CACHE_TTL           = 30
+CACHE_TTL = 30
 
 # orders cache + timestamp
-_orders_cache       = None
-_orders_ts          = 0
+_orders_cache = None
+_orders_ts = 0
 
 # embroidery list cache + timestamp
-_emb_cache          = None
-_emb_ts             = 0
+_emb_cache = None
+_emb_ts = 0
 
 # manualState cache + timestamp (for placeholders & machine assignments)
 _manual_state_cache = None
-_manual_state_ts    = 0
+_manual_state_ts = 0
 
 # overview + jobs-for-company micro-caches
-_overview_cache     = None
-_overview_ts        = 0
-_jobs_company_cache = {}   # { company_lower: {"ts": <epoch>, "data": {...}} }
+_overview_cache = None
+_overview_ts = 0
+_jobs_company_cache = {}  # { company_lower: {"ts": <epoch>, "data": {...}} }
 
 # combined: micro-cache + timestamp
 _combined_cache = None
-_combined_ts    = 0.0
+_combined_ts = 0.0
 
 # ID-column cache for updateStartTime
-_id_cache           = None
-_id_ts              = 0
+_id_cache = None
+_id_ts = 0
 
 # overview: upcoming jobs cache (keyed by days) + timestamp
-_overview_upcoming_cache = {}   # { int(days): {"jobs": [...]} }
-_overview_upcoming_ts    = 0.0
+_overview_upcoming_cache = {}  # { int(days): {"jobs": [...]} }
+_overview_upcoming_ts = 0.0
 
 # overview: materials-needed cache + timestamp
-_materials_needed_cache  = None  # {"vendors": [...]}
-_materials_needed_ts     = 0.0
+_materials_needed_cache = None  # {"vendors": [...]}
+_materials_needed_ts = 0.0
 
 # ─── Google client singletons ───────────────────────────────────────────────
 _sheets_service = None
-_drive_service  = None
-_service_ts     = 0
-SERVICE_TTL     = 900  # 15 minutes
+_drive_service = None
+_service_ts = 0
+SERVICE_TTL = 900  # 15 minutes
 # ────────────────────────────────────────────────────────────────────────────
 
 # ---- helpers: clear overview caches ----------------------------------------
@@ -4503,7 +5153,8 @@ SERVICE_TTL     = 900  # 15 minutes
 BOM_TABLE_RANGE = os.environ.get("BOM_TABLE_RANGE", "Table!A1:AB")
 # Set this in your backend env (Render) to the folder ID you gave me:
 # 1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu
-BOM_FOLDER_ID   = os.environ.get("BOM_FOLDER_ID", "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu")
+BOM_FOLDER_ID = os.environ.get("BOM_FOLDER_ID", "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu")
+
 
 def _safe_drive_id(link_or_id: str) -> str:
     """Accept a Drive link or a raw file ID; return just the file ID or ''."""
@@ -4518,23 +5169,32 @@ def _safe_drive_id(link_or_id: str) -> str:
     if not s:
         return ""
     import re
-    m = re.search(r"/d/([A-Za-z0-9_-]{20,})", s) or re.search(r"[?&]id=([A-Za-z0-9_-]{20,})", s)
+
+    m = re.search(r"/d/([A-Za-z0-9_-]{20,})", s) or re.search(
+        r"[?&]id=([A-Za-z0-9_-]{20,})", s
+    )
     if m:
         return m.group(1)
     if re.fullmatch(r"[A-Za-z0-9_-]{20,}", s):
         return s
     return ""
 
+
 def _get_drive_service():
     """Drive v3 client using your existing Google creds helper."""
     from googleapiclient.discovery import build
+
     creds = get_google_credentials()
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+
 
 # ─── ETag helper (weak ETag based on JSON bytes) ─────────────────────────────
 def _json_etag(payload_bytes: bytes) -> str:
     import hashlib as _hashlib
+
     return 'W/"%s"' % _hashlib.sha1(payload_bytes).hexdigest()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -4543,28 +5203,36 @@ def invalidate_materials_needed_cache():
     _materials_needed_cache = None
     _materials_needed_ts = 0.0
 
+
 def invalidate_upcoming_cache():
     global _overview_upcoming_cache, _overview_upcoming_ts
-    _overview_upcoming_cache = {}   # keyed by days
+    _overview_upcoming_cache = {}  # keyed by days
     _overview_upcoming_ts = 0.0
+
+
 # ---------------------------------------------------------------------------
 
 # ✅ You must define or update this function to match your actual Google Sheet logic
 import traceback
 
+
 def update_embroidery_start_time_in_sheet(order_id, new_start_time):
     """Write ISO start time into the 'Embroidery Start Time' column for the given Order #."""
     try:
         # 1) Read headers & rows
-        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render_option="UNFORMATTED_VALUE")
+        rows = fetch_sheet(
+            SPREADSHEET_ID, ORDERS_RANGE, value_render_option="UNFORMATTED_VALUE"
+        )
         if not rows:
             raise RuntimeError("orders range returned no rows")
         headers = [str(h).strip() for h in rows[0]]
         try:
-            id_idx    = headers.index("Order #")
+            id_idx = headers.index("Order #")
             start_idx = headers.index("Embroidery Start Time")
         except ValueError as e:
-            raise RuntimeError("Missing 'Order #' or 'Embroidery Start Time' header") from e
+            raise RuntimeError(
+                "Missing 'Order #' or 'Embroidery Start Time' header"
+            ) from e
 
         # 2) Locate target row
         row_num = None
@@ -4596,8 +5264,8 @@ def update_embroidery_start_time_in_sheet(order_id, new_start_time):
         raise
 
 
-
 import time
+
 
 def fetch_sheet(spreadsheet_id, range_a1, **opts):
     """
@@ -4623,7 +5291,11 @@ def fetch_sheet(spreadsheet_id, range_a1, **opts):
             return resp.get("values", []) or []
         except Exception as e:
             msg = str(e)
-            if "timed out" in msg.lower() or "transport" in msg.lower() or "unavailable" in msg.lower():
+            if (
+                "timed out" in msg.lower()
+                or "transport" in msg.lower()
+                or "unavailable" in msg.lower()
+            ):
                 if attempt < 3:
                     time.sleep(1 * attempt)  # 1s, 2s
                     continue
@@ -4637,13 +5309,17 @@ def write_sheet(spreadsheet_id, range_, values):
         "majorDimension": "ROWS",
         "values": values,
     }
-    return service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=range_,
-        valueInputOption="USER_ENTERED",
-        body=body
-    ).execute()
-
+    return (
+        service.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=range_,
+            valueInputOption="USER_ENTERED",
+            body=body,
+        )
+        .execute()
+    )
 
 
 def get_sheet_password():
@@ -4707,29 +5383,30 @@ def login():
     return render_template_string(_login_page, error=error, next=next_url)
 
 
-
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect("/login")
 
+
 import traceback
 from googleapiclient.errors import HttpError
 
+
 def _extract_file_id(s: str) -> str:
     s = str(s or "")
-    m = re.search(r'[?&]id=([A-Za-z0-9_-]+)', s)
+    m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", s)
     if m:
         return m.group(1)
-    m = re.search(r'/file/d/([A-Za-z0-9_-]+)', s)
+    m = re.search(r"/file/d/([A-Za-z0-9_-]+)", s)
     if m:
         return m.group(1)
     return ""
 
 
-
 # ── OVERVIEW payload builder (NO ROUTES HERE) ───────────────────────────────
 from datetime import date, timedelta
+
 
 @app.route("/api/overview")
 @login_required_session
@@ -4738,8 +5415,11 @@ def overview_combined_overview():
     Returns upcoming + overdue job data from Supabase, including incomplete jobs.
     """
     import traceback
+
     try:
-        app.logger.info("🔍 Running build_overview_payload() — fetching jobs from Supabase")
+        app.logger.info(
+            "🔍 Running build_overview_payload() — fetching jobs from Supabase"
+        )
 
         query = """
         SELECT
@@ -4756,14 +5436,17 @@ def overview_combined_overview():
         WHERE
           (
             to_date("Due Date", 'YYYY-MM-DD') >= CURRENT_DATE
-            OR ("Stage" IS DISTINCT FROM 'Complete' AND to_date("Due Date", 'YYYY-MM-DD') < CURRENT_DATE)
+            OR ("Stage" IS DISTINCT FROM 'Complete'
+               AND to_date("Due Date", 'YYYY-MM-DD') < CURRENT_DATE)
           )
         ORDER BY "Due Date";
         """
 
         app.logger.info("🧾 SQL QUERY:\n%s", query)
+
+        # Execute the Supabase SQL RPC function
         resp = supabase.rpc("exec_sql", {"sql": query}).execute()
-   print("🧠 Supabase exec_sql response:", resp)
+        print("🧠 Supabase exec_sql response:", resp)
 
         app.logger.info("✅ Supabase response keys: %s", list(resp.__dict__.keys()))
 
@@ -4799,9 +5482,11 @@ def overview_combined_overview():
         fallback = {"upcoming": [], "materials": [], "daysWindow": "7"}
         return jsonify(fallback), 500
 
+
 # ── OVERVIEW ROUTE WRAPPER (THIS is the endpoint) ───────────────────────────
 _overview_cache = None
 _overview_ts = 0.0
+
 
 @app.route("/overview", methods=["GET"], endpoint="overview_plain")
 @app.route("/api/overview", methods=["GET"], endpoint="overview_api")
@@ -4842,23 +5527,24 @@ def overview_combined():
             "error": str(e),
         }
 
-
     payload_bytes = json.dumps(payload).encode("utf-8")
     resp = Response(payload_bytes, mimetype="application/json")
     resp.headers["ETag"] = _json_etag(payload_bytes)
     resp.headers["Cache-Control"] = f"public, max-age={TTL}"
     return resp
 
+
 @app.route("/api/upcoming_jobs")
 @login_required_session
 def api_upcoming_jobs():
     """
     Returns upcoming and overdue (not complete) jobs directly from Supabase.
-    Adds detailed console + network logging.
+    Clean indentation fix.
     """
     import traceback
+
     try:
-        app.logger.info("⚡️ /api/upcoming_jobs called from frontend")
+        app.logger.info("⚡️ /api_upcoming_jobs called from frontend")
 
         query = """
         SELECT
@@ -4875,7 +5561,8 @@ def api_upcoming_jobs():
         WHERE
           (
             to_date("Due Date", 'YYYY-MM-DD') >= CURRENT_DATE
-            OR ("Stage" IS DISTINCT FROM 'Complete' AND to_date("Due Date", 'YYYY-MM-DD') < CURRENT_DATE)
+            OR ("Stage" IS DISTINCT FROM 'Complete'
+               AND to_date("Due Date", 'YYYY-MM-DD') < CURRENT_DATE)
           )
         ORDER BY "Due Date";
         """
@@ -4888,10 +5575,8 @@ def api_upcoming_jobs():
         rows = getattr(resp, "data", None) or []
         app.logger.info("📦 Retrieved %d rows", len(rows))
 
-        # 🧩 Format output
-        jobs = []
-        for r in rows:
-            jobs.append({
+        jobs = [
+            {
                 "Order #": r.get("Order #"),
                 "Company Name": r.get("Company Name"),
                 "Design": r.get("Design"),
@@ -4900,18 +5585,17 @@ def api_upcoming_jobs():
                 "Stage": r.get("Stage"),
                 "Due": r.get("Due Date"),
                 "Ship": r.get("Ship Date"),
-                "Hard/Soft": r.get("Hard Date/Soft Date")
-            })
+                "Hard/Soft": r.get("Hard Date/Soft Date"),
+            }
+            for r in rows
+        ]
 
-        return jsonify({
-            "debug": {
-                "query": query,
-                "row_count": len(rows),
-                "raw_response": str(resp)
-            },
-            "jobs": jobs,
-            "count": len(jobs)
-        })
+        return jsonify(
+            {
+                "count": len(jobs),
+                "jobs": jobs,
+            }
+        )
 
     except Exception as e:
         app.logger.error("❌ api_upcoming_jobs failed: %s", e)
@@ -4963,15 +5647,16 @@ def overview_upcoming():
         app.logger.exception("overview_upcoming failed (Supabase)")
         if debug:
             import traceback
+
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
         return jsonify({"error": "overview_upcoming failed"}), 500
-
 
 
 from math import ceil
 import re
 import traceback
 from googleapiclient.errors import HttpError
+
 
 @app.route("/api/overview/materials-needed")
 @login_required_session
@@ -4982,7 +5667,7 @@ def overview_materials_needed():
         resp = svc.get(
             spreadsheetId=SPREADSHEET_ID,
             range="Overview!M3:M",
-            valueRenderOption="FORMATTED_VALUE"
+            valueRenderOption="FORMATTED_VALUE",
         ).execute()
         vals = resp.get("values", [])
         lines = [str(r[0]).strip() for r in vals if r and str(r[0]).strip()]
@@ -5012,28 +5697,32 @@ def overview_materials_needed():
             if not name:
                 continue
             typ = "Thread" if unit.lower().startswith("cone") else "Material"
-            grouped.setdefault(vendor, []).append({
-                "name": name, "qty": qty, "unit": unit, "type": typ
-            })
+            grouped.setdefault(vendor, []).append(
+                {"name": name, "qty": qty, "unit": unit, "type": typ}
+            )
 
         vendor_list = [{"vendor": v, "items": items} for v, items in grouped.items()]
 
         # optional cache
         if CACHE_TTL:
             import time as _t
+
             global _materials_needed_cache, _materials_needed_ts
             _materials_needed_cache = {"vendors": vendor_list}
             _materials_needed_ts = _t.time()
             return jsonify(_materials_needed_cache)
 
         if debug:
-            return jsonify({"count_vendors": len(vendor_list), "sample": vendor_list[:1]})
+            return jsonify(
+                {"count_vendors": len(vendor_list), "sample": vendor_list[:1]}
+            )
         return jsonify({"vendors": vendor_list})
 
     except Exception as e:
         app.logger.exception("materials-needed failed")
         if debug:
             import traceback
+
             return jsonify({"error": str(e), "trace": traceback.format_exc()}), 200
         return jsonify({"error": "materials-needed failed"}), 500
 
@@ -5063,9 +5752,13 @@ def overview_metrics():
 
         # Match your frontend naming
         metrics = {
-            "headcovers_sold": round(float(metrics_row.get("headcovers_sold_per_day") or 0), 2),
+            "headcovers_sold": round(
+                float(metrics_row.get("headcovers_sold_per_day") or 0), 2
+            ),
             "goal": float(metrics_row.get("goal") or 0),
-            "average_price": round(float(metrics_row.get("average_price_per_cover") or 0), 2),
+            "average_price": round(
+                float(metrics_row.get("average_price_per_cover") or 0), 2
+            ),
         }
 
         # Cache it
@@ -5077,7 +5770,6 @@ def overview_metrics():
     except Exception as e:
         app.logger.exception("❌ Failed to fetch metrics from Supabase view")
         return jsonify({"error": str(e)}), 500
-
 
 
 @app.route("/api/fur/complete", methods=["POST", "OPTIONS"])
@@ -5124,7 +5816,7 @@ def api_fur_complete():
             return jsonify(ok=False, error="Missing 'Order #' or 'Quantity Made'"), 400
 
         order_ix = headers.index("Order #")
-        qty_ix   = headers.index("Quantity Made")
+        qty_ix = headers.index("Quantity Made")
 
         # Build lookup of order -> 1-based row number
         order_to_row = {}
@@ -5140,14 +5832,21 @@ def api_fur_complete():
         # Front
         row_num = order_to_row.get(oid_raw)
         if row_num:
-            updates.append({"range": f"Fur List!{col_letter(qty_ix)}{row_num}", "values": [[qty]]})
+            updates.append(
+                {"range": f"Fur List!{col_letter(qty_ix)}{row_num}", "values": [[qty]]}
+            )
 
         # Back (order+1), only if orderId is integer and exists in sheet
         try:
             back_oid = str(int(oid_raw) + 1)
             back_row = order_to_row.get(back_oid)
             if back_row:
-                updates.append({"range": f"Fur List!{col_letter(qty_ix)}{back_row}", "values": [[qty]]})
+                updates.append(
+                    {
+                        "range": f"Fur List!{col_letter(qty_ix)}{back_row}",
+                        "values": [[qty]],
+                    }
+                )
         except Exception:
             pass  # ignore non-integer order IDs
 
@@ -5181,7 +5880,10 @@ def fur_complete_batch():
         vsvc = get_sheets_service().spreadsheets().values()
     except Exception:
         app.logger.exception("fur_complete_batch: unable to init Sheets")
-        return jsonify(ok=False, error="Could not initialize Google Sheets client."), 503
+        return (
+            jsonify(ok=False, error="Could not initialize Google Sheets client."),
+            503,
+        )
 
     def col_letter(idx0: int) -> str:
         n = idx0 + 1
@@ -5204,10 +5906,15 @@ def fur_complete_batch():
 
         headers = [str(h).strip() for h in rows[0]]
         if "Order #" not in headers or "Quantity Made" not in headers:
-            return jsonify(ok=False, error="Missing 'Order #' or 'Quantity Made' in Fur List"), 400
+            return (
+                jsonify(
+                    ok=False, error="Missing 'Order #' or 'Quantity Made' in Fur List"
+                ),
+                400,
+            )
 
         order_ix = headers.index("Order #")
-        qty_ix   = headers.index("Quantity Made")
+        qty_ix = headers.index("Quantity Made")
 
         # order -> 1-based row
         order_to_row = {}
@@ -5218,7 +5925,7 @@ def fur_complete_batch():
                 order_to_row[val] = i + 1
 
         updates = []
-        wrote   = 0
+        wrote = 0
 
         for it in items:
             oid_raw = str(it.get("orderId") or "").strip()
@@ -5230,7 +5937,12 @@ def fur_complete_batch():
             # front
             row_num = order_to_row.get(oid_raw)
             if row_num:
-                updates.append({"range": f"Fur List!{col_letter(qty_ix)}{row_num}", "values": [[qty]]})
+                updates.append(
+                    {
+                        "range": f"Fur List!{col_letter(qty_ix)}{row_num}",
+                        "values": [[qty]],
+                    }
+                )
                 wrote += 1
 
             # back (order+1)
@@ -5238,7 +5950,12 @@ def fur_complete_batch():
                 back_oid = str(int(oid_raw) + 1)
                 back_row = order_to_row.get(back_oid)
                 if back_row:
-                    updates.append({"range": f"Fur List!{col_letter(qty_ix)}{back_row}", "values": [[qty]]})
+                    updates.append(
+                        {
+                            "range": f"Fur List!{col_letter(qty_ix)}{back_row}",
+                            "values": [[qty]],
+                        }
+                    )
                     wrote += 1
             except Exception:
                 pass
@@ -5272,10 +5989,19 @@ def cut_complete():
             svc = get_sheets_service().spreadsheets().values()
         except RuntimeError as e:
             app.logger.error("cut_complete: Google credentials missing: %s", e)
-            return jsonify(ok=False, error="Server is not connected to Google. Add GOOGLE_TOKEN_JSON or token.json."), 503
+            return (
+                jsonify(
+                    ok=False,
+                    error="Server is not connected to Google. Add GOOGLE_TOKEN_JSON or token.json.",
+                ),
+                503,
+            )
         except Exception as e:
             app.logger.exception("cut_complete: unable to init Google Sheets client")
-            return jsonify(ok=False, error="Could not initialize Google Sheets client."), 503
+            return (
+                jsonify(ok=False, error="Could not initialize Google Sheets client."),
+                503,
+            )
 
         # 1) Load the whole Cut List to find the row by "Order #"
         with sheet_lock:
@@ -5302,7 +6028,10 @@ def cut_complete():
                 break
 
         if not row_num:
-            return jsonify(ok=False, error=f"Order {order_id} not found in Cut List"), 404
+            return (
+                jsonify(ok=False, error=f"Order {order_id} not found in Cut List"),
+                404,
+            )
 
         # Get H..R for that row (sources)
         with sheet_lock:
@@ -5322,30 +6051,27 @@ def cut_complete():
             src_val = str(src_vals[idx]).strip()
             if src_val != "":
                 # destination column is next to the right: (H+idx)+1
-                dest_col_letter = chr(ord('H') + idx + 1)  # I..S
-                updates.append({
-                    "range": f"Cut List!{dest_col_letter}{row_num}",
-                    "values": [[quantity]],
-                })
+                dest_col_letter = chr(ord("H") + idx + 1)  # I..S
+                updates.append(
+                    {
+                        "range": f"Cut List!{dest_col_letter}{row_num}",
+                        "values": [[quantity]],
+                    }
+                )
 
         if not updates:
             return jsonify(ok=True, wrote=0)  # nothing to write
 
         # Batch update
-        body = {
-            "valueInputOption": "USER_ENTERED",
-            "data": updates
-        }
+        body = {"valueInputOption": "USER_ENTERED", "data": updates}
         with sheet_lock:
-            svc.batchUpdate(
-                spreadsheetId=SPREADSHEET_ID,
-                body=body
-            ).execute()
+            svc.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
 
         return jsonify(ok=True, wrote=len(updates))
     except Exception as e:
         app.logger.exception("cut_complete failed")
         return jsonify(ok=False, error=str(e)), 500
+
 
 @app.route("/api/cut/submitMaterial", methods=["POST"])
 @login_required_session
@@ -5363,7 +6089,14 @@ def cut_submit_material():
     material_key = str(data.get("materialKey", "")).strip()
     quantity = data.get("quantity", None)
 
-    VALID_KEYS = {"Material1", "Material2", "Material3", "Material4", "Material5", "Back Material"}
+    VALID_KEYS = {
+        "Material1",
+        "Material2",
+        "Material3",
+        "Material4",
+        "Material5",
+        "Back Material",
+    }
     if not order_id:
         return jsonify(ok=False, error="Missing orderId"), 400
     if material_key not in VALID_KEYS:
@@ -5374,7 +6107,10 @@ def cut_submit_material():
         vsvc = get_sheets_service().spreadsheets().values()
     except Exception as e:
         app.logger.exception("cut_submit_material: unable to init Google Sheets client")
-        return jsonify(ok=False, error="Could not initialize Google Sheets client."), 503
+        return (
+            jsonify(ok=False, error="Could not initialize Google Sheets client."),
+            503,
+        )
 
     try:
         with sheet_lock:
@@ -5395,8 +6131,17 @@ def cut_submit_material():
 
         # Map Material keys to their source headers (sheet must use these exact header strings)
         # (Customize these if your headers differ. The code below expects H..R to include these labels.)
-        material_headers = ["Material1", "Material2", "Material3", "Material4", "Material5", "Back Material"]
-        source_start_col = headers.index("Material1") if "Material1" in headers else None
+        material_headers = [
+            "Material1",
+            "Material2",
+            "Material3",
+            "Material4",
+            "Material5",
+            "Back Material",
+        ]
+        source_start_col = (
+            headers.index("Material1") if "Material1" in headers else None
+        )
         if source_start_col is None:
             # Fallback: search H..R for the first matching Material header
             source_start_col = None
@@ -5405,7 +6150,12 @@ def cut_submit_material():
                     source_start_col = idx
                     break
         if source_start_col is None:
-            return jsonify(ok=False, error="Could not locate material source columns (H..R)"), 400
+            return (
+                jsonify(
+                    ok=False, error="Could not locate material source columns (H..R)"
+                ),
+                400,
+            )
 
         # Find the row number by Order #
         row_num = None
@@ -5416,7 +6166,10 @@ def cut_submit_material():
                 row_num = i + 1
                 break
         if not row_num:
-            return jsonify(ok=False, error=f"Order {order_id} not found in Cut List"), 404
+            return (
+                jsonify(ok=False, error=f"Order {order_id} not found in Cut List"),
+                404,
+            )
 
         # If quantity isn’t provided, read job Quantity from this row (header must be "Quantity")
         if quantity is None:
@@ -5473,7 +6226,7 @@ def cut_submit_material():
                 is_submitted = False
                 if dc < len(row_vals):
                     v = row_vals[dc]
-                    is_submitted = (str(v).strip() != "")
+                    is_submitted = str(v).strip() != ""
                 submitted[key] = is_submitted
             except ValueError:
                 submitted[key] = False
@@ -5503,10 +6256,19 @@ def cut_complete_batch():
         vsvc = get_sheets_service().spreadsheets().values()
     except RuntimeError as e:
         app.logger.error("cut_complete_batch: Google credentials missing: %s", e)
-        return jsonify(ok=False, error="Server is not connected to Google. Add GOOGLE_TOKEN_JSON or token.json."), 503
+        return (
+            jsonify(
+                ok=False,
+                error="Server is not connected to Google. Add GOOGLE_TOKEN_JSON or token.json.",
+            ),
+            503,
+        )
     except Exception:
         app.logger.exception("cut_complete_batch: unable to init Google Sheets client")
-        return jsonify(ok=False, error="Could not initialize Google Sheets client."), 503
+        return (
+            jsonify(ok=False, error="Could not initialize Google Sheets client."),
+            503,
+        )
 
     # Helper: 0-based column index → A1 letter(s)
     def col_letter(idx0: int) -> str:
@@ -5571,10 +6333,12 @@ def cut_complete_batch():
                 if has_text:
                     dest_ix = src_ix + 1
                     dest_letter = col_letter(dest_ix)
-                    updates.append({
-                        "range": f"Cut List!{dest_letter}{row_num}",
-                        "values": [[qty]],
-                    })
+                    updates.append(
+                        {
+                            "range": f"Cut List!{dest_letter}{row_num}",
+                            "values": [[qty]],
+                        }
+                    )
                     wrote_cells += 1
 
         if not updates:
@@ -5584,9 +6348,18 @@ def cut_complete_batch():
         with sheet_lock:
             vsvc.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
 
-        app.logger.info("cut_complete_batch: updated orders=%d wrote cells=%d missing=%d",
-                        len(items) - len(missing), wrote_cells, len(missing))
-        return jsonify(ok=True, wrote=wrote_cells, updated=len(items) - len(missing), missing=missing)
+        app.logger.info(
+            "cut_complete_batch: updated orders=%d wrote cells=%d missing=%d",
+            len(items) - len(missing),
+            wrote_cells,
+            len(missing),
+        )
+        return jsonify(
+            ok=True,
+            wrote=wrote_cells,
+            updated=len(items) - len(missing),
+            missing=missing,
+        )
 
     except Exception as e:
         app.logger.exception("cut_complete_batch failed")
@@ -5600,15 +6373,34 @@ def get_orders():
 
     # Base fields MaterialLog needs
     KEEP_BASE = {
-        "Order #", "Company Name", "Design", "Product", "Stage",
-        "Due Date", "Quantity", "Preview", "Image"
+        "Order #",
+        "Company Name",
+        "Design",
+        "Product",
+        "Stage",
+        "Due Date",
+        "Quantity",
+        "Preview",
+        "Image",
     }
 
     # Columns that might carry preview links (match what MaterialLog.jsx checks)
     IMG_KEYS = {
-        "Preview", "Image", "Thumbnail", "Image URL", "Image Link",
-        "Photo", "Img", "Mockup", "Front Image", "Mockup Link",
-        "Artwork", "Art", "Picture", "Picture URL", "Artwork Link",
+        "Preview",
+        "Image",
+        "Thumbnail",
+        "Image URL",
+        "Image Link",
+        "Photo",
+        "Img",
+        "Mockup",
+        "Front Image",
+        "Mockup Link",
+        "Artwork",
+        "Art",
+        "Picture",
+        "Picture URL",
+        "Artwork Link",
     }
 
     # Union of base + image-ish keys
@@ -5616,7 +6408,10 @@ def get_orders():
 
     def build_payload():
         # 1) Pull unformatted values for everything (stable for dates/numbers)
-        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render="UNFORMATTED_VALUE") or []
+        rows = (
+            fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE, value_render="UNFORMATTED_VALUE")
+            or []
+        )
         if not rows:
             return []
 
@@ -5639,7 +6434,10 @@ def get_orders():
                     s = chr(65 + rem) + s
                 return s
 
-            ranges = [f"{sheet_name}!{col_to_a1(i)}2:{col_to_a1(i)}" for (_, i) in present_img_cols]
+            ranges = [
+                f"{sheet_name}!{col_to_a1(i)}2:{col_to_a1(i)}"
+                for (_, i) in present_img_cols
+            ]
 
             svc = get_sheets_service().spreadsheets().values()
             resp = svc.batchGet(
@@ -5699,9 +6497,6 @@ def get_orders():
     return result
 
 
-
-
-
 @app.route("/api/material-log/original-usage", methods=["GET"])  # ?order=123
 @login_required_session
 def material_log_original_usage():
@@ -5711,7 +6506,7 @@ def material_log_original_usage():
         return jsonify({"error": "Missing order"}), 400
 
     now = time.time()
-    fresh = (_matlog_cache and (now - _matlog_cache["ts"] < _matlog_cache_ttl))
+    fresh = _matlog_cache and (now - _matlog_cache["ts"] < _matlog_cache_ttl)
 
     if not fresh:
         # Rebuild cache once per TTL
@@ -5725,6 +6520,7 @@ def material_log_original_usage():
 
             by_order = {}
             for idx, r in enumerate(rows[1:], start=2):
+
                 def gv(key):
                     i = hi.get(key)
                     return r[i] if i is not None and i < len(r) else ""
@@ -5770,7 +6566,6 @@ def material_log_original_usage():
     return jsonify({"items": items}), 200
 
 
-
 @app.route("/api/material-log/rd-append", methods=["POST"])
 @login_required_session
 def material_log_rd_append():
@@ -5781,7 +6576,7 @@ def material_log_rd_append():
 
     # lookups (Material→Unit, Product→PPY)
     units = _get_material_units_lookup()
-    ppy   = _get_ppy_lookup()
+    ppy = _get_ppy_lookup()
 
     to_append = []
     now_iso = datetime.utcnow().isoformat()
@@ -5791,7 +6586,7 @@ def material_log_rd_append():
         prod = (it.get("product") or "").strip()
         w_in = it.get("widthIn")
         l_in = it.get("lengthIn")
-        qty  = it.get("quantity")
+        qty = it.get("quantity")
 
         # 1) material required
         if not mat:
@@ -5812,9 +6607,17 @@ def material_log_rd_append():
         # 4) units must be present & be exactly "Yards" or "Sqft"
         unit_str = units.get(mat)
         if not unit_str:
-            return jsonify({"error": f"Material '{mat}' not found in Material Inventory"}), 400
+            return (
+                jsonify({"error": f"Material '{mat}' not found in Material Inventory"}),
+                400,
+            )
         if unit_str not in ("Yards", "Sqft"):
-            return jsonify({"error": f"Unsupported unit '{unit_str}' for material '{mat}'"}), 400
+            return (
+                jsonify(
+                    {"error": f"Unsupported unit '{unit_str}' for material '{mat}'"}
+                ),
+                400,
+            )
 
         used = _compute_usage_units(mat, unit_str, prod, w_in, l_in, qty, ppy)
         shape = prod or (f"{int(w_in)}x{int(l_in)}" if (w_in and l_in) else "")
@@ -5829,17 +6632,18 @@ def material_log_rd_append():
             range="Material Log!A1:Z",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": to_append}
+            body={"values": to_append},
         ).execute()
 
     return jsonify({"added": len(to_append)}), 200
+
 
 @app.route("/api/material-log/recut-append", methods=["POST"])
 @login_required_session
 def material_log_recut_append():
     data = request.get_json(silent=True) or {}
     order_number = str(data.get("orderNumber") or "").strip()
-    items        = data.get("items") or []  # each has per-item recutQty (whole number)
+    items = data.get("items") or []  # each has per-item recutQty (whole number)
 
     if not order_number:
         return jsonify({"error": "Missing orderNumber"}), 400
@@ -5850,10 +6654,10 @@ def material_log_recut_append():
     rows = []
     for it in items:
         company = str(it.get("companyName") or "").strip()
-        shape   = str(it.get("shape") or "").strip()
-        mat     = str(it.get("material") or "").strip()
-        orig_q  = it.get("originalQuantity") or 0
-        orig_u  = it.get("originalUnits") or 0.0
+        shape = str(it.get("shape") or "").strip()
+        mat = str(it.get("material") or "").strip()
+        orig_q = it.get("originalQuantity") or 0
+        orig_u = it.get("originalUnits") or 0.0
 
         # Per-material recut qty (must be whole number > 0)
         rq = it.get("recutQty")
@@ -5868,7 +6672,9 @@ def material_log_recut_append():
 
         used = per_piece * rq
         # Date | Order # | Company Name | Quantity | Shape | Material | QTY | IN/OUT | O/R | Recut
-        rows.append([now_iso, order_number, company, rq, shape, mat, used, "OUT", "", "Recut"])
+        rows.append(
+            [now_iso, order_number, company, rq, shape, mat, used, "OUT", "", "Recut"]
+        )
 
     if not rows:
         return jsonify({"error": "No valid recut quantities provided"}), 400
@@ -5880,7 +6686,7 @@ def material_log_recut_append():
             range="Material Log!A1:Z",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": rows}
+            body={"values": rows},
         ).execute()
 
     return jsonify({"added": len(rows)}), 200
@@ -5894,25 +6700,31 @@ def prepare_shipment():
         order_ids = data.get("order_ids", [])
         if not order_ids:
             # keep shape stable for the UI
-            return jsonify({"error": "Missing order_ids", "boxes": [], "missing": []}), 400
+            return (
+                jsonify({"error": "Missing order_ids", "boxes": [], "missing": []}),
+                400,
+            )
 
         # ✅ ensure exists before use
         shipped_quantities = data.get("shipped_quantities", {}) or {}
 
         # ── Fetch both tabs defensively ────────────────────────────────
         try:
-            prod_data  = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM") or []
+            prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM") or []
             table_data = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z") or []
         except Exception as e:
             logging.exception("prepare-shipment: sheets fetch failed")
             # Don’t 500 → return safe, empty structure so UI stays up
-            return jsonify({"boxes": [], "missing": [], "note": "sheets-unavailable"}), 200
+            return (
+                jsonify({"boxes": [], "missing": [], "note": "sheets-unavailable"}),
+                200,
+            )
 
         if not prod_data or not prod_data[0] or not table_data or not table_data[0]:
             # Missing headers or empty data; still no 500
             return jsonify({"boxes": [], "missing": [], "note": "empty-data"}), 200
 
-        prod_headers  = prod_data[0]
+        prod_headers = prod_data[0]
         table_headers = table_data[0]
 
         # ── Step 1: Filter rows matching given Order # ─────────────────
@@ -5958,7 +6770,7 @@ def prepare_shipment():
 
         for row in prod_rows:
             order_id = str(row.get("Order #", "")).strip()
-            product  = str(row.get("Product", "")).strip()
+            product = str(row.get("Product", "")).strip()
 
             # Ignore “Back” jobs entirely
             if re.search(r"\s+Back$", product, flags=re.IGNORECASE):
@@ -5979,32 +6791,39 @@ def prepare_shipment():
             # physical dimensions from sheet (optional)
             try:
                 length = float(row.get("Length", 0) or 0)
-                width  = float(row.get("Width",  0) or 0)
+                width = float(row.get("Width", 0) or 0)
                 height = float(row.get("Height", 0) or 0)
             except Exception:
                 length = width = height = 0.0
 
-            jobs.append({
-                "order_id":  order_id,
-                "product":   product,
-                "volume":    volume,
-                "dimensions": (length, width, height),
-                "ship_qty":  ship_qty,
-            })
+            jobs.append(
+                {
+                    "order_id": order_id,
+                    "product": product,
+                    "volume": volume,
+                    "dimensions": (length, width, height),
+                    "ship_qty": ship_qty,
+                }
+            )
 
         # If volumes missing, return 200 with a helpful payload (don’t 500/502)
         if missing_products:
-            return jsonify({
-                "status": "needs-volume",
-                "boxes": [],
-                "missing": sorted(set(missing_products)),
-            }), 200
+            return (
+                jsonify(
+                    {
+                        "status": "needs-volume",
+                        "boxes": [],
+                        "missing": sorted(set(missing_products)),
+                    }
+                ),
+                200,
+            )
 
         # ── Step 4: Pack items (greedy, by vol & dims) ─────────────────
         BOX_TYPES = [
-            {"size": "Small",  "dims": (10, 10, 10), "vol": 10 * 10 * 10},
+            {"size": "Small", "dims": (10, 10, 10), "vol": 10 * 10 * 10},
             {"size": "Medium", "dims": (15, 15, 15), "vol": 15 * 15 * 15},
-            {"size": "Large",  "dims": (20, 20, 20), "vol": 20 * 20 * 20},
+            {"size": "Large", "dims": (20, 20, 20), "vol": 20 * 20 * 20},
         ]
 
         def can_fit(prod_dims, box_dims):
@@ -6016,48 +6835,54 @@ def prepare_shipment():
         items = []
         for job in jobs:
             for _ in range(max(0, int(job["ship_qty"]))):
-                items.append({
-                    "order_id": job["order_id"],
-                    "dims":     job["dimensions"],
-                    "volume":   job["volume"],
-                })
+                items.append(
+                    {
+                        "order_id": job["order_id"],
+                        "dims": job["dimensions"],
+                        "volume": job["volume"],
+                    }
+                )
 
         # 4b) Greedy fill
         boxes = []
         while items:
-            group     = [items.pop(0)]
+            group = [items.pop(0)]
             total_vol = group[0]["volume"]
-            max_dims  = list(group[0]["dims"])
+            max_dims = list(group[0]["dims"])
 
             i = 0
             while i < len(items):
-                it       = items[i]
+                it = items[i]
                 new_dims = (
                     max(max_dims[0], it["dims"][0]),
                     max(max_dims[1], it["dims"][1]),
                     max(max_dims[2], it["dims"][2]),
                 )
                 largest = BOX_TYPES[-1]
-                if (total_vol + it["volume"] <= largest["vol"]
-                        and can_fit(new_dims, largest["dims"])):
+                if total_vol + it["volume"] <= largest["vol"] and can_fit(
+                    new_dims, largest["dims"]
+                ):
                     total_vol += it["volume"]
-                    max_dims   = list(new_dims)
+                    max_dims = list(new_dims)
                     group.append(it)
                     items.pop(i)
                     continue
                 i += 1
 
             eligible = [
-                b for b in BOX_TYPES
+                b
+                for b in BOX_TYPES
                 if can_fit(max_dims, b["dims"]) and b["vol"] >= total_vol
             ]
             eligible.sort(key=lambda b: b["vol"])
-            chosen = (eligible[0]["size"] if eligible else BOX_TYPES[-1]["size"])
+            chosen = eligible[0]["size"] if eligible else BOX_TYPES[-1]["size"]
 
-            boxes.append({
-                "size": chosen,
-                "jobs": [g["order_id"] for g in group],
-            })
+            boxes.append(
+                {
+                    "size": chosen,
+                    "jobs": [g["order_id"] for g in group],
+                }
+            )
 
         return jsonify({"status": "ok", "boxes": boxes, "missing": []}), 200
 
@@ -6065,6 +6890,7 @@ def prepare_shipment():
         logging.exception("prepare-shipment failed")
         # Never bubble a 500 → keep the UI stable
         return jsonify({"boxes": [], "missing": [], "error": str(e)}), 200
+
 
 @app.route("/api/jobs-for-company")
 @login_required_session
@@ -6088,6 +6914,7 @@ def jobs_for_company():
             return jsonify({"jobs": []}), 200
 
         headers = prod_data[0]
+
         # Defensive: header lookup helper
         def idx(h):
             try:
@@ -6109,7 +6936,11 @@ def jobs_for_company():
                 elif "file/d/" in image_link:
                     file_id = image_link.split("file/d/")[-1].split("/")[0]
 
-                preview_url = f"https://drive.google.com/thumbnail?id={file_id}" if file_id else ""
+                preview_url = (
+                    f"https://drive.google.com/thumbnail?id={file_id}"
+                    if file_id
+                    else ""
+                )
 
                 row["image"] = preview_url
                 row["orderId"] = str(row.get("Order #", "")).strip()
@@ -6129,15 +6960,14 @@ def jobs_for_company():
         return resp
 
 
-
 @app.route("/api/set-volume", methods=["POST"])
 def set_volume():
     global SPREADSHEET_ID
     data = request.get_json()
     product = data.get("product")
-    length  = data.get("length")
-    width   = data.get("width")
-    height  = data.get("height")
+    length = data.get("length")
+    width = data.get("width")
+    height = data.get("height")
 
     if not all([product, length, width, height]):
         return jsonify({"error": "Missing fields"}), 400
@@ -6151,10 +6981,9 @@ def set_volume():
     table_range = "Table!A2:A"
 
     # ← now correctly using SPREADSHEET_ID
-    result = sheets.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=table_range
-    ).execute()
+    result = (
+        sheets.values().get(spreadsheetId=SPREADSHEET_ID, range=table_range).execute()
+    )
     rows = result.get("values", [])
     products = [row[0] for row in rows if row]
 
@@ -6166,7 +6995,7 @@ def set_volume():
             spreadsheetId=SPREADSHEET_ID,
             range="Table!A2",
             valueInputOption="RAW",
-            body={"values": [[product]]}
+            body={"values": [[product]]},
         ).execute()
 
     update_range = f"Table!N{row_index}"
@@ -6174,10 +7003,11 @@ def set_volume():
         spreadsheetId=SPREADSHEET_ID,
         range=update_range,
         valueInputOption="RAW",
-        body={"values": [[volume]]}
+        body={"values": [[volume]]},
     ).execute()
 
     return jsonify({"message": "Volume saved", "volume": volume})
+
 
 @app.route("/api/embroideryList", methods=["GET"])
 @login_required_session
@@ -6210,16 +7040,17 @@ def get_embroidery_list():
         logger.exception("Error fetching embroidery list")
         return jsonify([]), 200
 
+
 # ─── GET A SINGLE ORDER ───────────────────────────────────────────
 @app.route("/api/orders/<order_id>", methods=["GET"])
 @login_required_session
 def get_order(order_id):
-    rows    = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+    rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
     headers = rows[0]
     for row in rows[1:]:
         if str(row[0]) == str(order_id):
             return jsonify(dict(zip(headers, row))), 200
-    return jsonify({"error":"order not found"}), 404
+    return jsonify({"error": "order not found"}), 404
 
 
 @app.route("/api/orders/<order_id>", methods=["PUT"])
@@ -6232,21 +7063,24 @@ def update_order(order_id):
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Production Orders!H{order_id}",
                 valueInputOption="RAW",
-                body={"values": [[ data.get("embroidery_start","") ]]}
+                body={"values": [[data.get("embroidery_start", "")]]},
             ).execute()
         socketio.emit("orderUpdated", {"orderId": order_id})
-        return jsonify({"status":"ok"}), 200
+        return jsonify({"status": "ok"}), 200
     except Exception:
         logger.exception("Error updating order")
-        return jsonify({"error":"server error"}), 500
+        return jsonify({"error": "server error"}), 500
+
 
 # In-memory links
 _links_store = {}
+
 
 @app.route("/api/links", methods=["GET"])
 @login_required_session
 def get_links():
     return jsonify(_links_store), 200
+
 
 @app.route("/api/links", methods=["POST"])
 @login_required_session
@@ -6254,7 +7088,8 @@ def save_links():
     global _links_store
     _links_store = request.get_json() or {}
     socketio.emit("linksUpdated", _links_store)
-    return jsonify({"status":"ok"}), 200
+    return jsonify({"status": "ok"}), 200
+
 
 # KEEP this handler
 @app.route("/api/combined", methods=["GET"], endpoint="api_combined")
@@ -6268,11 +7103,7 @@ def get_combined():
 
     # ✅ LOCAL DEV OVERRIDE — DO NOT TOUCH GOOGLE SHEETS
     if os.getenv("LOCAL_DEV") == "true":
-        payload_obj = {
-            "mode": "local_dev",
-            "orders": [],
-            "links": {}
-        }
+        payload_obj = {"mode": "local_dev", "orders": [], "links": {}}
         payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
         etag = _json_etag(payload_bytes)
         resp = Response(payload_bytes, mimetype="application/json")
@@ -6294,8 +7125,8 @@ def get_combined():
 
         vrs = resp.get("valueRanges", [])
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
-        fur_rows    = (vrs[1].get("values") if len(vrs) > 1 else []) or []
-        cut_rows    = (vrs[2].get("values") if len(vrs) > 2 else []) or []
+        fur_rows = (vrs[1].get("values") if len(vrs) > 1 else []) or []
+        cut_rows = (vrs[2].get("values") if len(vrs) > 2 else []) or []
 
         def rows_to_dicts(rows):
             if not rows:
@@ -6310,8 +7141,8 @@ def get_combined():
             return out
 
         orders_full = rows_to_dicts(orders_rows)
-        fur_full    = rows_to_dicts(fur_rows)
-        cut_full    = rows_to_dicts(cut_rows)
+        fur_full = rows_to_dicts(fur_rows)
+        cut_full = rows_to_dicts(cut_rows)
 
         try:
             _orders_index["by_id"] = {
@@ -6322,10 +7153,16 @@ def get_combined():
         except Exception as e:
             current_app.logger.warning(f"[FAST] Failed to build cache: {e}")
 
-        fur_map = { str(r.get("Order #", "")).strip(): r
-                    for r in fur_full if str(r.get("Order #", "")).strip() }
-        cut_map = { str(r.get("Order #", "")).strip(): r
-                    for r in cut_full if str(r.get("Order #", "")).strip() }
+        fur_map = {
+            str(r.get("Order #", "")).strip(): r
+            for r in fur_full
+            if str(r.get("Order #", "")).strip()
+        }
+        cut_map = {
+            str(r.get("Order #", "")).strip(): r
+            for r in cut_full
+            if str(r.get("Order #", "")).strip()
+        }
 
         for o in orders_full:
             oid = str(o.get("Order #", "")).strip()
@@ -6343,31 +7180,33 @@ def get_combined():
 
         return {
             "orders": orders_full,
-            "links": _links_store if isinstance(_links_store, dict) else {}
+            "links": _links_store if isinstance(_links_store, dict) else {},
         }
 
     if request.args.get("refresh") == "1":
-        payload_obj   = build_payload()
+        payload_obj = build_payload()
         payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
-        etag          = _json_etag(payload_bytes)
+        etag = _json_etag(payload_bytes)
         _cache_set("combined", payload_bytes, TTL)
         resp = Response(payload_bytes, mimetype="application/json")
         resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = f"public, max-age={TTL}, stale-while-revalidate=300"
+        resp.headers["Cache-Control"] = (
+            f"public, max-age={TTL}, stale-while-revalidate=300"
+        )
         return resp
 
     return send_cached_json("combined", TTL, build_payload)
+
 
 @socketio.on("placeholdersUpdated")
 def handle_placeholders_updated(data):
     socketio.emit("placeholdersUpdated", data, broadcast=True)
 
+
 # Replace the single MANUAL_RANGE and single get() call with this:
 
 MANUAL_PLACEHOLDERS_RANGE = "Manual State!A2:H"
-MANUAL_MACHINES_RANGE     = "Manual State!I2:J2"
-
-
+MANUAL_MACHINES_RANGE = "Manual State!I2:J2"
 
 
 @app.route("/api/manualState", methods=["GET"])
@@ -6387,19 +7226,18 @@ def get_manual_state():
             valueRenderOption="UNFORMATTED_VALUE",
         ).execute()
 
-        ph_rows = (resp.get("valueRanges", [{}])[0].get("values") or [])
-        m_rows  = (resp.get("valueRanges", [{}, {}])[1].get("values") or [])
+        ph_rows = resp.get("valueRanges", [{}])[0].get("values") or []
+        m_rows = resp.get("valueRanges", [{}, {}])[1].get("values") or []
 
         # Parse machines (I–J from first row)
         # Parse machines (I–J from first row) — tolerate single-cell rows
-        first = (m_rows[0] if m_rows else [])
+        first = m_rows[0] if m_rows else []
         c0 = str(first[0]).strip() if len(first) > 0 and first[0] is not None else ""
         c1 = str(first[1]).strip() if len(first) > 1 and first[1] is not None else ""
 
         # Split, strip, and drop empties
         machine1_ids = [s.strip() for s in c0.split(",") if s and s.strip()]
         machine2_ids = [s.strip() for s in c1.split(",") if s and s.strip()]
-
 
         # Build set of ACTIVE IDs (exclude Sewing/Complete) from Production Orders as before...
         # Just return raw IDs from I2:J2 and placeholders; pruning happens client-side.
@@ -6410,23 +7248,25 @@ def get_manual_state():
                 break
             # Make sure indexes exist; pad to 8
             r = (r + [""] * (8 - len(r)))[:8]
-            phs.append({
-                "id":          str(r[0]),
-                "company":     r[1],
-                "quantity":    r[2],
-                "stitchCount": r[3],
-                "inHand":      r[4],
-                "dueType":     r[5],
-                "fieldG":      r[6],
-                "fieldH":      r[7],
-            })
+            phs.append(
+                {
+                    "id": str(r[0]),
+                    "company": r[1],
+                    "quantity": r[2],
+                    "stitchCount": r[3],
+                    "inHand": r[4],
+                    "dueType": r[5],
+                    "fieldG": r[6],
+                    "fieldH": r[7],
+                }
+            )
 
         # Return raw IDs from I2:J2 and placeholders; pruning happens client-side.
         m1_clean = machine1_ids
         m2_clean = machine2_ids
         result = {"machineColumns": [m1_clean, m2_clean], "placeholders": phs}
         _manual_state_cache = result
-        _manual_state_ts    = now
+        _manual_state_ts = now
         return jsonify(result), 200
 
     except Exception:
@@ -6434,6 +7274,7 @@ def get_manual_state():
         if _manual_state_cache:
             return jsonify(_manual_state_cache), 200
         return jsonify({"machineColumns": [], "placeholders": []}), 200
+
 
 # ─── MANUAL STATE ENDPOINT (POST) ──────────────────────────────────────────────
 @app.route("/api/manualState", methods=["POST"])
@@ -6445,8 +7286,12 @@ def save_manual_state():
     """
     try:
         data = request.get_json(force=True) or {}
-        incoming_m1 = [str(x).strip() for x in data.get("machine1", []) if str(x).strip()]
-        incoming_m2 = [str(x).strip() for x in data.get("machine2", []) if str(x).strip()]
+        incoming_m1 = [
+            str(x).strip() for x in data.get("machine1", []) if str(x).strip()
+        ]
+        incoming_m2 = [
+            str(x).strip() for x in data.get("machine2", []) if str(x).strip()
+        ]
         placeholders = data.get("placeholders", [])
 
         # --- Fast path: trust incoming machine lists; client will reconcile against active jobs ---
@@ -6467,7 +7312,6 @@ def save_manual_state():
         # Nothing pruned on the server; client will ignore unknown/complete/sewing IDs
         removed_ids = set()
 
-
         # --- Write the pruned lists back to Manual State (I2:J2) ---
         i2 = ",".join(pruned_m1)
         j2 = ",".join(pruned_m2)
@@ -6476,52 +7320,54 @@ def save_manual_state():
         sheets = get_sheets_service().spreadsheets().values()
 
         # Derive the sheet name from MANUAL_MACHINES_RANGE and write to I2:J2
-        _sheet_name = MANUAL_MACHINES_RANGE.split('!')[0]
+        _sheet_name = MANUAL_MACHINES_RANGE.split("!")[0]
         sheets.update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"{_sheet_name}!I2:J2",
             valueInputOption="RAW",
-            body={"values": [[i2, j2]]}
+            body={"values": [[i2, j2]]},
         ).execute()
 
-
-        return jsonify({
-            "ok": True,
-            "machineColumns": [pruned_m1, pruned_m2],
-            "placeholders": placeholders,
-            "removed": sorted(list(removed_ids))
-        }), 200
+        return (
+            jsonify(
+                {
+                    "ok": True,
+                    "machineColumns": [pruned_m1, pruned_m2],
+                    "placeholders": placeholders,
+                    "removed": sorted(list(removed_ids)),
+                }
+            ),
+            200,
+        )
 
     except Exception as e:
         logger.exception("Error in POST /api/manualState")
         return jsonify({"ok": False, "error": str(e)}), 200
 
 
-
 # ─────────────────────────────────────────────
 # helper: grant “anyone with link” reader access
 def make_public(file_id, drive_service):
     drive_service.permissions().create(
-        fileId=file_id,
-        body={"type": "anyone", "role": "reader"},
-        fields="id"
+        fileId=file_id, body={"type": "anyone", "role": "reader"}, fields="id"
     ).execute()
 
-@app.route("/submit", methods=["OPTIONS","POST"])
+
+@app.route("/submit", methods=["OPTIONS", "POST"])
 def submit_order():
     if request.method == "OPTIONS":
         return make_response("", 204)
 
     try:
-        data               = request.form
-        prod_files         = request.files.getlist("prodFiles")
-        print_files        = request.files.getlist("printFiles")
+        data = request.form
+        prod_files = request.files.getlist("prodFiles")
+        print_files = request.files.getlist("printFiles")
 
         # ─── EARLY VALIDATION ────────────────────────────────────────────────
-        materials          = data.getlist("materials")
-        material_percents  = data.getlist("materialPercents")
+        materials = data.getlist("materials")
+        material_percents = data.getlist("materialPercents")
         # pad both lists to exactly 5 entries
-        materials[:]         = (materials + [""] * 5)[:5]
+        materials[:] = (materials + [""] * 5)[:5]
         material_percents[:] = (material_percents + [""] * 5)[:5]
 
         # 1) Material1 is mandatory
@@ -6530,49 +7376,66 @@ def submit_order():
 
         # 2) If product contains “full”, backMaterial is mandatory
         product_lower = (data.get("product") or "").strip().lower()
-        if "full" in product_lower and not data.get("backMaterial","").strip():
-            return jsonify({"error": "Back Material is required for “Full” products."}), 400
+        if "full" in product_lower and not data.get("backMaterial", "").strip():
+            return (
+                jsonify({"error": "Back Material is required for “Full” products."}),
+                400,
+            )
 
         # 3) Every populated material must have its percent
         for idx, mat in enumerate(materials):
             if mat.strip():
                 pct = material_percents[idx].strip()
                 if not pct:
-                    return jsonify({
-                        "error": f"Percentage for Material{idx+1} (“{mat}”) is required."
-                    }), 400
+                    return (
+                        jsonify(
+                            {
+                                "error": f"Percentage for Material{idx+1} (“{mat}”) is required."
+                            }
+                        ),
+                        400,
+                    )
                 try:
                     float(pct)
                 except ValueError:
-                    return jsonify({
-                        "error": f"Material{idx+1} percentage (“{pct}”) must be a number."
-                    }), 400
+                    return (
+                        jsonify(
+                            {
+                                "error": f"Material{idx+1} percentage (“{pct}”) must be a number."
+                            }
+                        ),
+                        400,
+                    )
 
         # ─── DETERMINE NEXT ROW & ORDER # ────────────────────────────────────
-        col_a      = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Production Orders!A:A"
-        ).execute().get("values", [])
-        next_row   = len(col_a) + 1
+        col_a = (
+            sheets.values()
+            .get(spreadsheetId=SPREADSHEET_ID, range="Production Orders!A:A")
+            .execute()
+            .get("values", [])
+        )
+        next_row = len(col_a) + 1
         prev_order = int(col_a[-1][0]) if len(col_a) > 1 else 0
-        new_order  = prev_order + 1
+        new_order = prev_order + 1
 
         # ─── TEMPLATE FORMULAS ───────────────────────────────────────────────
         def tpl_formula(col_letter, target_row):
-            resp = sheets.values().get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Production Orders!{col_letter}2",
-                valueRenderOption="FORMULA"
-            ).execute()
+            resp = (
+                sheets.values()
+                .get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"Production Orders!{col_letter}2",
+                    valueRenderOption="FORMULA",
+                )
+                .execute()
+            )
             raw = resp.get("values", [[""]])[0][0] or ""
-            return re.sub(r"(\b[A-Z]+)2\b",
-                          lambda m: f"{m.group(1)}{target_row}",
-                          raw)
+            return re.sub(r"(\b[A-Z]+)2\b", lambda m: f"{m.group(1)}{target_row}", raw)
 
-        ts           = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
-        preview      = tpl_formula("C", next_row)
-        stage        = tpl_formula("I", next_row)
-        ship_date    = tpl_formula("V", next_row)
+        ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+        preview = tpl_formula("C", next_row)
+        stage = tpl_formula("I", next_row)
+        ship_date = tpl_formula("V", next_row)
         stitch_count = tpl_formula("W", next_row)
         schedule_str = tpl_formula("AC", next_row)
 
@@ -6583,7 +7446,12 @@ def submit_order():
             query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
             if parent_id:
                 query += f" and '{parent_id}' in parents"
-            existing = drive.files().list(q=query, fields="files(id)").execute().get("files", [])
+            existing = (
+                drive.files()
+                .list(q=query, fields="files(id)")
+                .execute()
+                .get("files", [])
+            )
             for f in existing:
                 drive.files().delete(fileId=f["id"]).execute()
             meta = {"name": str(name), "mimeType": "application/vnd.google-apps.folder"}
@@ -6594,31 +7462,36 @@ def submit_order():
 
         def make_public(file_id):
             drive.permissions().create(
-                fileId=file_id,
-                body={"role": "reader", "type": "anyone"}
+                fileId=file_id, body={"role": "reader", "type": "anyone"}
             ).execute()
 
         # ─── CREATE ORDER FOLDER & UPLOAD ────────────────────────────────────
-        order_folder_id = create_folder(new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
+        order_folder_id = create_folder(
+            new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
+        )
         make_public(order_folder_id)
 
         # if reorderFrom, copy .emb files
         if data.get("reorderFrom"):
             copy_emb_files(
-                old_order_num = data["reorderFrom"],
-                new_order_num = new_order,
-                drive_service = drive,
-                new_folder_id = order_folder_id
+                old_order_num=data["reorderFrom"],
+                new_order_num=new_order,
+                drive_service=drive,
+                new_folder_id=order_folder_id,
             )
 
         prod_links = []
         for f in prod_files:
-            m  = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
-            up = drive.files().create(
-                body={"name": f.filename, "parents": [order_folder_id]},
-                media_body=m,
-                fields="id,webViewLink"
-            ).execute()
+            m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+            up = (
+                drive.files()
+                .create(
+                    body={"name": f.filename, "parents": [order_folder_id]},
+                    media_body=m,
+                    fields="id,webViewLink",
+                )
+                .execute()
+            )
             make_public(up["id"])
             prod_links.append(up["webViewLink"])
 
@@ -6631,36 +7504,48 @@ def submit_order():
                 drive.files().create(
                     body={"name": f.filename, "parents": [pf_id]},
                     media_body=m,
-                    fields="id"
+                    fields="id",
                 ).execute()
             print_links = f"https://drive.google.com/drive/folders/{pf_id}"
 
         # ─── ASSEMBLE & WRITE ROW A→AK ───────────────────────────────────────
         row = [
-            new_order, ts, preview,
-            data.get("company"), data.get("designName"), data.get("quantity"),
+            new_order,
+            ts,
+            preview,
+            data.get("company"),
+            data.get("designName"),
+            data.get("quantity"),
             "",  # shipped
-            data.get("product"), stage, data.get("price"),
-            data.get("dueDate"), ("PRINT" if prod_links else "NO"),
-            *materials,                  # M–Q
-            data.get("backMaterial"), data.get("furColor"),
-            data.get("embBacking",""), "",  # top stitch blank
-            ship_date, stitch_count,
+            data.get("product"),
+            stage,
+            data.get("price"),
+            data.get("dueDate"),
+            ("PRINT" if prod_links else "NO"),
+            *materials,  # M–Q
+            data.get("backMaterial"),
+            data.get("furColor"),
+            data.get("embBacking", ""),
+            "",  # top stitch blank
+            ship_date,
+            stitch_count,
             data.get("notes"),
             ",".join(prod_links),
             print_links,
             "",  # AA blank
             data.get("dateType"),
             schedule_str,
-            "", "", "",                 # AD, AE, AF – pad so percents start at AG
-            *material_percents           # AG–AK
+            "",
+            "",
+            "",  # AD, AE, AF – pad so percents start at AG
+            *material_percents,  # AG–AK
         ]
 
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"Production Orders!A{next_row}:AK{next_row}",
             valueInputOption="USER_ENTERED",
-            body={"values": [row]}
+            body={"values": [row]},
         ).execute()
 
         # ─── SHADOW WRITE TO SUPABASE (NON-BLOCKING) ─────────────────────────
@@ -6686,33 +7571,40 @@ def submit_order():
                     "print_files_link": print_links,
                 }
 
-                supabase.table("Production Orders TEST").insert(supabase_payload).execute()
+                supabase.table("Production Orders TEST").insert(
+                    supabase_payload
+                ).execute()
 
             except Exception as e:
                 logger.error(f"[SUPABASE] Order insert failed for #{new_order}: {e}")
 
-
         # ─── COPY AF2 FORMULA DOWN ─────────────────────────────────────────
-        resp = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Production Orders!AF2",
-            valueRenderOption="FORMULA"
-        ).execute()
-        raw_f = resp.get("values",[[""]])[0][0] or ""
+        resp = (
+            sheets.values()
+            .get(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Production Orders!AF2",
+                valueRenderOption="FORMULA",
+            )
+            .execute()
+        )
+        raw_f = resp.get("values", [[""]])[0][0] or ""
         new_f = raw_f.replace("2", str(next_row))
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"Production Orders!AF{next_row}",
             valueInputOption="USER_ENTERED",
-            body={"values": [[new_f]]}
-        ).execute(); invalidate_upcoming_cache()
+            body={"values": [[new_f]]},
+        ).execute()
+        invalidate_upcoming_cache()
 
-        return jsonify({"status":"ok","order":new_order}), 200
+        return jsonify({"status": "ok", "order": new_order}), 200
 
     except Exception as e:
         tb = traceback.format_exc()
         logger.error("Error in /submit:\n%s", tb)
         return jsonify({"error": str(e), "trace": tb}), 500
+
 
 @app.route("/api/reorder", methods=["POST"])
 @login_required_session
@@ -6725,23 +7617,31 @@ def reorder():
 
     # This endpoint now just acknowledges reorder intent.
     # Actual reorder is handled via /submit with prefilled data.
-    print(f"↪️ Received reorder request for previous order #{prev_id}. Redirecting to /submit flow.")
-    return jsonify({"status": "ok", "message": f"Reorder initiated for #{prev_id}"}), 200
+    print(
+        f"↪️ Received reorder request for previous order #{prev_id}. Redirecting to /submit flow."
+    )
+    return (
+        jsonify({"status": "ok", "message": f"Reorder initiated for #{prev_id}"}),
+        200,
+    )
 
 
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
 def get_directory():
     from flask import make_response
+
     global _last_directory
 
     def build():
         rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A") or []
         companies = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
-        seen = set(); out = []
+        seen = set()
+        out = []
         for c in companies:
             if c not in seen:
-                seen.add(c); out.append(c)
+                seen.add(c)
+                out.append(c)
         return sorted(out, key=str.lower)
 
     try:
@@ -6808,13 +7708,13 @@ def add_directory_entry():
         return jsonify({"error": "Failed to add company"}), 500
 
 
-
 @app.route("/api/fur-colors", methods=["GET"])
 @login_required_session
 def get_fur_colors():
     def build():
         rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!I2:I")
         return [r[0] for r in rows if r and str(r[0]).strip()]
+
     return send_cached_json("furcolors:list", 300, build)
 
 
@@ -6824,23 +7724,31 @@ def get_fur_colors():
 def add_thread():
     try:
         # 1) Parse incoming JSON (single dict or list)
-        raw   = request.get_json(silent=True) or []
+        raw = request.get_json(silent=True) or []
         items = raw if isinstance(raw, list) else [raw]
 
         # 2) Find next empty row in Material Inventory column I
-        resp     = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!I2:I"
-        ).execute().get("values", [])
+        resp = (
+            sheets.values()
+            .get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!I2:I")
+            .execute()
+            .get("values", [])
+        )
         next_row = len(resp) + 2
 
         # 3) Helper to fetch raw formula text
         def tpl(col, src_row):
-            return sheets.values().get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Material Inventory!{col}{src_row}",
-                valueRenderOption="FORMULA"
-            ).execute().get("values", [[""]])[0][0] or ""
+            return (
+                sheets.values()
+                .get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"Material Inventory!{col}{src_row}",
+                    valueRenderOption="FORMULA",
+                )
+                .execute()
+                .get("values", [[""]])[0][0]
+                or ""
+            )
 
         # 4) Copy raw formulas from J4, K4 and O2
         rawJ = tpl("J", 4)
@@ -6856,9 +7764,9 @@ def add_thread():
         added = 0
         for item in items:
             threadColor = item.get("threadColor", "").strip()
-            minInv      = item.get("minInv",      "").strip()
-            reorder     = item.get("reorder",     "").strip()
-            cost        = item.get("cost",        "").strip()
+            minInv = item.get("minInv", "").strip()
+            reorder = item.get("reorder", "").strip()
+            cost = item.get("cost", "").strip()
 
             # skip any empty entries
             if not threadColor:
@@ -6868,18 +7776,22 @@ def add_thread():
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Material Inventory!I{next_row}:O{next_row}",
                 valueInputOption="USER_ENTERED",
-                body={"values": [[
-                    threadColor,
-                    formulaJ,
-                    formulaK,
-                    minInv,
-                    reorder,
-                    cost,
-                    formulaO
-                ]]}
+                body={
+                    "values": [
+                        [
+                            threadColor,
+                            formulaJ,
+                            formulaK,
+                            minInv,
+                            reorder,
+                            cost,
+                            formulaO,
+                        ]
+                    ]
+                },
             ).execute()
 
-            added    += 1
+            added += 1
             next_row += 1
 
         return jsonify({"added": added}), 200
@@ -6887,28 +7799,29 @@ def add_thread():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+
 @app.route("/api/table", methods=["POST"])
 @login_required_session
 def add_table_entry():
     data = request.get_json(silent=True) or {}
 
     # 1) Extract your original 11 fields + 3 new ones
-    product_name        = data.get("product", "").strip()        # → A
-    print_time          = data.get("printTime", "")             # → D
-    per_yard            = data.get("perYard", "")               # → F
-    foam_half           = data.get("foamHalf", "")              # → G
-    foam_38             = data.get("foam38", "")                # → H
-    foam_14             = data.get("foam14", "")                # → I
-    foam_18             = data.get("foam18", "")                # → J
-    n_magnets           = data.get("magnetN", "")               # → K
-    s_magnets           = data.get("magnetS", "")               # → L
-    elastic_half_length = data.get("elasticHalf", "")           # → M
-    volume              = data.get("volume", "")                # → N
+    product_name = data.get("product", "").strip()  # → A
+    print_time = data.get("printTime", "")  # → D
+    per_yard = data.get("perYard", "")  # → F
+    foam_half = data.get("foamHalf", "")  # → G
+    foam_38 = data.get("foam38", "")  # → H
+    foam_14 = data.get("foam14", "")  # → I
+    foam_18 = data.get("foam18", "")  # → J
+    n_magnets = data.get("magnetN", "")  # → K
+    s_magnets = data.get("magnetS", "")  # → L
+    elastic_half_length = data.get("elasticHalf", "")  # → M
+    volume = data.get("volume", "")  # → N
 
     # ← New pouch-specific fields:
-    black_grommets      = data.get("blackGrommets", "")         # → O
-    paracord_ft         = data.get("paracordFt", "")            # → P
-    cord_stoppers       = data.get("cordStoppers", "")          # → Q
+    black_grommets = data.get("blackGrommets", "")  # → O
+    paracord_ft = data.get("paracordFt", "")  # → P
+    cord_stoppers = data.get("cordStoppers", "")  # → Q
 
     if not product_name:
         return jsonify({"error": "Missing product name"}), 400
@@ -6921,26 +7834,28 @@ def add_table_entry():
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={
-                "values": [[
-                    product_name,        # A
-                    "",                  # B
-                    "",                  # C
-                    print_time,          # D
-                    "",                  # E
-                    per_yard,            # F
-                    foam_half,           # G
-                    foam_38,             # H
-                    foam_14,             # I
-                    foam_18,             # J
-                    n_magnets,           # K
-                    s_magnets,           # L
-                    elastic_half_length, # M
-                    volume,              # N
-                    black_grommets,      # O
-                    paracord_ft,         # P
-                    cord_stoppers        # Q
-                ]]
-            }
+                "values": [
+                    [
+                        product_name,  # A
+                        "",  # B
+                        "",  # C
+                        print_time,  # D
+                        "",  # E
+                        per_yard,  # F
+                        foam_half,  # G
+                        foam_38,  # H
+                        foam_14,  # I
+                        foam_18,  # J
+                        n_magnets,  # K
+                        s_magnets,  # L
+                        elastic_half_length,  # M
+                        volume,  # N
+                        black_grommets,  # O
+                        paracord_ft,  # P
+                        cord_stoppers,  # Q
+                    ]
+                ]
+            },
         ).execute()
 
         return jsonify({"status": "ok", "product": product_name}), 200
@@ -6968,14 +7883,17 @@ from flask import make_response  # if not already imported
 
 # ─── MATERIALS ENDPOINTS ────────────────────────────────────────────────
 
+
 @app.route("/api/materials", methods=["OPTIONS"])
 def materials_preflight():
     return make_response("", 204)
+
 
 @app.route("/api/materials", methods=["GET"])
 @login_required_session
 def get_materials():
     from flask import make_response
+
     def build():
         try:
             rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A") or []
@@ -6983,49 +7901,56 @@ def get_materials():
         except Exception:
             logging.exception("Error fetching materials")
             return []
+
     payload = build()
     resp = make_response(jsonify(payload), 200)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     return resp
 
+
 # 3) POST new material(s) into Material Inventory!A–H
 @app.route("/api/materials", methods=["POST"])
 @login_required_session
 def add_materials():
-    raw   = request.get_json(silent=True) or []
+    raw = request.get_json(silent=True) or []
     items = raw if isinstance(raw, list) else [raw]
 
     # fetch the raw formulas from row 2
     def get_formula(col):
-        resp = sheets.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Material Inventory!{col}2",
-            valueRenderOption="FORMULA"
-        ).execute()
+        resp = (
+            sheets.values()
+            .get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!{col}2",
+                valueRenderOption="FORMULA",
+            )
+            .execute()
+        )
         return resp.get("values", [[""]])[0][0] or ""
 
     rawB = get_formula("B")
     rawC = get_formula("C")
     rawH = get_formula("H")
 
-    now      = datetime.now(ZoneInfo("America/New_York"))\
-                    .strftime("%-m/%-d/%Y %H:%M:%S")
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
     inv_rows = []
-    
+
     # find where row 2 starts, so we can compute new rows dynamically
-    existing = sheets.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Material Inventory!A2:A"
-    ).execute().get("values", [])
+    existing = (
+        sheets.values()
+        .get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A2:A")
+        .execute()
+        .get("values", [])
+    )
     next_row = len(existing) + 2  # because A2 is first data row
 
     for it in items:
-        name    = it.get("materialName","").strip()
-        unit    = it.get("unit","").strip()
-        mininv  = it.get("minInv","").strip()
-        reorder = it.get("reorder","").strip()
-        cost    = it.get("cost","").strip()
+        name = it.get("materialName", "").strip()
+        unit = it.get("unit", "").strip()
+        mininv = it.get("minInv", "").strip()
+        reorder = it.get("reorder", "").strip()
+        cost = it.get("cost", "").strip()
 
         if not name:
             continue
@@ -7035,16 +7960,18 @@ def add_materials():
         formulaC = rawC.replace("2", str(next_row))
         formulaH = rawH.replace("2", str(next_row))
 
-        inv_rows.append([
-            name,       # A
-            formulaB,   # B: uses rawB but with "2"→next_row
-            formulaC,   # C: same
-            unit,       # D: user entry
-            mininv,     # E
-            reorder,    # F
-            cost,       # G
-            formulaH    # H: uses rawH but with "2"→next_row
-        ])
+        inv_rows.append(
+            [
+                name,  # A
+                formulaB,  # B: uses rawB but with "2"→next_row
+                formulaC,  # C: same
+                unit,  # D: user entry
+                mininv,  # E
+                reorder,  # F
+                cost,  # G
+                formulaH,  # H: uses rawH but with "2"→next_row
+            ]
+        )
 
         next_row += 1
     # end for
@@ -7056,16 +7983,18 @@ def add_materials():
             range="Material Inventory!A2:H",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": inv_rows}
-        ).execute(); invalidate_upcoming_cache()
+            body={"values": inv_rows},
+        ).execute()
+        invalidate_upcoming_cache()
 
-    return jsonify({"status":"submitted"}), 200
+    return jsonify({"status": "submitted"}), 200
 
 
 # ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
 @app.route("/api/materialInventory", methods=["OPTIONS"])
 def material_inventory_preflight():
     return make_response("", 204)
+
 
 # ─── MATERIAL-LOG POST ────────────────────────────────────────────────────
 @app.route("/api/materialInventory", methods=["POST"])
@@ -7083,35 +8012,46 @@ def submit_material_inventory():
         items = items if isinstance(items, list) else [items]
 
         sheet = get_sheets_service().spreadsheets().values()
-        timestamp = datetime.now(ZoneInfo("America/New_York")) \
-            .strftime("%-m/%-d/%Y %H:%M:%S")
+        timestamp = datetime.now(ZoneInfo("America/New_York")).strftime(
+            "%-m/%-d/%Y %H:%M:%S"
+        )
 
         material_log_rows = []
-        thread_log_rows   = []
+        thread_log_rows = []
 
         # ========= Material Inventory setup (unchanged behavior) =========
         # 2) Fetch row 2 formulas for Material Inventory (A2:H2)
-        mat_formula = sheet.get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A2:H2",
-            valueRenderOption="FORMULA"
-        ).execute().get("values", [[]])[0]
-        mat_inv_tpl  = str(mat_formula[1]) if len(mat_formula) > 1 else ""
-        mat_oo_tpl   = str(mat_formula[2]) if len(mat_formula) > 2 else ""
-        mat_val_tpl  = str(mat_formula[7]) if len(mat_formula) > 7 else ""
+        mat_formula = (
+            sheet.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Material Inventory!A2:H2",
+                valueRenderOption="FORMULA",
+            )
+            .execute()
+            .get("values", [[]])[0]
+        )
+        mat_inv_tpl = str(mat_formula[1]) if len(mat_formula) > 1 else ""
+        mat_oo_tpl = str(mat_formula[2]) if len(mat_formula) > 2 else ""
+        mat_val_tpl = str(mat_formula[7]) if len(mat_formula) > 7 else ""
 
         # 3) Fetch existing rows for Material Inventory
-        mat_rows = sheet.get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A1:H1000"
-        ).execute().get("values", [])[1:]  # skip header
+        mat_rows = (
+            sheet.get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A1:H1000")
+            .execute()
+            .get("values", [])[1:]
+        )  # skip header
         existing_mats = {r[0].strip().lower() for r in mat_rows if r and r[0].strip()}
 
         # Helper: find first blank row (1-based index + header) in a sheet's col A
         def first_blank_row(rows):
-            return next((i + 2 for i, r in enumerate(rows)
-                         if not r or not (r[0].strip() if len(r) > 0 else "")),
-                        len(rows) + 2)
+            return next(
+                (
+                    i + 2
+                    for i, r in enumerate(rows)
+                    if not r or not (r[0].strip() if len(r) > 0 else "")
+                ),
+                len(rows) + 2,
+            )
 
         # ========= Thread Data header-based mapping =========
         # Fetch Thread Data headers so we can place values by name
@@ -7122,23 +8062,28 @@ def submit_material_inventory():
         def build_thread_log_row(dt, color, feet, action):
             """Map values into a row aligned to Thread Data headers."""
             row = [""] * len(td_headers)
-            if "Date" in td_idx:         row[td_idx["Date"]] = dt
-            if "Color" in td_idx:        row[td_idx["Color"]] = color
-            if "Length (ft)" in td_idx:  row[td_idx["Length (ft)"]] = feet
-            if "IN/OUT" in td_idx:       row[td_idx["IN/OUT"]] = "IN"
-            if "O/R" in td_idx:          row[td_idx["O/R"]] = action  # Ordered/Received
+            if "Date" in td_idx:
+                row[td_idx["Date"]] = dt
+            if "Color" in td_idx:
+                row[td_idx["Color"]] = color
+            if "Length (ft)" in td_idx:
+                row[td_idx["Length (ft)"]] = feet
+            if "IN/OUT" in td_idx:
+                row[td_idx["IN/OUT"]] = "IN"
+            if "O/R" in td_idx:
+                row[td_idx["O/R"]] = action  # Ordered/Received
             return row
 
         # 5) Process each item
         for it in items:
-            name    = (it.get("materialName") or it.get("value") or "").strip()
-            type_   = (it.get("type") or "").strip() or "Material"
-            unit    = it.get("unit",    "").strip()
-            min_inv = it.get("minInv",  "").strip()
+            name = (it.get("materialName") or it.get("value") or "").strip()
+            type_ = (it.get("type") or "").strip() or "Material"
+            unit = it.get("unit", "").strip()
+            min_inv = it.get("minInv", "").strip()
             reorder = it.get("reorder", "").strip()
-            cost    = it.get("cost",    "").strip()  # not used for threads per request
-            action  = it.get("action",  "").strip()  # "Ordered" / "Received"
-            qty_raw = it.get("quantity","")
+            cost = it.get("cost", "").strip()  # not used for threads per request
+            action = it.get("action", "").strip()  # "Ordered" / "Received"
+            qty_raw = it.get("quantity", "")
 
             # must have name and quantity to do anything
             if not (name and str(qty_raw).strip()):
@@ -7151,21 +8096,26 @@ def submit_material_inventory():
                     target = first_blank_row(mat_rows)
 
                     # build formulas for the new target row
-                    inv_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_inv_tpl)
-                    oo_f  = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_oo_tpl)
-                    val_f = re.sub(r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_val_tpl)
+                    inv_f = re.sub(
+                        r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_inv_tpl
+                    )
+                    oo_f = re.sub(
+                        r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_oo_tpl
+                    )
+                    val_f = re.sub(
+                        r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_val_tpl
+                    )
 
-                    row_vals = [[
-                        name, inv_f, oo_f, unit,
-                        min_inv, reorder, cost, val_f
-                    ]]
+                    row_vals = [
+                        [name, inv_f, oo_f, unit, min_inv, reorder, cost, val_f]
+                    ]
 
                     # write the new inventory row
                     sheet.update(
                         spreadsheetId=SPREADSHEET_ID,
                         range=f"Material Inventory!A{target}:H{target}",
                         valueInputOption="USER_ENTERED",
-                        body={"values": row_vals}
+                        body={"values": row_vals},
                     ).execute()
 
                     # keep in-memory sets/rows up to date for subsequent items
@@ -7175,13 +8125,25 @@ def submit_material_inventory():
                     mat_rows.append([name])
 
                 # ALWAYS log the material movement (even if not new)
-                material_log_rows.append([timestamp, "", "", "", "", name, str(qty_raw).strip(), "IN", action])
+                material_log_rows.append(
+                    [
+                        timestamp,
+                        "",
+                        "",
+                        "",
+                        "",
+                        name,
+                        str(qty_raw).strip(),
+                        "IN",
+                        action,
+                    ]
+                )
 
             else:
                 # === THREAD: DO NOT write to "Thread Inventory"; ONLY log to "Thread Data" ===
                 try:
                     cones = int(str(qty_raw).strip())
-                    feet  = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
+                    feet = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
                 except Exception:
                     feet = ""
 
@@ -7196,7 +8158,7 @@ def submit_material_inventory():
                 range="Material Log!A2:I",
                 valueInputOption="USER_ENTERED",
                 insertDataOption="INSERT_ROWS",
-                body={"values": material_log_rows}
+                body={"values": material_log_rows},
             ).execute()
 
         if thread_log_rows:
@@ -7206,7 +8168,7 @@ def submit_material_inventory():
                 range="Thread Data!A2:Z",
                 valueInputOption="USER_ENTERED",
                 insertDataOption="INSERT_ROWS",
-                body={"values": thread_log_rows}
+                body={"values": thread_log_rows},
             ).execute()
 
         return jsonify({"status": "submitted"}), 200
@@ -7215,9 +8177,11 @@ def submit_material_inventory():
         logging.exception("❌ submit_material_inventory failed")
         return jsonify({"error": str(e)}), 500
 
+
 # server.py (or routes file)
 from flask import request, jsonify
 from datetime import datetime
+
 
 @app.route("/api/directory-row", methods=["GET"])
 @login_required_session
@@ -7231,7 +8195,7 @@ def directory_row():
     resp = sheet.get(
         spreadsheetId=SPREADSHEET_ID,
         range="Directory!A1:K10000",
-        valueRenderOption="UNFORMATTED_VALUE"
+        valueRenderOption="UNFORMATTED_VALUE",
     ).execute()
     rows = resp.get("values", [])
     if not rows:
@@ -7241,7 +8205,7 @@ def directory_row():
     # Find row where 'Company Name' matches (case-insensitive, trimmed)
     target = None
     for r in rows[1:]:
-        row = { headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers)) }
+        row = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
         name = str(row.get("Company Name", "")).strip()
         if name.lower() == company.lower():
             target = row
@@ -7252,19 +8216,23 @@ def directory_row():
 
     return jsonify(target)
 
+
 @app.route("/api/products", methods=["GET"])
 @login_required_session
 def get_products():
     from flask import make_response
+
     global _last_products
 
     def build():
         rows = fetch_sheet(SPREADSHEET_ID, "Table!A2:A") or []  # remove hard cap
         products = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
-        seen = set(); out = []
+        seen = set()
+        out = []
         for p in products:
             if p not in seen:
-                seen.add(p); out.append(p)
+                seen.add(p)
+                out.append(p)
         return sorted(out, key=str.lower)
 
     try:
@@ -7286,8 +8254,9 @@ def get_inventory():
     # Pull the header row + all data rows from Material Inventory!A1:H
     rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:H")
     headers = rows[0] if rows else []
-    data    = [dict(zip(headers, r)) for r in rows[1:]] if rows else []
-    return jsonify({ "headers": headers, "rows": data }), 200
+    data = [dict(zip(headers, r)) for r in rows[1:]] if rows else []
+    return jsonify({"headers": headers, "rows": data}), 200
+
 
 @app.route("/api/threadInventory", methods=["POST"])
 @login_required_session
@@ -7302,24 +8271,29 @@ def submit_thread_inventory():
 
     def build_row(color, feet, action):
         row = [""] * len(headers)
-        if "Date" in h_idx:         row[h_idx["Date"]] = now
-        if "Color" in h_idx:        row[h_idx["Color"]] = color
-        if "Length (ft)" in h_idx:  row[h_idx["Length (ft)"]] = feet
-        if "IN/OUT" in h_idx:       row[h_idx["IN/OUT"]] = "IN"
-        if "O/R" in h_idx:          row[h_idx["O/R"]] = action  # Ordered / Received
+        if "Date" in h_idx:
+            row[h_idx["Date"]] = now
+        if "Color" in h_idx:
+            row[h_idx["Color"]] = color
+        if "Length (ft)" in h_idx:
+            row[h_idx["Length (ft)"]] = feet
+        if "IN/OUT" in h_idx:
+            row[h_idx["IN/OUT"]] = "IN"
+        if "O/R" in h_idx:
+            row[h_idx["O/R"]] = action  # Ordered / Received
         return row
 
     to_log = []
     for e in (entries if isinstance(entries, list) else [entries]):
-        color     = (e.get("value") or "").strip()      # NOTE: frontend sends "value"
-        action    = (e.get("action") or "").strip()
+        color = (e.get("value") or "").strip()  # NOTE: frontend sends "value"
+        action = (e.get("action") or "").strip()
         qty_cones = (e.get("quantity") or "").strip()
         if not (color and action and qty_cones):
             continue
 
         try:
             cones = int(qty_cones)
-            feet  = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
+            feet = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
         except Exception:
             feet = ""
 
@@ -7331,13 +8305,14 @@ def submit_thread_inventory():
             range="Thread Data!A2:Z",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": to_log}
+            body={"values": to_log},
         ).execute()
 
     # ✅ invalidate materials-needed cache
     invalidate_materials_needed_cache()
 
     return jsonify({"added": len(to_log)}), 200
+
 
 @app.route("/api/inventoryOrdered", methods=["GET"])
 @login_required_session
@@ -7360,16 +8335,16 @@ def get_inventory_ordered():
         if view and len(view) > 1:
             # Load originals ONCE to map name -> row
             mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z") or []
-            th  = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z") or []
+            th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z") or []
 
             # Indices for Material Log
             mat_i = {}
             if mat:
                 mhdr = mat[0]
                 try:
-                    mat_i["Date"]     = mhdr.index("Date")
+                    mat_i["Date"] = mhdr.index("Date")
                     mat_i["Material"] = mhdr.index("Material")
-                    mat_i["O/R"]      = mhdr.index("O/R")
+                    mat_i["O/R"] = mhdr.index("O/R")
 
                     # Prefer QTY (case-insensitive), then Quantity; else fall back to O/R - 1
                     names = [str(h or "").strip() for h in mhdr]
@@ -7388,10 +8363,10 @@ def get_inventory_ordered():
             if th:
                 thdr = th[0]
                 try:
-                    th_i["Date"]   = thdr.index("Date")
-                    th_i["Color"]  = thdr.index("Color")
-                    th_i["LenFt"]  = thdr.index("Length (ft)")
-                    th_i["O/R"]    = thdr.index("O/R")
+                    th_i["Date"] = thdr.index("Date")
+                    th_i["Color"] = thdr.index("Color")
+                    th_i["LenFt"] = thdr.index("Length (ft)")
+                    th_i["O/R"] = thdr.index("O/R")
                 except ValueError:
                     th_i = {}
 
@@ -7428,7 +8403,14 @@ def get_inventory_ordered():
             hdr = view[0]  # Date | Type | Name | Quantity | Unit | Vendor
             for vix, vrow in enumerate(view[1:], start=2):
                 vrow = (vrow + ["", "", "", "", "", ""])[:6]
-                date, typ, name, qty, unit, vendor = vrow[0], vrow[1], vrow[2], vrow[3], vrow[4], vrow[5]
+                date, typ, name, qty, unit, vendor = (
+                    vrow[0],
+                    vrow[1],
+                    vrow[2],
+                    vrow[3],
+                    vrow[4],
+                    vrow[5],
+                )
                 if not name:
                     continue
 
@@ -7447,7 +8429,11 @@ def get_inventory_ordered():
                                 rq = _to_float(r[mat_i["Qty"]])
                             except Exception:
                                 pass
-                            if vq is not None and rq is not None and abs(vq - rq) < 1e-9:
+                            if (
+                                vq is not None
+                                and rq is not None
+                                and abs(vq - rq) < 1e-9
+                            ):
                                 best = rix
                                 break
                         src_row = best or cands[0][0]
@@ -7455,7 +8441,9 @@ def get_inventory_ordered():
                 elif typ_l == "thread" and thr_by_name:
                     cands = thr_by_name.get(name_l, [])
                     if cands:
-                        vq = _to_float(qty)  # view qty already divided by 16500 in the sheet
+                        vq = _to_float(
+                            qty
+                        )  # view qty already divided by 16500 in the sheet
                         best = None
                         for rix, r in cands:
                             rq = None
@@ -7465,7 +8453,11 @@ def get_inventory_ordered():
                                     rq = rq / 16500.0
                             except Exception:
                                 pass
-                            if vq is not None and rq is not None and abs(vq - rq) < 1e-9:
+                            if (
+                                vq is not None
+                                and rq is not None
+                                and abs(vq - rq) < 1e-9
+                            ):
                                 best = rix
                                 break
                         src_row = best or (cands[0][0] if cands else None)
@@ -7477,15 +8469,17 @@ def get_inventory_ordered():
                         except Exception:
                             pass
 
-                out.append({
-                    "row":      src_row,
-                    "date":     date,
-                    "type":     typ or "",
-                    "name":     name,
-                    "quantity": qty,
-                    "unit":     unit or "",
-                    "vendor":   vendor or "",
-                })
+                out.append(
+                    {
+                        "row": src_row,
+                        "date": date,
+                        "type": typ or "",
+                        "name": name,
+                        "quantity": qty,
+                        "unit": unit or "",
+                        "vendor": vendor or "",
+                    }
+                )
 
             return out
 
@@ -7494,47 +8488,57 @@ def get_inventory_ordered():
 
         # 0) Build Material→Unit and Material→Vendor maps (from Inventory sheet A2:I)
         inv_rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:I")
-        unit_map = {r[0]: (r[3] if len(r) > 3 else "") for r in inv_rows if r and str(r[0]).strip()}
-        vendor_map = {r[0]: (r[8] if len(r) > 8 else "") for r in inv_rows if r and str(r[0]).strip()}
+        unit_map = {
+            r[0]: (r[3] if len(r) > 3 else "")
+            for r in inv_rows
+            if r and str(r[0]).strip()
+        }
+        vendor_map = {
+            r[0]: (r[8] if len(r) > 8 else "")
+            for r in inv_rows
+            if r and str(r[0]).strip()
+        }
 
         # 1) Material Log sheet
         mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
         if mat:
-            hdr    = mat[0]  # ✅ define hdr for Material section
-            i_dt   = hdr.index("Date")
-            i_or   = hdr.index("O/R")
-            names  = [str(h or "").strip() for h in hdr]
-            lower  = [n.lower() for n in names]
+            hdr = mat[0]  # ✅ define hdr for Material section
+            i_dt = hdr.index("Date")
+            i_or = hdr.index("O/R")
+            names = [str(h or "").strip() for h in hdr]
+            lower = [n.lower() for n in names]
             if "qty" in lower:
                 qty_idx = lower.index("qty")
             elif "quantity" in lower:
                 qty_idx = lower.index("quantity")
             else:
                 qty_idx = i_or - 1
-            i_mat  = hdr.index("Material")
+            i_mat = hdr.index("Material")
 
             for idx, row in enumerate(mat[1:], start=2):
                 if len(row) > i_or and str(row[i_or]).strip().lower() == "ordered":
                     name = row[i_mat] if len(row) > i_mat else ""
-                    qty  = row[qty_idx] if len(row) > qty_idx else ""
-                    orders.append({
-                        "row":      idx,
-                        "date":     row[i_dt] if len(row) > i_dt else "",
-                        "type":     "Material",
-                        "name":     name,
-                        "quantity": qty,
-                        "unit":     unit_map.get(name, ""),
-                        "vendor":   vendor_map.get(name, "")
-                    })
+                    qty = row[qty_idx] if len(row) > qty_idx else ""
+                    orders.append(
+                        {
+                            "row": idx,
+                            "date": row[i_dt] if len(row) > i_dt else "",
+                            "type": "Material",
+                            "name": name,
+                            "quantity": qty,
+                            "unit": unit_map.get(name, ""),
+                            "vendor": vendor_map.get(name, ""),
+                        }
+                    )
 
         # 2) Thread Data sheet
         th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
         if th:
-            hdr    = th[0]
-            i_or   = hdr.index("O/R")
-            i_dt   = hdr.index("Date")
-            i_col  = hdr.index("Color")
-            i_len  = hdr.index("Length (ft)")
+            hdr = th[0]
+            i_or = hdr.index("O/R")
+            i_dt = hdr.index("Date")
+            i_col = hdr.index("Color")
+            i_len = hdr.index("Length (ft)")
 
             for idx, row in enumerate(th[1:], start=2):
                 if len(row) > i_or and str(row[i_or]).strip().lower() == "ordered":
@@ -7543,13 +8547,15 @@ def get_inventory_ordered():
                         qty = f"{float(qty) / 16500:.2f} cones"
                     except Exception:
                         pass
-                    orders.append({
-                        "row":      idx,
-                        "date":     row[i_dt] if len(row) > i_dt else "",
-                        "type":     "Thread",
-                        "name":     row[i_col] if len(row) > i_col else "",
-                        "quantity": qty
-                    })
+                    orders.append(
+                        {
+                            "row": idx,
+                            "date": row[i_dt] if len(row) > i_dt else "",
+                            "type": "Thread",
+                            "name": row[i_col] if len(row) > i_col else "",
+                            "quantity": qty,
+                        }
+                    )
 
         return orders
 
@@ -7579,16 +8585,22 @@ def _fast_inventory_view_entries():
       - if type == 'Thread'   → row in 'Thread Data'
     """
     sheets = get_sheets_service()  # use your existing helper
-    ssid   = os.environ.get("SPREADSHEET_ID") or app.config.get("SPREADSHEET_ID")
+    ssid = os.environ.get("SPREADSHEET_ID") or app.config.get("SPREADSHEET_ID")
     if not ssid:
         app.logger.warning("SPREADSHEET_ID missing; falling back to slow path")
         return None
 
     # Read the precomputed view (fast)
-    view_range = "'Inventory Ordered (View)'!A2:F"  # Date | Type | Name | Qty | Unit | Vendor
-    view_vals  = sheets.spreadsheets().values().get(
-        spreadsheetId=ssid, range=view_range, majorDimension="ROWS"
-    ).execute().get("values", [])
+    view_range = (
+        "'Inventory Ordered (View)'!A2:F"  # Date | Type | Name | Qty | Unit | Vendor
+    )
+    view_vals = (
+        sheets.spreadsheets()
+        .values()
+        .get(spreadsheetId=ssid, range=view_range, majorDimension="ROWS")
+        .execute()
+        .get("values", [])
+    )
 
     # If the view is empty, bail out so the caller can fallback
     if not view_vals:
@@ -7597,23 +8609,31 @@ def _fast_inventory_view_entries():
     # Read original sheets ONCE so we can map back to row numbers
     # Material Log: we need row index where O/R == "ordered"
     mat_range = "'Material Log'!A:I"
-    material_vals = sheets.spreadsheets().values().get(
-        spreadsheetId=ssid, range=mat_range, majorDimension="ROWS"
-    ).execute().get("values", [])
+    material_vals = (
+        sheets.spreadsheets()
+        .values()
+        .get(spreadsheetId=ssid, range=mat_range, majorDimension="ROWS")
+        .execute()
+        .get("values", [])
+    )
 
     # Thread Data: row index where O/R == "ordered"
     thr_range = "'Thread Data'!A:I"
-    thread_vals = sheets.spreadsheets().values().get(
-        spreadsheetId=ssid, range=thr_range, majorDimension="ROWS"
-    ).execute().get("values", [])
+    thread_vals = (
+        sheets.spreadsheets()
+        .values()
+        .get(spreadsheetId=ssid, range=thr_range, majorDimension="ROWS")
+        .execute()
+        .get("values", [])
+    )
 
     # Build quick lookup maps by name → list of candidate row indices
     # Material Log columns (per your header): A=Date, F=Material, G=QTY, I=O/R
     mat_by_name = {}
     for idx, r in enumerate(material_vals, start=1):  # 1-based row
         try:
-            name = (r[5] or "").strip()   # F
-            orv  = (r[8] or "").strip().lower()  # I
+            name = (r[5] or "").strip()  # F
+            orv = (r[8] or "").strip().lower()  # I
         except IndexError:
             continue
         if orv == "ordered" and name:
@@ -7623,8 +8643,8 @@ def _fast_inventory_view_entries():
     thr_by_name = {}
     for idx, r in enumerate(thread_vals, start=1):
         try:
-            name = (r[2] or "").strip()   # C
-            orv  = (r[7] or "").strip().lower()  # H
+            name = (r[2] or "").strip()  # C
+            orv = (r[7] or "").strip().lower()  # H
         except IndexError:
             continue
         if orv == "ordered" and name:
@@ -7638,7 +8658,14 @@ def _fast_inventory_view_entries():
     for row in view_vals:
         # Safe unpack with padding
         row += [""] * (6 - len(row))
-        date, typ, name, qty, unit, vendor = row[0], row[1], row[2], row[3], row[4], row[5]
+        date, typ, name, qty, unit, vendor = (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+        )
         if not name:
             continue
 
@@ -7670,17 +8697,20 @@ def _fast_inventory_view_entries():
             cands = thr_by_name.get(lname, [])
             src_row = cands[0][0] if cands else None
 
-        entries.append({
-            "date": _js_date_to_str(date),
-            "type": typ,
-            "name": name,
-            "quantity": qty,
-            "unit": unit,
-            "vendor": vendor,
-            "row": src_row,  # may be None if no match found
-        })
+        entries.append(
+            {
+                "date": _js_date_to_str(date),
+                "type": typ,
+                "name": name,
+                "quantity": qty,
+                "unit": unit,
+                "vendor": vendor,
+                "row": src_row,  # may be None if no match found
+            }
+        )
 
     return entries
+
 
 @app.route("/api/inventoryOrdered", methods=["PUT", "OPTIONS"])
 @login_required_session
@@ -7695,15 +8725,18 @@ def mark_inventory_received():
     # CORS preflight
     if request.method == "OPTIONS":
         from flask import make_response  # safe if already imported elsewhere
+
         resp = make_response("", 204)
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = (
+            "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        )
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         return resp
 
-    data      = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True) or {}
     sheetType = (data.get("type") or "").strip()
-    row       = data.get("row")
+    row = data.get("row")
 
     try:
         row = int(row)
@@ -7714,10 +8747,10 @@ def mark_inventory_received():
 
     # choose sheet & O/R column
     if sheetType == "Material":
-        sheet  = "Material Log"
+        sheet = "Material Log"
         col_or = "I"
     else:
-        sheet  = "Thread Data"
+        sheet = "Thread Data"
         col_or = "H"
 
     # Sheets client
@@ -7732,7 +8765,7 @@ def mark_inventory_received():
             spreadsheetId=SPREADSHEET_ID,
             range=f"{sheet}!A{row}",
             valueInputOption="USER_ENTERED",
-            body={"values": [[now]]}
+            body={"values": [[now]]},
         ).execute()
 
         # 2) Update the O/R cell to "Received"
@@ -7740,7 +8773,7 @@ def mark_inventory_received():
             spreadsheetId=SPREADSHEET_ID,
             range=f"{sheet}!{col_or}{row}",
             valueInputOption="USER_ENTERED",
-            body={"values": [["Received"]]}
+            body={"values": [["Received"]]},
         ).execute()
     except Exception as e:
         app.logger.exception("Receive failed for %s row %s", sheet, row)
@@ -7749,6 +8782,7 @@ def mark_inventory_received():
     resp = jsonify({"ok": True})
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
+
 
 @app.route("/api/inventoryOrdered/batch", methods=["PUT", "OPTIONS"])
 @login_required_session
@@ -7763,8 +8797,11 @@ def mark_inventory_received_batch():
     # CORS preflight
     if request.method == "OPTIONS":
         from flask import make_response
+
         resp = make_response("", 204)
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = (
+            "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        )
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         return resp
@@ -7810,8 +8847,10 @@ def mark_inventory_received_batch():
         ).execute()
 
     try:
-        _batch(mat_dates); _batch(mat_or)
-        _batch(th_dates);  _batch(th_or)
+        _batch(mat_dates)
+        _batch(mat_or)
+        _batch(th_dates)
+        _batch(th_or)
     except Exception as e:
         app.logger.exception("Batch receive failed")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -7822,7 +8861,7 @@ def mark_inventory_received_batch():
     except Exception:
         pass
 
-    resp = jsonify({ "ok": True, "processed": len(items) })
+    resp = jsonify({"ok": True, "processed": len(items)})
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
 
@@ -7833,7 +8872,9 @@ def update_inventory_ordered_quantity():
     # CORS preflight short-circuit (Render/Netlify proxies sometimes need this)
     if request.method == "OPTIONS":
         resp = make_response("", 204)
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = (
+            "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        )
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         return resp
@@ -7841,13 +8882,16 @@ def update_inventory_ordered_quantity():
     try:
         payload = request.get_json(silent=True) or {}
         sheet_type = str(payload.get("type", "")).strip().lower()
-        row        = payload.get("row")
-        qty_raw    = payload.get("quantity", "")
+        row = payload.get("row")
+        qty_raw = payload.get("quantity", "")
 
         app.logger.info("📝 PATCH /api/inventoryOrdered/quantity payload=%s", payload)
 
         if sheet_type not in {"material", "thread"}:
-            return jsonify({"error": "Invalid type; expected 'Material' or 'Thread'"}), 400
+            return (
+                jsonify({"error": "Invalid type; expected 'Material' or 'Thread'"}),
+                400,
+            )
         try:
             row = int(row)
         except Exception:
@@ -7869,7 +8913,7 @@ def update_inventory_ordered_quantity():
             hdr = rows[0]
             if "O/R" not in hdr:
                 return jsonify({"error": "Could not find 'O/R' in Material Log"}), 500
-            i_or  = hdr.index("O/R")
+            i_or = hdr.index("O/R")
             names = [str(h or "").strip() for h in hdr]
             lower = [n.lower() for n in names]
 
@@ -7889,9 +8933,8 @@ def update_inventory_ordered_quantity():
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Material Log!{colA1}{row}",
                 valueInputOption="USER_ENTERED",
-                body={"values": [[qty_val]]}
+                body={"values": [[qty_val]]},
             ).execute()
-
 
         else:  # thread
             # Thread Data: update "Length (ft)" then the view will show cones (length / 16500)
@@ -7901,14 +8944,19 @@ def update_inventory_ordered_quantity():
 
             hdr = rows[0]
             if "Length (ft)" not in hdr:
-                return jsonify({"error": "Could not find 'Length (ft)' in Thread Data"}), 500
+                return (
+                    jsonify({"error": "Could not find 'Length (ft)' in Thread Data"}),
+                    500,
+                )
             i_len = hdr.index("Length (ft)")
 
             # Accept "X cones" by converting back to feet, or raw number
             qty_str = str(qty_val).strip().lower()
             try:
                 if "cone" in qty_str:
-                    num = float(qty_str.replace("cones", "").replace("cone", "").strip())
+                    num = float(
+                        qty_str.replace("cones", "").replace("cone", "").strip()
+                    )
                     feet = num * 16500.0
                 else:
                     feet = float(qty_str)
@@ -7922,7 +8970,7 @@ def update_inventory_ordered_quantity():
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Thread Data!{colA1}{row}",
                 valueInputOption="USER_ENTERED",
-                body={"values": [[write_val]]}
+                body={"values": [[write_val]]},
             ).execute()
 
         # Force no caching on proxies
@@ -7934,7 +8982,6 @@ def update_inventory_ordered_quantity():
         app.logger.exception("❌ Error in PATCH /api/inventoryOrdered/quantity")
         # Return JSON (not HTML) so axios can show a useful message
         return jsonify({"error": str(e)}), 500
-
 
 
 @app.route("/api/company-list")
@@ -7954,17 +9001,24 @@ def company_list():
         return jsonify({"error": "Company name column not found in Directory tab"}), 500
 
     # Get all non-empty company names and deduplicate
-    companies = list({row[col_index].strip() for row in directory_data[1:] if len(row) > col_index and row[col_index].strip()})
+    companies = list(
+        {
+            row[col_index].strip()
+            for row in directory_data[1:]
+            if len(row) > col_index and row[col_index].strip()
+        }
+    )
     companies.sort()
 
     return jsonify({"companies": companies})
+
 
 @app.route("/api/process-shipment", methods=["POST"])
 @login_required_session
 def process_shipment():
     data = request.get_json()
     env_override = data.get("qboEnv")  # "sandbox" or "production"
-    session["qboEnv"] = (env_override or "production")
+    session["qboEnv"] = env_override or "production"
     print("📥 process-shipment received:", data)
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -7980,7 +9034,9 @@ def process_shipment():
 
     # 1) Parse incoming
     order_ids = [str(oid).strip() for oid in data.get("order_ids", [])]
-    shipped_quantities = {str(k).strip(): v for k, v in data.get("shipped_quantities", {}).items()}
+    shipped_quantities = {
+        str(k).strip(): v for k, v in data.get("shipped_quantities", {}).items()
+    }
     boxes = data.get("boxes", [])
     shipping_method = data.get("shipping_method", "")
     service_code = data.get("service_code")  # e.g., "03", "02", "01", etc.
@@ -7999,10 +9055,15 @@ def process_shipment():
         service = get_sheets_service()
 
         # 2) Read the full sheet
-        result = service.spreadsheets().values().get(
-            spreadsheetId=sheet_id,
-            range=f"{sheet_name}!A1:Z",
-        ).execute()
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=sheet_id,
+                range=f"{sheet_name}!A1:Z",
+            )
+            .execute()
+        )
         rows = result.get("values", [])
         headers_row = rows[0]
 
@@ -8024,15 +9085,21 @@ def process_shipment():
                     parsed_qty = 0
 
                 # queue sheet update
-                updates.append({
-                    "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
-                    "values": [[str(parsed_qty)]]
-                })
+                updates.append(
+                    {
+                        "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
+                        "values": [[str(parsed_qty)]],
+                    }
+                )
 
                 # build order_data dict for invoice
                 row_dict = dict(zip(headers_row, row))
                 order_dict = {
-                    h: (str(parsed_qty) if h in ("Shipped", "ShippedQty") else row_dict.get(h, ""))
+                    h: (
+                        str(parsed_qty)
+                        if h in ("Shipped", "ShippedQty")
+                        else row_dict.get(h, "")
+                    )
                     for h in headers_row
                 }
                 order_dict["ShippedQty"] = parsed_qty
@@ -8045,7 +9112,7 @@ def process_shipment():
             tracking_list=[],
             base_shipping_cost=0.0,
             sheet=service,
-            env_override=env_override
+            env_override=env_override,
         )
         print("✅ Invoice created:", invoice_url)
 
@@ -8067,13 +9134,19 @@ def process_shipment():
         media = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
         drive = get_drive_service()
         drive.files().create(
-            body={"name": pdf_filename, "parents": [os.environ["PACKING_SLIP_PRINT_FOLDER_ID"]]},
-            media_body=media
+            body={
+                "name": pdf_filename,
+                "parents": [os.environ["PACKING_SLIP_PRINT_FOLDER_ID"]],
+            },
+            media_body=media,
         ).execute()
         print("✅ Packing slip uploaded to watcher folder.")
 
         # 7b) ALSO upload the packing slip into each order's Drive folder
-        ORDERS_PARENT_FOLDER_ID = os.environ.get("ORDERS_PARENT_FOLDER_ID", "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz")
+        ORDERS_PARENT_FOLDER_ID = os.environ.get(
+            "ORDERS_PARENT_FOLDER_ID", "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
+        )
+
         def _find_folder_by_name(name, parent_id):
             q = (
                 f"name = '{name}' and "
@@ -8089,11 +9162,17 @@ def process_shipment():
             folder_id = _find_folder_by_name(str(oid), ORDERS_PARENT_FOLDER_ID)
             if not folder_id:
                 # Create the folder if it's missing (no delete!)
-                meta = {"name": str(oid), "mimeType": "application/vnd.google-apps.folder", "parents": [ORDERS_PARENT_FOLDER_ID]}
+                meta = {
+                    "name": str(oid),
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [ORDERS_PARENT_FOLDER_ID],
+                }
                 folder_id = drive.files().create(body=meta, fields="id").execute()["id"]
             drive.files().create(
                 body={"name": f"{oid}_packing_slip.pdf", "parents": [folder_id]},
-                media_body=MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
+                media_body=MediaIoBaseUpload(
+                    BytesIO(pdf_bytes), mimetype="application/pdf"
+                ),
             ).execute()
         print("✅ Packing slip copied into each order folder.")
 
@@ -8101,19 +9180,14 @@ def process_shipment():
         if updates:
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=sheet_id,
-                body={"valueInputOption": "USER_ENTERED", "data": updates}
+                body={"valueInputOption": "USER_ENTERED", "data": updates},
             ).execute()
             print("✅ Shipped quantities written to sheet.")
         else:
             print("⚠️ No updates to push—check order_ids match sheet.")
 
         # 9) Respond
-        return jsonify({
-            "labels": [],
-            "invoice": invoice_url,
-            "slips": [slip_url]
-        })
-
+        return jsonify({"labels": [], "invoice": invoice_url, "slips": [slip_url]})
 
     except RedirectException as e:
         # (Shouldn't hit here because we gate auth at the top, but safe to keep.)
@@ -8123,7 +9197,6 @@ def process_shipment():
         print("❌ Shipment error:", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
 
 
 @app.errorhandler(Exception)
@@ -8136,6 +9209,7 @@ def handle_exception(e):
     resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
     resp.headers["Access-Control-Allow-Credentials"] = "true"
     return resp
+
 
 @app.route("/api/product-specs", methods=["POST"])
 @login_required_session
@@ -8165,10 +9239,9 @@ def set_product_specs():
 
     # 1) Fetch column A (Products) to find the row
     sheet = get_sheets_service().spreadsheets()
-    result = sheet.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Table!A2:Z"
-    ).execute()
+    result = (
+        sheet.values().get(spreadsheetId=SPREADSHEET_ID, range="Table!A2:Z").execute()
+    )
     values = result.get("values", [])
 
     row_index = None
@@ -8182,16 +9255,16 @@ def set_product_specs():
 
     # 2) Map each incoming field to its sheet column
     updates = {
-        "D": data.get("printTime", ""),       # Print Times (1 Machine)
-        "F": data.get("perYard", ""),         # How Many Products Per Yard
-        "G": data.get("foamHalf", ""),        # 1/2" Foam
-        "H": data.get("foam38", ""),          # 3/8" Foam
-        "I": data.get("foam14", ""),          # 1/4" Foam
-        "J": data.get("foam18", ""),          # 1/8" Foam
-        "K": data.get("magnetN", ""),         # N Magnets
-        "L": data.get("magnetS", ""),         # S Magnets
-        "M": data.get("elasticHalf", ""),     # 1/2" Elastic
-        "N": data.get("volume", ""),          # Volume
+        "D": data.get("printTime", ""),  # Print Times (1 Machine)
+        "F": data.get("perYard", ""),  # How Many Products Per Yard
+        "G": data.get("foamHalf", ""),  # 1/2" Foam
+        "H": data.get("foam38", ""),  # 3/8" Foam
+        "I": data.get("foam14", ""),  # 1/4" Foam
+        "J": data.get("foam18", ""),  # 1/8" Foam
+        "K": data.get("magnetN", ""),  # N Magnets
+        "L": data.get("magnetS", ""),  # S Magnets
+        "M": data.get("elasticHalf", ""),  # 1/2" Elastic
+        "N": data.get("volume", ""),  # Volume
     }
 
     # 3) Write each one cell
@@ -8201,10 +9274,11 @@ def set_product_specs():
             spreadsheetId=SPREADSHEET_ID,
             range=f"Material Inventory!A{target_row}:P{target_row}",  # <- now includes column P
             valueInputOption="USER_ENTERED",
-            body={"values": [inventory_row]}
+            body={"values": [inventory_row]},
         ).execute()
 
     return jsonify({"status": "ok"}), 200
+
 
 @app.route("/api/logout-all", methods=["POST"])
 @login_required_session
@@ -8215,6 +9289,7 @@ def logout_all():
     # push a socket event to all connected clients
     socketio.emit("forceLogout")
     return jsonify({"status": "ok"}), 200
+
 
 @app.route("/api/rate", methods=["POST"])
 @login_required_session
@@ -8245,15 +9320,21 @@ def list_folder_files():
 
     try:
         drive = get_drive_service()
-        results = drive.files().list(
-            q=f"'{folder_id}' in parents and trashed = false",
-            fields="files(id, name, mimeType)"
-        ).execute()
+        results = (
+            drive.files()
+            .list(
+                q=f"'{folder_id}' in parents and trashed = false",
+                fields="files(id, name, mimeType)",
+            )
+            .execute()
+        )
         return jsonify({"files": results.get("files", [])})
     except Exception as e:
         import traceback
+
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/proxy-drive-file")
 def proxy_drive_file():
@@ -8275,8 +9356,10 @@ def proxy_drive_file():
     except Exception as e:
         print("❌ Error during proxying file:")
         import traceback
+
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/drive/warmThumbnails", methods=["POST"])
 @login_required_session
@@ -8294,11 +9377,15 @@ def warm_thumbnails():
         for p in pairs:
             fid = str(p.get("id") or "").strip()
             ver = str(p.get("v") or "").strip()
-            sz  = str(p.get("sz") or "w240").strip()
+            sz = str(p.get("sz") or "w240").strip()
             if fid and ver:
                 uniq[(fid, ver, sz)] = 1
         work = [{"id": fid, "v": ver, "sz": sz} for (fid, ver, sz) in uniq.keys()]
-        work = [p for p in work if not os.path.exists(_thumb_cache_path(p["id"], p["sz"], p["v"]))]
+        work = [
+            p
+            for p in work
+            if not os.path.exists(_thumb_cache_path(p["id"], p["sz"], p["v"]))
+        ]
 
         if not work:
             return jsonify({"ok": True, "warmed": 0}), 200
@@ -8339,7 +9426,11 @@ def warm_thumbnails():
                     thumb = f"{thumb}?s={px}"
 
                 img = requests.get(thumb, headers=headers, timeout=10)
-                if img.status_code == 200 and img.content and img.headers.get("Content-Type","").startswith("image/"):
+                if (
+                    img.status_code == 200
+                    and img.content
+                    and img.headers.get("Content-Type", "").startswith("image/")
+                ):
                     with open(cpath, "wb") as f:
                         f.write(img.content)
                     return True
@@ -8350,6 +9441,7 @@ def warm_thumbnails():
         # Fetch in parallel to speed up warm-up
         warmed = 0
         from concurrent.futures import ThreadPoolExecutor, as_completed
+
         with ThreadPoolExecutor(max_workers=3) as ex:
             futures = [ex.submit(_warm_one, p) for p in work]
             for fut in as_completed(futures):
@@ -8382,10 +9474,11 @@ def drive_meta_batch():
         svc = get_drive_service()
         for fid in ids:
             try:
-                info = svc.files().get(
-                    fileId=fid,
-                    fields="id, md5Checksum, modifiedTime"
-                ).execute()
+                info = (
+                    svc.files()
+                    .get(fileId=fid, fields="id, md5Checksum, modifiedTime")
+                    .execute()
+                )
                 ver = info.get("md5Checksum") or info.get("modifiedTime") or ""
                 versions[fid] = ver
             except Exception:
@@ -8407,18 +9500,23 @@ def drive_file_metadata():
     try:
         print(f"🔍 Fetching metadata for file ID: {file_id}")
         service = get_drive_service()
-        metadata = service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
+        metadata = (
+            service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
+        )
         print(f"✅ Metadata retrieved: {metadata}")
         return jsonify(metadata)
     except Exception as e:
         app.logger.error(f"❌ Error fetching metadata for file {file_id}: {e}")
         return jsonify({"error": str(e)}), 500
+
+
 def get_column_index(sheet, header_name):
     headers = sheet.row_values(1)
     for idx, col in enumerate(headers, start=1):
         if col.strip().lower() == header_name.strip().lower():
             return idx
     raise ValueError(f"Column '{header_name}' not found.")
+
 
 @app.route("/api/resetStartTime", methods=["POST"])
 @login_required_session
@@ -8443,7 +9541,9 @@ def reset_start_time():
         for i, row in enumerate(rows, start=2):
             if str(row.get("ID", "")).strip() == job_id:
                 sheet.update_cell(i, emb_start_col, timestamp)
-                print(f"✅ Reset start time for row {i} (Job ID {job_id}) → {timestamp}")
+                print(
+                    f"✅ Reset start time for row {i} (Job ID {job_id}) → {timestamp}"
+                )
                 return jsonify({"status": "ok"}), 200
 
         return jsonify({"error": "Job not found"}), 404
@@ -8457,7 +9557,12 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
     try:
         # Step 1: Look up the old folder
         query = f"name = '{old_order_num}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        folders = drive_service.files().list(q=query, fields="files(id)").execute().get("files", [])
+        folders = (
+            drive_service.files()
+            .list(q=query, fields="files(id)")
+            .execute()
+            .get("files", [])
+        )
         if not folders:
             print(f"❌ No folder found for order #{old_order_num}")
             return
@@ -8466,20 +9571,29 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
 
         # Step 2: List files inside old folder
         query = f"'{old_folder_id}' in parents and trashed = false"
-        files = drive_service.files().list(q=query, fields="files(id, name)").execute().get("files", [])
+        files = (
+            drive_service.files()
+            .list(q=query, fields="files(id, name)")
+            .execute()
+            .get("files", [])
+        )
 
         for file in files:
             if file["name"].lower().endswith(".emb"):
-                print(f"📤 Copying {file['name']} from order {old_order_num} → {new_order_num}")
+                print(
+                    f"📤 Copying {file['name']} from order {old_order_num} → {new_order_num}"
+                )
                 drive_service.files().copy(
                     fileId=file["id"],
-                    body={"name": f"{new_order_num}.emb", "parents": [new_folder_id]}
+                    body={"name": f"{new_order_num}.emb", "parents": [new_folder_id]},
                 ).execute()
     except Exception as e:
         print("❌ Error copying .emb files:", e)
 
+
 from flask import request, session, redirect
 from requests_oauthlib import OAuth2Session
+
 
 @app.route("/qbo/login")
 def qbo_login():
@@ -8493,17 +9607,18 @@ def qbo_login():
     client_id, client_secret = get_qbo_oauth_credentials(env_override)
 
     # Log what we’re sending so you can confirm in Render logs
-    print(f"QBO env: {session.get('qboEnv', QBO_ENV)} | redirect_uri={QBO_REDIRECT_URI!r}")
+    print(
+        f"QBO env: {session.get('qboEnv', QBO_ENV)} | redirect_uri={QBO_REDIRECT_URI!r}"
+    )
     print(f"QBO client id (first 6): {str(client_id)[:6]}…")
 
     # ── 2) Build the OAuth2Session with the chosen client_id ─────
     qbo = OAuth2Session(
-     client_id=client_id,
-     redirect_uri=QBO_REDIRECT_URI,
-     scope=QBO_SCOPES,
-     state=session.get("qbo_oauth_state")
+        client_id=client_id,
+        redirect_uri=QBO_REDIRECT_URI,
+        scope=QBO_SCOPES,
+        state=session.get("qbo_oauth_state"),
     )
-
 
     # ── 3) Generate the authorization URL ─────────────────────────
     auth_url, state = qbo.authorization_url(QBO_AUTH_URL)
@@ -8516,9 +9631,10 @@ def qbo_login():
 
 logger = logging.getLogger(__name__)
 
+
 @app.route("/qbo/callback", methods=["GET"])
 def qbo_callback():
-    code  = request.args.get("code")
+    code = request.args.get("code")
     state = request.args.get("state")
     realm = request.args.get("realmId")
 
@@ -8532,31 +9648,23 @@ def qbo_callback():
     client_id, client_secret = get_qbo_oauth_credentials(env_override)
 
     # ── 2) Rebuild OAuth2Session with that client_id & state ─────
-    qbo = OAuth2Session(
-        client_id,
-        redirect_uri=QBO_REDIRECT_URI,
-        state=state
-    )
+    qbo = OAuth2Session(client_id, redirect_uri=QBO_REDIRECT_URI, state=state)
 
     # ── 3) Exchange code for token using the matching client_secret ─
-    token = qbo.fetch_token(
-        QBO_TOKEN_URL,
-        client_secret=client_secret,
-        code=code
-    )
+    token = qbo.fetch_token(QBO_TOKEN_URL, client_secret=client_secret, code=code)
 
     # ── 4) Persist token & realmId to disk for reuse ─────────────
-    disk_data = { **token, "realmId": realm }
+    disk_data = {**token, "realmId": realm}
     with open(TOKEN_PATH, "w") as f:
         json.dump(disk_data, f, indent=2)
     logger.info("✅ Wrote QBO token to disk at %s", TOKEN_PATH)
 
     # ── 5) Store in session for your API calls ────────────────────
     session["qbo_token"] = {
-        "access_token":  token["access_token"],
+        "access_token": token["access_token"],
         "refresh_token": token["refresh_token"],
-        "expires_at":    time.time() + int(token["expires_in"]),
-        "realmId":       realm
+        "expires_at": time.time() + int(token["expires_in"]),
+        "realmId": realm,
     }
     session["qboEnv"] = env_override
     logger.info("✅ Stored QBO token in session, environment: %s", env_override)
@@ -8596,6 +9704,7 @@ def _build_qbo_login_redirect():
     qs = f"env={env}&source=ensure"
     return f"/qbo/login?{qs}"
 
+
 @app.route("/api/ensure-qbo-auth", methods=["POST"])
 @login_required_session
 def ensure_qbo_auth():
@@ -8617,16 +9726,14 @@ def ensure_qbo_auth():
         return jsonify({"redirect": _build_qbo_login_redirect()}), 200
 
 
-
 @app.route("/authorize-quickbooks")
 def authorize_quickbooks():
     from requests_oauthlib import OAuth2Session
 
     qbo = OAuth2Session(
-        client_id=QBO_CLIENT_ID,
-        redirect_uri=QBO_REDIRECT_URI,
-        scope=QBO_SCOPE
+        client_id=QBO_CLIENT_ID, redirect_uri=QBO_REDIRECT_URI, scope=QBO_SCOPE
     )
+
 
 @app.route("/quickbooks/login")
 def quickbooks_login_redirect():
@@ -8638,8 +9745,10 @@ def quickbooks_login_redirect():
     auth_url = get_quickbooks_auth_url(redirect_uri, state=next_path)
     return redirect(auth_url)
 
+
 # --- Protected thread images (behind login) ---
 THREAD_IMG_DIR = os.path.join(os.path.dirname(__file__), "static", "thread-images")
+
 
 @app.route("/thread-images/<int:num>.<ext>", methods=["GET", "OPTIONS"])
 @login_required_session
@@ -8651,10 +9760,11 @@ def serve_thread_image(num, ext):
     full_path = os.path.join(THREAD_IMG_DIR, filename)
     if not os.path.exists(full_path):
         return make_response(("Not found", 404))
-    resp = make_response(send_from_directory(THREAD_IMG_DIR, filename, conditional=True))
+    resp = make_response(
+        send_from_directory(THREAD_IMG_DIR, filename, conditional=True)
+    )
     resp.headers["Cache-Control"] = "private, max-age=2592000, immutable"
     return resp
-
 
 
 @app.route("/api/thread-colors", methods=["GET"])
@@ -8690,6 +9800,7 @@ def get_thread_colors():
         print("❌ Failed to fetch thread colors:", e)
         return jsonify([]), 500
 
+
 @app.route("/order/madeira", methods=["POST"])
 @login_required_session
 def order_madeira():
@@ -8708,6 +9819,7 @@ def order_madeira():
     except Exception as e:
         print("🔥 madeira order error:", str(e))
         return jsonify({"error": "Failed to add to cart", "details": str(e)}), 500
+
 
 # ── Material Images: robust fuzzy match (both /api/material-image and /material-image) ──
 from flask import send_from_directory, redirect
@@ -8729,21 +9841,24 @@ VENDOR_ALIASES = {
     "upholstery supplies": "Upholstery Supplies",
 }
 
+
 def _clean(s: str) -> str:
     """Loose normalizer for filenames & queries: lowercase, strip accents, remove punctuation, collapse spaces."""
     s = unquote(str(s or ""))
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
     s = s.replace('"', "").replace("'", "")
     s = s.replace("/", "_").replace("\\", "_")  # 1/2" => 1_2
-    s = s.replace("&", "and")                   # belts & buckles -> belts and buckles
+    s = s.replace("&", "and")  # belts & buckles -> belts and buckles
     s = re.sub(r"[^a-zA-Z0-9._\- ]+", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
 
 def _norm_key(s: str) -> str:
     """Aggressive key for fuzzy compare: lowercase and drop spaces/_/-/dots."""
     s = _clean(s).lower()
     return re.sub(r"[ \-_.]+", "", s)
+
 
 def _pick_vendor_dir(vendor_raw: str) -> str | None:
     """Choose a vendor directory: try exact, alias, and case-insensitive."""
@@ -8754,10 +9869,21 @@ def _pick_vendor_dir(vendor_raw: str) -> str | None:
     candidates = []
     if alias:
         candidates.append(alias)
-    candidates.extend([vendor_clean, vendor_clean.lower(), vendor_clean.title(), vendor_clean.replace(" ", "_")])
+    candidates.extend(
+        [
+            vendor_clean,
+            vendor_clean.lower(),
+            vendor_clean.title(),
+            vendor_clean.replace(" ", "_"),
+        ]
+    )
     # existing folders
     try:
-        folders = [d for d in os.listdir(MATERIAL_BASE) if os.path.isdir(os.path.join(MATERIAL_BASE, d))]
+        folders = [
+            d
+            for d in os.listdir(MATERIAL_BASE)
+            if os.path.isdir(os.path.join(MATERIAL_BASE, d))
+        ]
     except Exception:
         folders = []
     # exact/alias first
@@ -8771,6 +9897,7 @@ def _pick_vendor_dir(vendor_raw: str) -> str | None:
             return os.path.join(MATERIAL_BASE, f)
     return None
 
+
 def _find_best_file(vendor_dir: str, name_raw: str) -> tuple[str, str] | None:
     """
     Fuzzy match a file in vendor_dir to name_raw.
@@ -8782,12 +9909,18 @@ def _find_best_file(vendor_dir: str, name_raw: str) -> tuple[str, str] | None:
 
     name_clean = _clean(name_raw)
     # quick exact tries for common extensions on cleaned stems
-    stems = list(dict.fromkeys([name_clean,
-                                name_clean.replace(" ", "_"),
-                                name_clean.replace(" ", "-"),
-                                name_clean.lower(),
-                                name_clean.lower().replace(" ", "_"),
-                                name_clean.lower().replace(" ", "-")]))
+    stems = list(
+        dict.fromkeys(
+            [
+                name_clean,
+                name_clean.replace(" ", "_"),
+                name_clean.replace(" ", "-"),
+                name_clean.lower(),
+                name_clean.lower().replace(" ", "_"),
+                name_clean.lower().replace(" ", "-"),
+            ]
+        )
+    )
     exts = [".webp", ".jpg", ".jpeg", ".png"]
     for stem in stems:
         for ext in exts:
@@ -8799,7 +9932,11 @@ def _find_best_file(vendor_dir: str, name_raw: str) -> tuple[str, str] | None:
     # Fuzzy scan: normalize both requested name and file stems
     target = _norm_key(name_clean)
     try:
-        files = [f for f in os.listdir(vendor_dir) if os.path.isfile(os.path.join(vendor_dir, f))]
+        files = [
+            f
+            for f in os.listdir(vendor_dir)
+            if os.path.isfile(os.path.join(vendor_dir, f))
+        ]
     except Exception:
         files = []
 
@@ -8836,6 +9973,7 @@ def _find_best_file(vendor_dir: str, name_raw: str) -> tuple[str, str] | None:
 # ── Set Preview formula for an order (writes to Production Orders sheet) ─────
 from flask import request, jsonify
 
+
 def _col_letter(idx0: int) -> str:
     # 0-based index → A1 letter
     n = idx0 + 1
@@ -8844,6 +9982,7 @@ def _col_letter(idx0: int) -> str:
         n, r = divmod(n - 1, 26)
         s = chr(65 + r) + s
     return s
+
 
 # Back-compat alias for older code paths that call `col_to_a1`
 def col_to_a1(idx0: int) -> str:
@@ -8863,12 +10002,20 @@ def thread_relog():
     try:
         body = request.get_json(force=True) or {}
         order = str(body.get("orderNumber") or "").strip()
-        qty   = int(body.get("embroideryQty") or 0)
+        qty = int(body.get("embroideryQty") or 0)
         if not order or qty <= 0:
-            return jsonify({"error": "orderNumber and positive embroideryQty required"}), 400
+            return (
+                jsonify({"error": "orderNumber and positive embroideryQty required"}),
+                400,
+            )
 
         # 1) Load Thread Data
-        td_rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z", value_render="UNFORMATTED_VALUE") or []
+        td_rows = (
+            fetch_sheet(
+                SPREADSHEET_ID, "Thread Data!A1:Z", value_render="UNFORMATTED_VALUE"
+            )
+            or []
+        )
         if not td_rows:
             return jsonify({"error": "Thread Data tab empty"}), 400
 
@@ -8877,22 +10024,35 @@ def thread_relog():
 
         # Exact columns in your sheet:
         # Date | Order Number | Color | Color Name | Length (ft) | Stitch Count | IN/OUT | O/R
-        c_date   = idx.get("date")
-        c_order  = idx.get("order number")
-        c_color  = idx.get("color")
-        c_name   = idx.get("color name")
-        c_lenft  = idx.get("length (ft)")
+        c_date = idx.get("date")
+        c_order = idx.get("order number")
+        c_color = idx.get("color")
+        c_name = idx.get("color name")
+        c_lenft = idx.get("length (ft)")
         c_stitch = idx.get("stitch count")
-        c_inout  = idx.get("in/out")
-        c_or     = idx.get("o/r")
-        c_recut  = idx.get("recut") 
+        c_inout = idx.get("in/out")
+        c_or = idx.get("o/r")
+        c_recut = idx.get("recut")
 
         if c_order is None or c_lenft is None:
-            return jsonify({"error": "Thread Data headers missing 'Order Number' or 'Length (ft)'. Check tab."}), 400
-
+            return (
+                jsonify(
+                    {
+                        "error": "Thread Data headers missing 'Order Number' or 'Length (ft)'. Check tab."
+                    }
+                ),
+                400,
+            )
 
         if c_order is None or c_lenft is None:
-            return jsonify({"error": "Thread Data headers missing 'Order Number' or 'Length (ft)'. Check tab."}), 400
+            return (
+                jsonify(
+                    {
+                        "error": "Thread Data headers missing 'Order Number' or 'Length (ft)'. Check tab."
+                    }
+                ),
+                400,
+            )
 
         # 2) Get original quantity from client body (no Production Orders lookup)
         try:
@@ -8901,22 +10061,33 @@ def thread_relog():
             orig_qty = None
 
         if not orig_qty or orig_qty <= 0:
-            return jsonify({"error": "originalQuantity is required and must be > 0 to re-log thread."}), 400
-
+            return (
+                jsonify(
+                    {
+                        "error": "originalQuantity is required and must be > 0 to re-log thread."
+                    }
+                ),
+                400,
+            )
 
             po_hdr = [str(h or "").strip() for h in po_rows[0]]
             poi = {h.lower(): i for i, h in enumerate(po_hdr)}
 
             # Accept multiple aliases
-            po_order_col = (poi.get("order #") or
-                            poi.get("order number") or
-                            poi.get("order"))
-            po_qty_col   = (poi.get("quantity") or
-                            poi.get("qty") or
-                            poi.get("qty pieces"))
+            po_order_col = (
+                poi.get("order #") or poi.get("order number") or poi.get("order")
+            )
+            po_qty_col = poi.get("quantity") or poi.get("qty") or poi.get("qty pieces")
 
             if po_order_col is None or po_qty_col is None:
-                return jsonify({"error": "Production Orders missing an order id ('Order #','Order Number','Order') or quantity ('Quantity','Qty','Qty Pieces') header"}), 400
+                return (
+                    jsonify(
+                        {
+                            "error": "Production Orders missing an order id ('Order #','Order Number','Order') or quantity ('Quantity','Qty','Qty Pieces') header"
+                        }
+                    ),
+                    400,
+                )
 
             for r in po_rows[1:]:
                 if po_order_col < len(r) and str(r[po_order_col]).strip() == order:
@@ -8927,8 +10098,12 @@ def thread_relog():
                     break
 
             if not orig_qty or orig_qty <= 0:
-                return jsonify({"error": f"Original Quantity not found for order {order}"}), 400
-
+                return (
+                    jsonify(
+                        {"error": f"Original Quantity not found for order {order}"}
+                    ),
+                    400,
+                )
 
         # 3) Gather thread rows for this order
         matches = []
@@ -8937,7 +10112,12 @@ def thread_relog():
                 matches.append(r)
 
         if not matches:
-            return jsonify({"error": f"No thread rows found for order {order} in Thread Data"}), 404
+            return (
+                jsonify(
+                    {"error": f"No thread rows found for order {order} in Thread Data"}
+                ),
+                404,
+            )
 
         # 4) Build append rows scaled to 'qty'
         #    Per-piece ft = (logged_length_ft / orig_qty); new total = per_piece_ft * qty
@@ -8946,7 +10126,11 @@ def thread_relog():
 
         for r in matches:
             try:
-                total_ft = float(r[c_lenft]) if c_lenft is not None and c_lenft < len(r) else 0.0
+                total_ft = (
+                    float(r[c_lenft])
+                    if c_lenft is not None and c_lenft < len(r)
+                    else 0.0
+                )
             except Exception:
                 total_ft = 0.0
 
@@ -8956,31 +10140,36 @@ def thread_relog():
             # Build a row exactly aligned to your header array
             new_row = [""] * len(hdr)
 
-            if c_date   is not None: new_row[c_date]   = now_iso
-            if c_order  is not None: new_row[c_order]  = order
-            if c_color  is not None and c_color  < len(r): new_row[c_color]  = r[c_color]
-            if c_name   is not None and c_name   < len(r): new_row[c_name]   = r[c_name]
-            if c_lenft  is not None: new_row[c_lenft]  = new_total
-            if c_stitch is not None and c_stitch < len(r): new_row[c_stitch] = r[c_stitch]
-            if c_inout  is not None: new_row[c_inout]  = "OUT"
-            if c_or     is not None: new_row[c_or]     = ""
-            if c_recut is not None: new_row[c_recut] = "Recut"
+            if c_date is not None:
+                new_row[c_date] = now_iso
+            if c_order is not None:
+                new_row[c_order] = order
+            if c_color is not None and c_color < len(r):
+                new_row[c_color] = r[c_color]
+            if c_name is not None and c_name < len(r):
+                new_row[c_name] = r[c_name]
+            if c_lenft is not None:
+                new_row[c_lenft] = new_total
+            if c_stitch is not None and c_stitch < len(r):
+                new_row[c_stitch] = r[c_stitch]
+            if c_inout is not None:
+                new_row[c_inout] = "OUT"
+            if c_or is not None:
+                new_row[c_or] = ""
+            if c_recut is not None:
+                new_row[c_recut] = "Recut"
 
             append_values.append(new_row)
 
-
         # 5) Append to Thread Data
-        body = {
-            "values": append_values
-        }
+        body = {"values": append_values}
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Thread Data!A1",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": append_values}
+            body={"values": append_values},
         ).execute()
-
 
         return jsonify({"ok": True, "appended": len(append_values)}), 200
 
@@ -8989,7 +10178,11 @@ def thread_relog():
         return jsonify({"error": f"thread_relog failed: {e}"}), 500
 
 
-@app.route("/api/orders/<order_number>/preview", methods=["POST"], endpoint="api_set_order_preview")
+@app.route(
+    "/api/orders/<order_number>/preview",
+    methods=["POST"],
+    endpoint="api_set_order_preview",
+)
 @login_required_session
 def set_order_preview(order_number):
     """
@@ -9073,6 +10266,7 @@ def set_order_preview(order_number):
         # Don't blow up the client — report a clean error
         return jsonify(error=str(e)), 500
 
+
 @app.get("/api/drive/thumb/<file_id>")
 def drive_thumb(file_id):
     """
@@ -9087,7 +10281,11 @@ def drive_thumb(file_id):
     drive = get_drive_service()
     try:
         # Ask Drive for the thumbnail link (auth'd)
-        meta = drive.files().get(fileId=file_id, fields="thumbnailLink,mimeType,name").execute()
+        meta = (
+            drive.files()
+            .get(fileId=file_id, fields="thumbnailLink,mimeType,name")
+            .execute()
+        )
         tlink = meta.get("thumbnailLink")
 
         # Some files (esp. PDFs just renamed) need size coercion
@@ -9098,6 +10296,7 @@ def drive_thumb(file_id):
             # - Else fall back to the id+sz endpoint.
             if "=s" in tlink:
                 import re
+
                 tlink = re.sub(r"=s\d+", f"=s{sz.replace('w','')}", tlink)
         else:
             # Fallback to the classic endpoint
@@ -9106,7 +10305,12 @@ def drive_thumb(file_id):
         # Fetch the image bytes server-side
         upstream = requests.get(tlink, timeout=10)
         if upstream.status_code != 200 or not upstream.content:
-            app.logger.info("Thumb proxy miss for %r via %r: %s", file_id, tlink, upstream.status_code)
+            app.logger.info(
+                "Thumb proxy miss for %r via %r: %s",
+                file_id,
+                tlink,
+                upstream.status_code,
+            )
             # Graceful 204: let frontend swap to a local placeholder
             return Response(status=204)
 
@@ -9121,16 +10325,22 @@ def drive_thumb(file_id):
         app.logger.warning("drive_thumb error for %r: %s", file_id, e)
         return Response(status=204)
 
+
 def _drive_version_token(file_id: str) -> str:
     """Return a short version token that changes when the Drive file updates."""
     try:
         drive = get_drive_service()
-        meta = drive.files().get(fileId=file_id, fields="md5Checksum,modifiedTime").execute()
+        meta = (
+            drive.files()
+            .get(fileId=file_id, fields="md5Checksum,modifiedTime")
+            .execute()
+        )
         token = meta.get("md5Checksum") or meta.get("modifiedTime") or ""
         # sanitize for URLs
         return "".join(ch for ch in token if ch.isalnum())
     except Exception:
         return ""
+
 
 @app.route("/api/order-summary-lite", methods=["GET"])
 @login_required_session
@@ -9173,7 +10383,6 @@ def order_summary_lite():
         return jsonify({"error": "order summary lite failed"}), 500
 
 
-
 @app.route("/api/order-summary", methods=["GET"])
 @login_required_session
 def order_summary():
@@ -9188,6 +10397,7 @@ def order_summary():
             return None
         s = str(val).strip()
         import re
+
         if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
             return s
         m = re.search(r"(?:\bid=|/d/)([A-Za-z0-9_-]{10,})", s)
@@ -9195,13 +10405,22 @@ def order_summary():
 
     def _norm_key(s: str) -> str:
         import re
+
         return re.sub(r"[^a-z0-9]+", "", (s or "").strip().lower())
 
     # NEW: small helper – version token changes when Drive file changes
     def _drive_version_token(file_id: str) -> str:
         try:
-            svc = _get_drive_service_local() if "_get_drive_service_local" in globals() else _get_drive_service()
-            meta = svc.files().get(fileId=file_id, fields="md5Checksum,modifiedTime").execute()
+            svc = (
+                _get_drive_service_local()
+                if "_get_drive_service_local" in globals()
+                else _get_drive_service()
+            )
+            meta = (
+                svc.files()
+                .get(fileId=file_id, fields="md5Checksum,modifiedTime")
+                .execute()
+            )
             token = meta.get("md5Checksum") or meta.get("modifiedTime") or ""
             return "".join(ch for ch in token if ch.isalnum())
         except Exception:
@@ -9219,18 +10438,43 @@ def order_summary():
             return None
         base = os.path.splitext(str(name_hint).strip())[0]
         try:
-            svc = _get_drive_service_local() if "_get_drive_service_local" in globals() else _get_drive_service()
+            svc = (
+                _get_drive_service_local()
+                if "_get_drive_service_local" in globals()
+                else _get_drive_service()
+            )
         except Exception:
             return None
 
         # exact names first
-        exts = ["", ".pdf", ".PDF", ".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG", ".webp", ".WEBP"]
+        exts = [
+            "",
+            ".pdf",
+            ".PDF",
+            ".png",
+            ".PNG",
+            ".jpg",
+            ".JPG",
+            ".jpeg",
+            ".JPEG",
+            ".webp",
+            ".WEBP",
+        ]
         for ext in exts:
             qname = f"{base}{ext}"
             safe_qname = qname.replace("'", "\\'")
             q = f"'{folder_id}' in parents and name = '{safe_qname}' and trashed = false"
             try:
-                resp = svc.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=1).execute()
+                resp = (
+                    svc.files()
+                    .list(
+                        q=q,
+                        spaces="drive",
+                        fields="files(id,name,mimeType)",
+                        pageSize=1,
+                    )
+                    .execute()
+                )
                 files = resp.get("files", [])
                 if files:
                     return files[0].get("id")
@@ -9241,9 +10485,18 @@ def order_summary():
         safe_base = base.replace("'", "\\'")
         q = f"'{folder_id}' in parents and name contains '{safe_base}' and trashed = false"
         try:
-            resp = svc.files().list(q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10).execute()
+            resp = (
+                svc.files()
+                .list(
+                    q=q, spaces="drive", fields="files(id,name,mimeType)", pageSize=10
+                )
+                .execute()
+            )
             files = resp.get("files", []) or []
-            def _noext_lower(n): return os.path.splitext(n)[0].lower()
+
+            def _noext_lower(n):
+                return os.path.splitext(n)[0].lower()
+
             for f in files:
                 if _noext_lower(f.get("name", "")) == base.lower():
                     return f.get("id")
@@ -9263,7 +10516,7 @@ def order_summary():
         return None
 
     try:
-        dept  = (request.args.get("dept") or "").strip().lower()
+        dept = (request.args.get("dept") or "").strip().lower()
         order = (request.args.get("order") or "").strip()
         if not order:
             return jsonify({"error": "missing order"}), 400
@@ -9290,13 +10543,13 @@ def order_summary():
         if not hit:
             return jsonify({"error": "order not found"}), 404
 
-        company   = str(gv(hit, "Company Name", "") or "").strip()
-        design    = str(gv(hit, "Design", "") or "").strip()
-        product   = str(gv(hit, "Product", "") or "").strip()
-        stage     = str(gv(hit, "Stage", "") or "").strip()
-        due_raw   = str(gv(hit, "Due Date", "") or "").strip()
+        company = str(gv(hit, "Company Name", "") or "").strip()
+        design = str(gv(hit, "Design", "") or "").strip()
+        product = str(gv(hit, "Product", "") or "").strip()
+        stage = str(gv(hit, "Stage", "") or "").strip()
+        due_raw = str(gv(hit, "Due Date", "") or "").strip()
         fur_color = str(gv(hit, "Fur Color", "") or "").strip()
-        qty_raw   = gv(hit, "Quantity", "")
+        qty_raw = gv(hit, "Quantity", "")
 
         title = design or product or f"Order {order}"
         try:
@@ -9307,17 +10560,31 @@ def order_summary():
         def _fmt_date_mdy(s):
             try:
                 from datetime import datetime
+
                 d = datetime.fromisoformat(s)
                 return d.strftime("%m/%d/%Y")
             except Exception:
                 return s
+
         due_date = _fmt_date_mdy(due_raw)
 
         # MAIN IMAGE: scan several columns for first Drive id
         img_cols = [
-            "Preview", "Image", "Thumbnail", "Image URL", "Image Link", "Photo",
-            "Img", "Front Image", "Mockup", "Mockup Link", "Artwork", "Art",
-            "Picture", "Picture URL", "Artwork Link",
+            "Preview",
+            "Image",
+            "Thumbnail",
+            "Image URL",
+            "Image Link",
+            "Photo",
+            "Img",
+            "Front Image",
+            "Mockup",
+            "Mockup Link",
+            "Artwork",
+            "Art",
+            "Picture",
+            "Picture URL",
+            "Artwork Link",
         ]
         main_ids = []
         for c in img_cols:
@@ -9326,7 +10593,9 @@ def order_summary():
             if fid and fid not in main_ids:
                 main_ids.append(fid)
 
-        BACKEND_BASE = (os.environ.get("BACKEND_PUBLIC_URL") or request.host_url).rstrip("/")
+        BACKEND_BASE = (
+            os.environ.get("BACKEND_PUBLIC_URL") or request.host_url
+        ).rstrip("/")
 
         # Fur color → hex and white tolerance
         def _fur_hex(name: str | None) -> str | None:
@@ -9358,7 +10627,13 @@ def order_summary():
             return tbl.get((name or "").strip(), 24)
 
         # Build a proxied thumbnail URL, optional tint, plus small cache-buster when tint params change.
-        def abs_thumb(file_id: str, sz: str, fill_hex: str | None = None, white_tol: int | None = None, ver: str | None = None) -> str:
+        def abs_thumb(
+            file_id: str,
+            sz: str,
+            fill_hex: str | None = None,
+            white_tol: int | None = None,
+            ver: str | None = None,
+        ) -> str:
             base = f"{BACKEND_BASE}/api/drive/thumbnail?fileId={file_id}&sz={sz}"
             if fill_hex:
                 base += f"&fillHex={fill_hex}"
@@ -9388,9 +10663,21 @@ def order_summary():
             if file_id in _ver_cache:
                 return _ver_cache[file_id]
             try:
-                svc = _get_drive_service_local() if "_get_drive_service_local" in globals() else _get_drive_service()
-                meta = svc.files().get(fileId=file_id, fields="md5Checksum, modifiedTime, version").execute()
-                ver = meta.get("md5Checksum") or meta.get("modifiedTime") or str(meta.get("version") or "")
+                svc = (
+                    _get_drive_service_local()
+                    if "_get_drive_service_local" in globals()
+                    else _get_drive_service()
+                )
+                meta = (
+                    svc.files()
+                    .get(fileId=file_id, fields="md5Checksum, modifiedTime, version")
+                    .execute()
+                )
+                ver = (
+                    meta.get("md5Checksum")
+                    or meta.get("modifiedTime")
+                    or str(meta.get("version") or "")
+                )
                 # Keep it short but unique enough
                 ver = ver.replace(":", "").replace("-", "").replace(".", "")
                 _ver_cache[file_id] = ver
@@ -9398,9 +10685,9 @@ def order_summary():
             except Exception:
                 return None
 
-        fill_hex  = _fur_hex(fur_color)
+        fill_hex = _fur_hex(fur_color)
         white_tol = _fur_white_tol(fur_color) if fill_hex else None
-        main_id   = main_ids[0] if main_ids else None
+        main_id = main_ids[0] if main_ids else None
 
         # MAIN image: NO tint, always via our proxy, and add file version token
         imagesLabeled = []
@@ -9408,8 +10695,15 @@ def order_summary():
         thumbnail_url = abs_thumb(main_id, "w160", ver=main_ver) if main_id else None
 
         imagesLabeled = (
-            [{"src": _public_thumb(main_id, "w640", main_ver), "label": "", "kind": "main"}]
-            if main_id else []
+            [
+                {
+                    "src": _public_thumb(main_id, "w640", main_ver),
+                    "label": "",
+                    "kind": "main",
+                }
+            ]
+            if main_id
+            else []
         )
 
         # BOMs from the Table sheet (by Product)
@@ -9417,12 +10711,14 @@ def order_summary():
             table_rows = fetch_sheet(SPREADSHEET_ID, BOM_TABLE_RANGE) or []
             if table_rows:
                 t_hdr = [str(h or "").strip() for h in table_rows[0]]
+
                 def tidx(name):
                     try:
                         return t_hdr.index(name)
                     except ValueError:
                         return None
-                key_ix  = tidx("Products")
+
+                key_ix = tidx("Products")
                 bom1_ix, bom1l_ix = tidx("BOM1"), tidx("BOM1 Label")
                 bom2_ix, bom2l_ix = tidx("BOM2"), tidx("BOM2 Label")
                 bom3_ix, bom3l_ix = tidx("BOM3"), tidx("BOM3 Label")
@@ -9431,17 +10727,31 @@ def order_summary():
                 match = None
                 if key_ix is not None and prod_key:
                     for tr in table_rows[1:]:
-                        val = str(tr[key_ix] if key_ix < len(tr) else "").strip().lower()
+                        val = (
+                            str(tr[key_ix] if key_ix < len(tr) else "").strip().lower()
+                        )
                         if val == prod_key:
                             match = tr
                             break
 
                 if match:
-                    def gvi(rw, ix): return (rw[ix] if ix is not None and ix < len(rw) else "")
+
+                    def gvi(rw, ix):
+                        return rw[ix] if ix is not None and ix < len(rw) else ""
+
                     bom_pairs = [
-                        (str(gvi(match, bom1_ix)).strip(), str(gvi(match, bom1l_ix)).strip()),
-                        (str(gvi(match, bom2_ix)).strip(), str(gvi(match, bom2l_ix)).strip()),
-                        (str(gvi(match, bom3_ix)).strip(), str(gvi(match, bom3l_ix)).strip()),
+                        (
+                            str(gvi(match, bom1_ix)).strip(),
+                            str(gvi(match, bom1l_ix)).strip(),
+                        ),
+                        (
+                            str(gvi(match, bom2_ix)).strip(),
+                            str(gvi(match, bom2l_ix)).strip(),
+                        ),
+                        (
+                            str(gvi(match, bom3_ix)).strip(),
+                            str(gvi(match, bom3l_ix)).strip(),
+                        ),
                     ]
 
                     for name, label in bom_pairs:
@@ -9450,12 +10760,16 @@ def order_summary():
                             continue
 
                         base = (name or "").strip()
-                        app.logger.debug("Attempting BOM lookup for name=%r label=%r", base, label)
+                        app.logger.debug(
+                            "Attempting BOM lookup for name=%r label=%r", base, label
+                        )
 
                         # Does this look like a real Drive ID?
                         def _looks_like_drive_id(s: str) -> bool:
                             s = (s or "").strip()
-                            return len(s) >= 20 and all(ch.isalnum() or ch in "-_" for ch in s)
+                            return len(s) >= 20 and all(
+                                ch.isalnum() or ch in "-_" for ch in s
+                            )
 
                         # 1) ID/link straight parse
                         fid = _resolve_bom_to_id(base) or ""
@@ -9464,31 +10778,69 @@ def order_summary():
                         if not _looks_like_drive_id(fid):
                             fid = ""
                             if bom_folder_id:
-                                variants = [base, f"{base}.pdf", f"{base}.png", f"{base}.jpg", f"{base}.jpeg", f"{base}.webp"]
-                                spaced = "".join((" " + c if c.isupper() else c) for c in base).strip()
+                                variants = [
+                                    base,
+                                    f"{base}.pdf",
+                                    f"{base}.png",
+                                    f"{base}.jpg",
+                                    f"{base}.jpeg",
+                                    f"{base}.webp",
+                                ]
+                                spaced = "".join(
+                                    (" " + c if c.isupper() else c) for c in base
+                                ).strip()
                                 if spaced.lower() != base.lower():
-                                    variants += [spaced, f"{spaced}.pdf", f"{spaced}.png", f"{spaced}.jpg", f"{spaced}.jpeg", f"{spaced}.webp"]
+                                    variants += [
+                                        spaced,
+                                        f"{spaced}.pdf",
+                                        f"{spaced}.png",
+                                        f"{spaced}.jpg",
+                                        f"{spaced}.jpeg",
+                                        f"{spaced}.webp",
+                                    ]
 
                                 found = None
                                 for q in variants:
                                     try:
-                                        found_try = _drive_find_by_name(bom_folder_id, q)
-                                        found = found_try if isinstance(found_try, str) else (found_try.get("id") if found_try else None)
+                                        found_try = _drive_find_by_name(
+                                            bom_folder_id, q
+                                        )
+                                        found = (
+                                            found_try
+                                            if isinstance(found_try, str)
+                                            else (
+                                                found_try.get("id")
+                                                if found_try
+                                                else None
+                                            )
+                                        )
                                         if found:
-                                            app.logger.debug("Found BOM by variant=%r → %r", q, found)
+                                            app.logger.debug(
+                                                "Found BOM by variant=%r → %r", q, found
+                                            )
                                             break
                                     except Exception as e:
-                                        app.logger.warning("BOM lookup failed for %r variant %r: %s", base, q, e)
+                                        app.logger.warning(
+                                            "BOM lookup failed for %r variant %r: %s",
+                                            base,
+                                            q,
+                                            e,
+                                        )
                                 fid = found or ""
 
                         if not _looks_like_drive_id(fid):
-                            app.logger.info("BOM image not found for %r (no ID; check BOM_FOLDER_ID and filename in Drive)", base)
+                            app.logger.info(
+                                "BOM image not found for %r (no ID; check BOM_FOLDER_ID and filename in Drive)",
+                                base,
+                            )
                             continue
 
-                        app.logger.info("BOM image found for %r -> fileId=%r", base, fid)
+                        app.logger.info(
+                            "BOM image found for %r -> fileId=%r", base, fid
+                        )
 
                         # Tint only when the BOM cell text contains "fur"
-                        use_tint = ("fur" in base.lower())
+                        use_tint = "fur" in base.lower()
                         fid_ver = _file_ver(fid)
                         src = (
                             abs_thumb(fid, "w640", fill_hex, white_tol, ver=fid_ver)
@@ -9501,14 +10853,20 @@ def order_summary():
                         if ver_bom:
                             src += f"&ver={ver_bom}"
 
-                        app.logger.info("🎨 BOM tint (cell=%r) → %s", base, "ON" if (use_tint and fill_hex) else "off")
+                        app.logger.info(
+                            "🎨 BOM tint (cell=%r) → %s",
+                            base,
+                            "ON" if (use_tint and fill_hex) else "off",
+                        )
 
-                        imagesLabeled.append({
-                            "src":    src,
-                            "label":  label or "",
-                            "kind":   "bom",
-                            "bomName": base,
-                        })
+                        imagesLabeled.append(
+                            {
+                                "src": src,
+                                "label": label or "",
+                                "kind": "bom",
+                                "bomName": base,
+                            }
+                        )
 
         except Exception:
             app.logger.exception("BOM Table lookup failed")
@@ -9529,7 +10887,14 @@ def order_summary():
             return bool(main_id) and (str(main_id) in str(u or ""))
 
         if main_id and imagesLabeled:
-            idx = next((i for i, it in enumerate(imagesLabeled) if _has_main_id((it or {}).get("src"))), None)
+            idx = next(
+                (
+                    i
+                    for i, it in enumerate(imagesLabeled)
+                    if _has_main_id((it or {}).get("src"))
+                ),
+                None,
+            )
             if idx not in (None, 0):
                 imagesLabeled.insert(0, imagesLabeled.pop(idx))
 
@@ -9547,16 +10912,23 @@ def order_summary():
             "furColor": fur_color or "",
             "quantity": quantity,
             "thumbnailUrl": thumbnail_url,
-            "images": images,                # array of proxied thumbs
+            "images": images,  # array of proxied thumbs
             "imagesLabeled": imagesLabeled,  # [{src,label,kind,...}]
         }
-        app.logger.info("🧪 image URLs: thumb=%r, imagesLabeled=%r", thumbnail_url, [i.get("src") for i in imagesLabeled])
+        app.logger.info(
+            "🧪 image URLs: thumb=%r, imagesLabeled=%r",
+            thumbnail_url,
+            [i.get("src") for i in imagesLabeled],
+        )
         return jsonify(payload), 200
 
     except Exception:
         app.logger.exception("order_summary failed")
         return jsonify({"error": "server error"}), 500
+
+
 # ---- helpers for /api/order-summary ----------------------------------------
+
 
 def _fmt_date_mdy(s):
     """Try to normalize to MM/DD/YYYY or MM/DD; else return original string."""
@@ -9564,16 +10936,20 @@ def _fmt_date_mdy(s):
         return ""
     try:
         from datetime import datetime
+
         # Try common forms you might have in Sheets
         for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%m/%d"):
             try:
                 dt = datetime.strptime(s, fmt)
-                return dt.strftime("%m/%d/%Y") if fmt != "%m/%d" else dt.strftime("%m/%d")
+                return (
+                    dt.strftime("%m/%d/%Y") if fmt != "%m/%d" else dt.strftime("%m/%d")
+                )
             except Exception:
                 pass
         return s
     except Exception:
         return s
+
 
 def _safe_drive_id(link_or_id):
     """
@@ -9596,6 +10972,7 @@ def _safe_drive_id(link_or_id):
     if not s:
         return ""
     import re
+
     m = re.search(r"/d/([A-Za-z0-9_-]{20,})", s)
     if m:
         return m.group(1)
@@ -9606,23 +10983,29 @@ def _safe_drive_id(link_or_id):
         return s
     return ""
 
+
 # ─── Socket.IO connect/disconnect ─────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
     logger.info(f"Client connected: {request.sid}")
 
+
 @socketio.on("disconnect")
 def on_disconnect():
     logger.info(f"Client disconnected: {request.sid}")
 
+
 # Ensure all responses include CORS headers, even on errors
 @app.after_request
 def apply_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "https://machineschedule.netlify.app"
+    response.headers["Access-Control-Allow-Origin"] = (
+        "https://machineschedule.netlify.app"
+    )
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,PUT,DELETE"
     return response
+
 
 # --- Public URL shortener (no auth, no app redirects) ---
 @app.get("/api/util/shorten")
@@ -9631,15 +11014,17 @@ def util_shorten():
     if not url:
         return jsonify({"error": "missing url"}), 400
     try:
-        r = requests.get("https://tinyurl.com/api-create.php",
-                         params={"url": url}, timeout=10)
+        r = requests.get(
+            "https://tinyurl.com/api-create.php", params={"url": url}, timeout=10
+        )
         if r.status_code == 200 and str(r.text).strip().startswith("http"):
             return jsonify({"short": str(r.text).strip()})
         return jsonify({"error": "shorten_failed"}), 502
     except Exception as e:
         return jsonify({"error": "shorten_exception", "detail": str(e)}), 500
 
-@app.route('/print', methods=['POST'])
+
+@app.route("/print", methods=["POST"])
 def print_handler():
     data = request.json
     order = str(data.get("order"))
@@ -9663,11 +11048,14 @@ def print_handler():
                     # If blank → write timestamp (first print only)
                     if not row.get("Process Sheet Printed"):
                         from datetime import datetime
+
                         timestamp = datetime.now().strftime("%m/%d/%Y %I:%M %p")
 
                         # AO = column 41
                         sheet.update_cell(row_index, 41, timestamp)
-                        print(f"✔ Updated 'Process Sheet Printed' for Order {order} → {timestamp}")
+                        print(
+                            f"✔ Updated 'Process Sheet Printed' for Order {order} → {timestamp}"
+                        )
                     else:
                         print(f"➡ Already printed → no update for Order {order}")
 
@@ -9678,6 +11066,7 @@ def print_handler():
             return jsonify({"status": "sheet_update_failed"})
 
     return jsonify({"status": "ok"})
+
 
 @app.route("/api/material_image")
 def api_material_image_local():
@@ -9699,10 +11088,12 @@ def api_material_image_local():
 
     return send_file(file_path)
 
+
 from googleapiclient.discovery import build
 
 FUR_FOLDER_ID = "1q4WyrcLjDsumLyj5zquJYIl4gDoq4_Uu"
 FUR_CACHE = None  # keep it in memory so we don't re-query every request
+
 
 @app.route("/api/fur_files")
 def api_fur_files():
@@ -9737,11 +11128,14 @@ if __name__ == "__main__":
     # Optional one-off Google OAuth token generation
     if os.environ.get("GENERATE_GOOGLE_TOKEN", "false").lower() == "true":
         from google_auth_oauthlib.flow import InstalledAppFlow
+
         SCOPES = [
             "https://www.googleapis.com/auth/drive",
             "https://www.googleapis.com/auth/spreadsheets",
         ]
-        flow = InstalledAppFlow.from_client_secrets_file("oauth-credentials.json", SCOPES)
+        flow = InstalledAppFlow.from_client_secrets_file(
+            "oauth-credentials.json", SCOPES
+        )
         creds = flow.run_local_server(port=0)
         with open("token.json", "w") as token:
             token.write(creds.to_json())
@@ -9754,6 +11148,6 @@ if __name__ == "__main__":
             app,
             host="0.0.0.0",
             port=port,
-            debug=False,        # Debug off in production
-            use_reloader=False  # Avoid double-start on Render
+            debug=False,  # Debug off in production
+            use_reloader=False,  # Avoid double-start on Render
         )
