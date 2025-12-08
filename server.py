@@ -7465,8 +7465,27 @@ def write_material_log_for_order(order_number):
         # 3) Build material unit lookup
         inv = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:ZZ")
         inv_h = inv[0]
-        inv_map = {r[inv_h.index("Material")].strip(): r[inv_h.index("Unit")].strip()
-                   for r in inv[1:] if r and r[0]}
+        inv_rows = inv[1:]
+
+        MAT_NAME_HEADER = "Materials"  # must match sheet exactly
+
+        logger.info("[MATLOG] Material Inventory headers: %s", inv_h)
+
+        if MAT_NAME_HEADER not in inv_h or "Unit" not in inv_h:
+            raise RuntimeError(
+                f"Material Inventory missing required headers. "
+                f"Found: {inv_h}"
+            )
+
+        name_idx = inv_h.index(MAT_NAME_HEADER)
+        unit_idx = inv_h.index("Unit")
+
+        inv_map = {
+            r[name_idx].strip(): r[unit_idx].strip()
+            for r in inv_rows
+            if len(r) > max(name_idx, unit_idx)
+            and r[name_idx]
+        }
 
         def normalize_unit(unit):
             return unit.lower().replace(" ", "")
