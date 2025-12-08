@@ -1425,7 +1425,10 @@ def send_cached_json(key, ttl, payload_obj_builder):
 
         # If client already has the same ETag → return 304 Not Modified
         if etag and _maybe_304(etag):
-            return make_response("", 304)
+            resp = make_response("", 304)
+            resp.headers["ETag"] = etag
+            return resp
+
 
         resp = Response(ent["data"], mimetype="application/json")
 
