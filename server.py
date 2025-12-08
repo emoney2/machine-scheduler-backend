@@ -5545,7 +5545,10 @@ def overview_combined():
     TTL = 30
 
     # ✅ Serve cache
-    if _overview_cache and (now - _overview_ts) < TTL:
+   use_cache = request.args.get("nocache") != "1"
+
+   if use_cache and _overview_cache and (now - _overview_ts) < TTL:
+
         payload_bytes = json.dumps(_overview_cache).encode("utf-8")
         etag = _json_etag(payload_bytes)
 
