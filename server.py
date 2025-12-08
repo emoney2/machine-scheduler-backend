@@ -7522,8 +7522,8 @@ def write_material_log_for_order(order_number):
                 "IN/OUT": "OUT",
                 "O/R": "ORDERED",
                 "Recut": "",
-                "Source": "python",
             })
+
 
         # ───────────────────────────────────────────────────────────
         # Debug once per order
