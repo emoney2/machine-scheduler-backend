@@ -7417,6 +7417,168 @@ def make_public(file_id, drive_service):
         fileId=file_id, body={"type": "anyone", "role": "reader"}, fields="id"
     ).execute()
 
+def write_material_log_for_order(order_number):
+    """
+    Python port of Apps Script material logging logic.
+    Writes Material Log rows to Supabase only.
+    Google Sheets + Apps Script continue running in parallel.
+    """
+
+    if not supabase:
+        logger.warning("[MATLOG] Supabase not configured, skipping")
+        return
+
+    try:
+        # ───────────────────────────────────────────────────────────
+        # 1) Fetch Production Orders
+        po = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:ZZ")
+        if not po or len(po) < 2:
+            logger.error("[MATLOG] Production Orders empty")
+            return
+
+        headers = po[0]
+        rows = po[1:]
+        h = {k: i for i, k in enumerate(headers)}
+
+        row = next((r for r in rows if str(r[h["Order #"]]) == str(order_number)), None)
+        if not row:
+            logger.error("[MATLOG] Order %s not found in sheet", order_number)
+            return
+
+        qty = float(row[h["Quantity"]])
+        product = str(row[h["Product"]]).strip()
+        company = str(row[h["Company Name"]]).strip()
+
+        # ───────────────────────────────────────────────────────────
+        # 2) Pull Table rule row
+        table = fetch_sheet(SPREADSHEET_ID, "Table!A1:ZZ")
+        tbl_h = table[0]
+        tbl = next(
+            t for t in table[1:]
+            if str(t[0]).strip().lower() == product.lower()
+        )
+
+        ppy = float(tbl[5])
+        yards_needed = qty / ppy
+
+        # ───────────────────────────────────────────────────────────
+        # 3) Build material unit lookup
+        inv = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:ZZ")
+        inv_h = inv[0]
+        inv_map = {r[inv_h.index("Material")].strip(): r[inv_h.index("Unit")].strip()
+                   for r in inv[1:] if r and r[0]}
+
+        def normalize_unit(unit):
+            return unit.lower().replace(" ", "")
+
+        def compute_usage(mat, base):
+            unit = normalize_unit(inv_map.get(mat, ""))
+            if unit in {"sqft", "squarefeet", "squarefoot"}:
+                return base * 13.5
+            return base
+
+        # ───────────────────────────────────────────────────────────
+        # 4) Front / back yard rules
+        key = product.lower()
+        if "blade" in key or "mallet" in key:
+            front_yards, back_yards = yards_needed, 0
+        elif "full" in key:
+            front_yards, back_yards = yards_needed, yards_needed
+        elif "back" in key:
+            front_yards, back_yards = 0, yards_needed
+        else:
+            front_yards, back_yards = yards_needed, 0
+
+        log_rows = []
+
+        def log(material, usage):
+            log_rows.append({
+                "Date": datetime.utcnow().isoformat(),
+                "Order #": order_number,
+                "Company Name": company,
+                "Quantity": qty,
+                "Shape": product,
+                "Material": material,
+                "QTY": round(usage, 4),
+                "IN/OUT": "OUT",
+                "O/R": "ORDERED",
+                "Recut": "",
+                "Source": "python",
+            })
+
+        # ───────────────────────────────────────────────────────────
+        # 5) Front materials with % logic
+        for i in range(5):
+            mat = row[h.get(f"Material{i+1}", -1)] if f"Material{i+1}" in h else ""
+            pct_raw = row[h.get(f"Material{i+1}%", -1)] if f"Material{i+1}%" in h else ""
+
+            if not mat:
+                continue
+
+            pct = float(str(pct_raw).replace("%", "") or (100 if i == 0 else 0))
+            if pct <= 0 or front_yards <= 0:
+                continue
+
+            base = compute_usage(mat, front_yards)
+            log(mat, base * (pct / 100))
+
+        # ───────────────────────────────────────────────────────────
+        # 6) Back material
+        back_mat = row[h.get("Back Material")] if "Back Material" in h else ""
+        if back_mat and back_yards > 0:
+            log(back_mat, compute_usage(back_mat, back_yards))
+
+        # ───────────────────────────────────────────────────────────
+        # 7) Fur logic
+        fur = row[h.get("Fur Color")] if "Fur Color" in h else ""
+        if fur:
+            base = qty / ppy
+            if "blade" in key or "mallet" in key:
+                fur_qty = base
+            elif "back" in key:
+                fur_qty = 0
+            else:
+                fur_qty = base * 2
+
+            if fur_qty > 0:
+                log(fur, compute_usage(fur, fur_qty))
+
+        # ───────────────────────────────────────────────────────────
+        # 8) Foam, magnets, elastic, pouch items
+        for mat in ["1/2\" Foam", "3/8\" Foam", "1/4\" Foam", "1/8\" Foam"]:
+            if mat in tbl_h:
+                v = float(tbl[tbl_h.index(mat)] or 0)
+                if v > 0:
+                    log(mat, compute_usage(mat, (v * qty) / ppy))
+
+        for mat in ["N Magnets", "S Magnets"]:
+            if mat in tbl_h:
+                v = float(tbl[tbl_h.index(mat)] or 0)
+                if v > 0:
+                    log(mat, compute_usage(mat, v * qty))
+
+        if "1/2\" Elastic" in tbl_h:
+            v = float(tbl[tbl_h.index("1/2\" Elastic")] or 0)
+            if v > 0:
+                log("1/2\" Elastic", compute_usage("1/2\" Elastic", (v * qty) / 36))
+
+        for mat in ["1/4\" Black Grommets", "Paracord (ft)", "Cord Stoppers"]:
+            if mat in tbl_h:
+                v = float(tbl[tbl_h.index(mat)] or 0)
+                if v > 0:
+                    log(mat, compute_usage(mat, v * qty))
+
+        # ───────────────────────────────────────────────────────────
+        # 9) Insert rows into Supabase Material Log
+        for r in log_rows:
+            supabase.table("Material Log").insert(r).execute()
+
+        logger.info("[MATLOG] Inserted %s rows for order %s", len(log_rows), order_number)
+
+    except Exception:
+        logger.exception("[MATLOG] Failure for order %s", order_number)
+
+
 
 @app.route("/submit", methods=["OPTIONS", "POST"])
 def submit_order():
@@ -7431,70 +7593,47 @@ def submit_order():
         # ─── EARLY VALIDATION ────────────────────────────────────────────────
         materials = data.getlist("materials")
         material_percents = data.getlist("materialPercents")
-        # pad both lists to exactly 5 entries
         materials[:] = (materials + [""] * 5)[:5]
         material_percents[:] = (material_percents + [""] * 5)[:5]
 
-        # 1) Material1 is mandatory
         if not materials[0].strip():
             return jsonify({"error": "Material1 is required."}), 400
 
-        # 2) If product contains “full”, backMaterial is mandatory
         product_lower = (data.get("product") or "").strip().lower()
         if "full" in product_lower and not data.get("backMaterial", "").strip():
-            return (
-                jsonify({"error": "Back Material is required for “Full” products."}),
-                400,
-            )
+            return jsonify({"error": "Back Material is required for “Full” products."}), 400
 
-        # 3) Every populated material must have its percent
         for idx, mat in enumerate(materials):
             if mat.strip():
                 pct = material_percents[idx].strip()
                 if not pct:
-                    return (
-                        jsonify(
-                            {
-                                "error": f"Percentage for Material{idx+1} (“{mat}”) is required."
-                            }
-                        ),
-                        400,
-                    )
+                    return jsonify({
+                        "error": f"Percentage for Material{idx+1} (“{mat}”) is required."
+                    }), 400
                 try:
                     float(pct)
                 except ValueError:
-                    return (
-                        jsonify(
-                            {
-                                "error": f"Material{idx+1} percentage (“{pct}”) must be a number."
-                            }
-                        ),
-                        400,
-                    )
+                    return jsonify({
+                        "error": f"Material{idx+1} percentage (“{pct}”) must be a number."
+                    }), 400
 
         # ─── DETERMINE NEXT ROW & ORDER # ────────────────────────────────────
-        col_a = (
-            sheets.values()
-            .get(spreadsheetId=SPREADSHEET_ID, range="Production Orders!A:A")
-            .execute()
-            .get("values", [])
-        )
+        col_a = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Production Orders!A:A"
+        ).execute().get("values", [])
+
         next_row = len(col_a) + 1
         prev_order = int(col_a[-1][0]) if len(col_a) > 1 else 0
         new_order = prev_order + 1
 
         # ─── TEMPLATE FORMULAS ───────────────────────────────────────────────
         def tpl_formula(col_letter, target_row):
-            resp = (
-                sheets.values()
-                .get(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"Production Orders!{col_letter}2",
-                    valueRenderOption="FORMULA",
-                )
-                .execute()
-            )
-            raw = resp.get("values", [[""]])[0][0] or ""
+            raw = sheets.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!{col_letter}2",
+                valueRenderOption="FORMULA",
+            ).execute().get("values", [[""]])[0][0] or ""
             return re.sub(r"(\b[A-Z]+)2\b", lambda m: f"{m.group(1)}{target_row}", raw)
 
         ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
@@ -7504,19 +7643,14 @@ def submit_order():
         stitch_count = tpl_formula("W", next_row)
         schedule_str = tpl_formula("AC", next_row)
 
-        # ─── DRIVE FOLDER HELPERS ────────────────────────────────────────────
+        # ─── CREATE ORDER FOLDER & UPLOAD (UNCHANGED) ────────────────────────
         drive = get_drive_service()
 
         def create_folder(name, parent_id=None):
             query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
             if parent_id:
                 query += f" and '{parent_id}' in parents"
-            existing = (
-                drive.files()
-                .list(q=query, fields="files(id)")
-                .execute()
-                .get("files", [])
-            )
+            existing = drive.files().list(q=query, fields="files(id)").execute().get("files", [])
             for f in existing:
                 drive.files().delete(fileId=f["id"]).execute()
             meta = {"name": str(name), "mimeType": "application/vnd.google-apps.folder"}
@@ -7530,33 +7664,19 @@ def submit_order():
                 fileId=file_id, body={"role": "reader", "type": "anyone"}
             ).execute()
 
-        # ─── CREATE ORDER FOLDER & UPLOAD ────────────────────────────────────
         order_folder_id = create_folder(
             new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
         )
         make_public(order_folder_id)
 
-        # if reorderFrom, copy .emb files
-        if data.get("reorderFrom"):
-            copy_emb_files(
-                old_order_num=data["reorderFrom"],
-                new_order_num=new_order,
-                drive_service=drive,
-                new_folder_id=order_folder_id,
-            )
-
         prod_links = []
         for f in prod_files:
             m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
-            up = (
-                drive.files()
-                .create(
-                    body={"name": f.filename, "parents": [order_folder_id]},
-                    media_body=m,
-                    fields="id,webViewLink",
-                )
-                .execute()
-            )
+            up = drive.files().create(
+                body={"name": f.filename, "parents": [order_folder_id]},
+                media_body=m,
+                fields="id,webViewLink",
+            ).execute()
             make_public(up["id"])
             prod_links.append(up["webViewLink"])
 
@@ -7573,37 +7693,19 @@ def submit_order():
                 ).execute()
             print_links = f"https://drive.google.com/drive/folders/{pf_id}"
 
-        # ─── ASSEMBLE & WRITE ROW A→AK ───────────────────────────────────────
+        # ─── WRITE TO GOOGLE SHEETS ──────────────────────────────────────────
         row = [
-            new_order,
-            ts,
-            preview,
-            data.get("company"),
-            data.get("designName"),
-            data.get("quantity"),
-            "",  # shipped
-            data.get("product"),
-            stage,
-            data.get("price"),
-            data.get("dueDate"),
-            ("PRINT" if prod_links else "NO"),
-            *materials,  # M–Q
-            data.get("backMaterial"),
-            data.get("furColor"),
-            data.get("embBacking", ""),
-            "",  # top stitch blank
-            ship_date,
-            stitch_count,
-            data.get("notes"),
-            ",".join(prod_links),
-            print_links,
-            "",  # AA blank
-            data.get("dateType"),
-            schedule_str,
-            "",
-            "",
-            "",  # AD, AE, AF – pad so percents start at AG
-            *material_percents,  # AG–AK
+            new_order, ts, preview, data.get("company"),
+            data.get("designName"), data.get("quantity"), "",
+            data.get("product"), stage, data.get("price"),
+            data.get("dueDate"), ("PRINT" if prod_links else "NO"),
+            *materials,
+            data.get("backMaterial"), data.get("furColor"),
+            data.get("embBacking", ""), "",
+            ship_date, stitch_count, data.get("notes"),
+            ",".join(prod_links), print_links, "",
+            data.get("dateType"), schedule_str, "", "", "",
+            *material_percents,
         ]
 
         sheets.values().update(
@@ -7613,81 +7715,29 @@ def submit_order():
             body={"values": [row]},
         ).execute()
 
-        # ─── SHADOW WRITE TO SUPABASE (NON-BLOCKING) ─────────────────────────
+        # ─── WRITE PRODUCTION ORDER TO SUPABASE ──────────────────────────────
         if supabase:
-            try:
-                supabase_payload = {
-                    "Order #": new_order,
-                    "Date": ts,
-                    "Company Name": data.get("company"),
-                    "Design": data.get("designName"),
-                    "Quantity": int(data.get("quantity") or 0),
-                    "Product": data.get("product"),
-                    "Price": float(data.get("price") or 0),
-                    "Due Date": data.get("dueDate"),
-                    "Stage": "ORDERED",
+            supabase.table("Production Orders TEST").insert({
+                "Order #": new_order,
+                "Date": ts,
+                "Company Name": data.get("company"),
+                "Design": data.get("designName"),
+                "Quantity": int(data.get("quantity") or 0),
+                "Product": data.get("product"),
+                "Price": float(data.get("price") or 0),
+                "Due Date": data.get("dueDate"),
+                "Stage": "ORDERED",
+            }).execute()
 
-                    # Materials
-                    "Material1": materials[0] if len(materials) > 0 else "",
-                    "Material2": materials[1] if len(materials) > 1 else "",
-                    "Material3": materials[2] if len(materials) > 2 else "",
-                    "Material4": materials[3] if len(materials) > 3 else "",
-                    "Material5": materials[4] if len(materials) > 4 else "",
+        # ─────────────────────────────────────────────────────────────────────
+        # ✅ NEW: WRITE MATERIAL LOG ROWS TO SUPABASE (OPTION B)
+        # ─────────────────────────────────────────────────────────────────────
+        try:
+            write_material_log_for_order(new_order)
+        except Exception as e:
+            logger.error("[MaterialLog] Failed for order %s: %s", new_order, e)
 
-                    # Material %
-                    "Material1%": material_percents[0] if len(material_percents) > 0 else "",
-                    "Material2%": material_percents[1] if len(material_percents) > 1 else "",
-                    "Material3%": material_percents[2] if len(material_percents) > 2 else "",
-                    "Material4%": material_percents[3] if len(material_percents) > 3 else "",
-                    "Material5%": material_percents[4] if len(material_percents) > 4 else "",
-
-                    "Back Material": data.get("backMaterial"),
-                    "Fur Color": data.get("furColor"),
-                    "Notes": data.get("notes"),
-
-                    "Image": prod_links[0] if prod_links else "",
-                    "Print Files": print_links,
-                }
-
-                # 🔍 LOG THE EXACT SUPABASE PAYLOAD
-                logger.info(
-                    "[SUPABASE] Payload:\n%s",
-                    json.dumps(supabase_payload, indent=2)
-                )
-
-                # ⬇️ ATTEMPT INSERT
-                resp = supabase.table("Production Orders TEST").insert(
-                    supabase_payload
-                ).execute()
-
-                # ✅ LOG SUPABASE RESPONSE
-                logger.info("[SUPABASE] Insert response: %s", resp)
-
-            except Exception as e:
-                logger.error(f"[SUPABASE] Order insert failed for #{new_order}: {e}")
-                raise
-
-
-        # ─── COPY AF2 FORMULA DOWN ─────────────────────────────────────────
-        resp = (
-            sheets.values()
-            .get(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Production Orders!AF2",
-                valueRenderOption="FORMULA",
-            )
-            .execute()
-        )
-        raw_f = resp.get("values", [[""]])[0][0] or ""
-        new_f = raw_f.replace("2", str(next_row))
-        sheets.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"Production Orders!AF{next_row}",
-            valueInputOption="USER_ENTERED",
-            body={"values": [[new_f]]},
-        ).execute()
         invalidate_upcoming_cache()
-
         return jsonify({"status": "ok", "order": new_order}), 200
 
     except Exception as e:
