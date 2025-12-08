@@ -5433,10 +5433,12 @@ def build_overview_payload():
       "Hard Date/Soft Date"
     FROM "Production Orders TEST"
     WHERE
-      (
-        "Due Date" >= CURRENT_DATE
-        OR ("Stage" IS DISTINCT FROM 'Complete' AND "Due Date" < CURRENT_DATE)
+      LOWER("Stage") <> 'complete'
+      AND (
+        "Due Date" <= CURRENT_DATE + INTERVAL '7 days'
+        OR "Due Date" < CURRENT_DATE
       )
+
     ORDER BY "Due Date"
     """
 
