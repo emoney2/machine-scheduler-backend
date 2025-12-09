@@ -7168,7 +7168,7 @@ def save_links():
 def get_combined():
     """
     Returns: { orders: [...], links: {...} }
-    Uses 20s micro-cache and ETag/304.
+    Always returns data – no cache-based None failures.
     """
     import os
 
@@ -7177,20 +7177,18 @@ def get_combined():
         payload_obj = {"mode": "local_dev", "orders": [], "links": {}}
         payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
         etag = _json_etag(payload_bytes)
+
         resp = Response(payload_bytes, mimetype="application/json")
         resp.headers["ETag"] = etag
         resp.headers["Cache-Control"] = "no-store"
         return resp
-
-    # 🔽 PRODUCTION / NORMAL PATH (UNCHANGED)
-    TTL = 20
 
     def build_payload():
         svc = get_sheets_service().spreadsheets().values()
         with sheet_lock:
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
-                ranges=[ORDERS_RANGE, FUR_RANGE, CUT_RANGE],  # add Cut
+                ranges=[ORDERS_RANGE, FUR_RANGE, CUT_RANGE],
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
 
@@ -7218,17 +7216,18 @@ def get_combined():
         try:
             _orders_index["by_id"] = {
                 str(o.get("Order #", "")).strip(): o
-                for o in (orders_full or [])
-                if isinstance(o, dict) and str(o.get("Order #", "")).strip()
+                for o in orders_full
+                if str(o.get("Order #", "")).strip()
             }
         except Exception as e:
-            current_app.logger.warning(f"[FAST] Failed to build cache: {e}")
+            current_app.logger.warning(f"[FAST] Failed to build order index: {e}")
 
         fur_map = {
             str(r.get("Order #", "")).strip(): r
             for r in fur_full
             if str(r.get("Order #", "")).strip()
         }
+
         cut_map = {
             str(r.get("Order #", "")).strip(): r
             for r in cut_full
@@ -7254,52 +7253,30 @@ def get_combined():
             "links": _links_store if isinstance(_links_store, dict) else {},
         }
 
-    if request.args.get("refresh") == "1":
+    try:
         payload_obj = build_payload()
         payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
         etag = _json_etag(payload_bytes)
-        _cache_set("combined", payload_bytes, TTL)
+
         resp = Response(payload_bytes, mimetype="application/json")
         resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = (
-            f"public, max-age={TTL}, stale-while-revalidate=300"
-        )
-        return resp
-
-    try:
-        resp = send_cached_json("combined", TTL, build_payload)
-
-        # ✅ Normal case (cache hit or fresh build)
-        if resp is not None:
-            return resp
-
-        # ⚠️ Cache path failed — rebuild immediately
-        current_app.logger.warning(
-            "⚠️ send_cached_json returned None — rebuilding /api/combined cache"
-        )
-
-        payload_obj = build_payload()
-        payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
-        _cache_set("combined", payload_bytes, TTL)
-
-        resp = Response(payload_bytes, mimetype="application/json")
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
     except Exception:
         current_app.logger.error("❌ /api/combined fatal error", exc_info=True)
 
-    # ❌ ONLY if everything is broken
-    fallback = {
-        "orders": [],
-        "links": {},
-        "error": "combined_failed"
-    }
+        # ✅ HARD FAILSAFE — NEVER BREAK FRONTEND
+        fallback = {
+            "orders": [],
+            "links": {},
+            "error": "combined_failed"
+        }
 
-    payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
-    resp = Response(payload_bytes, mimetype="application/json")
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+        payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
 
 @socketio.on("placeholdersUpdated")
 def handle_placeholders_updated(data):
