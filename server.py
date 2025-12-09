@@ -6536,8 +6536,24 @@ def get_orders():
                 if (not val) and (k in IMG_KEYS):
                     val = formula_by_col.get(k, [""] * len(rows))[r_idx - 1]
                 obj[k] = val
+
+            # ✅ Add a clean 'id' field React can use
+            obj["id"] = str(
+                obj.get("Order #") or
+                obj.get("Order") or
+                obj.get("order") or
+                ""
+            ).strip()
+
+            # ✅ Remove any weird URL keys (like the Google Script link)
+            for bad_key in list(obj.keys()):
+                if isinstance(bad_key, str) and bad_key.startswith("http"):
+                    del obj[bad_key]
+
             out.append(obj)
+
         return out
+
 
     # --- NEW WRAPPER: populate fast lookup after cache returns ---
     result = send_cached_json("combined", TTL, build_payload)
