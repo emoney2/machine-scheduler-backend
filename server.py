@@ -145,6 +145,9 @@ from flask import send_file  # ADD if not present
 # Stores the lookup table used by /api/order_fast
 _orders_index = {"by_id": {}, "ts": 0}
 
+# ✅ Links store used by /api/combined
+_links_store = {}
+
 from google.oauth2.credentials import Credentials
 import json
 import os
@@ -7263,7 +7266,23 @@ def get_combined():
         )
         return resp
 
-    return send_cached_json("combined", TTL, build_payload)
+    try:
+        return send_cached_json("combined", TTL, build_payload)
+    except Exception as e:
+        current_app.logger.error("❌ /api/combined fatal error", exc_info=True)
+
+        # ✅ HARD FAILSAFE — NEVER return 500 to the frontend
+        fallback = {
+            "orders": [],
+            "links": {},
+            "error": "combined_failed"
+        }
+
+        payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
 
 
 @socketio.on("placeholdersUpdated")
