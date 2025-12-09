@@ -7267,21 +7267,25 @@ def get_combined():
         return resp
 
     try:
-        return send_cached_json("combined", TTL, build_payload)
-    except Exception as e:
+        resp = send_cached_json("combined", TTL, build_payload)
+        if resp is not None:
+            return resp
+        current_app.logger.error("❌ send_cached_json returned None for /api/combined")
+    except Exception:
         current_app.logger.error("❌ /api/combined fatal error", exc_info=True)
 
-        # ✅ HARD FAILSAFE — NEVER return 500 to the frontend
-        fallback = {
-            "orders": [],
-            "links": {},
-            "error": "combined_failed"
-        }
+    # ✅ FINAL FAILSAFE — ALWAYS RETURN A RESPONSE
+    fallback = {
+        "orders": [],
+        "links": {},
+        "error": "combined_failed"
+    }
 
-        payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
-        resp = Response(payload_bytes, mimetype="application/json")
-        resp.headers["Cache-Control"] = "no-store"
-        return resp
+    payload_bytes = json.dumps(fallback, separators=(",", ":")).encode("utf-8")
+    resp = Response(payload_bytes, mimetype="application/json")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
 
 
 
