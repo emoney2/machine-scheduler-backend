@@ -7268,13 +7268,28 @@ def get_combined():
 
     try:
         resp = send_cached_json("combined", TTL, build_payload)
+
+        # ✅ Normal case (cache hit or fresh build)
         if resp is not None:
             return resp
-        current_app.logger.error("❌ send_cached_json returned None for /api/combined")
+
+        # ⚠️ Cache path failed — rebuild immediately
+        current_app.logger.warning(
+            "⚠️ send_cached_json returned None — rebuilding /api/combined cache"
+        )
+
+        payload_obj = build_payload()
+        payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+        _cache_set("combined", payload_bytes, TTL)
+
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
     except Exception:
         current_app.logger.error("❌ /api/combined fatal error", exc_info=True)
 
-    # ✅ FINAL FAILSAFE — ALWAYS RETURN A RESPONSE
+    # ❌ ONLY if everything is broken
     fallback = {
         "orders": [],
         "links": {},
@@ -7285,9 +7300,6 @@ def get_combined():
     resp = Response(payload_bytes, mimetype="application/json")
     resp.headers["Cache-Control"] = "no-store"
     return resp
-
-
-
 
 @socketio.on("placeholdersUpdated")
 def handle_placeholders_updated(data):
