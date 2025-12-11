@@ -5496,7 +5496,47 @@ def build_overview_payload():
 
         grouped = {}
         for s in lines:
-            # Split "Item Qty Unit - Vendor"
+            s = (s or "").strip()
+            if not s:
+                continue
+
+            # 🔹 Special handling for THREAD rows from Overview!M:
+            # Format from sheet (current): THREAD|<code>|<qtyCones>|<pct>|...
+            if s.startswith("THREAD|"):
+                parts = s.split("|")
+                if len(parts) >= 4:
+                    code = parts[1].strip()
+
+                    # cones to order
+                    try:
+                        qty = int(float(parts[2]))
+                    except Exception:
+                        qty = 0
+
+                    # percentage remaining (can be negative)
+                    try:
+                        pct = int(float(parts[3]))
+                    except Exception:
+                        pct = 0
+
+                    vendor = "Madeira"
+                    # What we show in the UI:
+                    name = f"{code} (Polyneon)"
+
+                    grouped.setdefault(vendor, []).append(
+                        {
+                            "name": name,       # "1800 (Polyneon)"
+                            "qty": qty,         # 12
+                            "unit": "Cones",
+                            "type": "Thread",
+                            "code": code,       # "1800" (in case we need it later)
+                            "pct": pct,         # -133, etc.
+                        }
+                    )
+                # Skip generic parsing for THREAD rows
+                continue
+
+            # 🔹 Generic material line: "Item Qty Unit - Vendor"
             vendor = "Misc."
             left = s
             if " - " in s:
@@ -5523,6 +5563,7 @@ def build_overview_payload():
             grouped.setdefault(vendor, []).append(
                 {"name": name, "qty": qty, "unit": unit, "type": typ}
             )
+
 
         vendor_list = [{"vendor": v, "items": items} for v, items in grouped.items()]
     except Exception:
