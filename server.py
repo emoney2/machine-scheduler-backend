@@ -8670,7 +8670,12 @@ def submit_thread_inventory():
 
     to_log = []
     for e in (entries if isinstance(entries, list) else [entries]):
-        color = (e.get("value") or "").strip()  # NOTE: frontend sends "value"
+        raw_value = (e.get("value") or "").strip()
+
+        # Extract ONLY the 4-digit Madeira code (e.g., "1800")
+        m = re.search(r"\b(\d{4})\b", raw_value)
+        color = m.group(1) if m else raw_value  # fallback to raw if no match
+
         action = (e.get("action") or "").strip()
         qty_cones = (e.get("quantity") or "").strip()
         if not (color and action and qty_cones):
