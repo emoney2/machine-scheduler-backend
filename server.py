@@ -5790,58 +5790,81 @@ def overview_materials_needed():
             # Format: THREAD|<code>|<conesToOrder>|<pctRounded>|<deficitCones>
             if s.startswith("THREAD|"):
                 parts = s.split("|")
-                # THREAD FORMAT (Flexible)
-                # Accepts:
-                # THREAD|CODE|QTY|PCT|VENDOR|LABEL
-                # or older versions with fewer parts
-                if s.startswith("THREAD|"):
-                    parts = s.split("|")
 
-                    # Minimum required parts: THREAD|code|qty|pct
-                    if len(parts) >= 4:
-                        code = parts[1].strip()
+                # Expecting: THREAD|code|qty|pct|vendor|label
+                if len(parts) >= 6:
+                    code  = parts[1].strip()
+                    raw_qty = parts[2].strip()
+                    raw_pct = parts[3].strip()
+                    vendor = "Madeira"  # ALWAYS force Madeira
 
-                        # qty
-                        try:
-                            cones_to_order = int(float(parts[2]))
-                        except Exception:
-                            cones_to_order = 0
+                    # qty
+                    try:
+                        qty = int(float(raw_qty))
+                    except Exception:
+                        qty = 0
 
-                        # pct
-                        try:
-                            pct = int(float(parts[3]))
-                        except Exception:
-                            pct = 0
+                    # pct
+                    try:
+                        pct = int(float(raw_pct))
+                    except Exception:
+                        pct = 0
 
-                        # vendor (optional — defaults to Madeira)
-                        vendor = parts[4].strip() if len(parts) >= 5 and parts[4].strip() else "Madeira"
+                    # Clean label (remove newlines)
+                    label = parts[5].replace("\n", " ").replace("\r", " ").replace("  ", " ").strip()
 
-                        # label (optional — backend will use sheet label if provided)
-                        if len(parts) >= 6 and parts[5].strip():
-                            label = parts[5].strip()
-                        else:
-                            label = f"{code} – {cones_to_order} Cones ({pct}%)"
+                    # UI label should be ONLY "1800 (Polyneon)"
+                    ui_label = f"{code} (Polyneon)"
 
-                        grouped.setdefault(vendor, []).append(
-                            {
-                                "name": code,
-                                "label": label,
-                                "qty": cones_to_order,
-                                "unit": "Cones",
-                                "type": "Thread",
-                                "pct": pct,
-                            }
-                        )
-                        continue
+                    grouped.setdefault(vendor, []).append(
+                        {
+                            "name": code,         # used for email + ordering
+                            "label": ui_label,    # used for UI display
+                            "qty": qty,
+                            "unit": "Cones",
+                            "type": "Thread",
+                            "pct": pct,
+                        }
+                    )
+                    continue
+
+                # Fallback for older 4-part format
+                if len(parts) >= 4:
+                    code = parts[1].strip()
+                    try:
+                        qty = int(float(parts[2]))
+                    except:
+                        qty = 0
+                    try:
+                        pct = int(float(parts[3]))
+                    except:
+                        pct = 0
+
+                    vendor = "Madeira"
+                    ui_label = f"{code} (Polyneon)"
+
+                    grouped.setdefault(vendor, []).append(
+                        {
+                            "name": code,
+                            "label": ui_label,
+                            "qty": qty,
+                            "unit": "Cones",
+                            "type": "Thread",
+                            "pct": pct,
+                        }
+                    )
+                    continue
+
 
                 # If malformed, fall through to generic parsing below
 
             # 🔹 Generic material line: "Item Qty Unit - Vendor"
             vendor = "Misc."
             left = s
-            if " - " in s:
+            # Only treat as a material line if it does NOT start with THREAD|
+            if not s.startswith("THREAD|") and " - " in s:
                 left, vendor = s.rsplit(" - ", 1)
-                vendor = vendor.strip() or "Misc."
+
 
             tokens = left.split()
             # Expect "... <qty> <unit>" at the end
