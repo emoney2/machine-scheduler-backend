@@ -5745,7 +5745,47 @@ def overview_materials_needed():
 
         grouped = {}
         for s in lines:
-            # Split "Item Qty Unit - Vendor"
+            # 🔹 Special handling for thread pod rows coming from Overview!M:
+            # Format: THREAD|<code>|<conesToOrder>|<pctRounded>|<deficitCones>
+            if s.startswith("THREAD|"):
+                parts = s.split("|")
+                if len(parts) >= 5:
+                    code = parts[1].strip()
+
+                    # cones to order
+                    try:
+                        cones_to_order = int(float(parts[2]))
+                    except Exception:
+                        cones_to_order = 0
+
+                    # current inventory percentage (can be negative)
+                    try:
+                        pct = int(float(parts[3]))
+                    except Exception:
+                        pct = 0
+
+                    # Human-readable label for the UI
+                    label = f"{code} – {cones_to_order} Cones Needed (Inventory: {pct}%)"
+
+                    # Force these into the Madeira group
+                    vendor = "Madeira"
+
+                    grouped.setdefault(vendor, []).append(
+                        {
+                            # name = raw code → used for email, cart, logging
+                            "name": code,
+                            # label = pretty text → used for display in Overview.jsx
+                            "label": label,
+                            "qty": cones_to_order,
+                            "unit": "Cones",
+                            "type": "Thread",
+                        }
+                    )
+                    # Done with this line
+                    continue
+                # If malformed, fall through to generic parsing below
+
+            # 🔹 Generic material line: "Item Qty Unit - Vendor"
             vendor = "Misc."
             left = s
             if " - " in s:
@@ -5753,7 +5793,7 @@ def overview_materials_needed():
                 vendor = vendor.strip() or "Misc."
 
             tokens = left.split()
-            # Expect ... <qty> <unit> at the end
+            # Expect "... <qty> <unit>" at the end
             if len(tokens) >= 3:
                 unit = tokens[-1]
                 qty_str = tokens[-2]
@@ -5767,12 +5807,14 @@ def overview_materials_needed():
 
             if not name:
                 continue
+
             typ = "Thread" if unit.lower().startswith("cone") else "Material"
             grouped.setdefault(vendor, []).append(
                 {"name": name, "qty": qty, "unit": unit, "type": typ}
             )
 
         vendor_list = [{"vendor": v, "items": items} for v, items in grouped.items()]
+
 
         # optional cache
         if CACHE_TTL:
