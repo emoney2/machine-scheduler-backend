@@ -5749,40 +5749,50 @@ def overview_materials_needed():
             # Format: THREAD|<code>|<conesToOrder>|<pctRounded>|<deficitCones>
             if s.startswith("THREAD|"):
                 parts = s.split("|")
-                if len(parts) >= 5:
-                    code = parts[1].strip()
+                # THREAD FORMAT (Flexible)
+                # Accepts:
+                # THREAD|CODE|QTY|PCT|VENDOR|LABEL
+                # or older versions with fewer parts
+                if s.startswith("THREAD|"):
+                    parts = s.split("|")
 
-                    # cones to order
-                    try:
-                        cones_to_order = int(float(parts[2]))
-                    except Exception:
-                        cones_to_order = 0
+                    # Minimum required parts: THREAD|code|qty|pct
+                    if len(parts) >= 4:
+                        code = parts[1].strip()
 
-                    # current inventory percentage (can be negative)
-                    try:
-                        pct = int(float(parts[3]))
-                    except Exception:
-                        pct = 0
+                        # qty
+                        try:
+                            cones_to_order = int(float(parts[2]))
+                        except Exception:
+                            cones_to_order = 0
 
-                    # Human-readable label for the UI
-                    label = f"{code} – {cones_to_order} Cones Needed (Inventory: {pct}%)"
+                        # pct
+                        try:
+                            pct = int(float(parts[3]))
+                        except Exception:
+                            pct = 0
 
-                    # Force these into the Madeira group
-                    vendor = "Madeira"
+                        # vendor (optional — defaults to Madeira)
+                        vendor = parts[4].strip() if len(parts) >= 5 and parts[4].strip() else "Madeira"
 
-                    grouped.setdefault(vendor, []).append(
-                        {
-                            # name = raw code → used for email, cart, logging
-                            "name": code,
-                            # label = pretty text → used for display in Overview.jsx
-                            "label": label,
-                            "qty": cones_to_order,
-                            "unit": "Cones",
-                            "type": "Thread",
-                        }
-                    )
-                    # Done with this line
-                    continue
+                        # label (optional — backend will use sheet label if provided)
+                        if len(parts) >= 6 and parts[5].strip():
+                            label = parts[5].strip()
+                        else:
+                            label = f"{code} – {cones_to_order} Cones ({pct}%)"
+
+                        grouped.setdefault(vendor, []).append(
+                            {
+                                "name": code,
+                                "label": label,
+                                "qty": cones_to_order,
+                                "unit": "Cones",
+                                "type": "Thread",
+                                "pct": pct,
+                            }
+                        )
+                        continue
+
                 # If malformed, fall through to generic parsing below
 
             # 🔹 Generic material line: "Item Qty Unit - Vendor"
