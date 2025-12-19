@@ -7992,44 +7992,35 @@ def reorder():
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
 def get_directory():
+    """
+    Return unique sorted company names from Supabase.directory table.
+    """
     from flask import make_response
 
-    global _last_directory
-
-    def build():
-        if not supabase:
-            raise RuntimeError("Supabase client not configured")
-
-        # query Directory table, return distinct company names
-        res = supabase.table("Directory").select("Company Name").execute()
-
-        # Extract names
-        rows = res.data or []
-
-        companies = []
-        seen = set()
-
-        for row in rows:
-            name = (row.get("Company Name") or "").strip()
-            if name and name not in seen:
-                seen.add(name)
-                companies.append(name)
-
-        # preserve sorting behavior
-        return sorted(companies, key=str.lower)
-
-
     try:
-        payload = build()
-        _last_directory = {"data": payload, "ts": time.time()}
-    except Exception:
-        logging.exception("Error fetching directory; serving last known good")
-        payload = _last_directory["data"]
+        # query supabase
+        res = supabase.table("directory").select("company").execute()
 
-    resp = make_response(jsonify(payload), 200)
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    resp.headers["Pragma"] = "no-cache"
-    return resp
+        rows = res.data or []
+        names = []
+
+        for r in rows:
+            c = str(r.get("company","")).strip()
+            if c:
+                names.append(c)
+
+        # unique + sorted
+        unique = sorted(set(names), key=str.lower)
+
+        resp = make_response(jsonify(unique), 200)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
+
+    except Exception as e:
+        print("❌ Directory supabase fetch failed:", e)
+        return jsonify([]), 200
+
 
 
 @app.route("/api/directory", methods=["POST"])
