@@ -7940,6 +7940,7 @@ def process_submit_async(form_data, prod_files, print_files):
 
 
 @app.route("/submit", methods=["OPTIONS", "POST"])
+@login_required_session
 def submit_order():
     if request.method == "OPTIONS":
         return make_response("", 204)
