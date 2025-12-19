@@ -7998,7 +7998,8 @@ def get_directory():
     """
     from flask import make_response
 
-    global _last_directory     # cached good payload
+    global _last_directory
+    _last_directory = {"data": []}   # force no fallback     # cached good payload
 
     try:
         if not supabase:
@@ -8006,6 +8007,11 @@ def get_directory():
 
         # fetch all rows, but only the Company Name column
         resp = supabase.table("Directory").select("Company Name").execute()
+        print("\n=== /api/directory DEBUG ===")
+        print("resp:", resp)
+        print("resp.data:", getattr(resp, "data", None))
+        print("============================\n")
+
 
         if resp.error:
             raise RuntimeError(str(resp.error))
