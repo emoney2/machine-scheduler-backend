@@ -1349,14 +1349,29 @@ except Exception:
 
 CORS(
     app,
+    supports_credentials=True,
     resources={
         r"/*": {
-            "origins": ["https://machineschedule.netlify.app", "http://localhost:3000"]
+            "origins": [
+                "https://machineschedule.netlify.app",
+                "http://localhost:3000",
+                "http://127.0.0.1:3000"
+            ],
+            "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            "allow_headers": [
+                "Content-Type",
+                "Authorization",
+                "X-Requested-With",
+                "Accept"
+            ],
+            "expose_headers": [
+                "ETag",
+                "Content-Type"
+            ]
         }
-    },
-    supports_credentials=True,
-    expose_headers=["ETag", "Content-Type"],
+    }
 )
+
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
 
 logout_all_ts = int(os.environ.get("LOGOUT_ALL_TS", "0"))
@@ -7776,7 +7791,13 @@ def write_material_log_for_order(order_number):
 @login_required_session
 def submit_order():
     if request.method == "OPTIONS":
-        return make_response("", 204)
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = "https://machineschedule.netlify.app"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return resp
+
 
     try:
         data = request.form
