@@ -7992,34 +7992,46 @@ def reorder():
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
 def get_directory():
-    """
-    Return unique sorted company names from Supabase.directory table.
-    """
     from flask import make_response
 
+    global _last_directory
+
     try:
-        # query supabase
-        res = supabase.table("directory").select("company").execute()
+        if not supabase:
+            raise Exception("Supabase not configured")
 
-        rows = res.data or []
+        # pull ALL rows, but only the company name column
+        resp = supabase.table("Directory") \
+            .select('Company Name') \
+            .execute()
+
+        rows = resp.data or []
+
+        # extract company names
         names = []
-
         for r in rows:
-            c = str(r.get("company","")).strip()
-            if c:
-                names.append(c)
+            name = r.get("Company Name")
+            if name and name.strip():
+                names.append(name.strip())
 
         # unique + sorted
-        unique = sorted(set(names), key=str.lower)
+        payload = sorted(set(names), key=str.lower)
 
-        resp = make_response(jsonify(unique), 200)
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        resp.headers["Pragma"] = "no-cache"
-        return resp
+        # remember last good version
+        _last_directory = {"data": payload, "ts": time.time()}
 
     except Exception as e:
-        print("❌ Directory supabase fetch failed:", e)
-        return jsonify([]), 200
+        logging.exception("Error fetching Supabase directory; serving last known good")
+
+        payload = []
+        if _last_directory:
+            payload = _last_directory["data"]
+
+    resp = make_response(jsonify(payload), 200)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
+
 
 
 
