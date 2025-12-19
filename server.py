@@ -7959,6 +7959,15 @@ def submit_order():
         logger.error("Error in /submit:\n%s", tb)
         return jsonify({"error": str(e), "trace": tb}), 500
 
+@submit_order.after_request
+def add_submit_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "https://machineschedule.netlify.app"
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
+
 
 @app.route("/api/reorder", methods=["POST"])
 @login_required_session
@@ -7988,15 +7997,27 @@ def get_directory():
     global _last_directory
 
     def build():
-        rows = fetch_sheet(SPREADSHEET_ID, "Directory!A2:A") or []
-        companies = [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
+        if not supabase:
+            raise RuntimeError("Supabase client not configured")
+
+        # query Directory table, return distinct company names
+        res = supabase.table("Directory").select("Company Name").execute()
+
+        # Extract names
+        rows = res.data or []
+
+        companies = []
         seen = set()
-        out = []
-        for c in companies:
-            if c not in seen:
-                seen.add(c)
-                out.append(c)
-        return sorted(out, key=str.lower)
+
+        for row in rows:
+            name = (row.get("Company Name") or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                companies.append(name)
+
+        # preserve sorting behavior
+        return sorted(companies, key=str.lower)
+
 
     try:
         payload = build()
