@@ -7992,40 +7992,45 @@ def reorder():
 @app.route("/api/directory", methods=["GET"])
 @login_required_session
 def get_directory():
+    """
+    Return unique company names from Supabase Directory table,
+    sorted alphabetically. Falls back to last good payload.
+    """
     from flask import make_response
 
-    global _last_directory
+    global _last_directory     # cached good payload
 
     try:
         if not supabase:
-            raise Exception("Supabase not configured")
+            raise RuntimeError("Supabase unavailable")
 
-        # pull ALL rows, but only the company name column
-        resp = supabase.table("Directory") \
-            .select('Company Name') \
-            .execute()
+        # fetch all rows, but only the Company Name column
+        resp = supabase.table("Directory").select("Company Name").execute()
+
+        if resp.error:
+            raise RuntimeError(str(resp.error))
 
         rows = resp.data or []
 
         # extract company names
         names = []
+        seen = set()
         for r in rows:
-            name = r.get("Company Name")
-            if name and name.strip():
-                names.append(name.strip())
+            name = (r.get("Company Name") or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
 
-        # unique + sorted
-        payload = sorted(set(names), key=str.lower)
+        names = sorted(names, key=str.lower)
 
-        # remember last good version
-        _last_directory = {"data": payload, "ts": time.time()}
+        # cache result
+        _last_directory = {"data": names, "ts": time.time()}
+        payload = names
 
     except Exception as e:
-        logging.exception("Error fetching Supabase directory; serving last known good")
-
-        payload = []
-        if _last_directory:
-            payload = _last_directory["data"]
+        logger.exception(f"❌ /api/directory supabase fetch failed: {e}")
+        # fallback to last known good cache
+        payload = _last_directory.get("data", [])
 
     resp = make_response(jsonify(payload), 200)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
