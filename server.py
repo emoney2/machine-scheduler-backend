@@ -8009,7 +8009,7 @@ def get_directory():
         resp = (
             supabase
             .table("Directory")
-            .select('"Company Name"')    # ← FIXED HERE
+            .select('"Company Name"')
             .execute()
         )
 
@@ -8018,10 +8018,9 @@ def get_directory():
         print("resp.data:", getattr(resp, "data", None))
         print("============================\n")
 
-        if resp.error:
-            raise RuntimeError(str(resp.error))
-
+        # Supabase python client returns data/errors differently, so just trust resp.data
         rows = resp.data or []
+
 
         # extract company names
         names = []
