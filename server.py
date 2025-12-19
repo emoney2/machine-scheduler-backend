@@ -8005,13 +8005,18 @@ def get_directory():
         if not supabase:
             raise RuntimeError("Supabase unavailable")
 
-        # fetch all rows, but only the Company Name column
-        resp = supabase.table("Directory").select("Company Name").execute()
+        # fetch all rows, select quoted identifier for spaces
+        resp = (
+            supabase
+            .table("Directory")
+            .select('"Company Name"')    # ← FIXED HERE
+            .execute()
+        )
+
         print("\n=== /api/directory DEBUG ===")
         print("resp:", resp)
         print("resp.data:", getattr(resp, "data", None))
         print("============================\n")
-
 
         if resp.error:
             raise RuntimeError(str(resp.error))
@@ -8035,7 +8040,6 @@ def get_directory():
 
     except Exception as e:
         logger.exception(f"❌ /api/directory supabase fetch failed: {e}")
-        # fallback to last known good cache
         payload = _last_directory.get("data", [])
 
     resp = make_response(jsonify(payload), 200)
