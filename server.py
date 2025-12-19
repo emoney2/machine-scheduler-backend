@@ -7772,194 +7772,171 @@ def write_material_log_for_order(order_number):
 
 
 
-from threading import Thread
-import time
-
-def process_submit_async(form_data, prod_files, print_files):
-    """
-    Background worker that performs SLOW submission tasks.
-    Running outside HTTP response prevents timeout.
-    """
-    start = time.time()
-    logger.info("🧵 [submit worker] started")
-
-    try:
-        # rebind request globals safely
-        sheets_local = get_sheets_service().spreadsheets()
-        drive_local = get_drive_service()
-
-        logger.info("📄 Sheets+Drive services initialized")
-
-        # paste your existing slow logic here unchanged
-        # BEGIN: original /submit core logic
-        try:
-            materials = form_data.getlist("materials")
-            material_percents = form_data.getlist("materialPercents")
-            materials[:] = (materials + [""] * 5)[:5]
-            material_percents[:] = (material_percents + [""] * 5)[:5]
-
-            logger.info("✔ materials validated: %s", materials)
-
-            col_a = sheets_local.values().get(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Production Orders!A:A"
-            ).execute().get("values", [])
-
-            logger.info("📊 loaded A column length: %s", len(col_a))
-
-            next_row = len(col_a) + 1
-            prev_order = int(col_a[-1][0]) if len(col_a) > 1 else 0
-            new_order = prev_order + 1
-
-            logger.info("🆕 new order assigned: %s (row %s)", new_order, next_row)
-
-            def tpl_formula(col_letter, target_row):
-                raw = sheets_local.values().get(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"Production Orders!{col_letter}2",
-                    valueRenderOption="FORMULA",
-                ).execute().get("values", [[""]])[0][0] or ""
-                return re.sub(r"(\b[A-Z]+)2\b", lambda m: f"{m.group(1)}{target_row}", raw)
-
-            ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
-            preview      = tpl_formula("C", next_row)
-            stage        = tpl_formula("I", next_row)
-            ship_date    = tpl_formula("V", next_row)
-            stitch_count = tpl_formula("W", next_row)
-            schedule_str = tpl_formula("AC", next_row)
-
-            logger.info("🧮 template formulas applied")
-
-            drive = drive_local
-
-            logger.info("📁 creating drive folders and uploading files")
-
-            def create_folder(name, parent_id=None):
-                query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-                if parent_id:
-                    query += f" and '{parent_id}' in parents"
-                existing = drive.files().list(q=query, fields="files(id)").execute().get("files", [])
-                for f in existing:
-                    drive.files().delete(fileId=f["id"]).execute()
-                meta = {"name": str(name), "mimeType": "application/vnd.google-apps.folder"}
-                if parent_id:
-                    meta["parents"] = [parent_id]
-                folder = drive.files().create(body=meta, fields="id").execute()
-                return folder["id"]
-
-            def make_public(file_id):
-                drive.permissions().create(
-                    fileId=file_id, body={"role": "reader", "type": "anyone"}
-                ).execute()
-
-            order_folder_id = create_folder(
-                new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
-            )
-            make_public(order_folder_id)
-
-            prod_links = []
-            for f in prod_files:
-                m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
-                up = drive.files().create(
-                    body={"name": f.filename, "parents": [order_folder_id]},
-                    media_body=m,
-                    fields="id,webViewLink",
-                ).execute()
-                make_public(up["id"])
-                prod_links.append(up["webViewLink"])
-
-            print_links = ""
-            if print_files:
-                pf_id = create_folder("Print Files", parent_id=order_folder_id)
-                make_public(pf_id)
-                for f in print_files:
-                    m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
-                    drive.files().create(
-                        body={"name": f.filename, "parents": [pf_id]},
-                        media_body=m,
-                        fields="id",
-                    ).execute()
-                print_links = f"https://drive.google.com/drive/folders/{pf_id}"
-
-            row = [
-                new_order, ts, preview, form_data.get("company"),
-                form_data.get("designName"), form_data.get("quantity"), "",
-                form_data.get("product"), stage, form_data.get("price"),
-                form_data.get("dueDate"), ("PRINT" if prod_links else "NO"),
-                *materials,
-                form_data.get("backMaterial"), form_data.get("furColor"),
-                form_data.get("embBacking", ""), "",
-                ship_date, stitch_count, form_data.get("notes"),
-                ",".join(prod_links), print_links, "",
-                form_data.get("dateType"), schedule_str, "", "", "",
-                *material_percents,
-            ]
-
-            sheets_local.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Production Orders!A{next_row}:AK{next_row}",
-                valueInputOption="USER_ENTERED",
-                body={"values": [row]},
-            ).execute()
-
-            logger.info("📝 wrote sheet row %s", next_row)
-
-            # supabase writes
-            if supabase:
-                supabase.table("Production Orders TEST").insert({
-                    "Order #": new_order,
-                    "Date": ts,
-                    "Company Name": form_data.get("company"),
-                    "Design": form_data.get("designName"),
-                    "Quantity": int(form_data.get("quantity") or 0),
-                    "Product": form_data.get("product"),
-                    "Price": float(form_data.get("price") or 0),
-                    "Due Date": form_data.get("dueDate"),
-                    "Stage": "ORDERED",
-                }).execute()
-
-                logger.info("🟣 inserted into supabase")
-
-            try:
-                write_material_log_for_order(new_order)
-                logger.info("🧵 material log done")
-            except Exception as e:
-                logger.error("[MaterialLog] Failed for order %s: %s", new_order, e)
-
-            invalidate_upcoming_cache()
-            logger.info("♻ cache invalidated")
-
-        except Exception as inner:
-            logger.exception("❌ worker error: %s", inner)
-
-        logger.info("✅ [submit worker] finished in %.2fs", time.time() - start)
-
-    except Exception as e:
-        logger.exception("💥 submit worker crashed: %s", e)
-
-
-
 @app.route("/submit", methods=["OPTIONS", "POST"])
 @login_required_session
 def submit_order():
     if request.method == "OPTIONS":
         return make_response("", 204)
 
-    logger.info("📥 incoming order submission")
+    try:
+        data = request.form
+        prod_files = request.files.getlist("prodFiles")
+        print_files = request.files.getlist("printFiles")
 
-    # extract data + files BEFORE thread
-    data = request.form
-    prod_files = request.files.getlist("prodFiles")
-    print_files = request.files.getlist("printFiles")
+        # ─── EARLY VALIDATION ────────────────────────────────────────────────
+        materials = data.getlist("materials")
+        material_percents = data.getlist("materialPercents")
+        materials[:] = (materials + [""] * 5)[:5]
+        material_percents[:] = (material_percents + [""] * 5)[:5]
 
-    # spawn detached worker thread
-    t = Thread(target=process_submit_async, args=(data, prod_files, print_files))
-    t.daemon = True
-    t.start()
+        if not materials[0].strip():
+            return jsonify({"error": "Material1 is required."}), 400
 
-    logger.info("🚀 async worker launched — returning immediately")
+        product_lower = (data.get("product") or "").strip().lower()
+        if "full" in product_lower and not data.get("backMaterial", "").strip():
+            return jsonify({"error": "Back Material is required for “Full” products."}), 400
 
-    return jsonify({"ok": True, "msg": "Order queued for processing"}), 202
+        for idx, mat in enumerate(materials):
+            if mat.strip():
+                pct = material_percents[idx].strip()
+                if not pct:
+                    return jsonify({
+                        "error": f"Percentage for Material{idx+1} (“{mat}”) is required."
+                    }), 400
+                try:
+                    float(pct)
+                except ValueError:
+                    return jsonify({
+                        "error": f"Material{idx+1} percentage (“{pct}”) must be a number."
+                    }), 400
+
+        # ─── DETERMINE NEXT ROW & ORDER # ────────────────────────────────────
+        col_a = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Production Orders!A:A"
+        ).execute().get("values", [])
+
+        next_row = len(col_a) + 1
+        prev_order = int(col_a[-1][0]) if len(col_a) > 1 else 0
+        new_order = prev_order + 1
+
+        # ─── TEMPLATE FORMULAS ───────────────────────────────────────────────
+        def tpl_formula(col_letter, target_row):
+            raw = sheets.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!{col_letter}2",
+                valueRenderOption="FORMULA",
+            ).execute().get("values", [[""]])[0][0] or ""
+            return re.sub(r"(\b[A-Z]+)2\b", lambda m: f"{m.group(1)}{target_row}", raw)
+
+        ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+        preview = tpl_formula("C", next_row)
+        stage = tpl_formula("I", next_row)
+        ship_date = tpl_formula("V", next_row)
+        stitch_count = tpl_formula("W", next_row)
+        schedule_str = tpl_formula("AC", next_row)
+
+        # ─── CREATE ORDER FOLDER & UPLOAD (UNCHANGED) ────────────────────────
+        drive = get_drive_service()
+
+        def create_folder(name, parent_id=None):
+            query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            if parent_id:
+                query += f" and '{parent_id}' in parents"
+            existing = drive.files().list(q=query, fields="files(id)").execute().get("files", [])
+            for f in existing:
+                drive.files().delete(fileId=f["id"]).execute()
+            meta = {"name": str(name), "mimeType": "application/vnd.google-apps.folder"}
+            if parent_id:
+                meta["parents"] = [parent_id]
+            folder = drive.files().create(body=meta, fields="id").execute()
+            return folder["id"]
+
+        def make_public(file_id):
+            drive.permissions().create(
+                fileId=file_id, body={"role": "reader", "type": "anyone"}
+            ).execute()
+
+        order_folder_id = create_folder(
+            new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
+        )
+        make_public(order_folder_id)
+
+        prod_links = []
+        for f in prod_files:
+            m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+            up = drive.files().create(
+                body={"name": f.filename, "parents": [order_folder_id]},
+                media_body=m,
+                fields="id,webViewLink",
+            ).execute()
+            make_public(up["id"])
+            prod_links.append(up["webViewLink"])
+
+        print_links = ""
+        if print_files:
+            pf_id = create_folder("Print Files", parent_id=order_folder_id)
+            make_public(pf_id)
+            for f in print_files:
+                m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+                drive.files().create(
+                    body={"name": f.filename, "parents": [pf_id]},
+                    media_body=m,
+                    fields="id",
+                ).execute()
+            print_links = f"https://drive.google.com/drive/folders/{pf_id}"
+
+        # ─── WRITE TO GOOGLE SHEETS ──────────────────────────────────────────
+        row = [
+            new_order, ts, preview, data.get("company"),
+            data.get("designName"), data.get("quantity"), "",
+            data.get("product"), stage, data.get("price"),
+            data.get("dueDate"), ("PRINT" if prod_links else "NO"),
+            *materials,
+            data.get("backMaterial"), data.get("furColor"),
+            data.get("embBacking", ""), "",
+            ship_date, stitch_count, data.get("notes"),
+            ",".join(prod_links), print_links, "",
+            data.get("dateType"), schedule_str, "", "", "",
+            *material_percents,
+        ]
+
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!A{next_row}:AK{next_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [row]},
+        ).execute()
+
+        # ─── WRITE PRODUCTION ORDER TO SUPABASE ──────────────────────────────
+        if supabase:
+            supabase.table("Production Orders TEST").insert({
+                "Order #": new_order,
+                "Date": ts,
+                "Company Name": data.get("company"),
+                "Design": data.get("designName"),
+                "Quantity": int(data.get("quantity") or 0),
+                "Product": data.get("product"),
+                "Price": float(data.get("price") or 0),
+                "Due Date": data.get("dueDate"),
+                "Stage": "ORDERED",
+            }).execute()
+
+        # ─────────────────────────────────────────────────────────────────────
+        # ✅ NEW: WRITE MATERIAL LOG ROWS TO SUPABASE (OPTION B)
+        # ─────────────────────────────────────────────────────────────────────
+        try:
+            write_material_log_for_order(new_order)
+        except Exception as e:
+            logger.error("[MaterialLog] Failed for order %s: %s", new_order, e)
+
+        invalidate_upcoming_cache()
+        return jsonify({"status": "ok", "order": new_order}), 200
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error("Error in /submit:\n%s", tb)
+        return jsonify({"error": str(e), "trace": tb}), 500
 
 
 @app.route("/api/reorder", methods=["POST"])
