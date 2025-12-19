@@ -7959,7 +7959,7 @@ def submit_order():
         logger.error("Error in /submit:\n%s", tb)
         return jsonify({"error": str(e), "trace": tb}), 500
 
-@submit_order.after_request
+@app.after_request
 def add_submit_cors_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = "https://machineschedule.netlify.app"
     resp.headers["Access-Control-Allow-Credentials"] = "true"
