@@ -5437,6 +5437,7 @@ def build_overview_payload():
     This returns a plain dict; HTTP + caching is handled by overview_combined().
     """
     import traceback
+    import json
 
     # ── 1) Upcoming jobs from Supabase ───────────────────────────────────────
     app.logger.info("🔍 build_overview_payload() — fetching jobs from Supabase")
@@ -5455,10 +5456,9 @@ def build_overview_payload():
     FROM "Production Orders TEST"
     WHERE
       UPPER(TRIM("Stage")) <> 'COMPLETE'
-    ORDER BY "Due Date" ASC
+    ORDER BY "Due Date" ASC NULLS LAST
     LIMIT 25
     """
-
 
     app.logger.info("🧾 SQL QUERY:\n%s", query)
 
@@ -5466,20 +5466,24 @@ def build_overview_payload():
     try:
         resp = supabase.rpc("exec_sql", {"sql": query}).execute()
 
-        if resp.data:
-            if isinstance(resp.data, list):
-                # ✅ exec_sql returns list[dict] — use it directly
-                if len(resp.data) > 0 and isinstance(resp.data[0], dict):
-                    rows = resp.data
-                # ✅ rare fallback if it ever returns JSON text
-                elif len(resp.data) == 1 and isinstance(resp.data[0], str):
-                    rows = json.loads(resp.data[0])
+        if resp.data and isinstance(resp.data, list):
+            # ✅ Normal case: list[dict]
+            if len(resp.data) > 0 and isinstance(resp.data[0], dict):
+                rows = resp.data
 
-    app.logger.warning("🧪 Upcoming jobs pulled from Supabase: %d rows", len(rows))
+            # ✅ Fallback: JSON string
+            elif len(resp.data) == 1 and isinstance(resp.data[0], str):
+                rows = json.loads(resp.data[0])
+
     except Exception:
         app.logger.exception("Failed to parse Supabase exec_sql result")
         rows = []
 
+    # ✅ LOG OUTSIDE try/except
+    app.logger.warning(
+        "🧪 Upcoming jobs pulled from Supabase: %d rows",
+        len(rows)
+    )
 
     upcoming = [
         {
@@ -5495,6 +5499,8 @@ def build_overview_payload():
         }
         for r in (rows or [])
     ]
+
+    # ── 2) Materials section continues below (unchanged) ──
 
     # ── 2) Materials-to-order grouped by vendor (Overview!M3:M) ──────────────
     vendor_list = []
