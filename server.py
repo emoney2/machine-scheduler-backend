@@ -5464,20 +5464,26 @@ def build_overview_payload():
 
     rows = []
     try:
-        resp = supabase.rpc("exec_sql", {"sql": query}).execute()
+        resp = (
+            supabase
+            .table("Production Orders TEST")
+            .select(
+                '"Order #", "Company Name", "Design", "Quantity", "Product", '
+                '"Stage", "Due Date", "Ship Date", "Hard Date/Soft Date"'
+            )
+            .neq("Stage", "COMPLETE")
+            .order("Due Date", desc=False, nulls_last=True)
+            .limit(25)
+            .execute()
+        )
 
         if resp.data and isinstance(resp.data, list):
-            # ✅ Normal case: list[dict]
-            if len(resp.data) > 0 and isinstance(resp.data[0], dict):
-                rows = resp.data
-
-            # ✅ Fallback: JSON string
-            elif len(resp.data) == 1 and isinstance(resp.data[0], str):
-                rows = json.loads(resp.data[0])
+            rows = resp.data
 
     except Exception:
-        app.logger.exception("Failed to parse Supabase exec_sql result")
+        app.logger.exception("Failed to fetch upcoming jobs from Supabase")
         rows = []
+
 
     # ✅ LOG OUTSIDE try/except
     app.logger.warning(
