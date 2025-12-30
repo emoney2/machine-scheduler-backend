@@ -5454,14 +5454,11 @@ def build_overview_payload():
       "Hard Date/Soft Date"
     FROM "Production Orders TEST"
     WHERE
-      LOWER("Stage") <> 'complete'
-      AND (
-        "Due Date" <= CURRENT_DATE + INTERVAL '7 days'
-        OR "Due Date" < CURRENT_DATE
-      )
-
-    ORDER BY "Due Date"
+      UPPER(TRIM("Stage")) <> 'COMPLETE'
+    ORDER BY "Due Date" ASC
+    LIMIT 25
     """
+
 
     app.logger.info("🧾 SQL QUERY:\n%s", query)
 
@@ -5477,6 +5474,8 @@ def build_overview_payload():
                 # ✅ rare fallback if it ever returns JSON text
                 elif len(resp.data) == 1 and isinstance(resp.data[0], str):
                     rows = json.loads(resp.data[0])
+
+    app.logger.warning("🧪 Upcoming jobs pulled from Supabase: %d rows", len(rows))
     except Exception:
         app.logger.exception("Failed to parse Supabase exec_sql result")
         rows = []
