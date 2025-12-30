@@ -5687,7 +5687,11 @@ def api_upcoming_jobs():
         """
         # 🔧 Run query through Supabase RPC
         app.logger.info("🧠 Running Supabase exec_sql query...")
-        resp = supabase.rpc("exec_sql", {"sql": query}).execute()
+        resp = supabase.rpc(
+            "exec_sql",
+            {"sql": query},
+            timeout=10  # prevent runaway RPC
+        ).execute()
         print("🧠 Supabase exec_sql response:", resp)
 
         # The exec_sql RPC returns a JSON array inside resp.data[0]
