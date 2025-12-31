@@ -5947,6 +5947,8 @@ def overview_materials_needed():
 @app.route("/overview/metrics", methods=["GET"])
 @login_required_session
 def overview_metrics():
+    print("🔥 OVERVIEW METRICS HIT — NEW CODE 🔥", flush=True)
+
     """Fetch pre-calculated performance metrics from Supabase views."""
     now = time.time()
 
