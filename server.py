@@ -5947,7 +5947,7 @@ def overview_materials_needed():
 @app.route("/overview/metrics", methods=["GET"])
 @login_required_session
 def overview_metrics():
-    """Fetch pre-calculated performance metrics from Supabase view."""
+    """Fetch pre-calculated performance metrics from Supabase views."""
     now = time.time()
 
     # ✅ Return cached copy if still fresh
@@ -5958,16 +5958,26 @@ def overview_metrics():
         return jsonify(_OVERVIEW_METRICS_CACHE["data"])
 
     try:
-        # ✅ Query the 'metrics' view directly
-        resp = supabase.table("metrics").select("*").execute()
-        data = resp.data or []
-        if not data:
+        # ─── 1️⃣ SALES METRICS ─────────────────────────────
+        metrics_resp = supabase.table("metrics").select("*").execute()
+        metrics_data = metrics_resp.data or []
+        if not metrics_data:
             return jsonify({"error": "No metrics found"}), 404
 
-        # Use first row of the metrics view
-        metrics_row = data[0]
+        metrics_row = metrics_data[0]
 
-        # Match your frontend naming
+        # ─── 2️⃣ TURNAROUND METRICS ─────────────────────────
+        turnaround_resp = (
+            supabase
+            .table("actual_turnaround_time")
+            .select("hours, weeks")
+            .single()
+            .execute()
+        )
+
+        turnaround = turnaround_resp.data or {}
+
+        # ─── 3️⃣ MERGED RESPONSE ────────────────────────────
         metrics = {
             "headcovers_sold": round(
                 float(metrics_row.get("headcovers_sold_per_day") or 0), 2
@@ -5977,24 +5987,23 @@ def overview_metrics():
                 float(metrics_row.get("average_price_per_cover") or 0), 2
             ),
 
-            # 🧵 NEW METRIC
+            # 🧵 Embroidery backlog (NOW CORRECT)
             "embroidery_backlog_hours": round(
-                float(metrics_row.get("embroidery_backlog_hours") or 0), 1
+                float(turnaround.get("hours") or 0), 1
             ),
             "embroidery_backlog_weeks": round(
-                float(metrics_row.get("embroidery_backlog_hours") or 0) / 40, 2
+                float(turnaround.get("weeks") or 0), 2
             ),
         }
 
-
-        # Cache it
+        # ─── Cache ─────────────────────────────────────────
         _OVERVIEW_METRICS_CACHE["data"] = metrics
         _OVERVIEW_METRICS_CACHE["ts"] = now
 
         return jsonify(metrics)
 
     except Exception as e:
-        app.logger.exception("❌ Failed to fetch metrics from Supabase view")
+        app.logger.exception("❌ Failed to fetch overview metrics")
         return jsonify({"error": str(e)}), 500
 
 
