@@ -5977,17 +5977,18 @@ def overview_metrics():
 
         turnaround = turnaround_resp.data or {}
 
-        # ─── 3️⃣ MERGED RESPONSE ────────────────────────────
+        # ─── 3️⃣ MERGED METRICS (KEEP EXISTING KEYS) ───────
         metrics = {
-            "headcovers_sold": round(
+            # 🔒 EXISTING (DO NOT CHANGE)
+            "headcovers_sold_per_day": round(
                 float(metrics_row.get("headcovers_sold_per_day") or 0), 2
             ),
             "goal": float(metrics_row.get("goal") or 0),
-            "average_price": round(
+            "average_price_per_cover": round(
                 float(metrics_row.get("average_price_per_cover") or 0), 2
             ),
 
-            # 🧵 Embroidery backlog (NOW CORRECT)
+            # 🧵 NEW (ONLY ADD THESE)
             "embroidery_backlog_hours": round(
                 float(turnaround.get("hours") or 0), 1
             ),
@@ -5995,6 +5996,7 @@ def overview_metrics():
                 float(turnaround.get("weeks") or 0), 2
             ),
         }
+
 
         # ─── Cache ─────────────────────────────────────────
         _OVERVIEW_METRICS_CACHE["data"] = metrics
