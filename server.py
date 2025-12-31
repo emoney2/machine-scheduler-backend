@@ -5976,7 +5976,16 @@ def overview_metrics():
             "average_price": round(
                 float(metrics_row.get("average_price_per_cover") or 0), 2
             ),
+
+            # 🧵 NEW METRIC
+            "embroidery_backlog_hours": round(
+                float(metrics_row.get("embroidery_backlog_hours") or 0), 1
+            ),
+            "embroidery_backlog_weeks": round(
+                float(metrics_row.get("embroidery_backlog_hours") or 0) / 40, 2
+            ),
         }
+
 
         # Cache it
         _OVERVIEW_METRICS_CACHE["data"] = metrics
