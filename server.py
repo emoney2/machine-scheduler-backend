@@ -8804,247 +8804,89 @@ def submit_thread_inventory():
 @app.route("/api/inventoryOrdered", methods=["GET"])
 @login_required_session
 def get_inventory_ordered():
-    app.logger.info("📦 /api/inventoryOrdered requested")
+        app.logger.info("📦 /api/inventoryOrdered requested")
 
-    def build():
-        """
-        Fast path:
-          - Read precomputed 'Inventory Ordered (View)'!A:F  (Date | Type | Name | Qty | Unit | Vendor)
-          - Map each row back to its ORIGINAL sheet row:
-                * Material  -> 'Material Log' row where O/R='ordered'
-                * Thread    -> 'Thread Data' row where O/R='ordered'
-            (we match by name, and prefer same quantity if available)
-        Fallback:
-          - if view empty/unavailable, use the original slow builder logic.
-        """
-        # --------- Try FAST VIEW first ---------
-        # --------- Try FAST VIEW first ---------
         try:
-            view = fetch_sheet(SPREADSHEET_ID, "Inventory Ordered (View)!A1:F")
-        except Exception as e:
-            app.logger.error("Inventory Ordered view fetch failed: %s", e)
-            view = None
+                orders = []
 
-        if view and len(view) > 1:
-            try:
-                # Load originals ONCE to map name -> row
+                # -------------------------
+                # Material Log
+                # -------------------------
+                inv_rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:I") or []
+                unit_map = {
+                        r[0]: (r[3] if len(r) > 3 else "")
+                        for r in inv_rows
+                        if r and str(r[0]).strip()
+                }
+                vendor_map = {
+                        r[0]: (r[8] if len(r) > 8 else "")
+                        for r in inv_rows
+                        if r and str(r[0]).strip()
+                }
+
                 mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z") or []
-                th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z") or []
-
-                # Indices for Material Log
-                mat_i = {}
                 if mat:
-                    mhdr = mat[0]
-                    try:
-                        mat_i["Date"] = mhdr.index("Date")
-                        mat_i["Material"] = mhdr.index("Material")
-                        mat_i["O/R"] = mhdr.index("O/R")
+                        hdr = mat[0]
+                        h = {name: i for i, name in enumerate(hdr)}
 
-                        names = [str(h or "").strip() for h in mhdr]
-                        lower = [n.lower() for n in names]
-                        if "qty" in lower:
-                            mat_i["Qty"] = lower.index("qty")
-                        elif "quantity" in lower:
-                            mat_i["Qty"] = lower.index("quantity")
-                        else:
-                            mat_i["Qty"] = mat_i["O/R"] - 1
-                    except Exception:
-                        mat_i = {}
-
-                # Indices for Thread Data
-                th_i = {}
-                if th:
-                    thdr = th[0]
-                    try:
-                        th_i["Date"] = thdr.index("Date")
-                        th_i["Color"] = thdr.index("Color")
-                        th_i["LenFt"] = thdr.index("Length (ft)")
-                        th_i["O/R"] = thdr.index("O/R")
-                    except Exception:
-                        th_i = {}
-
-                # Build candidate lookup maps
-                mat_by_name = {}
-                if mat and mat_i:
-                    for rix, r in enumerate(mat[1:], start=2):
-                        try:
-                            orv = (r[mat_i["O/R"]] or "").strip().lower()
-                            name = (r[mat_i["Material"]] or "").strip()
-                        except Exception:
-                            continue
-                        if orv == "ordered" and name:
-                            mat_by_name.setdefault(name.lower(), []).append((rix, r))
-
-                thr_by_name = {}
-                if th and th_i:
-                    for rix, r in enumerate(th[1:], start=2):
-                        try:
-                            orv = (r[th_i["O/R"]] or "").strip().lower()
-                            name = (r[th_i["Color"]] or "").strip()
-                        except Exception:
-                            continue
-                        if orv == "ordered" and name:
-                            thr_by_name.setdefault(name.lower(), []).append((rix, r))
-
-                def _to_float(x):
-                    try:
-                        return float(str(x).replace(",", "").strip())
-                    except Exception:
-                        return None
-
-                out = []
-                for vix, vrow in enumerate(view[1:], start=2):
-                    vrow = (vrow + ["", "", "", "", "", ""])[:6]
-
-                    date, typ, name, qty, unit, vendor = vrow
-                    if not name:
-                        continue
-
-                    typ_l = (typ or "").strip().lower()
-                    name_l = name.strip().lower()
-                    src_row = None
-
-                    if typ_l == "material" and mat_by_name:
-                        cands = mat_by_name.get(name_l, [])
-                        if cands:
-                            vq = _to_float(qty)
-                            best = None
-                            for rix, r in cands:
-                                rq = _to_float(r[mat_i.get("Qty")]) if mat_i.get("Qty") is not None else None
-                                if vq is not None and rq is not None and abs(vq - rq) < 1e-9:
-                                    best = rix
-                                    break
-                            src_row = best or cands[0][0]
-
-                    elif typ_l == "thread" and thr_by_name:
-                        cands = thr_by_name.get(name_l, [])
-                        if cands:
-                            vq = _to_float(qty)
-                            best = None
-                            for rix, r in cands:
+                        for idx, row in enumerate(mat[1:], start=2):
                                 try:
-                                    rq = _to_float(r[th_i["LenFt"]])
-                                    if rq is not None:
-                                        rq = rq / 16500.0
+                                        if str(row[h["O/R"]]).strip().lower() != "ordered":
+                                                continue
+
+                                        name = row[h["Material"]]
+                                        qty_idx = h.get("QTY", h.get("Quantity"))
+                                        qty = row[qty_idx] if qty_idx is not None else ""
+
+                                        orders.append({
+                                                "row": idx,
+                                                "date": row[h["Date"]] if "Date" in h else "",
+                                                "type": "Material",
+                                                "name": name,
+                                                "quantity": qty,
+                                                "unit": unit_map.get(name, ""),
+                                                "vendor": vendor_map.get(name, ""),
+                                        })
                                 except Exception:
-                                    rq = None
-                                if vq is not None and rq is not None and abs(vq - rq) < 1e-9:
-                                    best = rix
-                                    break
-                            src_row = best or cands[0][0]
+                                        continue
 
-                        if qty and "cone" not in str(qty).lower():
-                            try:
-                                qty = f"{float(qty):.2f} cones"
-                            except Exception:
-                                pass
+                # -------------------------
+                # Thread Data
+                # -------------------------
+                th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z") or []
+                if th:
+                        hdr = th[0]
+                        h = {name: i for i, name in enumerate(hdr)}
 
-                    out.append({
-                        "row": src_row,
-                        "date": date,
-                        "type": typ or "",
-                        "name": name,
-                        "quantity": qty,
-                        "unit": unit or "",
-                        "vendor": vendor or "",
-                    })
+                        for idx, row in enumerate(th[1:], start=2):
+                                try:
+                                        if str(row[h["O/R"]]).strip().lower() != "ordered":
+                                                continue
 
-                return out
+                                        feet = row[h["Length (ft)"]]
+                                        try:
+                                                qty = f"{float(feet) / 16500:.2f} cones"
+                                        except Exception:
+                                                qty = ""
 
-            except Exception as e:
-                app.logger.error("FAST inventoryOrdered failed, falling back: %s", e)
+                                        orders.append({
+                                                "row": idx,
+                                                "date": row[h["Date"]] if "Date" in h else "",
+                                                "type": "Thread",
+                                                "name": row[h["Color"]],
+                                                "quantity": qty,
+                                                "unit": "Cones",
+                                                "vendor": "Madeira",
+                                        })
+                                except Exception:
+                                        continue
 
+                return jsonify(orders), 200
 
-        # --------- Fallback to your ORIGINAL (slow) logic if view empty ---------
-        orders = []
+        except Exception as e:
+                app.logger.exception("❌ inventoryOrdered failed")
+                return jsonify({"error": "inventoryOrdered failed"}), 500
 
-        # 0) Build Material→Unit and Material→Vendor maps (from Inventory sheet A2:I)
-        inv_rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:I")
-        unit_map = {
-            r[0]: (r[3] if len(r) > 3 else "")
-            for r in inv_rows
-            if r and str(r[0]).strip()
-        }
-        vendor_map = {
-            r[0]: (r[8] if len(r) > 8 else "")
-            for r in inv_rows
-            if r and str(r[0]).strip()
-        }
-
-        # 1) Material Log sheet
-        mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
-        if mat:
-            hdr = mat[0]  # ✅ define hdr for Material section
-            i_dt = hdr.index("Date")
-            i_or = hdr.index("O/R")
-            names = [str(h or "").strip() for h in hdr]
-            lower = [n.lower() for n in names]
-            if "qty" in lower:
-                qty_idx = lower.index("qty")
-            elif "quantity" in lower:
-                qty_idx = lower.index("quantity")
-            else:
-                qty_idx = i_or - 1
-            i_mat = hdr.index("Material")
-
-            for idx, row in enumerate(mat[1:], start=2):
-                if len(row) > i_or and str(row[i_or]).strip().lower() == "ordered":
-                    name = row[i_mat] if len(row) > i_mat else ""
-                    qty = row[qty_idx] if len(row) > qty_idx else ""
-                    orders.append(
-                        {
-                            "row": idx,
-                            "date": row[i_dt] if len(row) > i_dt else "",
-                            "type": "Material",
-                            "name": name,
-                            "quantity": qty,
-                            "unit": unit_map.get(name, ""),
-                            "vendor": vendor_map.get(name, ""),
-                        }
-                    )
-
-        # 2) Thread Data sheet
-        th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
-        if th:
-            hdr = th[0]
-            i_or = hdr.index("O/R")
-            i_dt = hdr.index("Date")
-            i_col = hdr.index("Color")
-            i_len = hdr.index("Length (ft)")
-
-            for idx, row in enumerate(th[1:], start=2):
-                if len(row) > i_or and str(row[i_or]).strip().lower() == "ordered":
-                    qty = row[i_len] if len(row) > i_len else ""
-                    try:
-                        qty = f"{float(qty) / 16500:.2f} cones"
-                    except Exception:
-                        pass
-                    orders.append(
-                        {
-                            "row": idx,
-                            "date": row[i_dt] if len(row) > i_dt else "",
-                            "type": "Thread",
-                            "name": row[i_col] if len(row) > i_col else "",
-                            "quantity": qty,
-                        }
-                    )
-
-        return orders
-
-    # If caller passes a cache-busting param (?t=...), BYPASS server cache
-    if request.args.get("t"):
-        rows = build()
-        resp = jsonify(rows)
-        resp.headers["Cache-Control"] = "no-store, max-age=0"
-        return resp
-
-    # Otherwise, serve from server-side cache but still tell the browser not to cache
-    resp = send_cached_json("inventoryOrdered", 60, build)
-    try:
-        resp.headers["Cache-Control"] = "no-store, max-age=0"
-    except Exception:
-        pass
-    return resp
 
 
 # --- Fast reader for the "Inventory Ordered (View)" sheet + row mapping ---
