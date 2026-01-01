@@ -8818,146 +8818,128 @@ def get_inventory_ordered():
           - if view empty/unavailable, use the original slow builder logic.
         """
         # --------- Try FAST VIEW first ---------
-        view = fetch_sheet(SPREADSHEET_ID, "Inventory Ordered (View)!A1:F")
+        # --------- Try FAST VIEW first ---------
+        try:
+            view = fetch_sheet(SPREADSHEET_ID, "Inventory Ordered (View)!A1:F")
+        except Exception as e:
+            app.logger.error("Inventory Ordered view fetch failed: %s", e)
+            view = None
+
         if view and len(view) > 1:
-            # Load originals ONCE to map name -> row
-            mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z") or []
-            th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z") or []
+            try:
+                # Load originals ONCE to map name -> row
+                mat = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z") or []
+                th = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z") or []
 
-            # Indices for Material Log
-            mat_i = {}
-            if mat:
-                mhdr = mat[0]
-                try:
-                    mat_i["Date"] = mhdr.index("Date")
-                    mat_i["Material"] = mhdr.index("Material")
-                    mat_i["O/R"] = mhdr.index("O/R")
-
-                    # Prefer QTY (case-insensitive), then Quantity; else fall back to O/R - 1
-                    names = [str(h or "").strip() for h in mhdr]
-                    lower = [n.lower() for n in names]
-                    if "qty" in lower:
-                        mat_i["Qty"] = lower.index("qty")
-                    elif "quantity" in lower:
-                        mat_i["Qty"] = lower.index("quantity")
-                    else:
-                        mat_i["Qty"] = mat_i["O/R"] - 1
-                except ValueError:
-                    mat_i = {}
-
-            # Indices for Thread Data
-            th_i = {}
-            if th:
-                thdr = th[0]
-                try:
-                    th_i["Date"] = thdr.index("Date")
-                    th_i["Color"] = thdr.index("Color")
-                    th_i["LenFt"] = thdr.index("Length (ft)")
-                    th_i["O/R"] = thdr.index("O/R")
-                except ValueError:
-                    th_i = {}
-
-            # Build name -> candidate rows (ordered only)
-            mat_by_name = {}
-            if mat and mat_i:
-                for rix, r in enumerate(mat[1:], start=2):
+                # Indices for Material Log
+                mat_i = {}
+                if mat:
+                    mhdr = mat[0]
                     try:
-                        orv = (r[mat_i["O/R"]] or "").strip().lower()
-                        name = (r[mat_i["Material"]] or "").strip()
-                    except Exception:
-                        continue
-                    if orv == "ordered" and name:
-                        mat_by_name.setdefault(name.lower(), []).append((rix, r))
+                        mat_i["Date"] = mhdr.index("Date")
+                        mat_i["Material"] = mhdr.index("Material")
+                        mat_i["O/R"] = mhdr.index("O/R")
 
-            thr_by_name = {}
-            if th and th_i:
-                for rix, r in enumerate(th[1:], start=2):
+                        names = [str(h or "").strip() for h in mhdr]
+                        lower = [n.lower() for n in names]
+                        if "qty" in lower:
+                            mat_i["Qty"] = lower.index("qty")
+                        elif "quantity" in lower:
+                            mat_i["Qty"] = lower.index("quantity")
+                        else:
+                            mat_i["Qty"] = mat_i["O/R"] - 1
+                    except Exception:
+                        mat_i = {}
+
+                # Indices for Thread Data
+                th_i = {}
+                if th:
+                    thdr = th[0]
                     try:
-                        orv = (r[th_i["O/R"]] or "").strip().lower()
-                        name = (r[th_i["Color"]] or "").strip()
+                        th_i["Date"] = thdr.index("Date")
+                        th_i["Color"] = thdr.index("Color")
+                        th_i["LenFt"] = thdr.index("Length (ft)")
+                        th_i["O/R"] = thdr.index("O/R")
                     except Exception:
-                        continue
-                    if orv == "ordered" and name:
-                        thr_by_name.setdefault(name.lower(), []).append((rix, r))
+                        th_i = {}
 
-            def _to_float(x):
-                try:
-                    return float(str(x).replace(",", "").strip())
-                except Exception:
-                    return None
-
-            out = []
-            hdr = view[0]  # Date | Type | Name | Quantity | Unit | Vendor
-            for vix, vrow in enumerate(view[1:], start=2):
-                vrow = (vrow + ["", "", "", "", "", ""])[:6]
-                date, typ, name, qty, unit, vendor = (
-                    vrow[0],
-                    vrow[1],
-                    vrow[2],
-                    vrow[3],
-                    vrow[4],
-                    vrow[5],
-                )
-                if not name:
-                    continue
-
-                typ_l = (typ or "").strip().lower()
-                name_l = name.strip().lower()
-                src_row = None
-
-                if typ_l == "material" and mat_by_name:
-                    cands = mat_by_name.get(name_l, [])
-                    if cands:
-                        vq = _to_float(qty)
-                        best = None
-                        for rix, r in cands:
-                            rq = None
-                            try:
-                                rq = _to_float(r[mat_i["Qty"]])
-                            except Exception:
-                                pass
-                            if (
-                                vq is not None
-                                and rq is not None
-                                and abs(vq - rq) < 1e-9
-                            ):
-                                best = rix
-                                break
-                        src_row = best or cands[0][0]
-
-                elif typ_l == "thread" and thr_by_name:
-                    cands = thr_by_name.get(name_l, [])
-                    if cands:
-                        vq = _to_float(
-                            qty
-                        )  # view qty already divided by 16500 in the sheet
-                        best = None
-                        for rix, r in cands:
-                            rq = None
-                            try:
-                                rq = _to_float(r[th_i["LenFt"]])
-                                if rq is not None:
-                                    rq = rq / 16500.0
-                            except Exception:
-                                pass
-                            if (
-                                vq is not None
-                                and rq is not None
-                                and abs(vq - rq) < 1e-9
-                            ):
-                                best = rix
-                                break
-                        src_row = best or (cands[0][0] if cands else None)
-
-                    if qty and "cone" not in str(qty).lower():
+                # Build candidate lookup maps
+                mat_by_name = {}
+                if mat and mat_i:
+                    for rix, r in enumerate(mat[1:], start=2):
                         try:
-                            qf = float(qty)
-                            qty = f"{qf:.2f} cones"
+                            orv = (r[mat_i["O/R"]] or "").strip().lower()
+                            name = (r[mat_i["Material"]] or "").strip()
                         except Exception:
-                            pass
+                            continue
+                        if orv == "ordered" and name:
+                            mat_by_name.setdefault(name.lower(), []).append((rix, r))
 
-                out.append(
-                    {
+                thr_by_name = {}
+                if th and th_i:
+                    for rix, r in enumerate(th[1:], start=2):
+                        try:
+                            orv = (r[th_i["O/R"]] or "").strip().lower()
+                            name = (r[th_i["Color"]] or "").strip()
+                        except Exception:
+                            continue
+                        if orv == "ordered" and name:
+                            thr_by_name.setdefault(name.lower(), []).append((rix, r))
+
+                def _to_float(x):
+                    try:
+                        return float(str(x).replace(",", "").strip())
+                    except Exception:
+                        return None
+
+                out = []
+                for vix, vrow in enumerate(view[1:], start=2):
+                    vrow = (vrow + ["", "", "", "", "", ""])[:6]
+
+                    date, typ, name, qty, unit, vendor = vrow
+                    if not name:
+                        continue
+
+                    typ_l = (typ or "").strip().lower()
+                    name_l = name.strip().lower()
+                    src_row = None
+
+                    if typ_l == "material" and mat_by_name:
+                        cands = mat_by_name.get(name_l, [])
+                        if cands:
+                            vq = _to_float(qty)
+                            best = None
+                            for rix, r in cands:
+                                rq = _to_float(r[mat_i.get("Qty")]) if mat_i.get("Qty") is not None else None
+                                if vq is not None and rq is not None and abs(vq - rq) < 1e-9:
+                                    best = rix
+                                    break
+                            src_row = best or cands[0][0]
+
+                    elif typ_l == "thread" and thr_by_name:
+                        cands = thr_by_name.get(name_l, [])
+                        if cands:
+                            vq = _to_float(qty)
+                            best = None
+                            for rix, r in cands:
+                                try:
+                                    rq = _to_float(r[th_i["LenFt"]])
+                                    if rq is not None:
+                                        rq = rq / 16500.0
+                                except Exception:
+                                    rq = None
+                                if vq is not None and rq is not None and abs(vq - rq) < 1e-9:
+                                    best = rix
+                                    break
+                            src_row = best or cands[0][0]
+
+                        if qty and "cone" not in str(qty).lower():
+                            try:
+                                qty = f"{float(qty):.2f} cones"
+                            except Exception:
+                                pass
+
+                    out.append({
                         "row": src_row,
                         "date": date,
                         "type": typ or "",
@@ -8965,10 +8947,13 @@ def get_inventory_ordered():
                         "quantity": qty,
                         "unit": unit or "",
                         "vendor": vendor or "",
-                    }
-                )
+                    })
 
-            return out
+                return out
+
+            except Exception as e:
+                app.logger.error("FAST inventoryOrdered failed, falling back: %s", e)
+
 
         # --------- Fallback to your ORIGINAL (slow) logic if view empty ---------
         orders = []
