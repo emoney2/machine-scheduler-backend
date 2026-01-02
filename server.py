@@ -11338,8 +11338,16 @@ def util_shorten():
         return jsonify({"error": "shorten_exception", "detail": str(e)}), 500
 
 
-@app.route("/print", methods=["POST"])
+@app.route("/print", methods=["POST", "OPTIONS"])
 def print_handler():
+    # Handle CORS preflight
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type")
+        response.headers.add("Access-Control-Allow-Methods", "POST, OPTIONS")
+        return response
+    
     data = request.json
     order = str(data.get("order"))
     mode = data.get("mode")
@@ -11347,7 +11355,19 @@ def print_handler():
 
     print(f"PRINT REQUEST → Order {order}, Mode={mode}, UpdateAllowed={should_update}")
 
-    # TODO: (Later) Add silent printing logic here
+    # Forward print request to local print service
+    try:
+        print_response = requests.post(
+            "http://127.0.0.1:5009/print",
+            json=data,
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        print_response.raise_for_status()
+        print(f"✅ Print request forwarded to local service successfully")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Failed to forward print request to local service: {e}")
+        return jsonify({"status": "print_service_error", "error": str(e)}), 500
 
     # ---- Update Google Sheet if process sheet printed ----
     if should_update:
@@ -11380,6 +11400,37 @@ def print_handler():
             return jsonify({"status": "sheet_update_failed"})
 
     return jsonify({"status": "ok"})
+
+
+@app.route("/queue-emb", methods=["POST", "OPTIONS"])
+def queue_emb_handler():
+    # Handle CORS preflight
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type")
+        response.headers.add("Access-Control-Allow-Methods", "POST, OPTIONS")
+        return response
+    
+    data = request.json
+    path = data.get("path")
+    
+    print(f"QUEUE-EMB REQUEST → Path: {path}")
+
+    # Forward queue-emb request to local print service
+    try:
+        queue_response = requests.post(
+            "http://127.0.0.1:5009/queue-emb",
+            json=data,
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        queue_response.raise_for_status()
+        print(f"✅ Queue-emb request forwarded to local service successfully")
+        return jsonify({"status": "ok"})
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Failed to forward queue-emb request to local service: {e}")
+        return jsonify({"status": "queue_service_error", "error": str(e)}), 500
 
 
 @app.route("/api/material_image")
