@@ -11355,19 +11355,93 @@ def print_handler():
 
     print(f"PRINT REQUEST → Order {order}, Mode={mode}, UpdateAllowed={should_update}")
 
-    # Forward print request to local print service
     try:
-        print_response = requests.post(
-            "http://127.0.0.1:5009/print",
-            json=data,
-            headers={"Content-Type": "application/json"},
-            timeout=10
+        drive = get_drive_service()
+        ORDERS_PARENT_FOLDER_ID = os.environ.get(
+            "ORDERS_PARENT_FOLDER_ID", "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
         )
-        print_response.raise_for_status()
-        print(f"✅ Print request forwarded to local service successfully")
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Failed to forward print request to local service: {e}")
-        return jsonify({"status": "print_service_error", "error": str(e)}), 500
+
+        # 1. Find the order folder
+        order_folder_query = (
+            f"name = '{order}' and "
+            f"mimeType = 'application/vnd.google-apps.folder' and "
+            f"trashed = false and "
+            f"'{ORDERS_PARENT_FOLDER_ID}' in parents"
+        )
+        order_folders = drive.files().list(
+            q=order_folder_query, fields="files(id, name)"
+        ).execute().get("files", [])
+        
+        if not order_folders:
+            print(f"❌ Order folder not found for order {order}")
+            return jsonify({"status": "error", "error": f"Order folder not found for {order}"}), 404
+        
+        order_folder_id = order_folders[0]["id"]
+        print(f"✅ Found order folder: {order_folder_id}")
+
+        # 2. List all PDF files in the order folder
+        pdf_query = (
+            f"'{order_folder_id}' in parents and "
+            f"mimeType = 'application/pdf' and "
+            f"trashed = false"
+        )
+        pdf_files = drive.files().list(
+            q=pdf_query, 
+            fields="files(id, name, modifiedTime)",
+            orderBy="modifiedTime desc"
+        ).execute().get("files", [])
+        
+        if not pdf_files:
+            print(f"❌ No PDF files found in order folder {order}")
+            return jsonify({"status": "error", "error": f"No PDF files found for order {order}"}), 404
+
+        # 3. Get the latest PDF (first one since we sorted by modifiedTime desc)
+        latest_pdf = pdf_files[0]
+        print(f"✅ Found latest PDF: {latest_pdf['name']} (modified: {latest_pdf.get('modifiedTime')})")
+
+        # 4. Find or create "Print Fur PDF" folder in root
+        print_folder_query = (
+            f"name = 'Print Fur PDF' and "
+            f"mimeType = 'application/vnd.google-apps.folder' and "
+            f"trashed = false and "
+            f"'root' in parents"
+        )
+        print_folders = drive.files().list(
+            q=print_folder_query, fields="files(id)"
+        ).execute().get("files", [])
+        
+        if print_folders:
+            print_folder_id = print_folders[0]["id"]
+            print(f"✅ Found 'Print Fur PDF' folder: {print_folder_id}")
+        else:
+            # Create the folder
+            folder_metadata = {
+                "name": "Print Fur PDF",
+                "mimeType": "application/vnd.google-apps.folder"
+            }
+            print_folder = drive.files().create(
+                body=folder_metadata, fields="id"
+            ).execute()
+            print_folder_id = print_folder["id"]
+            print(f"✅ Created 'Print Fur PDF' folder: {print_folder_id}")
+
+        # 5. Copy the PDF to the Print Fur PDF folder with order number prefix
+        new_pdf_name = f"{order}_{latest_pdf['name']}"
+        
+        copied_file = drive.files().copy(
+            fileId=latest_pdf["id"],
+            body={"name": new_pdf_name, "parents": [print_folder_id]},
+            fields="id, name"
+        ).execute()
+        
+        print(f"✅ Copied PDF to Print Fur PDF folder: {copied_file['name']} (ID: {copied_file['id']})")
+
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        print(f"❌ Error processing print request: {error_msg}")
+        traceback.print_exc()
+        return jsonify({"status": "error", "error": error_msg}), 500
 
     # ---- Update Google Sheet if process sheet printed ----
     if should_update:
