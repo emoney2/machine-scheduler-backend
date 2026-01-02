@@ -11350,10 +11350,9 @@ def print_handler():
     
     data = request.json
     order = str(data.get("order"))
-    mode = data.get("mode")
-    should_update = data.get("requiresProcessSheetUpdate", False)
+    mode = data.get("mode")  # "process", "binsheet", or "both"
 
-    print(f"PRINT REQUEST → Order {order}, Mode={mode}, UpdateAllowed={should_update}")
+    print(f"PRINT REQUEST → Order {order}, Mode={mode}")
 
     try:
         drive = get_drive_service()
@@ -11361,45 +11360,7 @@ def print_handler():
             "ORDERS_PARENT_FOLDER_ID", "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
         )
 
-        # 1. Find the order folder
-        order_folder_query = (
-            f"name = '{order}' and "
-            f"mimeType = 'application/vnd.google-apps.folder' and "
-            f"trashed = false and "
-            f"'{ORDERS_PARENT_FOLDER_ID}' in parents"
-        )
-        order_folders = drive.files().list(
-            q=order_folder_query, fields="files(id, name)"
-        ).execute().get("files", [])
-        
-        if not order_folders:
-            print(f"❌ Order folder not found for order {order}")
-            return jsonify({"status": "error", "error": f"Order folder not found for {order}"}), 404
-        
-        order_folder_id = order_folders[0]["id"]
-        print(f"✅ Found order folder: {order_folder_id}")
-
-        # 2. List all PDF files in the order folder
-        pdf_query = (
-            f"'{order_folder_id}' in parents and "
-            f"mimeType = 'application/pdf' and "
-            f"trashed = false"
-        )
-        pdf_files = drive.files().list(
-            q=pdf_query, 
-            fields="files(id, name, modifiedTime)",
-            orderBy="modifiedTime desc"
-        ).execute().get("files", [])
-        
-        if not pdf_files:
-            print(f"❌ No PDF files found in order folder {order}")
-            return jsonify({"status": "error", "error": f"No PDF files found for order {order}"}), 404
-
-        # 3. Get the latest PDF (first one since we sorted by modifiedTime desc)
-        latest_pdf = pdf_files[0]
-        print(f"✅ Found latest PDF: {latest_pdf['name']} (modified: {latest_pdf.get('modifiedTime')})")
-
-        # 4. Find or create "Print Fur PDF" folder in root
+        # Find or create "Print Fur PDF" folder in root
         print_folder_query = (
             f"name = 'Print Fur PDF' and "
             f"mimeType = 'application/vnd.google-apps.folder' and "
@@ -11425,16 +11386,106 @@ def print_handler():
             print_folder_id = print_folder["id"]
             print(f"✅ Created 'Print Fur PDF' folder: {print_folder_id}")
 
-        # 5. Copy the PDF to the Print Fur PDF folder with order number prefix
-        new_pdf_name = f"{order}_{latest_pdf['name']}"
-        
-        copied_file = drive.files().copy(
-            fileId=latest_pdf["id"],
-            body={"name": new_pdf_name, "parents": [print_folder_id]},
-            fields="id, name"
-        ).execute()
-        
-        print(f"✅ Copied PDF to Print Fur PDF folder: {copied_file['name']} (ID: {copied_file['id']})")
+        # Handle process sheet (mode is "process" or "both")
+        if mode == "process" or mode == "both":
+            # 1. Find the order folder
+            order_folder_query = (
+                f"name = '{order}' and "
+                f"mimeType = 'application/vnd.google-apps.folder' and "
+                f"trashed = false and "
+                f"'{ORDERS_PARENT_FOLDER_ID}' in parents"
+            )
+            order_folders = drive.files().list(
+                q=order_folder_query, fields="files(id, name)"
+            ).execute().get("files", [])
+            
+            if not order_folders:
+                print(f"❌ Order folder not found for order {order}")
+                return jsonify({"status": "error", "error": f"Order folder not found for {order}"}), 404
+            
+            order_folder_id = order_folders[0]["id"]
+            print(f"✅ Found order folder: {order_folder_id}")
+
+            # 2. List all PDF files in the order folder
+            pdf_query = (
+                f"'{order_folder_id}' in parents and "
+                f"mimeType = 'application/pdf' and "
+                f"trashed = false"
+            )
+            pdf_files = drive.files().list(
+                q=pdf_query, 
+                fields="files(id, name, modifiedTime)",
+                orderBy="modifiedTime desc"
+            ).execute().get("files", [])
+            
+            if not pdf_files:
+                print(f"❌ No PDF files found in order folder {order}")
+                return jsonify({"status": "error", "error": f"No PDF files found for order {order}"}), 404
+
+            # 3. Get the latest PDF (first one since we sorted by modifiedTime desc)
+            latest_pdf = pdf_files[0]
+            print(f"✅ Found latest PDF: {latest_pdf['name']} (modified: {latest_pdf.get('modifiedTime')})")
+
+            # 4. Copy the PDF to the Print Fur PDF folder with order number prefix
+            new_pdf_name = f"{order}_{latest_pdf['name']}"
+            
+            copied_file = drive.files().copy(
+                fileId=latest_pdf["id"],
+                body={"name": new_pdf_name, "parents": [print_folder_id]},
+                fields="id, name"
+            ).execute()
+            
+            print(f"✅ Copied process sheet PDF: {copied_file['name']} (ID: {copied_file['id']})")
+
+        # Handle bin sheet (mode is "binsheet" or "both")
+        if mode == "binsheet" or mode == "both":
+            # 1. Find the BinSheet folder in root
+            binsheet_folder_query = (
+                f"name = 'BinSheet' and "
+                f"mimeType = 'application/vnd.google-apps.folder' and "
+                f"trashed = false and "
+                f"'root' in parents"
+            )
+            binsheet_folders = drive.files().list(
+                q=binsheet_folder_query, fields="files(id)"
+            ).execute().get("files", [])
+            
+            if not binsheet_folders:
+                print(f"❌ BinSheet folder not found")
+                return jsonify({"status": "error", "error": "BinSheet folder not found"}), 404
+            
+            binsheet_folder_id = binsheet_folders[0]["id"]
+            print(f"✅ Found BinSheet folder: {binsheet_folder_id}")
+
+            # 2. Find the bin sheet file: {order}_BINSHEET.pdf
+            bin_sheet_filename = f"{order}_BINSHEET.pdf"
+            bin_sheet_query = (
+                f"name = '{bin_sheet_filename}' and "
+                f"'{binsheet_folder_id}' in parents and "
+                f"mimeType = 'application/pdf' and "
+                f"trashed = false"
+            )
+            bin_sheet_files = drive.files().list(
+                q=bin_sheet_query, fields="files(id, name)"
+            ).execute().get("files", [])
+            
+            if not bin_sheet_files:
+                print(f"❌ Bin sheet file not found: {bin_sheet_filename}")
+                return jsonify({"status": "error", "error": f"Bin sheet file not found: {bin_sheet_filename}"}), 404
+
+            bin_sheet_file = bin_sheet_files[0]
+            print(f"✅ Found bin sheet file: {bin_sheet_file['name']}")
+
+            # 3. Copy the bin sheet to the Print Fur PDF folder
+            new_bin_sheet_name = f"{order}_{bin_sheet_file['name']}"
+            
+            copied_bin_sheet = drive.files().copy(
+                fileId=bin_sheet_file["id"],
+                body={"name": new_bin_sheet_name, "parents": [print_folder_id]},
+                fields="id, name"
+            ).execute()
+            
+            print(f"✅ Copied bin sheet PDF: {copied_bin_sheet['name']} (ID: {copied_bin_sheet['id']})")
 
     except Exception as e:
         import traceback
@@ -11442,36 +11493,6 @@ def print_handler():
         print(f"❌ Error processing print request: {error_msg}")
         traceback.print_exc()
         return jsonify({"status": "error", "error": error_msg}), 500
-
-    # ---- Update Google Sheet if process sheet printed ----
-    if should_update:
-        try:
-            sheet = client.open_by_key(SPREADSHEET_ID).worksheet("Production Orders")
-            records = sheet.get_all_records()
-
-            # Find matching row (skip header row)
-            for row_index, row in enumerate(records, start=2):
-                if str(row.get("Order #")) == order:
-
-                    # If blank → write timestamp (first print only)
-                    if not row.get("Process Sheet Printed"):
-                        from datetime import datetime
-
-                        timestamp = datetime.now().strftime("%m/%d/%Y %I:%M %p")
-
-                        # AO = column 41
-                        sheet.update_cell(row_index, 41, timestamp)
-                        print(
-                            f"✔ Updated 'Process Sheet Printed' for Order {order} → {timestamp}"
-                        )
-                    else:
-                        print(f"➡ Already printed → no update for Order {order}")
-
-                    break
-
-        except Exception as e:
-            print("❌ Sheet update error:", e)
-            return jsonify({"status": "sheet_update_failed"})
 
     return jsonify({"status": "ok"})
 
