@@ -3869,6 +3869,9 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
     data = [["Product", "Design", "Qty"]]
     for od in order_data_list:
         product_raw = od.get("Product", "")
+        # Skip products that contain the word "back"
+        if "back" in product_raw.lower():
+            continue
         product_norm = _normalize_product_for_slip(product_raw)
         data.append([product_norm, od.get("Design", ""), str(od.get("ShippedQty", ""))])
 
