@@ -7645,8 +7645,145 @@ def save_manual_state():
         return jsonify({"ok": False, "error": str(e)}), 200
 
 
+@app.route("/api/autoFillMachines", methods=["POST"])
+@login_required_session
+def auto_fill_machines():
+    """
+    Auto-fill machines to 10 jobs each (only machines with >= 6 heads).
+    Logic:
+    1. Only target machines with >= 6 heads (exclude 1-head machines)
+    2. Fill each machine to at least 10 jobs
+    3. Process queue in order
+    4. If top job matches last job's company on a machine, add to that machine
+    5. Don't split companies unnecessarily - if all remaining jobs are same company
+       as jobs on machine X, don't move to machine Y
+    6. Cards remain free/movable after auto-fill
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        queue_jobs = data.get("queue", [])
+        machine1_jobs = data.get("machine1", [])
+        machine2_jobs = data.get("machine2", [])
+        machine1_headCount = data.get("machine1_headCount", 1)
+        machine2_headCount = data.get("machine2_headCount", 6)
+        
+        # Only process machines with >= 6 heads
+        target_machines = []
+        if machine2_headCount >= 6:
+            target_machines.append({
+                "key": "machine2",
+                "jobs": machine2_jobs[:],  # copy
+                "headCount": machine2_headCount
+            })
+        # Note: machine1 has 1 head, so it's excluded
+        
+        # Helper to get company from a job
+        def get_company(job):
+            return str(job.get("company") or job.get("Company Name") or "").strip()
+        
+        # Helper to get last job's company on a machine
+        def get_last_company(machine_jobs):
+            if not machine_jobs:
+                return None
+            return get_company(machine_jobs[-1])
+        
+        # Process each target machine
+        remaining_queue = queue_jobs[:]  # copy to work with
+        moves_made = []
+        
+        for machine in target_machines:
+            current_jobs = machine["jobs"]
+            needed = max(0, 10 - len(current_jobs))
+            
+            if needed == 0:
+                continue  # Machine already has 10+ jobs
+            
+            last_company = get_last_company(current_jobs)
+            added_count = 0
+            i = 0
+            
+            while i < len(remaining_queue) and added_count < needed:
+                job = remaining_queue[i]
+                job_company = get_company(job)
+                
+                # Rule 1: If top job matches last job's company, add it
+                if last_company and job_company and job_company.lower() == last_company.lower():
+                    current_jobs.append(job)
+                    remaining_queue.pop(i)
+                    moves_made.append({"job_id": job.get("id"), "to": machine["key"]})
+                    added_count += 1
+                    # Update last_company for next iteration
+                    last_company = job_company
+                    continue
+                
+                # Rule 2: Check if we should skip this company
+                # a) If all remaining jobs are same company as jobs on other machines that are NOT full, don't split
+                # b) If this company is on a FULL machine (10+ jobs), skip it (let that machine keep it)
+                should_skip = False
+                
+                # Check if this company is on a FULL machine
+                for other_machine in target_machines:
+                    if other_machine["key"] == machine["key"]:
+                        continue
+                    if len(other_machine["jobs"]) >= 10:
+                        # Other machine is full - check if it has this company
+                        other_machine_companies = {get_company(j).lower() for j in other_machine["jobs"] if get_company(j)}
+                        if job_company and job_company.lower() in other_machine_companies:
+                            # Skip this job - full machine already has this company
+                            should_skip = True
+                            break
+                
+                if not should_skip:
+                    # Check if all remaining jobs are same company as jobs on other machines that are NOT full
+                    for other_machine in target_machines:
+                        if other_machine["key"] == machine["key"]:
+                            continue
+                        # Only check if the other machine is NOT full
+                        if len(other_machine["jobs"]) >= 10:
+                            continue  # Skip full machines
+                        # Check if ANY job on this other machine has the same company
+                        other_machine_companies = {get_company(j).lower() for j in other_machine["jobs"] if get_company(j)}
+                        if job_company and job_company.lower() in other_machine_companies:
+                            # Check if ALL remaining jobs are this company
+                            all_same_company = all(
+                                get_company(j).lower() == job_company.lower() 
+                                for j in remaining_queue[i:]
+                            )
+                            if all_same_company:
+                                should_skip = True
+                                break
+                
+                if should_skip:
+                    # Skip this job
+                    i += 1
+                    continue
+                
+                # Otherwise, add the job
+                current_jobs.append(job)
+                remaining_queue.pop(i)
+                moves_made.append({"job_id": job.get("id"), "to": machine["key"]})
+                added_count += 1
+                if not last_company:
+                    last_company = job_company
+        
+        # Return updated state
+        result = {
+            "status": "ok",
+            "queue": remaining_queue,
+            "machine1": machine1_jobs,  # unchanged (1 head, excluded)
+            "machine2": target_machines[0]["jobs"] if target_machines and target_machines[0]["key"] == "machine2" else machine2_jobs,
+            "moves_made": moves_made
+        }
+        
+        return jsonify(result), 200
+        
+    except Exception as e:
+        logger.exception("auto_fill_machines failed")
+        return jsonify({"error": str(e)}), 500
+
+
 # ─────────────────────────────────────────────
-# helper: grant “anyone with link” reader access
+# helper: grant "anyone with link" reader access
 def make_public(file_id, drive_service):
     drive_service.permissions().create(
         fileId=file_id, body={"type": "anyone", "role": "reader"}, fields="id"
