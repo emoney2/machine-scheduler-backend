@@ -1519,6 +1519,21 @@ def send_cached_json(key, ttl, payload_obj_builder):
         resp.headers["Warning"] = '110 - "stale response served while refreshing"'
         return resp
 
+    # 3) No cache at all - build fresh payload
+    try:
+        payload_obj = payload_obj_builder()
+        payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+        etag = _cache_set(key, payload_bytes, ttl)
+
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = f"public, max-age={ttl}"
+        return resp
+    except Exception as e:
+        current_app.logger.error(f"send_cached_json: build_payload failed for {key}: {e}")
+        # Return None to signal failure - caller should handle
+        return None
+
 
 def login_required_session(f):
     @wraps(f)
@@ -7461,6 +7476,9 @@ def get_combined():
     TTL = 15
     try:
         result = send_cached_json("combined-v2", TTL, build_payload)
+        if result is None:
+            # If send_cached_json failed, fall through to exception handler
+            raise Exception("send_cached_json returned None")
         # Override Cache-Control to allow short-term browser caching
         result.headers["Cache-Control"] = f"public, max-age={TTL}"
         return result
