@@ -854,6 +854,11 @@ GOOGLE_TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from google.auth.transport.requests import Request as GoogleRequest
 
+# Cache credentials to avoid reloading/refreshing on every request
+_google_creds_cache = None
+_google_creds_cache_ts = 0
+_google_creds_cache_ttl = 300  # Cache for 5 minutes
+
 
 def get_google_credentials():
     """
@@ -861,16 +866,35 @@ def get_google_credentials():
       1) GOOGLE_TOKEN_JSON env (your boot writes token.json from env on startup)
       2) token.json file (GOOGLE_TOKEN_PATH)
     Will auto-refresh if expired and refresh_token is present.
+    Uses caching to avoid reloading on every request.
     """
-    # Prefer the same loader your Drive code uses
+    global _google_creds_cache, _google_creds_cache_ts
+    
+    now = time.time()
+    
+    # Return cached creds if still valid and within TTL
+    if _google_creds_cache and (now - _google_creds_cache_ts) < _google_creds_cache_ttl:
+        # Only refresh if actually expired (not just checking)
+        if _google_creds_cache.valid:
+            return _google_creds_cache
+        # If expired, try refresh but don't fail if it errors
+        try:
+            if getattr(_google_creds_cache, "refresh_token", None):
+                _google_creds_cache.refresh(GoogleRequest())
+                _google_creds_cache_ts = now  # Update cache time after refresh
+                return _google_creds_cache
+        except Exception:
+            # If refresh fails, fall through to reload
+            pass
+    
+    # Load fresh credentials
     creds = _load_google_creds()
     if not creds:
         raise RuntimeError(
             "No Google OAuth credentials found. Set GOOGLE_TOKEN_JSON or provide token.json"
         )
 
-    # If token is expired but refresh_token exists, google-auth refreshes on first request;
-    # we can optionally preemptively refresh:
+    # Only refresh if actually expired (not on every load)
     try:
         if not creds.valid and getattr(creds, "refresh_token", None):
             creds.refresh(GoogleRequest())
@@ -878,6 +902,10 @@ def get_google_credentials():
         # Ignore refresh hiccups here; the API client will retry/raise cleanly.
         pass
 
+    # Cache the credentials
+    _google_creds_cache = creds
+    _google_creds_cache_ts = now
+    
     return creds
 
 
@@ -4823,17 +4851,8 @@ def _load_google_creds():
                 )
             )
             print("🔎 token (env) scopes:", token_scopes)
-            # Try to refresh, but don't fail if Google is flaky
-            try:
-                if not creds.valid and getattr(creds, "refresh_token", None):
-                    from google.auth.transport.requests import Request as GoogleRequest
-
-                    creds.refresh(GoogleRequest())
-            except Exception as _e:
-                # Log once but still return the creds; API calls can retry refresh
-                print(
-                    "⚠️ ENV token refresh failed (will return creds anyway):", repr(_e)
-                )
+            # Don't refresh here - let get_google_credentials() handle it with caching
+            # This avoids unnecessary refresh attempts on every credential load
             return creds
         except Exception as e:
             print("❌ ENV token could not build OAuthCredentials:", repr(e))
@@ -4852,10 +4871,8 @@ def _load_google_creds():
                     info, scopes=GOOGLE_SCOPES
                 )
             print("🔎 token (file) scopes:", token_scopes)
-            if not creds.valid and creds.refresh_token:
-                from google.auth.transport.requests import Request as GoogleRequest
-
-                creds.refresh(GoogleRequest())
+            # Don't refresh here - let get_google_credentials() handle it with caching
+            # This avoids unnecessary refresh attempts on every credential load
             return creds
     except Exception as e:
         print("❌ FILE token could not build OAuthCredentials:", repr(e))
@@ -7440,15 +7457,13 @@ def get_combined():
             "links": _links_store if isinstance(_links_store, dict) else {},
         }
 
+    # Use caching to reduce Google Sheets API calls (15 second TTL)
+    TTL = 15
     try:
-        payload_obj = build_payload()
-        payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
-        etag = _json_etag(payload_bytes)
-
-        resp = Response(payload_bytes, mimetype="application/json")
-        resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = "no-store"
-        return resp
+        result = send_cached_json("combined-v2", TTL, build_payload)
+        # Override Cache-Control to allow short-term browser caching
+        result.headers["Cache-Control"] = f"public, max-age={TTL}"
+        return result
 
     except Exception:
         current_app.logger.error("❌ /api/combined fatal error", exc_info=True)
@@ -11342,6 +11357,95 @@ def util_shorten():
 
 
 @app.route("/print", methods=["POST", "OPTIONS"])
+def _process_single_order_print(drive, order, mode, print_folder_id, binsheet_folder_id, ORDERS_PARENT_FOLDER_ID):
+    """Helper function to process printing for a single order. Returns (success, error_message)"""
+    try:
+        # Handle process sheet (mode is "process" or "both")
+        if mode == "process" or mode == "both":
+            # 1. Find the order folder
+            order_folder_query = (
+                f"name = '{order}' and "
+                f"mimeType = 'application/vnd.google-apps.folder' and "
+                f"trashed = false and "
+                f"'{ORDERS_PARENT_FOLDER_ID}' in parents"
+            )
+            order_folders = drive.files().list(
+                q=order_folder_query, fields="files(id, name)"
+            ).execute().get("files", [])
+            
+            if not order_folders:
+                return (False, f"Order folder not found for {order}")
+            
+            order_folder_id = order_folders[0]["id"]
+
+            # 2. List all PDF files in the order folder
+            pdf_query = (
+                f"'{order_folder_id}' in parents and "
+                f"mimeType = 'application/pdf' and "
+                f"trashed = false"
+            )
+            pdf_files = drive.files().list(
+                q=pdf_query, 
+                fields="files(id, name, modifiedTime)",
+                orderBy="modifiedTime desc"
+            ).execute().get("files", [])
+            
+            if not pdf_files:
+                return (False, f"No PDF files found for order {order}")
+
+            # 3. Get the latest PDF (first one since we sorted by modifiedTime desc)
+            latest_pdf = pdf_files[0]
+
+            # 4. Copy the PDF to the Print Fur PDF folder with order number prefix
+            new_pdf_name = f"{order}_{latest_pdf['name']}"
+            
+            drive.files().copy(
+                fileId=latest_pdf["id"],
+                body={"name": new_pdf_name, "parents": [print_folder_id]},
+                fields="id, name"
+            ).execute()
+            
+            print(f"✅ Copied process sheet PDF for order {order}")
+
+        # Handle bin sheet (mode is "binsheet" or "both")
+        if mode == "binsheet" or mode == "both":
+            # 1. Find the bin sheet file: {order}_BINSHEET.pdf
+            bin_sheet_filename = f"{order}_BINSHEET.pdf"
+            bin_sheet_query = (
+                f"name = '{bin_sheet_filename}' and "
+                f"'{binsheet_folder_id}' in parents and "
+                f"mimeType = 'application/pdf' and "
+                f"trashed = false"
+            )
+            bin_sheet_files = drive.files().list(
+                q=bin_sheet_query, fields="files(id, name)"
+            ).execute().get("files", [])
+            
+            if not bin_sheet_files:
+                return (False, f"Bin sheet file not found: {bin_sheet_filename}")
+
+            bin_sheet_file = bin_sheet_files[0]
+
+            # 2. Copy the bin sheet to the Print Fur PDF folder
+            new_bin_sheet_name = f"{order}_{bin_sheet_file['name']}"
+            
+            drive.files().copy(
+                fileId=bin_sheet_file["id"],
+                body={"name": new_bin_sheet_name, "parents": [print_folder_id]},
+                fields="id, name"
+            ).execute()
+            
+            print(f"✅ Copied bin sheet PDF for order {order}")
+
+        return (True, None)
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        print(f"❌ Error processing order {order}: {error_msg}")
+        traceback.print_exc()
+        return (False, error_msg)
+
+
 def print_handler():
     # Handle CORS preflight
     if request.method == "OPTIONS":
@@ -11352,10 +11456,19 @@ def print_handler():
         return response
     
     data = request.json
-    order = str(data.get("order"))
     mode = data.get("mode")  # "process", "binsheet", or "both"
+    
+    # Support both single order and batch orders
+    if "orders" in data:
+        orders = [str(o) for o in data.get("orders", [])]
+        is_batch = True
+    elif "order" in data:
+        orders = [str(data.get("order"))]
+        is_batch = False
+    else:
+        return jsonify({"status": "error", "error": "Missing 'order' or 'orders' parameter"}), 400
 
-    print(f"PRINT REQUEST → Order {order}, Mode={mode}")
+    print(f"PRINT REQUEST → Orders: {orders}, Mode={mode}, Batch={is_batch}")
 
     try:
         drive = get_drive_service()
@@ -11389,60 +11502,9 @@ def print_handler():
             print_folder_id = print_folder["id"]
             print(f"✅ Created 'Print Fur PDF' folder: {print_folder_id}")
 
-        # Handle process sheet (mode is "process" or "both")
-        if mode == "process" or mode == "both":
-            # 1. Find the order folder
-            order_folder_query = (
-                f"name = '{order}' and "
-                f"mimeType = 'application/vnd.google-apps.folder' and "
-                f"trashed = false and "
-                f"'{ORDERS_PARENT_FOLDER_ID}' in parents"
-            )
-            order_folders = drive.files().list(
-                q=order_folder_query, fields="files(id, name)"
-            ).execute().get("files", [])
-            
-            if not order_folders:
-                print(f"❌ Order folder not found for order {order}")
-                return jsonify({"status": "error", "error": f"Order folder not found for {order}"}), 404
-            
-            order_folder_id = order_folders[0]["id"]
-            print(f"✅ Found order folder: {order_folder_id}")
-
-            # 2. List all PDF files in the order folder
-            pdf_query = (
-                f"'{order_folder_id}' in parents and "
-                f"mimeType = 'application/pdf' and "
-                f"trashed = false"
-            )
-            pdf_files = drive.files().list(
-                q=pdf_query, 
-                fields="files(id, name, modifiedTime)",
-                orderBy="modifiedTime desc"
-            ).execute().get("files", [])
-            
-            if not pdf_files:
-                print(f"❌ No PDF files found in order folder {order}")
-                return jsonify({"status": "error", "error": f"No PDF files found for order {order}"}), 404
-
-            # 3. Get the latest PDF (first one since we sorted by modifiedTime desc)
-            latest_pdf = pdf_files[0]
-            print(f"✅ Found latest PDF: {latest_pdf['name']} (modified: {latest_pdf.get('modifiedTime')})")
-
-            # 4. Copy the PDF to the Print Fur PDF folder with order number prefix
-            new_pdf_name = f"{order}_{latest_pdf['name']}"
-            
-            copied_file = drive.files().copy(
-                fileId=latest_pdf["id"],
-                body={"name": new_pdf_name, "parents": [print_folder_id]},
-                fields="id, name"
-            ).execute()
-            
-            print(f"✅ Copied process sheet PDF: {copied_file['name']} (ID: {copied_file['id']})")
-
-        # Handle bin sheet (mode is "binsheet" or "both")
+        # Find BinSheet folder (needed for binsheet mode)
+        binsheet_folder_id = None
         if mode == "binsheet" or mode == "both":
-            # 1. Find the BinSheet folder in root
             binsheet_folder_query = (
                 f"name = 'BinSheet' and "
                 f"mimeType = 'application/vnd.google-apps.folder' and "
@@ -11454,41 +11516,36 @@ def print_handler():
             ).execute().get("files", [])
             
             if not binsheet_folders:
-                print(f"❌ BinSheet folder not found")
                 return jsonify({"status": "error", "error": "BinSheet folder not found"}), 404
             
             binsheet_folder_id = binsheet_folders[0]["id"]
             print(f"✅ Found BinSheet folder: {binsheet_folder_id}")
 
-            # 2. Find the bin sheet file: {order}_BINSHEET.pdf
-            bin_sheet_filename = f"{order}_BINSHEET.pdf"
-            bin_sheet_query = (
-                f"name = '{bin_sheet_filename}' and "
-                f"'{binsheet_folder_id}' in parents and "
-                f"mimeType = 'application/pdf' and "
-                f"trashed = false"
+        # Process all orders
+        success_count = 0
+        errors = []
+        for order in orders:
+            success, error_msg = _process_single_order_print(
+                drive, order, mode, print_folder_id, binsheet_folder_id, ORDERS_PARENT_FOLDER_ID
             )
-            bin_sheet_files = drive.files().list(
-                q=bin_sheet_query, fields="files(id, name)"
-            ).execute().get("files", [])
-            
-            if not bin_sheet_files:
-                print(f"❌ Bin sheet file not found: {bin_sheet_filename}")
-                return jsonify({"status": "error", "error": f"Bin sheet file not found: {bin_sheet_filename}"}), 404
+            if success:
+                success_count += 1
+            else:
+                errors.append(f"Order {order}: {error_msg}")
 
-            bin_sheet_file = bin_sheet_files[0]
-            print(f"✅ Found bin sheet file: {bin_sheet_file['name']}")
-
-            # 3. Copy the bin sheet to the Print Fur PDF folder
-            new_bin_sheet_name = f"{order}_{bin_sheet_file['name']}"
-            
-            copied_bin_sheet = drive.files().copy(
-                fileId=bin_sheet_file["id"],
-                body={"name": new_bin_sheet_name, "parents": [print_folder_id]},
-                fields="id, name"
-            ).execute()
-            
-            print(f"✅ Copied bin sheet PDF: {copied_bin_sheet['name']} (ID: {copied_bin_sheet['id']})")
+        if is_batch:
+            return jsonify({
+                "status": "ok",
+                "successCount": success_count,
+                "totalCount": len(orders),
+                "errors": errors if errors else None
+            })
+        else:
+            # Single order mode - return error if failed
+            if success_count == 0:
+                error_msg = errors[0] if errors else "Unknown error"
+                return jsonify({"status": "error", "error": error_msg}), 500
+            return jsonify({"status": "ok"})
 
     except Exception as e:
         import traceback
@@ -11496,8 +11553,6 @@ def print_handler():
         print(f"❌ Error processing print request: {error_msg}")
         traceback.print_exc()
         return jsonify({"status": "error", "error": error_msg}), 500
-
-    return jsonify({"status": "ok"})
 
 
 @app.route("/queue-emb", methods=["POST", "OPTIONS"])
