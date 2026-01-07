@@ -5507,7 +5507,7 @@ def build_overview_payload():
                 '"Stage", "Due Date", "Ship Date", "Hard Date/Soft Date"'
             )
             .neq("Stage", "COMPLETE")
-            .order("Due Date", desc=False, nulls_last=True)
+            .order("Due Date", desc=False)
             .limit(25)
             .execute()
         )
@@ -7691,6 +7691,11 @@ def auto_fill_machines():
         remaining_queue = queue_jobs[:]  # copy to work with
         moves_made = []
         
+        # Safety limit: don't process more than 200 jobs at once
+        MAX_JOBS_TO_PROCESS = 200
+        if len(remaining_queue) > MAX_JOBS_TO_PROCESS:
+            remaining_queue = remaining_queue[:MAX_JOBS_TO_PROCESS]
+        
         for machine in target_machines:
             current_jobs = machine["jobs"]
             needed = max(0, 10 - len(current_jobs))
@@ -7701,8 +7706,10 @@ def auto_fill_machines():
             last_company = get_last_company(current_jobs)
             added_count = 0
             i = 0
+            skipped_count = 0
+            MAX_SKIPS = 100  # Safety: if we skip too many in a row, break to avoid infinite loop
             
-            while i < len(remaining_queue) and added_count < needed:
+            while i < len(remaining_queue) and added_count < needed and skipped_count < MAX_SKIPS:
                 job = remaining_queue[i]
                 job_company = get_company(job)
                 
@@ -7756,7 +7763,11 @@ def auto_fill_machines():
                 if should_skip:
                     # Skip this job
                     i += 1
+                    skipped_count += 1
                     continue
+                
+                # Reset skip counter when we add a job
+                skipped_count = 0
                 
                 # Otherwise, add the job
                 current_jobs.append(job)
@@ -7767,11 +7778,18 @@ def auto_fill_machines():
                     last_company = job_company
         
         # Return updated state
+        # Find machine2 jobs from target_machines if it was processed
+        updated_machine2 = machine2_jobs
+        for machine in target_machines:
+            if machine["key"] == "machine2":
+                updated_machine2 = machine["jobs"]
+                break
+        
         result = {
             "status": "ok",
             "queue": remaining_queue,
             "machine1": machine1_jobs,  # unchanged (1 head, excluded)
-            "machine2": target_machines[0]["jobs"] if target_machines and target_machines[0]["key"] == "machine2" else machine2_jobs,
+            "machine2": updated_machine2,
             "moves_made": moves_made
         }
         
