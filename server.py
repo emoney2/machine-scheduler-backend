@@ -8139,21 +8139,31 @@ def submit_order():
             return jsonify({"error": "Material1 is required."}), 400
 
         product_lower = (data.get("product") or "").strip().lower()
+        product = data.get("product") or ""
+        
+        # Check if this is a quilted front product that needs a back order
+        quilted_front_products = [
+            "quilted driver front",
+            "quilted fairway front", 
+            "quilted hybrid front"
+        ]
+        is_quilted_front = any(qfp in product_lower for qfp in quilted_front_products)
+        
         if "full" in product_lower and not data.get("backMaterial", "").strip():
-            return jsonify({"error": "Back Material is required for “Full” products."}), 400
+            return jsonify({"error": 'Back Material is required for "Full" products.'}), 400
 
         for idx, mat in enumerate(materials):
             if mat.strip():
                 pct = material_percents[idx].strip()
                 if not pct:
                     return jsonify({
-                        "error": f"Percentage for Material{idx+1} (“{mat}”) is required."
+                        "error": f'Percentage for Material{idx+1} ("{mat}") is required.'
                     }), 400
                 try:
                     float(pct)
                 except ValueError:
                     return jsonify({
-                        "error": f"Material{idx+1} percentage (“{pct}”) must be a number."
+                        "error": f'Material{idx+1} percentage ("{pct}") must be a number.'
                     }), 400
 
         # ─── DETERMINE NEXT ROW & ORDER # ────────────────────────────────────
@@ -8165,6 +8175,10 @@ def submit_order():
         next_row = len(col_a) + 1
         prev_order = int(col_a[-1][0]) if len(col_a) > 1 else 0
         new_order = prev_order + 1
+        
+        # For quilted front products, we'll create two orders (front and back)
+        # The back order will be new_order + 1
+        back_order = new_order + 1 if is_quilted_front else None
 
         # ─── TEMPLATE FORMULAS ───────────────────────────────────────────────
         def tpl_formula(col_letter, target_row):
@@ -8182,7 +8196,7 @@ def submit_order():
         stitch_count = tpl_formula("W", next_row)
         schedule_str = tpl_formula("AC", next_row)
 
-        # ─── CREATE ORDER FOLDER & UPLOAD (UNCHANGED) ────────────────────────
+        # ─── CREATE ORDER FOLDER & UPLOAD ────────────────────────────────────────
         drive = get_drive_service()
 
         def create_folder(name, parent_id=None):
@@ -8203,33 +8217,84 @@ def submit_order():
                 fileId=file_id, body={"role": "reader", "type": "anyone"}
             ).execute()
 
+        # ─── READ FILES INTO MEMORY IF NEEDED FOR DUPLICATE UPLOAD ────────────────
+        from io import BytesIO
+        if is_quilted_front:
+            # Read all files into memory for reuse in second order
+            prod_files_data = []
+            for f in prod_files:
+                file_data = f.read()
+                prod_files_data.append({
+                    "filename": f.filename,
+                    "mimetype": f.mimetype,
+                    "data": file_data
+                })
+            
+            print_files_data = []
+            if print_files:
+                for f in print_files:
+                    file_data = f.read()
+                    print_files_data.append({
+                        "filename": f.filename,
+                        "mimetype": f.mimetype,
+                        "data": file_data
+                    })
+        else:
+            prod_files_data = None
+            print_files_data = None
+
+        # ─── CREATE FIRST ORDER (FRONT) ───────────────────────────────────────────
         order_folder_id = create_folder(
             new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
         )
         make_public(order_folder_id)
 
         prod_links = []
-        for f in prod_files:
-            m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
-            up = drive.files().create(
-                body={"name": f.filename, "parents": [order_folder_id]},
-                media_body=m,
-                fields="id,webViewLink",
-            ).execute()
-            make_public(up["id"])
-            prod_links.append(up["webViewLink"])
+        if is_quilted_front:
+            # Use in-memory data
+            for f_data in prod_files_data:
+                m = MediaIoBaseUpload(BytesIO(f_data["data"]), mimetype=f_data["mimetype"])
+                up = drive.files().create(
+                    body={"name": f_data["filename"], "parents": [order_folder_id]},
+                    media_body=m,
+                    fields="id,webViewLink",
+                ).execute()
+                make_public(up["id"])
+                prod_links.append(up["webViewLink"])
+        else:
+            # Use original file streams
+            for f in prod_files:
+                m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+                up = drive.files().create(
+                    body={"name": f.filename, "parents": [order_folder_id]},
+                    media_body=m,
+                    fields="id,webViewLink",
+                ).execute()
+                make_public(up["id"])
+                prod_links.append(up["webViewLink"])
 
         print_links = ""
-        if print_files:
+        if print_files or (is_quilted_front and print_files_data):
             pf_id = create_folder("Print Files", parent_id=order_folder_id)
             make_public(pf_id)
-            for f in print_files:
-                m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
-                drive.files().create(
-                    body={"name": f.filename, "parents": [pf_id]},
-                    media_body=m,
-                    fields="id",
-                ).execute()
+            if is_quilted_front and print_files_data:
+                # Use in-memory data
+                for f_data in print_files_data:
+                    m = MediaIoBaseUpload(BytesIO(f_data["data"]), mimetype=f_data["mimetype"])
+                    drive.files().create(
+                        body={"name": f_data["filename"], "parents": [pf_id]},
+                        media_body=m,
+                        fields="id",
+                    ).execute()
+            elif print_files:
+                # Use original file streams
+                for f in print_files:
+                    m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+                    drive.files().create(
+                        body={"name": f.filename, "parents": [pf_id]},
+                        media_body=m,
+                        fields="id",
+                    ).execute()
             print_links = f"https://drive.google.com/drive/folders/{pf_id}"
 
         # ─── WRITE TO GOOGLE SHEETS ──────────────────────────────────────────
@@ -8276,8 +8341,97 @@ def submit_order():
         except Exception as e:
             logger.error("[MaterialLog] Failed for order %s: %s", new_order, e)
 
+        # ─── CREATE SECOND ORDER (BACK) FOR QUILTED FRONT PRODUCTS ──────────
+        if is_quilted_front and back_order:
+            # Create folder for back order
+            back_order_folder_id = create_folder(
+                back_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
+            )
+            make_public(back_order_folder_id)
+
+            # Upload production files to back order folder
+            back_prod_links = []
+            for f_data in prod_files_data:
+                m = MediaIoBaseUpload(BytesIO(f_data["data"]), mimetype=f_data["mimetype"])
+                up = drive.files().create(
+                    body={"name": f_data["filename"], "parents": [back_order_folder_id]},
+                    media_body=m,
+                    fields="id,webViewLink",
+                ).execute()
+                make_public(up["id"])
+                back_prod_links.append(up["webViewLink"])
+
+            # Upload print files to back order folder
+            back_print_links = ""
+            if print_files_data:
+                back_pf_id = create_folder("Print Files", parent_id=back_order_folder_id)
+                make_public(back_pf_id)
+                for f_data in print_files_data:
+                    m = MediaIoBaseUpload(BytesIO(f_data["data"]), mimetype=f_data["mimetype"])
+                    drive.files().create(
+                        body={"name": f_data["filename"], "parents": [back_pf_id]},
+                        media_body=m,
+                        fields="id",
+                    ).execute()
+                back_print_links = f"https://drive.google.com/drive/folders/{back_pf_id}"
+
+            # Get formulas for back order row
+            back_next_row = next_row + 1
+            back_preview = tpl_formula("C", back_next_row)
+            back_stage = tpl_formula("I", back_next_row)
+            back_ship_date = tpl_formula("V", back_next_row)
+            back_stitch_count = tpl_formula("W", back_next_row)
+            back_schedule_str = tpl_formula("AC", back_next_row)
+
+            # Write back order to Google Sheets with price = 0
+            back_row = [
+                back_order, ts, back_preview, data.get("company"),
+                data.get("designName"), data.get("quantity"), "",
+                data.get("product"), back_stage, "0",  # Price set to 0
+                data.get("dueDate"), ("PRINT" if back_prod_links else "NO"),
+                *materials,
+                data.get("backMaterial"), data.get("furColor"),
+                data.get("embBacking", ""), "",
+                back_ship_date, back_stitch_count, data.get("notes"),
+                ",".join(back_prod_links), back_print_links, "",
+                data.get("dateType"), back_schedule_str, "", "", "",
+                *material_percents,
+            ]
+
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!A{back_next_row}:AK{back_next_row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [back_row]},
+            ).execute()
+
+            # Write back order to Supabase with price = 0
+            if supabase:
+                supabase.table("Production Orders TEST").insert({
+                    "Order #": back_order,
+                    "Date": ts,
+                    "Company Name": data.get("company"),
+                    "Design": data.get("designName"),
+                    "Quantity": int(data.get("quantity") or 0),
+                    "Product": data.get("product"),
+                    "Price": 0.0,  # Price set to 0
+                    "Due Date": data.get("dueDate"),
+                    "Stage": "ORDERED",
+                }).execute()
+
+            # Write material log for back order
+            try:
+                write_material_log_for_order(back_order)
+            except Exception as e:
+                logger.error("[MaterialLog] Failed for back order %s: %s", back_order, e)
+
         invalidate_upcoming_cache()
-        return jsonify({"status": "ok", "order": new_order}), 200
+        
+        # Return both order numbers if quilted front, otherwise just the one
+        if is_quilted_front and back_order:
+            return jsonify({"status": "ok", "order": new_order, "back_order": back_order}), 200
+        else:
+            return jsonify({"status": "ok", "order": new_order}), 200
 
     except Exception as e:
         tb = traceback.format_exc()
