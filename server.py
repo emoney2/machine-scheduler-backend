@@ -8318,7 +8318,6 @@ def submit_order():
             ",".join(prod_links), print_links, "",
             data.get("dateType"), schedule_str, "", "", "",
             *material_percents,
-            threads_formula if threads_formula else "",  # Add Threads formula at the end
         ]
 
         sheets.values().update(
@@ -8327,6 +8326,15 @@ def submit_order():
             valueInputOption="USER_ENTERED",
             body={"values": [row]},
         ).execute()
+        
+        # ─── WRITE THREADS FORMULA SEPARATELY (column AF) ─────────────────────
+        if threads_formula:
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!AF{next_row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[threads_formula]]},
+            ).execute()
 
         # ─── WRITE PRODUCTION ORDER TO SUPABASE ──────────────────────────────
         if supabase:
@@ -8417,7 +8425,6 @@ def submit_order():
                 ",".join(back_prod_links), back_print_links, "",
                 data.get("dateType"), back_schedule_str, "", "", "",
                 *material_percents,
-                back_threads_formula if back_threads_formula else "",  # Add Threads formula at the end
             ]
 
             sheets.values().update(
@@ -8426,6 +8433,15 @@ def submit_order():
                 valueInputOption="USER_ENTERED",
                 body={"values": [back_row]},
             ).execute()
+            
+            # ─── WRITE THREADS FORMULA SEPARATELY FOR BACK ORDER (column AF) ───
+            if back_threads_formula:
+                sheets.values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"Production Orders!AF{back_next_row}",
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[back_threads_formula]]},
+                ).execute()
 
             # Write back order to Supabase with price = 0
             if supabase:
