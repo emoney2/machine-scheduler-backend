@@ -310,6 +310,17 @@ KANBAN_REQUEST_COOLDOWN_SECS = int(
 import re, os
 
 _DRIVE_NAME_CACHE: dict[tuple[str, str], dict] = {}
+_DRIVE_NAME_CACHE_MAX_SIZE = 500  # Maximum number of entries
+
+
+def _drive_name_cache_cleanup():
+    """Enforce size limit on _DRIVE_NAME_CACHE by removing oldest entries."""
+    if len(_DRIVE_NAME_CACHE) > _DRIVE_NAME_CACHE_MAX_SIZE:
+        # Remove oldest entries (FIFO - remove first N entries)
+        to_remove = len(_DRIVE_NAME_CACHE) - _DRIVE_NAME_CACHE_MAX_SIZE
+        keys_to_remove = list(_DRIVE_NAME_CACHE.keys())[:to_remove]
+        for k in keys_to_remove:
+            _DRIVE_NAME_CACHE.pop(k, None)
 
 
 def _build_full_scan_payload(order_row: dict) -> dict:
@@ -476,6 +487,7 @@ def _drive_find_first_in_folder_by_name(folder_id: str, name_hint: str):
             )
             files = resp.get("files", [])
             if files:
+                _drive_name_cache_cleanup()  # Enforce size limit before adding
                 _DRIVE_NAME_CACHE[cache_key] = files[0]
                 return files[0]
         except Exception as e:
@@ -497,9 +509,11 @@ def _drive_find_first_in_folder_by_name(folder_id: str, name_hint: str):
 
         for f in files:
             if _noext_lower(f.get("name", "")) == base.lower():
+                _drive_name_cache_cleanup()  # Enforce size limit before adding
                 _DRIVE_NAME_CACHE[cache_key] = f
                 return f
         if files:
+            _drive_name_cache_cleanup()  # Enforce size limit before adding
             _DRIVE_NAME_CACHE[cache_key] = files[0]
             return files[0]
     except Exception as e:
@@ -513,8 +527,43 @@ THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
 # --- Tiny in-process cache for Drive thumbnails ---
-_drive_thumb_cache = {}  # key: f"{file_id}:{modified_time}" -> bytes
+_drive_thumb_cache = {}  # key: f"{file_id}:{modified_time}" -> {'bytes': b, 'ts': float}
 _drive_thumb_ttl = 600  # seconds (10 min)
+_drive_thumb_cache_max_size = 1000  # Maximum number of entries
+_drive_thumb_cache_last_cleanup = 0
+_drive_thumb_cache_cleanup_interval = 300  # Clean up every 5 minutes
+
+
+def _drive_thumb_cache_cleanup():
+    """Remove expired entries and enforce size limit on _drive_thumb_cache."""
+    global _drive_thumb_cache_last_cleanup
+    now = time.time()
+    
+    # Only cleanup periodically to avoid overhead
+    if now - _drive_thumb_cache_last_cleanup < _drive_thumb_cache_cleanup_interval:
+        return
+    
+    _drive_thumb_cache_last_cleanup = now
+    
+    # Remove expired entries
+    expired_keys = [
+        k for k, v in _drive_thumb_cache.items()
+        if isinstance(v, dict) and (now - v.get("ts", 0)) >= _drive_thumb_ttl
+    ]
+    for k in expired_keys:
+        _drive_thumb_cache.pop(k, None)
+    
+    # If still too large, remove oldest entries
+    if len(_drive_thumb_cache) > _drive_thumb_cache_max_size:
+        # Sort by timestamp (oldest first)
+        entries_with_ts = [
+            (k, v.get("ts", 0) if isinstance(v, dict) else 0)
+            for k, v in _drive_thumb_cache.items()
+        ]
+        sorted_entries = sorted(entries_with_ts, key=lambda kv: kv[1])
+        to_remove = len(_drive_thumb_cache) - _drive_thumb_cache_max_size
+        for k, _ in sorted_entries[:to_remove]:
+            _drive_thumb_cache.pop(k, None)
 
 _matlog_cache = None  # {"by_order": {"123": [items...]}, "ts": float}
 _matlog_cache_ttl = 60.0  # seconds
@@ -1411,6 +1460,39 @@ import hashlib, threading
 _cache_lock = threading.Lock()
 # key -> {'ts': float, 'ttl': int, 'etag': str, 'data': bytes}
 _json_cache = {}
+_json_cache_last_cleanup = 0
+_json_cache_cleanup_interval = 300  # Clean up every 5 minutes
+_json_cache_max_size = 1000  # Maximum number of entries
+
+
+def _cache_cleanup():
+    """Remove expired entries and enforce size limit."""
+    global _json_cache_last_cleanup, _json_cache
+    now = time.time()
+    
+    # Only cleanup periodically to avoid overhead
+    if now - _json_cache_last_cleanup < _json_cache_cleanup_interval:
+        return
+    
+    _json_cache_last_cleanup = now
+    with _cache_lock:
+        # Remove expired entries
+        expired_keys = [
+            k for k, v in _json_cache.items()
+            if (now - v["ts"]) >= v["ttl"]
+        ]
+        for k in expired_keys:
+            _json_cache.pop(k, None)
+        
+        # If still too large, remove oldest entries
+        if len(_json_cache) > _json_cache_max_size:
+            sorted_entries = sorted(
+                _json_cache.items(),
+                key=lambda kv: kv[1]["ts"]
+            )
+            to_remove = len(_json_cache) - _json_cache_max_size
+            for k, _ in sorted_entries[:to_remove]:
+                _json_cache.pop(k, None)
 
 
 def _cache_get(key):
@@ -1424,7 +1506,8 @@ def _cache_get(key):
         if not ent:
             return None
         if (now - ent["ts"]) >= ent["ttl"]:
-            # expired – treat as missing
+            # expired – remove it
+            _json_cache.pop(key, None)
             return None
         return ent
 
@@ -1432,6 +1515,7 @@ def _cache_get(key):
 def _cache_set(key, data, ttl=30):
     """
     Store bytes in _json_cache with a TTL and return a safe, quoted ETag.
+    Periodically cleans up expired entries.
     """
     ts = time.time()
     etag = f'"{key}-{int(ts)}"'
@@ -1442,6 +1526,8 @@ def _cache_set(key, data, ttl=30):
             "ttl": ttl,
             "etag": etag,
         }
+    # Periodic cleanup (non-blocking check)
+    _cache_cleanup()
     return etag
 
 
@@ -2599,6 +2685,7 @@ def drive_thumbnail():
                 buf = BytesIO()
                 out_img.save(buf, format="PNG", optimize=True)
                 out = buf.getvalue()
+                _drive_thumb_cache_cleanup()  # Cleanup before adding
                 _drive_thumb_cache[tinted_key] = {"bytes": out, "ts": time.time()}
                 return Response(
                     out,
@@ -2681,6 +2768,7 @@ def drive_thumbnail():
                 buf = BytesIO()
                 out_img.save(buf, format="PNG", optimize=True)
                 out = buf.getvalue()
+                _drive_thumb_cache_cleanup()  # Cleanup before adding
                 _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
                 _drive_thumb_cache[tinted_key] = {"bytes": out, "ts": time.time()}
                 return Response(
@@ -2690,6 +2778,7 @@ def drive_thumbnail():
                 )
             except Exception as e:
                 app.logger.info("🎨 tint failed: %s", e)
+                _drive_thumb_cache_cleanup()  # Cleanup before adding
                 _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
                 return Response(
                     raw_bytes,
@@ -2697,6 +2786,7 @@ def drive_thumbnail():
                     headers={"Cache-Control": "public, max-age=86400"},
                 )
         else:
+            _drive_thumb_cache_cleanup()  # Cleanup before adding
             _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
             return Response(
                 raw_bytes,
@@ -2819,6 +2909,7 @@ def drive_thumbnail():
                 buf = BytesIO()
                 out_img.save(buf, format="PNG", optimize=True)
                 out = buf.getvalue()
+                _drive_thumb_cache_cleanup()  # Cleanup before adding
                 _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
                 _drive_thumb_cache[tinted_key] = {"bytes": out, "ts": time.time()}
                 return Response(
@@ -2828,6 +2919,7 @@ def drive_thumbnail():
                 )
             except Exception as e:
                 app.logger.info("🎨 tint(lh3) failed: %s", e)
+                _drive_thumb_cache_cleanup()  # Cleanup before adding
                 _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
                 return Response(
                     raw_bytes,
@@ -2835,6 +2927,7 @@ def drive_thumbnail():
                     headers={"Cache-Control": "public, max-age=86400"},
                 )
         else:
+            _drive_thumb_cache_cleanup()  # Cleanup before adding
             _drive_thumb_cache[base_key] = {"bytes": raw_bytes, "ts": time.time()}
             return Response(
                 raw_bytes,
@@ -2895,6 +2988,7 @@ def drive_thumbnail():
                         buf = BytesIO()
                         out_img.save(buf, format="PNG", optimize=True)
                         out = buf.getvalue()
+                        _drive_thumb_cache_cleanup()  # Cleanup before adding
                         _drive_thumb_cache[base_key] = {
                             "bytes": raw_bytes,
                             "ts": time.time(),
@@ -2910,6 +3004,7 @@ def drive_thumbnail():
                         )
                     except Exception as e:
                         app.logger.info("🎨 tint(raw) failed: %s", e)
+                        _drive_thumb_cache_cleanup()  # Cleanup before adding
                         _drive_thumb_cache[base_key] = {
                             "bytes": raw_bytes,
                             "ts": time.time(),
@@ -2920,6 +3015,7 @@ def drive_thumbnail():
                             headers={"Cache-Control": "public, max-age=86400"},
                         )
                 else:
+                    _drive_thumb_cache_cleanup()  # Cleanup before adding
                     _drive_thumb_cache[base_key] = {
                         "bytes": raw_bytes,
                         "ts": time.time(),
@@ -3749,6 +3845,7 @@ def drive_proxy(file_id):
         etag = '"' + hashlib.sha1(data).hexdigest() + '"'  # weak-ish ETag
 
         # Save to cache
+        _drive_thumb_cache_cleanup()  # Cleanup before adding
         _drive_thumb_cache[key] = {"data": data, "ct": ct, "etag": etag, "ts": now}
 
         resp = Response(data, mimetype=ct)
@@ -4724,14 +4821,6 @@ CORS(
     },
     supports_credentials=True,
 )
-
-
-from flask import session  # (if not already imported)
-
-
-@app.before_request
-def _debug_session():
-    logger.info("🔑 Session data for %s → %s", request.path, dict(session))
 
 
 # ─── Session & Auth Helpers ──────────────────────────────────────────────────
