@@ -5508,6 +5508,36 @@ def build_overview_payload():
     )
 
     # Map fields to match frontend expectations (only filter out COMPLETE jobs, which is already done in query)
+    # Optimized date parsing helper
+    from datetime import datetime
+    
+    def parse_date_fast(val):
+        """Fast date parser - handles common formats without exceptions"""
+        if not val:
+            return None
+        if hasattr(val, 'year'):  # Already a date object
+            return val
+        if hasattr(val, 'date'):  # datetime object
+            return val.date()
+        
+        if isinstance(val, str):
+            date_str = val.split()[0]  # Get date part only
+            # Try ISO format first (most common from Supabase)
+            if len(date_str) == 10 and date_str[4] == '-' and date_str[7] == '-':
+                try:
+                    return datetime.strptime(date_str, "%Y-%m-%d").date()
+                except:
+                    pass
+            # Try MM/DD/YYYY format
+            if '/' in date_str:
+                parts = date_str.split('/')
+                if len(parts) == 3:
+                    try:
+                        return datetime(int(parts[2]), int(parts[0]), int(parts[1])).date()
+                    except:
+                        pass
+        return None
+    
     upcoming = []
     for r in (rows or []):
         # Map fields to match frontend expectations
@@ -5530,51 +5560,11 @@ def build_overview_payload():
         }
         upcoming.append(job)
     
-    # Sort by Ship Date, then Due Date
+    # Sort by Ship Date, then Due Date - optimized
     def sort_key(j):
-        ship = j.get("Ship Date")
-        due = j.get("Due Date")
-        ship_date = None
-        due_date = None
-        try:
-            if ship:
-                from datetime import datetime
-                if isinstance(ship, str):
-                    date_part = ship.split()[0]
-                    # Try ISO format first
-                    try:
-                        ship_date = datetime.strptime(date_part, "%Y-%m-%d").date()
-                    except:
-                        for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y"]:
-                            try:
-                                ship_date = datetime.strptime(date_part, fmt).date()
-                                break
-                            except:
-                                continue
-                elif hasattr(ship, 'date'):
-                    ship_date = ship.date()
-                elif hasattr(ship, 'year'):  # date object
-                    ship_date = ship
-            if due:
-                from datetime import datetime
-                if isinstance(due, str):
-                    date_part = due.split()[0]
-                    # Try ISO format first
-                    try:
-                        due_date = datetime.strptime(date_part, "%Y-%m-%d").date()
-                    except:
-                        for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y"]:
-                            try:
-                                due_date = datetime.strptime(date_part, fmt).date()
-                                break
-                            except:
-                                continue
-                elif hasattr(due, 'date'):
-                    due_date = due.date()
-                elif hasattr(due, 'year'):  # date object
-                    due_date = due
-        except:
-            pass
+        ship_date = parse_date_fast(j.get("Ship Date"))
+        due_date = parse_date_fast(j.get("Due Date"))
+        # Use tuple comparison - None values sort last
         return (ship_date or date.max, due_date or date.max)
     
     upcoming.sort(key=sort_key)
