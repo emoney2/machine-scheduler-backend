@@ -4041,56 +4041,8 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
 
 
 def get_quickbooks_credentials():
-    # 1) First, try the live session token in Flask session
-    token_data = session.get("qbo_token")
-    if token_data and "access_token" in token_data:
-        realm_id = token_data.get("realmId")
-        token = {
-            "access_token": token_data["access_token"],
-            "refresh_token": token_data.get("refresh_token"),
-            "expires_at": token_data.get("expires_at", 0),
-        }
-
-        # → refresh if expired
-        if token["expires_at"] < time.time():
-            env_for_oauth = session.get("qboEnv", QBO_ENV)
-            client_id, client_secret = get_qbo_oauth_credentials(env_for_oauth)
-
-            oauth = OAuth2Session(
-                client_id=client_id,
-                token=token,
-                auto_refresh_kwargs={
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                },
-                auto_refresh_url=QBO_TOKEN_URL,
-                token_updater=lambda new_tok: None,
-            )
-            new_token = oauth.refresh_token(
-                QBO_TOKEN_URL, client_id=client_id, client_secret=client_secret
-            )
-
-            new_token["expires_at"] = time.time() + int(new_token["expires_in"])
-
-            # persist refreshed token to session & disk
-            session["qbo_token"] = {
-                "access_token": new_token["access_token"],
-                "refresh_token": new_token["refresh_token"],
-                "expires_at": new_token["expires_at"],
-                "realmId": realm_id,
-            }
-            with open(TOKEN_PATH, "w") as f:
-                json.dump({**new_token, "realmId": realm_id}, f, indent=2)
-            token = new_token
-
-        headers = {
-            "Authorization": f"Bearer {token['access_token']}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
-        return headers, realm_id
-
-    # 2) Fallback to disk-persisted token
+    # Always read from disk to avoid storing large tokens in sessions
+    # Sessions only store a flag (qbo_authenticated) to indicate auth status
     if os.path.exists(TOKEN_PATH):
         with open(TOKEN_PATH) as f:
             file_token = json.load(f)
@@ -4143,15 +4095,11 @@ def get_quickbooks_credentials():
                     new_token.get("expires_in", 3600)
                 )
 
-                # persist refreshed token to disk & session
+                # persist refreshed token to disk only (not session to save memory)
                 with open(TOKEN_PATH, "w") as f:
                     json.dump({**new_token, "realmId": realm_id}, f, indent=2)
-                session["qbo_token"] = {
-                    "access_token": new_token.get("access_token"),
-                    "refresh_token": new_token.get("refresh_token"),
-                    "expires_at": new_token.get("expires_at"),
-                    "realmId": realm_id,
-                }
+                # Only store a flag in session, not the full token
+                session["qbo_authenticated"] = True
                 token = new_token
 
             headers = {
@@ -4231,13 +4179,8 @@ def refresh_quickbooks_token():
     with open(TOKEN_PATH, "w") as f:
         json.dump(disk_data, f, indent=2)
 
-    # ── 6) Update session so API calls see the new expiry ───────
-    session["qbo_token"] = {
-        "access_token": new_token["access_token"],
-        "refresh_token": new_token["refresh_token"],
-        "expires_at": time.time() + int(new_token["expires_in"]),
-        "realmId": disk_data["realmId"],
-    }
+    # ── 6) Only store a flag in session (not the full token to save memory) ───────
+    session["qbo_authenticated"] = True
 
     print(f"🔁 Refreshed QBO token for env '{env_override}'")
 
@@ -4526,9 +4469,19 @@ def create_invoice_in_quickbooks(
 ):
     print(f"🧾 Creating real QuickBooks invoice for order {order_data['Order #']}")
 
-    token = session.get("qbo_token")
-    print("🔑 QBO Token in session:", token)
-    print("🏢 Realm ID in session:", token.get("realmId") if token else None)
+    # Read token from disk instead of session to avoid memory issues
+    token = None
+    if os.path.exists(TOKEN_PATH):
+        with open(TOKEN_PATH) as f:
+            disk_token = json.load(f)
+            token = {
+                "access_token": disk_token.get("access_token"),
+                "refresh_token": disk_token.get("refresh_token"),
+                "expires_at": disk_token.get("expires_at", 0),
+                "realmId": disk_token.get("realmId"),
+            }
+    print("🔑 QBO Token from disk:", "present" if token else "missing")
+    print("🏢 Realm ID:", token.get("realmId") if token else None)
     if not token or "access_token" not in token or "expires_at" not in token:
         env_qbo = session.get("qboEnv", QBO_ENV)
         next_url = f"/qbo/login?env={env_qbo}"
@@ -4538,7 +4491,25 @@ def create_invoice_in_quickbooks(
     if time.time() >= token["expires_at"]:
         print("🔁 Access token expired. Refreshing...")
         refresh_quickbooks_token()
-        token = session.get("qbo_token")  # re-pull refreshed token
+        # Re-read token from disk after refresh
+        if os.path.exists(TOKEN_PATH):
+            with open(TOKEN_PATH) as f:
+                disk_token = json.load(f)
+                token = {
+                    "access_token": disk_token.get("access_token"),
+                    "refresh_token": disk_token.get("refresh_token"),
+                    "expires_at": disk_token.get("expires_at", 0),
+                    "realmId": disk_token.get("realmId"),
+                }
+        if os.path.exists(TOKEN_PATH):
+            with open(TOKEN_PATH) as f:
+                disk_token = json.load(f)
+                token = {
+                    "access_token": disk_token.get("access_token"),
+                    "refresh_token": disk_token.get("refresh_token"),
+                    "expires_at": disk_token.get("expires_at", 0),
+                    "realmId": disk_token.get("realmId"),
+                }
 
     access_token = token.get("access_token")
     realm_id = token.get("realmId")
@@ -10290,13 +10261,8 @@ def qbo_callback():
         json.dump(disk_data, f, indent=2)
     logger.info("✅ Wrote QBO token to disk at %s", TOKEN_PATH)
 
-    # ── 5) Store in session for your API calls ────────────────────
-    session["qbo_token"] = {
-        "access_token": token["access_token"],
-        "refresh_token": token["refresh_token"],
-        "expires_at": time.time() + int(token["expires_in"]),
-        "realmId": realm,
-    }
+    # ── 5) Only store a flag in session (not the full token to save memory) ────────────────────
+    session["qbo_authenticated"] = True
     session["qboEnv"] = env_override
     logger.info("✅ Stored QBO token in session, environment: %s", env_override)
 
