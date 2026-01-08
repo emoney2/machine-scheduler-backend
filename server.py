@@ -5480,6 +5480,7 @@ def build_overview_payload():
     rows = []
     try:
         # Query Supabase for incomplete jobs, including image fields
+        # Try case-insensitive filter - Supabase neq is case-sensitive, so we'll filter in Python
         resp = (
             supabase
             .table("Production Orders TEST")
@@ -5488,17 +5489,24 @@ def build_overview_payload():
                 '"Stage", "Due Date", "Ship Date", "Hard Date/Soft Date", '
                 '"Preview", "Image", "Art Link", "Print"'
             )
-            .neq("Stage", "COMPLETE")
             .order("Due Date", desc=False)
-            .limit(100)  # Fetch more to allow for sorting
+            .limit(200)  # Fetch more to allow for filtering and sorting
             .execute()
         )
 
         if resp.data and isinstance(resp.data, list):
-            rows = resp.data
+            # Filter out COMPLETE jobs (case-insensitive)
+            rows = [
+                r for r in resp.data 
+                if r.get("Stage") 
+                and str(r.get("Stage", "")).strip().upper() not in ["COMPLETE", "COMPLETED"]
+            ]
+            app.logger.info("📊 Filtered to %d non-complete jobs from %d total", len(rows), len(resp.data))
+        else:
+            app.logger.warning("⚠️ Supabase returned no data or unexpected format: %s", type(resp.data))
 
-    except Exception:
-        app.logger.exception("Failed to fetch upcoming jobs from Supabase")
+    except Exception as e:
+        app.logger.exception("Failed to fetch upcoming jobs from Supabase: %s", str(e))
         rows = []
 
     # ✅ LOG OUTSIDE try/except
