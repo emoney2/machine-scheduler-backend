@@ -5477,38 +5477,20 @@ def build_overview_payload():
     # ── 1) Upcoming jobs from Supabase ───────────────────────────────────────
     app.logger.info("🔍 build_overview_payload() — fetching jobs from Supabase")
 
-    query = """
-    SELECT
-      "Order #",
-      "Company Name",
-      "Design",
-      "Quantity",
-      "Product",
-      "Stage",
-      "Due Date",
-      "Ship Date",
-      "Hard Date/Soft Date"
-    FROM "Production Orders TEST"
-    WHERE
-      UPPER(TRIM("Stage")) <> 'COMPLETE'
-    ORDER BY "Due Date" ASC NULLS LAST
-    LIMIT 25
-    """
-
-    app.logger.info("🧾 SQL QUERY:\n%s", query)
-
     rows = []
     try:
+        # Query Supabase for incomplete jobs, including image fields
         resp = (
             supabase
             .table("Production Orders TEST")
             .select(
                 '"Order #", "Company Name", "Design", "Quantity", "Product", '
-                '"Stage", "Due Date", "Ship Date", "Hard Date/Soft Date"'
+                '"Stage", "Due Date", "Ship Date", "Hard Date/Soft Date", '
+                '"Preview", "Image", "Art Link", "Print"'
             )
             .neq("Stage", "COMPLETE")
             .order("Due Date", desc=False)
-            .limit(25)
+            .limit(100)  # Fetch more to allow for sorting
             .execute()
         )
 
@@ -5519,27 +5501,84 @@ def build_overview_payload():
         app.logger.exception("Failed to fetch upcoming jobs from Supabase")
         rows = []
 
-
     # ✅ LOG OUTSIDE try/except
     app.logger.warning(
         "🧪 Upcoming jobs pulled from Supabase: %d rows",
         len(rows)
     )
 
-    upcoming = [
-        {
+    # Map fields to match frontend expectations (only filter out COMPLETE jobs, which is already done in query)
+    upcoming = []
+    for r in (rows or []):
+        # Map fields to match frontend expectations
+        job = {
             "Order #": r.get("Order #"),
             "Company Name": r.get("Company Name"),
             "Design": r.get("Design"),
-            "Qty": r.get("Quantity"),
+            "Quantity": r.get("Quantity"),  # Changed from "Qty" to "Quantity"
             "Product": r.get("Product"),
             "Stage": r.get("Stage"),
-            "Due": r.get("Due Date"),
-            "Ship": r.get("Ship Date"),
-            "Hard/Soft": r.get("Hard Date/Soft Date"),
+            "Due Date": r.get("Due Date"),  # Changed from "Due" to "Due Date"
+            "Ship Date": r.get("Ship Date"),  # Changed from "Ship" to "Ship Date"
+            "Hard Date/Soft Date": r.get("Hard Date/Soft Date"),
+            "Hard/Soft": r.get("Hard Date/Soft Date"),  # Keep both for compatibility
+            # Image fields - try multiple possible field names
+            "Preview": r.get("Preview") or r.get("Image") or r.get("Art Link"),
+            "Image": r.get("Image") or r.get("Preview") or r.get("Art Link"),
+            "Art Link": r.get("Art Link") or r.get("Preview") or r.get("Image"),
+            "Print": r.get("Print"),
         }
-        for r in (rows or [])
-    ]
+        upcoming.append(job)
+    
+    # Sort by Ship Date, then Due Date
+    def sort_key(j):
+        ship = j.get("Ship Date")
+        due = j.get("Due Date")
+        ship_date = None
+        due_date = None
+        try:
+            if ship:
+                from datetime import datetime
+                if isinstance(ship, str):
+                    date_part = ship.split()[0]
+                    # Try ISO format first
+                    try:
+                        ship_date = datetime.strptime(date_part, "%Y-%m-%d").date()
+                    except:
+                        for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y"]:
+                            try:
+                                ship_date = datetime.strptime(date_part, fmt).date()
+                                break
+                            except:
+                                continue
+                elif hasattr(ship, 'date'):
+                    ship_date = ship.date()
+                elif hasattr(ship, 'year'):  # date object
+                    ship_date = ship
+            if due:
+                from datetime import datetime
+                if isinstance(due, str):
+                    date_part = due.split()[0]
+                    # Try ISO format first
+                    try:
+                        due_date = datetime.strptime(date_part, "%Y-%m-%d").date()
+                    except:
+                        for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y"]:
+                            try:
+                                due_date = datetime.strptime(date_part, fmt).date()
+                                break
+                            except:
+                                continue
+                elif hasattr(due, 'date'):
+                    due_date = due.date()
+                elif hasattr(due, 'year'):  # date object
+                    due_date = due
+        except:
+            pass
+        return (ship_date or date.max, due_date or date.max)
+    
+    upcoming.sort(key=sort_key)
+    upcoming = upcoming[:25]  # Limit to 25 after sorting
 
     # ── 2) Materials section continues below (unchanged) ──
 
