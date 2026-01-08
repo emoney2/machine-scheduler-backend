@@ -8195,6 +8195,14 @@ def submit_order():
         ship_date = tpl_formula("V", next_row)
         stitch_count = tpl_formula("W", next_row)
         schedule_str = tpl_formula("AC", next_row)
+        
+        # Get Threads formula from row 2
+        threads_formula_raw = sheets.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Production Orders!AF2",
+            valueRenderOption="FORMULA",
+        ).execute().get("values", [[""]])[0][0] or ""
+        threads_formula = re.sub(r"(\b[A-Z]+)2\b", lambda m: f"{m.group(1)}{next_row}", threads_formula_raw) if threads_formula_raw else ""
 
         # ─── CREATE ORDER FOLDER & UPLOAD ────────────────────────────────────────
         drive = get_drive_service()
@@ -8302,7 +8310,7 @@ def submit_order():
             new_order, ts, preview, data.get("company"),
             data.get("designName"), data.get("quantity"), "",
             data.get("product"), stage, data.get("price"),
-            data.get("dueDate"), ("PRINT" if prod_links else "NO"),
+            data.get("dueDate"), "NO",  # Always write "NO" to Print column
             *materials,
             data.get("backMaterial"), data.get("furColor"),
             data.get("embBacking", ""), "",
@@ -8310,6 +8318,7 @@ def submit_order():
             ",".join(prod_links), print_links, "",
             data.get("dateType"), schedule_str, "", "", "",
             *material_percents,
+            threads_formula if threads_formula else "",  # Add Threads formula at the end
         ]
 
         sheets.values().update(
@@ -8382,13 +8391,25 @@ def submit_order():
             back_ship_date = tpl_formula("V", back_next_row)
             back_stitch_count = tpl_formula("W", back_next_row)
             back_schedule_str = tpl_formula("AC", back_next_row)
+            
+            # Get Threads formula from row 2 for back order
+            back_threads_formula_raw = sheets.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Production Orders!AF2",
+                valueRenderOption="FORMULA",
+            ).execute().get("values", [[""]])[0][0] or ""
+            back_threads_formula = re.sub(r"(\b[A-Z]+)2\b", lambda m: f"{m.group(1)}{back_next_row}", back_threads_formula_raw) if back_threads_formula_raw else ""
 
+            # Change product name from "Front" to "Back" for back order
+            original_product = data.get("product", "")
+            back_product = original_product.replace("Front", "Back").replace("front", "back")
+            
             # Write back order to Google Sheets with price = 0
             back_row = [
                 back_order, ts, back_preview, data.get("company"),
                 data.get("designName"), data.get("quantity"), "",
-                data.get("product"), back_stage, "0",  # Price set to 0
-                data.get("dueDate"), ("PRINT" if back_prod_links else "NO"),
+                back_product, back_stage, "0",  # Price set to 0, product changed to Back
+                data.get("dueDate"), "NO",  # Always write "NO" to Print column
                 *materials,
                 data.get("backMaterial"), data.get("furColor"),
                 data.get("embBacking", ""), "",
@@ -8396,6 +8417,7 @@ def submit_order():
                 ",".join(back_prod_links), back_print_links, "",
                 data.get("dateType"), back_schedule_str, "", "", "",
                 *material_percents,
+                back_threads_formula if back_threads_formula else "",  # Add Threads formula at the end
             ]
 
             sheets.values().update(
@@ -8413,7 +8435,7 @@ def submit_order():
                     "Company Name": data.get("company"),
                     "Design": data.get("designName"),
                     "Quantity": int(data.get("quantity") or 0),
-                    "Product": data.get("product"),
+                    "Product": back_product,  # Product changed to Back
                     "Price": 0.0,  # Price set to 0
                     "Due Date": data.get("dueDate"),
                     "Stage": "ORDERED",
@@ -8424,6 +8446,17 @@ def submit_order():
                 write_material_log_for_order(back_order)
             except Exception as e:
                 logger.error("[MaterialLog] Failed for back order %s: %s", back_order, e)
+
+            # ─── CLEANUP: Clear file data from memory to prevent memory leaks ─────
+            # Explicitly clear large file data after uploads complete
+            if prod_files_data:
+                for f_data in prod_files_data:
+                    f_data["data"] = None  # Clear byte data to free memory
+                del prod_files_data[:]  # Clear list
+            if print_files_data:
+                for f_data in print_files_data:
+                    f_data["data"] = None  # Clear byte data to free memory
+                del print_files_data[:]  # Clear list
 
         invalidate_upcoming_cache()
         
