@@ -8962,6 +8962,89 @@ def add_materials():
         return jsonify({"status": "ok"}), 200
 
 
+# ─── THREAD INVENTORY STATUS (for scheduler color coding) ──────────────────
+# Simple cache for thread inventory status
+_thread_inventory_cache = {"ts": 0.0, "data": {}, "ttl": 45}  # 45 second TTL
+
+@app.route("/api/thread-inventory-status", methods=["GET"])
+@login_required_session
+def get_thread_inventory_status():
+    """
+    Returns a map of thread color -> status ("green", "yellow", "red")
+    - green: Inventory.. > 0
+    - yellow: Inventory.. < 0 AND On Order.. > 0
+    - red: Inventory.. < 0 AND On Order.. <= 0
+    
+    Cached for 45 seconds to avoid excessive API calls.
+    """
+    global _thread_inventory_cache
+    now = time.time()
+    
+    # Check cache
+    if now - _thread_inventory_cache["ts"] < _thread_inventory_cache["ttl"]:
+        return jsonify(_thread_inventory_cache["data"]), 200
+    
+    try:
+        # Fetch Thread Inventory sheet
+        rows = fetch_sheet(SPREADSHEET_ID, "Thread Inventory!A1:G")
+        if not rows or len(rows) < 2:
+            return jsonify({}), 200
+        
+        headers = rows[0]
+        # Find column indices
+        try:
+            col_thread = headers.index("Thread Colors")
+            col_inventory = headers.index("Inventory..")
+            col_on_order = headers.index("On Order..")
+        except ValueError as e:
+            logger.error(f"Missing required column in Thread Inventory: {e}")
+            return jsonify({}), 200
+        
+        status_map = {}
+        
+        # Process each row
+        for row in rows[1:]:
+            if len(row) <= max(col_thread, col_inventory, col_on_order):
+                continue
+            
+            thread_color = str(row[col_thread]).strip()
+            if not thread_color:
+                continue
+            
+            # Parse inventory and on_order values
+            try:
+                inventory = float(str(row[col_inventory]).replace(",", "").strip() or "0")
+            except (ValueError, TypeError):
+                inventory = 0.0
+            
+            try:
+                on_order = float(str(row[col_on_order]).replace(",", "").strip() or "0")
+            except (ValueError, TypeError):
+                on_order = 0.0
+            
+            # Determine status
+            if inventory > 0:
+                status = "green"
+            elif inventory < 0 and on_order > 0:
+                status = "yellow"
+            else:  # inventory < 0 and on_order <= 0
+                status = "red"
+            
+            status_map[thread_color] = status
+        
+        # Update cache
+        _thread_inventory_cache["ts"] = now
+        _thread_inventory_cache["data"] = status_map
+        
+        return jsonify(status_map), 200
+        
+    except Exception as e:
+        logger.exception("Error fetching thread inventory status")
+        # Return cached data if available, otherwise empty
+        if _thread_inventory_cache["data"]:
+            return jsonify(_thread_inventory_cache["data"]), 200
+        return jsonify({}), 200
+
 
 # ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
 @app.route("/api/materialInventory", methods=["OPTIONS"])
