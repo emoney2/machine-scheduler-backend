@@ -11896,7 +11896,6 @@ def util_shorten():
         return jsonify({"error": "shorten_exception", "detail": str(e)}), 500
 
 
-@app.route("/print", methods=["POST", "OPTIONS"])
 def _process_single_order_print(drive, order, mode, print_folder_id, binsheet_folder_id, ORDERS_PARENT_FOLDER_ID):
     """Helper function to process printing for a single order. Returns (success, error_message)"""
     try:
@@ -11986,6 +11985,7 @@ def _process_single_order_print(drive, order, mode, print_folder_id, binsheet_fo
         return (False, error_msg)
 
 
+@app.route("/print", methods=["POST", "OPTIONS"])
 def print_handler():
     # Handle CORS preflight
     if request.method == "OPTIONS":
@@ -12007,6 +12007,56 @@ def print_handler():
         is_batch = False
     else:
         return jsonify({"status": "error", "error": "Missing 'order' or 'orders' parameter"}), 400
+
+    # 🆕 Expand orders: if any order has "front" in Product, also include the next numerical order (back)
+    try:
+        # Fetch orders data to check products
+        rows = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+        if rows and len(rows) > 1:
+            headers = [str(h).strip() for h in rows[0]]
+            try:
+                order_ix = headers.index("Order #")
+                product_ix = headers.index("Product")
+            except ValueError:
+                order_ix = None
+                product_ix = None
+            
+            if order_ix is not None and product_ix is not None:
+                # Build lookup: order number -> product
+                order_to_product = {}
+                for row in rows[1:]:
+                    if len(row) > max(order_ix, product_ix):
+                        order_num = str(row[order_ix] or "").strip()
+                        product = str(row[product_ix] or "").strip()
+                        if order_num:
+                            order_to_product[order_num] = product
+                
+                # Expand orders list to include back orders for front products
+                expanded_orders = set(orders)  # Use set to avoid duplicates
+                for order_id in orders:
+                    product = order_to_product.get(order_id, "")
+                    # Check if product contains "front" (case-insensitive)
+                    if product and "front" in product.lower():
+                        try:
+                            # Calculate next order number
+                            current_num = int(order_id)
+                            next_order_id = str(current_num + 1)
+                            # Only add if the next order exists in our data
+                            if next_order_id in order_to_product:
+                                expanded_orders.add(next_order_id)
+                                print(f"🔄 Auto-added back order {next_order_id} for front order {order_id}")
+                        except (ValueError, TypeError):
+                            # Order ID is not a simple integer, skip
+                            pass
+                
+                orders = sorted(list(expanded_orders), key=lambda x: (len(x), x))
+        else:
+            print("⚠️ Could not fetch orders data to check for front/back pairs")
+    except Exception as e:
+        # If expansion fails, continue with original orders
+        print(f"⚠️ Error expanding front/back orders: {e}")
+        import traceback
+        traceback.print_exc()
 
     print(f"PRINT REQUEST → Orders: {orders}, Mode={mode}, Batch={is_batch}")
 
