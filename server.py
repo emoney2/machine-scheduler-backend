@@ -3992,6 +3992,10 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
     elems.append(Paragraph("PACKING SLIP", title_style))
 
     # ─── Line Items ────────────────────────────────────────
+    def _is_back_item(name: str) -> bool:
+        # Check if product contains the word "back" as a whole word (using word boundaries)
+        return bool(re.search(r"(?i)\bback\b", name or ""))
+    
     def _normalize_product_for_slip(name: str) -> str:
         # Remove the tokens front/full/back anywhere, collapse whitespace and trim
         base = re.sub(r"(?i)\b(front|full|back)\b", "", name or "")
@@ -4003,11 +4007,16 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
     data = [["Product", "Design", "Qty"]]
     for od in order_data_list:
         product_raw = od.get("Product", "")
-        # Skip products that contain the word "back"
-        if "back" in product_raw.lower():
+        # Skip products that contain the word "back" (as a whole word)
+        if _is_back_item(product_raw):
             continue
         product_norm = _normalize_product_for_slip(product_raw)
         data.append([product_norm, od.get("Design", ""), str(od.get("ShippedQty", ""))])
+
+    # Ensure packing slip is always created, even if no items (just headers)
+    # If no items were added (only header row), add a message row
+    if len(data) == 1:
+        data.append(["No items to ship", "", ""])
 
     # widen the table columns
     table = Table(data, colWidths=[3.0 * inch, 3.0 * inch, 1.0 * inch])
@@ -9993,13 +10002,30 @@ def process_shipment():
         )
         print("✅ Invoice created:", invoice_url)
 
-        # 5) Build packing slip PDF
-        company_info = fetch_company_info(headers, realm_id, env_override)
-        pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
-        filename = f"packing_slip_{int(time.time())}.pdf"
-        tmp_path = os.path.join(tempfile.gettempdir(), filename)
-        with open(tmp_path, "wb") as f:
-            f.write(pdf_bytes)
+        # 5) Build packing slip PDF (always create, even if empty)
+        try:
+            company_info = fetch_company_info(headers, realm_id, env_override)
+            pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
+            filename = f"packing_slip_{int(time.time())}.pdf"
+            tmp_path = os.path.join(tempfile.gettempdir(), filename)
+            with open(tmp_path, "wb") as f:
+                f.write(pdf_bytes)
+            print("✅ Packing slip PDF created:", filename)
+        except Exception as e:
+            print(f"⚠️ Error creating packing slip PDF: {e}")
+            traceback.print_exc()
+            # Still create a minimal packing slip to ensure it's always created
+            try:
+                company_info = fetch_company_info(headers, realm_id, env_override)
+                pdf_bytes = build_packing_slip_pdf([], boxes, company_info)
+                filename = f"packing_slip_{int(time.time())}.pdf"
+                tmp_path = os.path.join(tempfile.gettempdir(), filename)
+                with open(tmp_path, "wb") as f:
+                    f.write(pdf_bytes)
+                print("✅ Fallback packing slip PDF created:", filename)
+            except Exception as e2:
+                print(f"❌ Failed to create fallback packing slip: {e2}")
+                raise
 
         # 6) Build a public URL for the front-end
         slip_url = url_for("serve_slip", filename=filename, _external=True)
