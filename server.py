@@ -7312,8 +7312,8 @@ def jobs_for_company():
         for r in prod_data[1:]:
             row = dict(zip(headers, r))
             row_company = str(row.get("Company Name", "")).strip().lower()
-            stage = str(row.get("Stage", "")).strip().lower()
-            if row_company == company and stage != "complete":
+            # Return all jobs for the company, including completed ones
+            if row_company == company:
                 image_link = str(row.get("Image", "")).strip()
                 file_id = ""
                 if "id=" in image_link:
