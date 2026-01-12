@@ -8255,6 +8255,16 @@ def submit_order():
         )
         make_public(order_folder_id)
 
+        # 🧵 If this is a reorder, copy any .emb and .svg files from the original job folder
+        reorder_from = data.get("reorderFrom")
+        if reorder_from:
+            copy_emb_files(
+                old_order_num=reorder_from,
+                new_order_num=new_order,
+                drive_service=drive,
+                new_folder_id=order_folder_id
+            )
+
         prod_links = []
         if is_quilted_front:
             # Use in-memory data
@@ -8363,6 +8373,15 @@ def submit_order():
                 back_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
             )
             make_public(back_order_folder_id)
+
+            # 🧵 If this is a reorder, copy any .emb and .svg files from the original job folder to back order folder too
+            if reorder_from:
+                copy_emb_files(
+                    old_order_num=reorder_from,
+                    new_order_num=back_order,
+                    drive_service=drive,
+                    new_folder_id=back_order_folder_id
+                )
 
             # Upload production files to back order folder
             back_prod_links = []
@@ -10482,16 +10501,27 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
         )
 
         for file in files:
-            if file["name"].lower().endswith(".emb"):
+            file_name_lower = file["name"].lower()
+            if file_name_lower.endswith(".emb"):
+                # Rename .emb files to new order number
                 print(
-                    f"📤 Copying {file['name']} from order {old_order_num} → {new_order_num}"
+                    f"📤 Copying {file['name']} from order {old_order_num} → {new_order_num} (renamed to {new_order_num}.emb)"
                 )
                 drive_service.files().copy(
                     fileId=file["id"],
                     body={"name": f"{new_order_num}.emb", "parents": [new_folder_id]},
                 ).execute()
+            elif file_name_lower.endswith(".svg"):
+                # Keep .svg files with their original names
+                print(
+                    f"📤 Copying {file['name']} from order {old_order_num} → {new_order_num} (keeping original name)"
+                )
+                drive_service.files().copy(
+                    fileId=file["id"],
+                    body={"name": file["name"], "parents": [new_folder_id]},
+                ).execute()
     except Exception as e:
-        print("❌ Error copying .emb files:", e)
+        print("❌ Error copying .emb and .svg files:", e)
 
 
 from flask import request, session, redirect
