@@ -1051,11 +1051,104 @@ from googleapiclient.discovery import build
 
 
 def get_sheets_service():
+    """
+    Get Google Sheets service with improved error handling.
+    Raises RuntimeError if credentials are missing, other exceptions for API issues.
+    """
     from googleapiclient.discovery import build
 
-    creds = get_google_credentials()
-    # Pass credentials directly; no httplib2/authorize dance needed
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    try:
+        creds = get_google_credentials()
+    except RuntimeError as e:
+        # Re-raise credential errors as-is
+        raise
+    except Exception as e:
+        app.logger.exception("get_sheets_service: failed to get credentials")
+        raise RuntimeError(f"Failed to load Google credentials: {str(e)}")
+    
+    try:
+        # Pass credentials directly; no httplib2/authorize dance needed
+        return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        app.logger.exception("get_sheets_service: failed to build service")
+        raise RuntimeError(f"Failed to build Google Sheets service: {str(e)}")
+
+
+def acquire_sheet_lock(timeout=None):
+    """
+    Acquire the sheet_lock with a timeout.
+    Returns a context manager that releases the lock on exit.
+    Usage:
+        with acquire_sheet_lock():
+            # do sheets operations
+    """
+    from eventlet import Timeout
+    
+    if timeout is None:
+        timeout = SHEET_LOCK_TIMEOUT
+    
+    class LockContext:
+        def __init__(self, lock, timeout_sec):
+            self.lock = lock
+            self.timeout_sec = timeout_sec
+            self.acquired = False
+            
+        def __enter__(self):
+            try:
+                with Timeout(timeout_sec=self.timeout_sec):
+                    self.lock.acquire()
+                    self.acquired = True
+                    return self
+            except Timeout:
+                app.logger.warning(f"Timeout acquiring sheet_lock after {self.timeout_sec}s")
+                raise RuntimeError(f"Sheet operation timeout: could not acquire lock within {self.timeout_sec} seconds")
+            
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if self.acquired:
+                self.lock.release()
+            return False
+    
+    return LockContext(sheet_lock, timeout)
+
+
+def retry_google_api_call(func, max_retries=3, retry_delay=1):
+    """
+    Retry wrapper for Google API calls that may fail transiently.
+    Retries on 429 (rate limit), 500, 502, 503, 504 errors.
+    """
+    from googleapiclient.errors import HttpError
+    import time as time_module
+    
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except HttpError as e:
+            status_code = e.resp.status if hasattr(e, 'resp') else None
+            if status_code in [429, 500, 502, 503, 504] and attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                app.logger.warning(
+                    f"Google API call failed with {status_code}, retrying in {wait_time}s "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                time_module.sleep(wait_time)
+                continue
+            # Re-raise if not retryable or out of retries
+            raise
+        except Exception as e:
+            # For non-HTTP errors, check if it's a connection/timeout issue
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in ['timeout', 'connection', 'network']) and attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)
+                app.logger.warning(
+                    f"Google API call failed with connection error, retrying in {wait_time}s "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                time_module.sleep(wait_time)
+                continue
+            raise
+    
+    # Should never reach here, but just in case
+    raise Exception("Retry logic failed unexpectedly")
 
 
 # === Kanban helpers ============================================================
@@ -5001,7 +5094,10 @@ def drive_make_public():
 
 
 # ─── Google Sheets Credentials & Semaphore ───────────────────────────────────
-sheet_lock = Semaphore(1)
+# Increased from 1 to 3 to allow more concurrent operations while staying within Google API rate limits
+# Google Sheets API allows ~60 requests per minute per user, so 3 concurrent should be safe
+sheet_lock = Semaphore(3)
+SHEET_LOCK_TIMEOUT = 30  # seconds - timeout for acquiring the lock
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 ORDERS_RANGE = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AM")
 FUR_RANGE = os.environ.get("FUR_RANGE", "Fur List!A1:Z")
@@ -6157,8 +6253,11 @@ def api_fur_complete():
 
     try:
         vsvc = get_sheets_service().spreadsheets().values()
-    except Exception:
-        app.logger.exception("api_fur_complete: init sheets failed")
+    except RuntimeError as e:
+        app.logger.error(f"api_fur_complete: Google credentials/service issue: {e}")
+        return jsonify(ok=False, error=f"Sheets service unavailable: {str(e)}"), 503
+    except Exception as e:
+        app.logger.exception(f"api_fur_complete: unexpected error initializing sheets: {e}")
         return jsonify(ok=False, error="Sheets init failed"), 503
 
     def col_letter(idx0: int) -> str:
@@ -6247,8 +6346,14 @@ def fur_complete_batch():
 
     try:
         vsvc = get_sheets_service().spreadsheets().values()
-    except Exception:
-        app.logger.exception("fur_complete_batch: unable to init Sheets")
+    except RuntimeError as e:
+        app.logger.error(f"fur_complete_batch: Google credentials/service issue: {e}")
+        return (
+            jsonify(ok=False, error=f"Could not initialize Google Sheets client: {str(e)}"),
+            503,
+        )
+    except Exception as e:
+        app.logger.exception(f"fur_complete_batch: unexpected error initializing sheets: {e}")
         return (
             jsonify(ok=False, error="Could not initialize Google Sheets client."),
             503,
@@ -6472,14 +6577,20 @@ def cut_submit_material():
         return jsonify(ok=False, error="Invalid materialKey"), 400
 
     # Initialize Sheets client
-    try:
-        vsvc = get_sheets_service().spreadsheets().values()
-    except Exception as e:
-        app.logger.exception("cut_submit_material: unable to init Google Sheets client")
-        return (
-            jsonify(ok=False, error="Could not initialize Google Sheets client."),
-            503,
-        )
+        try:
+            vsvc = get_sheets_service().spreadsheets().values()
+        except RuntimeError as e:
+            app.logger.error(f"cut_submit_material: Google credentials/service issue: {e}")
+            return (
+                jsonify(ok=False, error=f"Could not initialize Google Sheets client: {str(e)}"),
+                503,
+            )
+        except Exception as e:
+            app.logger.exception(f"cut_submit_material: unexpected error initializing sheets: {e}")
+            return (
+                jsonify(ok=False, error="Could not initialize Google Sheets client."),
+                503,
+            )
 
     try:
         with sheet_lock:
@@ -6632,8 +6743,8 @@ def cut_complete_batch():
             ),
             503,
         )
-    except Exception:
-        app.logger.exception("cut_complete_batch: unable to init Google Sheets client")
+    except Exception as e:
+        app.logger.exception(f"cut_complete_batch: unexpected error initializing sheets: {e}")
         return (
             jsonify(ok=False, error="Could not initialize Google Sheets client."),
             503,
