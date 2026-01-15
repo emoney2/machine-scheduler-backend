@@ -9918,9 +9918,16 @@ def company_list():
     return jsonify({"companies": companies})
 
 
-@app.route("/api/process-shipment", methods=["POST"])
+@app.route("/api/process-shipment", methods=["OPTIONS", "POST"])
 @login_required_session
 def process_shipment():
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
     data = request.get_json()
     env_override = data.get("qboEnv")  # "sandbox" or "production"
     session["qboEnv"] = env_override or "production"
@@ -9935,7 +9942,10 @@ def process_shipment():
         headers, realm_id = get_quickbooks_credentials()
     except RedirectException as e:
         print("🔁 Redirecting to OAuth:", e.redirect_url)
-        return jsonify({"redirect": e.redirect_url}), 200
+        resp = jsonify({"redirect": e.redirect_url})
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp, 200
 
     # 1) Parse incoming
     order_ids = [str(oid).strip() for oid in data.get("order_ids", [])]
@@ -10108,17 +10118,26 @@ def process_shipment():
         else:
             print("⚠️ No updates to push—check order_ids match sheet.")
 
-        # 9) Respond
-        return jsonify({"labels": [], "invoice": invoice_url, "slips": [slip_url]})
+        # 9) Respond with CORS headers
+        resp = jsonify({"labels": [], "invoice": invoice_url, "slips": [slip_url]})
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
 
     except RedirectException as e:
         # (Shouldn't hit here because we gate auth at the top, but safe to keep.)
         print("🔁 Redirecting to OAuth (late):", e.redirect_url)
-        return jsonify({"redirect": e.redirect_url}), 200
+        resp = jsonify({"redirect": e.redirect_url})
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp, 200
     except Exception as e:
         print("❌ Shipment error:", e)
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        resp = jsonify({"error": str(e)})
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp, 500
 
 
 @app.errorhandler(Exception)
