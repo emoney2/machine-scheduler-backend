@@ -1507,6 +1507,16 @@ from flask_cors import CORS
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
 
+# Register Shopify integration routes
+try:
+    from shopify_integration import register_shopify_routes
+    register_shopify_routes(app)
+    print("✅ Shopify integration routes registered")
+except ImportError as e:
+    print(f"⚠️ Shopify integration not available: {e}")
+except Exception as e:
+    print(f"⚠️ Error registering Shopify routes: {e}")
+
 
 # Optional GZIP compression (safe if package missing)
 try:
@@ -8220,6 +8230,44 @@ def write_material_log_for_order(order_number):
         logger.exception("[MATLOG] Failure for order %s", order_number)
 
 
+def log_material_to_google_sheets(order_number):
+    """
+    Calls Google Apps Script web app to log materials to Material Log sheet.
+    This is needed because onEdit triggers don't fire for programmatic edits.
+    """
+    apps_script_url = os.environ.get("GOOGLE_APPS_SCRIPT_WEBAPP_URL")
+    
+    if not apps_script_url:
+        logger.warning("[MaterialLog] GOOGLE_APPS_SCRIPT_WEBAPP_URL not set, skipping Google Sheets material log")
+        return
+    
+    try:
+        payload = {
+            "orderNumber": str(order_number)
+        }
+        
+        response = requests.post(
+            apps_script_url,
+            json=payload,
+            timeout=30,
+            headers={"Content-Type": "application/json"}
+        )
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        if result.get("success"):
+            logger.info("[MaterialLog] Successfully logged materials to Google Sheets for order %s", order_number)
+        else:
+            logger.error("[MaterialLog] Google Apps Script returned error for order %s: %s", 
+                       order_number, result.get("error", "Unknown error"))
+            
+    except requests.exceptions.RequestException as e:
+        logger.error("[MaterialLog] Failed to call Google Apps Script web app for order %s: %s", 
+                    order_number, str(e))
+    except Exception as e:
+        logger.exception("[MaterialLog] Unexpected error calling Google Apps Script for order %s", order_number)
+
 
 @app.route("/submit", methods=["OPTIONS", "POST"])
 @login_required_session
@@ -8477,6 +8525,14 @@ def submit_order():
         except Exception as e:
             logger.error("[MaterialLog] Failed for order %s: %s", new_order, e)
 
+        # ─────────────────────────────────────────────────────────────────────
+        # ✅ NEW: LOG MATERIALS TO GOOGLE SHEETS MATERIAL LOG VIA APPS SCRIPT
+        # ─────────────────────────────────────────────────────────────────────
+        try:
+            log_material_to_google_sheets(new_order)
+        except Exception as e:
+            logger.error("[MaterialLog] Failed to log to Google Sheets for order %s: %s", new_order, e)
+
         # ─── CREATE SECOND ORDER (BACK) FOR QUILTED FRONT PRODUCTS ──────────
         if is_quilted_front and back_order:
             # Create folder for back order
@@ -8590,6 +8646,12 @@ def submit_order():
                 write_material_log_for_order(back_order)
             except Exception as e:
                 logger.error("[MaterialLog] Failed for back order %s: %s", back_order, e)
+
+            # Log materials to Google Sheets Material Log for back order
+            try:
+                log_material_to_google_sheets(back_order)
+            except Exception as e:
+                logger.error("[MaterialLog] Failed to log to Google Sheets for back order %s: %s", back_order, e)
 
             # ─── CLEANUP: Clear file data from memory to prevent memory leaks ─────
             # Explicitly clear large file data after uploads complete
