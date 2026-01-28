@@ -8237,11 +8237,16 @@ def log_material_to_google_sheets(order_number):
     Calls Google Apps Script web app to log materials to Material Log sheet.
     This is needed because onEdit triggers don't fire for programmatic edits.
     """
+    logger.info("[MaterialLog] Attempting to log materials to Google Sheets for order %s", order_number)
     apps_script_url = os.environ.get("GOOGLE_APPS_SCRIPT_WEBAPP_URL")
     
     if not apps_script_url:
-        logger.warning("[MaterialLog] GOOGLE_APPS_SCRIPT_WEBAPP_URL not set, skipping Google Sheets material log")
+        logger.error("[MaterialLog] GOOGLE_APPS_SCRIPT_WEBAPP_URL environment variable not set! "
+                    "Skipping Google Sheets material log for order %s. "
+                    "Please set this variable to your Google Apps Script web app URL.", order_number)
         return
+    
+    logger.info("[MaterialLog] Calling Google Apps Script web app at: %s", apps_script_url)
     
     try:
         payload = {
