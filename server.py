@@ -4721,7 +4721,8 @@ def create_invoice_in_quickbooks(
         if (env_override or QBO_ENV) == "production"
         else "https://app.sandbox.qbo.intuit.com"
     )
-    return f"{app_url}/app/invoice?txnId={invoice['Id']}"
+    # Include name parameter to ensure QuickBooks opens existing invoice, not creates new one
+    return f"{app_url}/app/invoice?name=Invoice&txnId={invoice['Id']}"
 
 
 def create_consolidated_invoice_in_quickbooks(
@@ -4868,7 +4869,8 @@ def create_consolidated_invoice_in_quickbooks(
         if (env_override or QBO_ENV) == "production"
         else "https://app.sandbox.qbo.intuit.com"
     )
-    return f"{app_url}/app/invoice?txnId={inv_id}"
+    # Include name parameter to ensure QuickBooks opens existing invoice, not creates new one
+    return f"{app_url}/app/invoice?name=Invoice&txnId={inv_id}"
 
 
 @app.route("/", methods=["GET"])
