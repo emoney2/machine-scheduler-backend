@@ -8246,15 +8246,49 @@ def log_material_to_google_sheets(order_number):
             "orderNumber": str(order_number)
         }
         
+        # Google Apps Script web apps may redirect, so we allow redirects
+        # but also check for HTML error pages
         response = requests.post(
             apps_script_url,
             json=payload,
             timeout=30,
-            headers={"Content-Type": "application/json"}
+            headers={"Content-Type": "application/json"},
+            allow_redirects=True
         )
         
         response.raise_for_status()
-        result = response.json()
+        
+        # Log response details for debugging
+        content_type = response.headers.get("Content-Type", "")
+        response_text = response.text[:1000]  # First 1000 chars for logging
+        
+        logger.info("[MaterialLog] Response status: %s, Content-Type: %s, Body preview: %s", 
+                    response.status_code, content_type, response_text[:200])
+        
+        # Check if response is HTML (error page or authorization required)
+        if "text/html" in content_type.lower() or response_text.strip().startswith("<"):
+            logger.error("[MaterialLog] Google Apps Script returned HTML instead of JSON for order %s. "
+                        "This usually means the web app needs authorization. "
+                        "Please visit the web app URL in a browser once to authorize it. "
+                        "Response preview: %s", 
+                        order_number, response_text[:500])
+            return
+        
+        # Check if response is empty
+        if not response_text.strip():
+            logger.error("[MaterialLog] Empty response from Google Apps Script for order %s. "
+                        "The web app may not be deployed correctly or the URL may be incorrect.", 
+                        order_number)
+            return
+        
+        # Try to parse JSON
+        try:
+            result = response.json()
+        except ValueError as json_err:
+            logger.error("[MaterialLog] Failed to parse JSON response for order %s. "
+                        "Response text: %s, Error: %s", 
+                        order_number, response_text[:500], str(json_err))
+            return
         
         if result.get("success"):
             logger.info("[MaterialLog] Successfully logged materials to Google Sheets for order %s", order_number)
