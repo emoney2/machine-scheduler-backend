@@ -2092,27 +2092,33 @@ async def madeira_login_and_cart(items):
 def handle_preflight():
     if request.method == "OPTIONS":
         origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-        allowed = {
-            (
-                os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
-                .strip()
-                .rstrip("/")
-            ),
-            "https://machineschedule.netlify.app",
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-        }
+        # Env-driven allow-list + safe defaults
+        allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
+        allowed = {o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()}
+        allowed.update(
+            {
+                (
+                    os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+                    .strip()
+                    .rstrip("/")
+                ),
+                "https://machineschedule.netlify.app",
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+            }
+        )
 
         resp = make_response("", 204)
         if origin in allowed:
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With,Accept"
             resp.headers["Access-Control-Allow-Methods"] = (
                 "GET,POST,PUT,PATCH,DELETE,OPTIONS"
             )
+            resp.headers["Vary"] = "Origin"
         return resp  # short-circuit OPTIONS
 
 
@@ -2141,7 +2147,7 @@ def apply_cors(response):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Vary"] = "Origin"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With,Accept"
     response.headers["Access-Control-Allow-Methods"] = (
         "GET,POST,PUT,PATCH,DELETE,OPTIONS"
     )
@@ -8314,11 +8320,30 @@ def log_material_to_google_sheets(order_number):
 @login_required_session
 def submit_order():
     if request.method == "OPTIONS":
+        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+        allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
+        allowed = {o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()}
+        allowed.update(
+            {
+                (
+                    os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+                    .strip()
+                    .rstrip("/")
+                ),
+                "https://machineschedule.netlify.app",
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+            }
+        )
         resp = make_response("", 204)
-        resp.headers["Access-Control-Allow-Origin"] = "https://machineschedule.netlify.app"
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE, PATCH"
         return resp
 
 
@@ -8720,10 +8745,25 @@ def submit_order():
 
 @app.after_request
 def add_submit_cors_headers(resp):
-    resp.headers["Access-Control-Allow-Origin"] = "https://machineschedule.netlify.app"
-    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    allowed = {
+        (
+            os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+            .strip()
+            .rstrip("/")
+        ),
+        "https://machineschedule.netlify.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    }
+    if origin in allowed:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE, PATCH"
     return resp
 
 
@@ -12159,12 +12199,31 @@ def on_disconnect():
 # Ensure all responses include CORS headers, even on errors
 @app.after_request
 def apply_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = (
-        "https://machineschedule.netlify.app"
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    # Env-driven allow-list + safe defaults
+    allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
+    allowed = {o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()}
+    allowed.update(
+        {
+            (
+                os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+                .strip()
+                .rstrip("/")
+            ),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        }
     )
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,PUT,DELETE"
+    
+    if origin in allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With,Accept"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,PUT,DELETE,PATCH"
     return response
 
 
