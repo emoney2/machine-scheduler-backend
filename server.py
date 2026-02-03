@@ -5841,6 +5841,7 @@ def build_overview_payload():
         ).execute()
         vals = resp.get("values", [])
         lines = [str(r[0]).strip() for r in vals if r and str(r[0]).strip()]
+        app.logger.info(f"📦 Overview!M3:M returned {len(lines)} material lines")
 
         grouped = {}
         for s in lines:
@@ -5908,17 +5909,45 @@ def build_overview_payload():
                 continue
 
             typ = "Thread" if unit.lower().startswith("cone") else "Material"
+            
+            # Look up color from Material Inventory for materials
+            material_color = None
+            if typ == "Material":
+                try:
+                    # Fetch Material Inventory to get color
+                    inv_resp = svc.get(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range="Material Inventory!A1:J",
+                        valueRenderOption="UNFORMATTED_VALUE",
+                    ).execute()
+                    inv_rows = inv_resp.get("values", [])
+                    if inv_rows and len(inv_rows) > 1:
+                        headers = [str(h).strip() for h in inv_rows[0]]
+                        name_idx = headers.index("Materials") if "Materials" in headers else 0
+                        color_idx = headers.index("Color") if "Color" in headers else None
+                        
+                        if color_idx is not None:
+                            for row in inv_rows[1:]:
+                                if len(row) > name_idx and str(row[name_idx]).strip().lower() == name.lower():
+                                    if len(row) > color_idx and row[color_idx]:
+                                        material_color = str(row[color_idx]).strip()
+                                        break
+                except Exception as e:
+                    app.logger.warning(f"Failed to lookup material color for {name}: {e}")
+            
             grouped.setdefault(vendor, []).append(
-                {"name": name, "qty": qty, "unit": unit, "type": typ}
+                {"name": name, "qty": qty, "unit": unit, "type": typ, "color": material_color}
             )
 
 
         vendor_list = [{"vendor": v, "items": items} for v, items in grouped.items()]
-    except Exception:
+        app.logger.info(f"📦 Materials grouped: {len(vendor_list)} vendors, {sum(len(g['items']) for g in vendor_list)} total items")
+    except Exception as e:
         app.logger.exception(
-            "materials-needed section inside build_overview_payload failed"
+            "materials-needed section inside build_overview_payload failed: %s", str(e)
         )
         # leave vendor_list empty if it fails
+        vendor_list = []
 
     return {
         "upcoming": upcoming,
@@ -5960,6 +5989,7 @@ def overview_combined():
     # Build fresh
     try:
         payload = build_overview_payload()
+        app.logger.info(f"📦 Overview payload built: {len(payload.get('upcoming', []))} upcoming, {len(payload.get('materials', []))} material vendors")
         _overview_cache = payload
         _overview_ts = now
     except Exception as e:
