@@ -144,9 +144,12 @@ from flask import send_file  # ADD if not present
 # ---- GLOBAL ORDER CACHE ----
 # Stores the lookup table used by /api/order_fast
 _orders_index = {"by_id": {}, "ts": 0}
+_orders_index_max_size = 5000  # Maximum number of orders to cache
+_orders_index_ttl = 300  # 5 minutes TTL
 
 # ✅ Links store used by /api/combined
 _links_store = {}
+_links_store_max_size = 1000  # Maximum number of links to cache
 
 from google.oauth2.credentials import Credentials
 import json
@@ -235,6 +238,21 @@ def _get_material_quadrant_images(product_name: str, fur_color: str):
     }
 
 
+def _cleanup_orders_index():
+    """Enforce size limit on _orders_index by removing oldest entries."""
+    global _orders_index
+    if not isinstance(_orders_index, dict) or "by_id" not in _orders_index:
+        return
+    
+    by_id = _orders_index.get("by_id", {})
+    if len(by_id) > _orders_index_max_size:
+        # Remove oldest entries (simple: keep only the most recent N)
+        items = list(by_id.items())
+        to_remove = len(items) - _orders_index_max_size
+        for i in range(to_remove):
+            by_id.pop(items[i][0], None)
+        app.logger.info(f"[CACHE] Cleaned _orders_index: removed {to_remove} entries")
+
 def ensure_orders_cache():
     """
     Backwards-compatible stub.
@@ -250,6 +268,7 @@ def ensure_orders_cache():
 
 # GLOBAL in-memory cache store
 _cache = {}
+_cache_max_size = 500  # Maximum number of entries
 
 # --- BOM folder & Drive helpers ------------------------------------------------
 BOM_FOLDER_ID = (os.environ.get("BOM_FOLDER_ID") or "").strip() or None
@@ -528,10 +547,10 @@ os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
 # --- Tiny in-process cache for Drive thumbnails ---
 _drive_thumb_cache = {}  # key: f"{file_id}:{modified_time}" -> {'bytes': b, 'ts': float}
-_drive_thumb_ttl = 600  # seconds (10 min)
-_drive_thumb_cache_max_size = 1000  # Maximum number of entries
+_drive_thumb_ttl = 300  # seconds (5 min) - reduced from 10 min
+_drive_thumb_cache_max_size = 200  # Maximum number of entries - reduced from 1000 (images are large)
 _drive_thumb_cache_last_cleanup = 0
-_drive_thumb_cache_cleanup_interval = 300  # Clean up every 5 minutes
+_drive_thumb_cache_cleanup_interval = 120  # Clean up every 2 minutes - more frequent
 
 
 def _drive_thumb_cache_cleanup():
@@ -1564,8 +1583,8 @@ _cache_lock = threading.Lock()
 # key -> {'ts': float, 'ttl': int, 'etag': str, 'data': bytes}
 _json_cache = {}
 _json_cache_last_cleanup = 0
-_json_cache_cleanup_interval = 300  # Clean up every 5 minutes
-_json_cache_max_size = 1000  # Maximum number of entries
+_json_cache_cleanup_interval = 120  # Clean up every 2 minutes - more frequent
+_json_cache_max_size = 500  # Maximum number of entries - reduced from 1000
 
 
 def _cache_cleanup():
@@ -2163,17 +2182,72 @@ def _mem_before():
         g._rss_before = None
 
 
+# Proactive cache cleanup - runs periodically
+_last_proactive_cleanup = 0
+_proactive_cleanup_interval = 60  # Run every 60 seconds
+
+def _proactive_cache_cleanup():
+    """Clean up all caches proactively to prevent memory growth."""
+    global _last_proactive_cleanup
+    now = time.time()
+    if now - _last_proactive_cleanup < _proactive_cleanup_interval:
+        return
+    _last_proactive_cleanup = now
+    
+    try:
+        # Clean up orders index
+        _cleanup_orders_index()
+        
+        # Clean up jobs company cache
+        global _jobs_company_cache
+        expired = [k for k, v in _jobs_company_cache.items() 
+                   if now - v.get("ts", 0) > _jobs_company_cache_ttl]
+        for k in expired:
+            _jobs_company_cache.pop(k, None)
+        if len(_jobs_company_cache) > _jobs_company_cache_max_size:
+            items = sorted(_jobs_company_cache.items(), key=lambda x: x[1].get("ts", 0))
+            to_remove = len(items) - _jobs_company_cache_max_size
+            for i in range(to_remove):
+                _jobs_company_cache.pop(items[i][0], None)
+        
+        # Clean up links store
+        global _links_store
+        if len(_links_store) > _links_store_max_size:
+            items = list(_links_store.items())[-_links_store_max_size:]
+            _links_store = dict(items)
+        
+        # Clean up global cache
+        global _cache
+        if len(_cache) > _cache_max_size:
+            items = list(_cache.items())[-_cache_max_size:]
+            _cache = dict(items)
+        
+        # Clean up drive thumb cache (already has cleanup function)
+        _drive_thumb_cache_cleanup()
+        
+        # Clean up JSON cache (already has cleanup function)
+        _cache_cleanup()
+        
+        app.logger.info("[CACHE] Proactive cleanup completed")
+    except Exception as e:
+        app.logger.warning(f"[CACHE] Proactive cleanup failed: {e}")
+
 # NEW: log RSS delta after each request and trigger opportunistic GC
 @app.after_request
 def _mem_after(resp):
     try:
+        # Run proactive cleanup
+        _proactive_cache_cleanup()
+        
         rss_now = _process.memory_info().rss
         rss_before = getattr(g, "_rss_before", None)
         if rss_before is not None:
             delta_mb = (rss_now - rss_before) / (1024 * 1024)
-            app.logger.info(
-                f"[MEM] {request.method} {request.path} Δ={delta_mb:.2f}MB rss={rss_now/1024/1024:.2f}MB"
-            )
+            # Only log if memory increased significantly (>10MB)
+            if delta_mb > 10:
+                app.logger.warning(
+                    f"[MEM] {request.method} {request.path} Δ={delta_mb:.2f}MB rss={rss_now/1024/1024:.2f}MB"
+                )
         # Opportunistic GC to curb fragmentation during bursts
         gc.collect()
     except Exception:
@@ -2642,6 +2716,8 @@ def api_order_fast():
         if "by_id" not in _orders_index or not isinstance(_orders_index["by_id"], dict):
             _orders_index["by_id"] = {}
         _orders_index["by_id"][order_number] = full_payload
+        # Enforce size limit
+        _cleanup_orders_index()
     except Exception as e:
         current_app.logger.warning(
             f"order_fast: failed to cache payload for {order_number}: {e}"
@@ -5352,6 +5428,8 @@ _manual_state_ts = 0
 _overview_cache = None
 _overview_ts = 0
 _jobs_company_cache = {}  # { company_lower: {"ts": <epoch>, "data": {...}} }
+_jobs_company_cache_max_size = 100  # Maximum number of companies to cache
+_jobs_company_cache_ttl = 300  # 5 minutes TTL
 
 # combined: micro-cache + timestamp
 _combined_cache = None
@@ -7004,6 +7082,8 @@ def get_orders():
 
         _orders_index["by_id"] = by_id
         _orders_index["ts"] = time.time()
+        # Enforce size limit
+        _cleanup_orders_index()
 
     except Exception as e:
         current_app.logger.warning("Failed to build fast order cache: %s", e)
@@ -7416,6 +7496,20 @@ def jobs_for_company():
     global _jobs_company_cache
     now = time.time()
 
+    # Cleanup expired entries and enforce size limit
+    if len(_jobs_company_cache) > _jobs_company_cache_max_size:
+        # Remove oldest entries
+        items = sorted(_jobs_company_cache.items(), key=lambda x: x[1].get("ts", 0))
+        to_remove = len(items) - _jobs_company_cache_max_size
+        for i in range(to_remove):
+            _jobs_company_cache.pop(items[i][0], None)
+    
+    # Remove expired entries
+    expired = [k for k, v in _jobs_company_cache.items() 
+               if now - v.get("ts", 0) > _jobs_company_cache_ttl]
+    for k in expired:
+        _jobs_company_cache.pop(k, None)
+
     # 15s micro-cache
     cached = _jobs_company_cache.get(company)
     if cached and (now - cached["ts"] < 15):
@@ -7601,6 +7695,11 @@ def get_links():
 def save_links():
     global _links_store
     _links_store = request.get_json() or {}
+    # Enforce size limit
+    if len(_links_store) > _links_store_max_size:
+        # Keep only the most recent entries (simple truncation)
+        items = list(_links_store.items())[-_links_store_max_size:]
+        _links_store = dict(items)
     socketio.emit("linksUpdated", _links_store)
     return jsonify({"status": "ok"}), 200
 
@@ -7662,6 +7761,9 @@ def get_combined():
                 for o in orders_full
                 if str(o.get("Order #", "")).strip()
             }
+            _orders_index["ts"] = time.time()
+            # Enforce size limit
+            _cleanup_orders_index()
         except Exception as e:
             current_app.logger.warning(f"[FAST] Failed to build order index: {e}")
 
