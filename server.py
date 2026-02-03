@@ -6235,8 +6235,34 @@ def overview_materials_needed():
                 continue
 
             typ = "Thread" if unit.lower().startswith("cone") else "Material"
+            
+            # Look up color from Material Inventory for materials
+            material_color = None
+            if typ == "Material":
+                try:
+                    # Fetch Material Inventory to get color
+                    inv_resp = svc.get(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range="Material Inventory!A1:J",
+                        valueRenderOption="UNFORMATTED_VALUE",
+                    ).execute()
+                    inv_rows = inv_resp.get("values", [])
+                    if inv_rows and len(inv_rows) > 1:
+                        headers = [str(h).strip() for h in inv_rows[0]]
+                        name_idx = headers.index("Materials") if "Materials" in headers else 0
+                        color_idx = headers.index("Color") if "Color" in headers else None
+                        
+                        if color_idx is not None:
+                            for row in inv_rows[1:]:
+                                if len(row) > name_idx and str(row[name_idx]).strip().lower() == name.lower():
+                                    if len(row) > color_idx and row[color_idx]:
+                                        material_color = str(row[color_idx]).strip()
+                                        break
+                except Exception as e:
+                    app.logger.warning(f"Failed to lookup material color for {name}: {e}")
+            
             grouped.setdefault(vendor, []).append(
-                {"name": name, "qty": qty, "unit": unit, "type": typ}
+                {"name": name, "qty": qty, "unit": unit, "type": typ, "color": material_color}
             )
 
         vendor_list = [{"vendor": v, "items": items} for v, items in grouped.items()]
@@ -9230,11 +9256,13 @@ def get_materials():
 def add_materials():
     raw = request.get_json(silent=True) or []
     items = raw if isinstance(raw, list) else [raw]
+    
+    sheets_vals = get_sheets_service().spreadsheets().values()
 
     # fetch the raw formulas from row 2
     def get_formula(col):
         resp = (
-            sheets.values()
+            sheets_vals
             .get(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"Material Inventory!{col}2",
@@ -9260,12 +9288,16 @@ def add_materials():
     )
     next_row = len(existing) + 2  # because A2 is first data row
 
+    color_requests = []  # Store color formatting requests
+    
     for it in items:
         name = it.get("materialName", "").strip()
         unit = it.get("unit", "").strip()
         mininv = it.get("minInv", "").strip()
         reorder = it.get("reorder", "").strip()
         cost = it.get("cost", "").strip()
+        vendor = it.get("vendor", "").strip()
+        color = it.get("color", "#000000").strip()
 
         if not name:
             continue
@@ -9285,21 +9317,82 @@ def add_materials():
                 reorder,  # F
                 cost,  # G
                 formulaH,  # H: uses rawH but with "2"→next_row
+                vendor,  # I: Vendor
+                color,  # J: Color (hex value)
             ]
         )
+
+        # Convert hex color to RGB for Google Sheets API
+        def hex_to_rgb(hex_color):
+            hex_color = hex_color.lstrip('#')
+            if len(hex_color) == 6:
+                return {
+                    'red': int(hex_color[0:2], 16) / 255.0,
+                    'green': int(hex_color[2:4], 16) / 255.0,
+                    'blue': int(hex_color[4:6], 16) / 255.0
+                }
+            return {'red': 0.0, 'green': 0.0, 'blue': 0.0}
+        
+        rgb = hex_to_rgb(color)
+        
+        # Add color formatting request for column J
+        color_requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": 0,  # Material Inventory sheet (adjust if needed)
+                    "startRowIndex": next_row - 1,  # 0-based
+                    "endRowIndex": next_row,
+                    "startColumnIndex": 9,  # Column J (0-based: A=0, B=1, ..., J=9)
+                    "endColumnIndex": 10,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": rgb
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor"
+            }
+        })
 
         next_row += 1
     # end for
 
-    # append the rows you’ve built
+    # append the rows you've built
     if inv_rows:
-        sheets.values().append(
+        sheets_vals.append(
             spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A2:H",
+            range="Material Inventory!A2:J",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": inv_rows},
         ).execute()
+        
+        # Apply color formatting if we have color requests
+        if color_requests:
+            try:
+                # Get the sheet ID for Material Inventory
+                sheets_service = get_sheets_service()
+                sheet_metadata = sheets_service.spreadsheets().get(
+                    spreadsheetId=SPREADSHEET_ID
+                ).execute()
+                sheet_id = None
+                for sheet in sheet_metadata.get('sheets', []):
+                    if sheet['properties']['title'] == 'Material Inventory':
+                        sheet_id = sheet['properties']['sheetId']
+                        break
+                
+                if sheet_id is not None:
+                    # Update color_requests with correct sheet_id
+                    for req in color_requests:
+                        req['repeatCell']['range']['sheetId'] = sheet_id
+                    
+                    # Apply formatting
+                    sheets_service.spreadsheets().batchUpdate(
+                        spreadsheetId=SPREADSHEET_ID,
+                        body={'requests': color_requests}
+                    ).execute()
+            except Exception as e:
+                logger.warning(f"Failed to apply color formatting: {e}")
 
         # ─── Mirror into Supabase Material Inventory ───────────────
         if supabase:
