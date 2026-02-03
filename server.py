@@ -9424,6 +9424,13 @@ def add_materials():
                 raise
 
         invalidate_upcoming_cache()
+        invalidate_materials_needed_cache()
+        
+        # Emit socket event to notify clients that materials have been updated
+        try:
+            socketio.emit("materialsUpdated", {"status": "ok", "count": len(inv_rows)})
+        except Exception as e:
+            logger.warning(f"Failed to emit materialsUpdated event: {e}")
 
         return jsonify({"status": "ok"}), 200
 
