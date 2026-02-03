@@ -5834,6 +5834,31 @@ def build_overview_payload():
     vendor_list = []
     try:
         svc = get_sheets_service().spreadsheets().values()
+        
+        # Fetch Material Inventory once for color lookups (optimization)
+        material_color_map = {}
+        try:
+            inv_resp = svc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Material Inventory!A1:J",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+            inv_rows = inv_resp.get("values", [])
+            if inv_rows and len(inv_rows) > 1:
+                headers = [str(h).strip() for h in inv_rows[0]]
+                name_idx = headers.index("Materials") if "Materials" in headers else 0
+                color_idx = headers.index("Color") if "Color" in headers else None
+                
+                if color_idx is not None:
+                    for row in inv_rows[1:]:
+                        if len(row) > name_idx and len(row) > color_idx:
+                            mat_name = str(row[name_idx]).strip().lower()
+                            mat_color = str(row[color_idx]).strip() if row[color_idx] else None
+                            if mat_name and mat_color:
+                                material_color_map[mat_name] = mat_color
+        except Exception as e:
+            app.logger.warning(f"Failed to fetch Material Inventory for color lookup: {e}")
+        
         resp = svc.get(
             spreadsheetId=SPREADSHEET_ID,
             range="Overview!M3:M",
@@ -5910,30 +5935,10 @@ def build_overview_payload():
 
             typ = "Thread" if unit.lower().startswith("cone") else "Material"
             
-            # Look up color from Material Inventory for materials
+            # Look up color from pre-fetched Material Inventory map
             material_color = None
-            if typ == "Material":
-                try:
-                    # Fetch Material Inventory to get color
-                    inv_resp = svc.get(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range="Material Inventory!A1:J",
-                        valueRenderOption="UNFORMATTED_VALUE",
-                    ).execute()
-                    inv_rows = inv_resp.get("values", [])
-                    if inv_rows and len(inv_rows) > 1:
-                        headers = [str(h).strip() for h in inv_rows[0]]
-                        name_idx = headers.index("Materials") if "Materials" in headers else 0
-                        color_idx = headers.index("Color") if "Color" in headers else None
-                        
-                        if color_idx is not None:
-                            for row in inv_rows[1:]:
-                                if len(row) > name_idx and str(row[name_idx]).strip().lower() == name.lower():
-                                    if len(row) > color_idx and row[color_idx]:
-                                        material_color = str(row[color_idx]).strip()
-                                        break
-                except Exception as e:
-                    app.logger.warning(f"Failed to lookup material color for {name}: {e}")
+            if typ == "Material" and material_color_map:
+                material_color = material_color_map.get(name.lower())
             
             grouped.setdefault(vendor, []).append(
                 {"name": name, "qty": qty, "unit": unit, "type": typ, "color": material_color}
@@ -6158,6 +6163,26 @@ def overview_materials_needed():
     debug = request.args.get("debug") == "1"
     try:
         svc = get_sheets_service().spreadsheets().values()
+        
+        # Fetch Material Inventory once for color lookups (optimization)
+        mat_inv_map = {}
+        try:
+            mat_inv_rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:J") or []
+            if mat_inv_rows and len(mat_inv_rows) > 1:
+                mat_inv_headers = [str(h).strip() for h in mat_inv_rows[0]]
+                if "Materials" in mat_inv_headers and "Vendor" in mat_inv_headers and "Color" in mat_inv_headers:
+                    mat_name_idx = mat_inv_headers.index("Materials")
+                    vendor_idx = mat_inv_headers.index("Vendor")
+                    color_idx = mat_inv_headers.index("Color")
+                    for r in mat_inv_rows[1:]:
+                        if len(r) > max(mat_name_idx, vendor_idx, color_idx):
+                            mat_inv_map[str(r[mat_name_idx]).strip().lower()] = {
+                                "vendor": str(r[vendor_idx]).strip(),
+                                "color": str(r[color_idx]).strip()
+                            }
+        except Exception as e:
+            app.logger.warning(f"Failed to fetch Material Inventory for color lookup: {e}")
+        
         resp = svc.get(
             spreadsheetId=SPREADSHEET_ID,
             range="Overview!M3:M",
@@ -6266,30 +6291,13 @@ def overview_materials_needed():
 
             typ = "Thread" if unit.lower().startswith("cone") else "Material"
             
-            # Look up color from Material Inventory for materials
-            material_color = None
-            if typ == "Material":
-                try:
-                    # Fetch Material Inventory to get color
-                    inv_resp = svc.get(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range="Material Inventory!A1:J",
-                        valueRenderOption="UNFORMATTED_VALUE",
-                    ).execute()
-                    inv_rows = inv_resp.get("values", [])
-                    if inv_rows and len(inv_rows) > 1:
-                        headers = [str(h).strip() for h in inv_rows[0]]
-                        name_idx = headers.index("Materials") if "Materials" in headers else 0
-                        color_idx = headers.index("Color") if "Color" in headers else None
-                        
-                        if color_idx is not None:
-                            for row in inv_rows[1:]:
-                                if len(row) > name_idx and str(row[name_idx]).strip().lower() == name.lower():
-                                    if len(row) > color_idx and row[color_idx]:
-                                        material_color = str(row[color_idx]).strip()
-                                        break
-                except Exception as e:
-                    app.logger.warning(f"Failed to lookup material color for {name}: {e}")
+            # Look up vendor and color from pre-fetched Material Inventory map
+            material_info = mat_inv_map.get(name.lower())
+            if material_info:
+                vendor = material_info["vendor"]
+                material_color = material_info["color"]
+            else:
+                material_color = None
             
             grouped.setdefault(vendor, []).append(
                 {"name": name, "qty": qty, "unit": unit, "type": typ, "color": material_color}
