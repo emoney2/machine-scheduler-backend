@@ -47,6 +47,7 @@ import time
 from zoneinfo import ZoneInfo
 
 import socket
+import ssl
 from requests.exceptions import (
     ConnectionError as ReqConnError,
     Timeout as ReqTimeout,
@@ -1435,15 +1436,13 @@ def _orders_list_for_changes():
     """
     Read the 'Production Orders' sheet. Adjust the tab name if yours differs.
     We read many columns so we get fields like Order #, Due Date, Stage, etc.
+    Uses fetch_sheet for retry on SSL/transport errors.
     """
-    svc = get_sheets_service().spreadsheets().values()
-    # Read up to column ZZ to be safe
-    resp = svc.get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Production Orders!A1:ZZ",
-        valueRenderOption="FORMATTED_VALUE",
-    ).execute()
-    rows = resp.get("values", []) or []
+    rows = fetch_sheet(
+        SPREADSHEET_ID,
+        "Production Orders!A1:ZZ",
+        value_render_option="FORMATTED_VALUE",
+    )
     return _rows_to_dicts(rows)
 
 
@@ -4981,15 +4980,24 @@ CORS(
 
 # ─── Session & Auth Helpers ──────────────────────────────────────────────────
 
-ALLOWED_WS_ORIGINS = list(
-    {
+def _allowed_ws_origins():
+    origins = {
         os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
         .strip()
         .rstrip("/"),
         "https://machineschedule.netlify.app",
         "http://localhost:3000",
     }
-)
+    extra = os.environ.get("EXTRA_WS_ORIGINS", "").strip()
+    if extra:
+        for o in extra.split(","):
+            o = o.strip().rstrip("/")
+            if o:
+                origins.add(o)
+    return list(origins)
+
+
+ALLOWED_WS_ORIGINS = _allowed_ws_origins()
 
 socketio = SocketIO(
     app,
@@ -5597,14 +5605,15 @@ def fetch_sheet(spreadsheet_id, range_a1, **opts):
             return resp.get("values", []) or []
         except Exception as e:
             msg = str(e)
-            if (
+            is_retryable = (
                 "timed out" in msg.lower()
                 or "transport" in msg.lower()
                 or "unavailable" in msg.lower()
-            ):
-                if attempt < 3:
-                    time.sleep(1 * attempt)  # 1s, 2s
-                    continue
+                or isinstance(e, ssl.SSLEOFError)
+            )
+            if is_retryable and attempt < 3:
+                time.sleep(1 * attempt)  # 1s, 2s
+                continue
             raise
 
 
@@ -8705,11 +8714,13 @@ def submit_order():
             print_links = f"https://drive.google.com/drive/folders/{pf_id}"
 
         # ─── WRITE TO GOOGLE SHEETS ──────────────────────────────────────────
+        print_val = (data.get("print") or "").strip().upper()
+        print_cell = "YES" if print_val == "YES" else "NO"
         row = [
             new_order, ts, preview, data.get("company"),
             data.get("designName"), data.get("quantity"), "",
             data.get("product"), stage, data.get("price"),
-            data.get("dueDate"), "NO",  # Always write "NO" to Print column
+            data.get("dueDate"), print_cell,  # Print column: YES when checkbox checked
             *materials,
             data.get("backMaterial"), data.get("furColor"),
             data.get("embBacking", ""), "",
@@ -8833,7 +8844,7 @@ def submit_order():
                 back_order, ts, back_preview, data.get("company"),
                 data.get("designName"), data.get("quantity"), "",
                 back_product, back_stage, "0",  # Price set to 0, product changed to Back
-                data.get("dueDate"), "NO",  # Always write "NO" to Print column
+                data.get("dueDate"), print_cell,  # Print column: YES when checkbox checked
                 *materials,
                 data.get("backMaterial"), data.get("furColor"),
                 data.get("embBacking", ""), "",
@@ -9557,10 +9568,75 @@ def get_thread_inventory_status():
         return jsonify({}), 200
 
 
+# ─── MATERIAL INVENTORY STATUS (for scheduler / UI) ────────────────────────
+_material_inventory_status_cache = {"ts": 0.0, "data": {}, "ttl": 45}
+
+
+@app.route("/api/material-inventory-status", methods=["GET"])
+@login_required_session
+def get_material_inventory_status():
+    """
+    Returns a map of material name -> status ("green", "yellow", "red") for UI.
+    Cached 45s. Uses Material Inventory sheet column A (name); no stock columns = all "green".
+    """
+    global _material_inventory_status_cache
+    now = time.time()
+    if now - _material_inventory_status_cache["ts"] < _material_inventory_status_cache["ttl"]:
+        return jsonify(_material_inventory_status_cache["data"]), 200
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:H")
+        if not rows or len(rows) < 2:
+            return jsonify({}), 200
+        headers = [str(h).strip().lower() for h in rows[0]]
+        status_map = {}
+        name_col = 0
+        for row in rows[1:]:
+            if not row or len(row) <= name_col:
+                continue
+            name = str(row[name_col]).strip()
+            if not name:
+                continue
+            status_map[name] = "green"
+        _material_inventory_status_cache["ts"] = now
+        _material_inventory_status_cache["data"] = status_map
+        return jsonify(status_map), 200
+    except Exception as e:
+        logger.exception("Error fetching material inventory status: %s", e)
+        if _material_inventory_status_cache["data"]:
+            return jsonify(_material_inventory_status_cache["data"]), 200
+        return jsonify({}), 200
+
+
 # ─── MATERIAL-LOG Preflight (OPTIONS) ─────────────────────────────────────
 @app.route("/api/materialInventory", methods=["OPTIONS"])
 def material_inventory_preflight():
     return make_response("", 204)
+
+
+@app.route("/api/materialInventory", methods=["GET"])
+@login_required_session
+def get_material_inventory():
+    """
+    GET: returns list of materials from Material Inventory (name from col A).
+    POST is used to submit new material log entries.
+    """
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:H")
+        if not rows or len(rows) < 2:
+            return jsonify([]), 200
+        headers = rows[0]
+        materials = []
+        for row in rows[1:]:
+            if not row:
+                continue
+            name = str(row[0]).strip() if len(row) > 0 else ""
+            if not name:
+                continue
+            materials.append({"name": name})
+        return jsonify(materials), 200
+    except Exception as e:
+        logger.exception("Error fetching material inventory: %s", e)
+        return jsonify([]), 200
 
 
 # ─── MATERIAL-LOG POST ────────────────────────────────────────────────────
