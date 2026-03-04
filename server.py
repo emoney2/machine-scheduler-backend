@@ -2105,70 +2105,57 @@ async def madeira_login_and_cart(items):
         return {"cart_url": cart_url}
 
 
-# --- CORS: handle all OPTIONS preflight early ---
+# --- CORS: shared allowed origins (used by preflight + after_request + Socket.IO) ---
+def _cors_allowed_origins():
+    """Set of allowed origins for CORS. Includes FRONTEND_URL, localhost, ALLOWED_ORIGINS, EXTRA_WS_ORIGINS."""
+    allowed = {
+        os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/"),
+        "https://machineschedule.netlify.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    }
+    for env_name in ("ALLOWED_ORIGINS", "EXTRA_WS_ORIGINS"):
+        val = os.environ.get(env_name, "").strip()
+        if val:
+            for o in val.split(","):
+                o = o.strip().rstrip("/")
+                if o:
+                    allowed.add(o)
+    return allowed
+
+
+# --- CORS: handle all OPTIONS preflight early; always send CORS so preflight never fails ---
 @app.before_request
 def handle_preflight():
     if request.method == "OPTIONS":
         origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-        # Env-driven allow-list + safe defaults
-        allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
-        allowed = {o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()}
-        allowed.update(
-            {
-                (
-                    os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
-                    .strip()
-                    .rstrip("/")
-                ),
-                "https://machineschedule.netlify.app",
-                "http://localhost:3000",
-                "http://127.0.0.1:3000",
-                "http://localhost:5173",
-                "http://127.0.0.1:5173",
-            }
-        )
-
+        allowed = _cors_allowed_origins()
+        # Always set CORS on preflight so browser gets valid response even under load
         resp = make_response("", 204)
-        if origin in allowed:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With,Accept"
-            resp.headers["Access-Control-Allow-Methods"] = (
-                "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-            )
-            resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Origin"] = origin if origin in allowed else (
+            os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")
+        )
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With,Accept"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        resp.headers["Vary"] = "Origin"
         return resp  # short-circuit OPTIONS
 
 
 @app.after_request
 def apply_cors(response):
+    # Always attach CORS to every response so errors/timeouts still allow frontend to see body
     origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-    # Env-driven allow-list + safe defaults
-    allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
-    allowed = {o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()}
-    allowed.update(
-        {
-            (
-                os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
-                .strip()
-                .rstrip("/")
-            ),
-            "https://machineschedule.netlify.app",
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-        }
+    allowed = _cors_allowed_origins()
+    response.headers["Access-Control-Allow-Origin"] = origin if origin in allowed else (
+        os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")
     )
-
-    if origin in allowed:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Vary"] = "Origin"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With,Accept"
-    response.headers["Access-Control-Allow-Methods"] = (
-        "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-    )
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
     return response
 
 
@@ -8027,6 +8014,11 @@ def save_manual_state():
             body={"values": [[i2, j2]]},
         ).execute()
 
+        # Invalidate cache so next GET returns fresh data (stops periodic poll from reverting the UI)
+        global _manual_state_cache, _manual_state_ts
+        _manual_state_cache = None
+        _manual_state_ts = 0
+
         return (
             jsonify(
                 {
@@ -8496,27 +8488,13 @@ def log_material_to_google_sheets(order_number):
 def submit_order():
     if request.method == "OPTIONS":
         origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-        allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
-        allowed = {o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()}
-        allowed.update(
-            {
-                (
-                    os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
-                    .strip()
-                    .rstrip("/")
-                ),
-                "https://machineschedule.netlify.app",
-                "http://localhost:3000",
-                "http://127.0.0.1:3000",
-                "http://localhost:5173",
-                "http://127.0.0.1:5173",
-            }
-        )
+        allowed = _cors_allowed_origins()
         resp = make_response("", 204)
-        if origin in allowed:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Origin"] = origin if origin in allowed else (
+            os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")
+        )
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE, PATCH"
         return resp
@@ -8623,40 +8601,32 @@ def submit_order():
                 fileId=file_id, body={"role": "reader", "type": "anyone"}
             ).execute()
 
-        # ─── READ FILES INTO MEMORY IF NEEDED FOR DUPLICATE UPLOAD ────────────────
+        # ─── CREATE FIRST ORDER (FRONT) FOLDER ───────────────────────────────────
         from io import BytesIO
-        if is_quilted_front:
-            # Read all files into memory for reuse in second order
-            prod_files_data = []
-            for f in prod_files:
-                file_data = f.read()
-                prod_files_data.append({
-                    "filename": f.filename,
-                    "mimetype": f.mimetype,
-                    "data": file_data
-                })
-            
-            print_files_data = []
-            if print_files:
-                for f in print_files:
-                    file_data = f.read()
-                    print_files_data.append({
-                        "filename": f.filename,
-                        "mimetype": f.mimetype,
-                        "data": file_data
-                    })
-        else:
-            prod_files_data = None
-            print_files_data = None
-
-        # ─── CREATE FIRST ORDER (FRONT) ───────────────────────────────────────────
+        reorder_from = data.get("reorderFrom")
         order_folder_id = create_folder(
             new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
         )
         make_public(order_folder_id)
 
+        # For quilted front: create back order folder early so we can upload one file at a time
+        # (avoids loading all print/prod files into memory at once)
+        back_order_folder_id = None
+        back_pf_id = None
+        if is_quilted_front and back_order:
+            back_order_folder_id = create_folder(
+                back_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
+            )
+            make_public(back_order_folder_id)
+            if reorder_from:
+                copy_emb_files(
+                    old_order_num=reorder_from,
+                    new_order_num=back_order,
+                    drive_service=drive,
+                    new_folder_id=back_order_folder_id,
+                )
+
         # 🧵 If this is a reorder, copy any .emb and .svg files from the original job folder
-        reorder_from = data.get("reorderFrom")
         if reorder_from:
             copy_emb_files(
                 old_order_num=reorder_from,
@@ -8666,21 +8636,12 @@ def submit_order():
             )
 
         prod_links = []
+        back_prod_links = []
         if is_quilted_front:
-            # Use in-memory data
-            for f_data in prod_files_data:
-                m = MediaIoBaseUpload(BytesIO(f_data["data"]), mimetype=f_data["mimetype"])
-                up = drive.files().create(
-                    body={"name": f_data["filename"], "parents": [order_folder_id]},
-                    media_body=m,
-                    fields="id,webViewLink",
-                ).execute()
-                make_public(up["id"])
-                prod_links.append(up["webViewLink"])
-        else:
-            # Use original file streams
+            # One file at a time to avoid loading all into memory; reuse one buffer for both uploads
             for f in prod_files:
-                m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+                buf = BytesIO(f.read())
+                m = MediaIoBaseUpload(buf, mimetype=f.mimetype)
                 up = drive.files().create(
                     body={"name": f.filename, "parents": [order_folder_id]},
                     media_body=m,
@@ -8688,34 +8649,72 @@ def submit_order():
                 ).execute()
                 make_public(up["id"])
                 prod_links.append(up["webViewLink"])
+                buf.seek(0)
+                m2 = MediaIoBaseUpload(buf, mimetype=f.mimetype)
+                up2 = drive.files().create(
+                    body={"name": f.filename, "parents": [back_order_folder_id]},
+                    media_body=m2,
+                    fields="id,webViewLink",
+                ).execute()
+                make_public(up2["id"])
+                back_prod_links.append(up2["webViewLink"])
+                del buf
+        else:
+            # One prod file at a time to avoid holding multiple large files in memory
+            for f in prod_files:
+                buf = BytesIO(f.read())
+                m = MediaIoBaseUpload(buf, mimetype=f.mimetype)
+                up = drive.files().create(
+                    body={"name": f.filename, "parents": [order_folder_id]},
+                    media_body=m,
+                    fields="id,webViewLink",
+                ).execute()
+                make_public(up["id"])
+                prod_links.append(up["webViewLink"])
+                del buf
 
+        # Create Print Files subfolder if user uploaded print files OR checked the Print checkbox
+        print_val = (data.get("print") or "").strip().upper()
+        print_cell = "YES" if print_val == "YES" else "NO"
         print_links = ""
-        if print_files or (is_quilted_front and print_files_data):
+        back_print_links = ""
+        if print_files or print_val == "YES":
             pf_id = create_folder("Print Files", parent_id=order_folder_id)
             make_public(pf_id)
-            if is_quilted_front and print_files_data:
-                # Use in-memory data
-                for f_data in print_files_data:
-                    m = MediaIoBaseUpload(BytesIO(f_data["data"]), mimetype=f_data["mimetype"])
-                    drive.files().create(
-                        body={"name": f_data["filename"], "parents": [pf_id]},
-                        media_body=m,
-                        fields="id",
-                    ).execute()
-            elif print_files:
-                # Use original file streams
+            if is_quilted_front and back_order_folder_id:
+                back_pf_id = create_folder("Print Files", parent_id=back_order_folder_id)
+                make_public(back_pf_id)
                 for f in print_files:
-                    m = MediaIoBaseUpload(f.stream, mimetype=f.mimetype)
+                    buf = BytesIO(f.read())
+                    m = MediaIoBaseUpload(buf, mimetype=f.mimetype)
                     drive.files().create(
                         body={"name": f.filename, "parents": [pf_id]},
                         media_body=m,
                         fields="id",
                     ).execute()
+                    buf.seek(0)
+                    m2 = MediaIoBaseUpload(buf, mimetype=f.mimetype)
+                    drive.files().create(
+                        body={"name": f.filename, "parents": [back_pf_id]},
+                        media_body=m2,
+                        fields="id",
+                    ).execute()
+                    del buf
+                back_print_links = f"https://drive.google.com/drive/folders/{back_pf_id}"
+            else:
+                # Process one print file at a time to avoid holding multiple large files in memory
+                for f in print_files:
+                    buf = BytesIO(f.read())
+                    m = MediaIoBaseUpload(buf, mimetype=f.mimetype)
+                    drive.files().create(
+                        body={"name": f.filename, "parents": [pf_id]},
+                        media_body=m,
+                        fields="id",
+                    ).execute()
+                    del buf
             print_links = f"https://drive.google.com/drive/folders/{pf_id}"
 
         # ─── WRITE TO GOOGLE SHEETS ──────────────────────────────────────────
-        print_val = (data.get("print") or "").strip().upper()
-        print_cell = "YES" if print_val == "YES" else "NO"
         row = [
             new_order, ts, preview, data.get("company"),
             data.get("designName"), data.get("quantity"), "",
@@ -8776,49 +8775,9 @@ def submit_order():
         except Exception as e:
             logger.error("[MaterialLog] Failed to log to Google Sheets for order %s: %s", new_order, e)
 
-        # ─── CREATE SECOND ORDER (BACK) FOR QUILTED FRONT PRODUCTS ──────────
+        # ─── WRITE SECOND ORDER (BACK) ROW FOR QUILTED FRONT PRODUCTS ──────────
+        # (Files already uploaded to back_order_folder_id one-at-a-time above)
         if is_quilted_front and back_order:
-            # Create folder for back order
-            back_order_folder_id = create_folder(
-                back_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
-            )
-            make_public(back_order_folder_id)
-
-            # 🧵 If this is a reorder, copy any .emb and .svg files from the original job folder to back order folder too
-            if reorder_from:
-                copy_emb_files(
-                    old_order_num=reorder_from,
-                    new_order_num=back_order,
-                    drive_service=drive,
-                    new_folder_id=back_order_folder_id
-                )
-
-            # Upload production files to back order folder
-            back_prod_links = []
-            for f_data in prod_files_data:
-                m = MediaIoBaseUpload(BytesIO(f_data["data"]), mimetype=f_data["mimetype"])
-                up = drive.files().create(
-                    body={"name": f_data["filename"], "parents": [back_order_folder_id]},
-                    media_body=m,
-                    fields="id,webViewLink",
-                ).execute()
-                make_public(up["id"])
-                back_prod_links.append(up["webViewLink"])
-
-            # Upload print files to back order folder
-            back_print_links = ""
-            if print_files_data:
-                back_pf_id = create_folder("Print Files", parent_id=back_order_folder_id)
-                make_public(back_pf_id)
-                for f_data in print_files_data:
-                    m = MediaIoBaseUpload(BytesIO(f_data["data"]), mimetype=f_data["mimetype"])
-                    drive.files().create(
-                        body={"name": f_data["filename"], "parents": [back_pf_id]},
-                        media_body=m,
-                        fields="id",
-                    ).execute()
-                back_print_links = f"https://drive.google.com/drive/folders/{back_pf_id}"
-
             # Get formulas for back order row
             back_next_row = next_row + 1
             back_preview = tpl_formula("C", back_next_row)
@@ -8896,17 +8855,6 @@ def submit_order():
             except Exception as e:
                 logger.error("[MaterialLog] Failed to log to Google Sheets for back order %s: %s", back_order, e)
 
-            # ─── CLEANUP: Clear file data from memory to prevent memory leaks ─────
-            # Explicitly clear large file data after uploads complete
-            if prod_files_data:
-                for f_data in prod_files_data:
-                    f_data["data"] = None  # Clear byte data to free memory
-                del prod_files_data[:]  # Clear list
-            if print_files_data:
-                for f_data in print_files_data:
-                    f_data["data"] = None  # Clear byte data to free memory
-                del print_files_data[:]  # Clear list
-
         invalidate_upcoming_cache()
         
         # Return both order numbers if quilted front, otherwise just the one
@@ -8923,22 +8871,12 @@ def submit_order():
 @app.after_request
 def add_submit_cors_headers(resp):
     origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-    allowed = {
-        (
-            os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
-            .strip()
-            .rstrip("/")
-        ),
-        "https://machineschedule.netlify.app",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    }
-    if origin in allowed:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Vary"] = "Origin"
+    allowed = _cors_allowed_origins()
+    resp.headers["Access-Control-Allow-Origin"] = origin if origin in allowed else (
+        os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")
+    )
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE, PATCH"
     return resp
