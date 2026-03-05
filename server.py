@@ -9515,7 +9515,10 @@ _material_inventory_status_cache = {"ts": 0.0, "data": {}, "ttl": 45}
 def get_material_inventory_status():
     """
     Returns a map of material name -> status ("green", "yellow", "red") for UI.
-    Cached 45s. Uses Material Inventory sheet column A (name); no stock columns = all "green".
+    - green: Inventory > 0
+    - yellow: Inventory <= 0 AND On Order > 0 (material on the way)
+    - red: Inventory <= 0 AND On Order <= 0
+    Cached 45s. Uses Material Inventory sheet: name (col A), Inventory, On Order.
     """
     global _material_inventory_status_cache
     now = time.time()
@@ -9525,16 +9528,49 @@ def get_material_inventory_status():
         rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:H")
         if not rows or len(rows) < 2:
             return jsonify({}), 200
-        headers = [str(h).strip().lower() for h in rows[0]]
-        status_map = {}
+        raw_headers = rows[0]
+        headers_lower = [str(h).strip().lower() for h in raw_headers]
         name_col = 0
+        # Find Inventory and On Order columns (support "Inventory"/"Inventory.." and "On Order"/"On Order..")
+        col_inventory = None
+        col_on_order = None
+        for i, h in enumerate(headers_lower):
+            if h in ("inventory..", "inventory") and col_inventory is None:
+                col_inventory = i
+            if h in ("on order..", "on order") and col_on_order is None:
+                col_on_order = i
+        if col_inventory is None:
+            col_inventory = 1 if len(raw_headers) > 1 else None
+        if col_on_order is None:
+            col_on_order = 2 if len(raw_headers) > 2 else None
+
+        status_map = {}
         for row in rows[1:]:
             if not row or len(row) <= name_col:
                 continue
             name = str(row[name_col]).strip()
             if not name:
                 continue
-            status_map[name] = "green"
+            inventory = 0.0
+            on_order = 0.0
+            if col_inventory is not None and len(row) > col_inventory:
+                try:
+                    inventory = float(str(row[col_inventory]).replace(",", "").strip() or "0")
+                except (ValueError, TypeError):
+                    pass
+            if col_on_order is not None and len(row) > col_on_order:
+                try:
+                    on_order = float(str(row[col_on_order]).replace(",", "").strip() or "0")
+                except (ValueError, TypeError):
+                    pass
+            if inventory > 0:
+                status = "green"
+            elif inventory <= 0 and on_order > 0:
+                status = "yellow"
+            else:
+                status = "red"
+            status_map[name] = status
+
         _material_inventory_status_cache["ts"] = now
         _material_inventory_status_cache["data"] = status_map
         return jsonify(status_map), 200
