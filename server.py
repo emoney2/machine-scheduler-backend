@@ -8919,21 +8919,27 @@ def get_directory():
         if not supabase:
             raise RuntimeError("Supabase unavailable")
 
-        # fetch all rows, select quoted identifier for spaces
-        resp = (
-            supabase
-            .table("Directory")
-            .select('"Company Name"')
-            .execute()
-        )
+        # Supabase returns max 1000 rows by default; paginate to get all customers
+        chunk_size = 1000
+        rows = []
+        offset = 0
+        while True:
+            resp = (
+                supabase
+                .table("Directory")
+                .select('"Company Name"')
+                .range(offset, offset + chunk_size - 1)
+                .execute()
+            )
+            chunk = resp.data or []
+            rows.extend(chunk)
+            if len(chunk) < chunk_size:
+                break
+            offset += chunk_size
 
         print("\n=== /api/directory DEBUG ===")
-        print("resp:", resp)
-        print("resp.data:", getattr(resp, "data", None))
+        print("total rows fetched:", len(rows))
         print("============================\n")
-
-        # Supabase python client returns data/errors differently, so just trust resp.data
-        rows = resp.data or []
 
 
         # extract company names
