@@ -8584,16 +8584,31 @@ def submit_order():
         drive = get_drive_service()
 
         def create_folder(name, parent_id=None):
+            from googleapiclient.errors import HttpError
             query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
             if parent_id:
                 query += f" and '{parent_id}' in parents"
             existing = drive.files().list(q=query, fields="files(id)").execute().get("files", [])
             for f in existing:
-                drive.files().delete(fileId=f["id"]).execute()
+                fid = f["id"]
+                try:
+                    retry_google_api_call(lambda: drive.files().delete(fileId=fid).execute())
+                except HttpError as e:
+                    # Fallback: move to trash instead of permanent delete (avoids 500s on delete)
+                    try:
+                        retry_google_api_call(
+                            lambda: drive.files().update(
+                                fileId=fid, body={"trashed": True}
+                            ).execute()
+                        )
+                    except Exception:
+                        raise e
             meta = {"name": str(name), "mimeType": "application/vnd.google-apps.folder"}
             if parent_id:
                 meta["parents"] = [parent_id]
-            folder = drive.files().create(body=meta, fields="id").execute()
+            folder = retry_google_api_call(
+                lambda: drive.files().create(body=meta, fields="id").execute()
+            )
             return folder["id"]
 
         def make_public(file_id):
