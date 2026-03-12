@@ -9059,6 +9059,7 @@ def shopify_webhook_orders_create():
         ).execute()
 
         if supabase:
+            # Match columns from Production Orders TEST (no Fur Color / Material 1 in schema)
             supabase.table(SUPABASE_PB_ORDERS_TABLE).insert({
                 "Order #": new_order,
                 "Date": ts,
@@ -9069,8 +9070,6 @@ def shopify_webhook_orders_create():
                 "Price": price,
                 "Due Date": "",
                 "Stage": "ORDERED",
-                "Fur Color": fur_color or None,
-                "Material 1": material1 or None,
             }).execute()
 
         created.append(new_order)
