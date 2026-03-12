@@ -9035,7 +9035,16 @@ def _send_design_confirmation_email(
     if urls:
         for i, url in enumerate(urls):
             if url and str(url).strip():
-                html_body += f'<p style="margin: 16px 0;"><img src="{_html_escape(url)}" alt="Design preview {i + 1}" style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px;" /></p>\n'
+                # Use Drive thumbnail URL for mobile/email clients (direct image; uc?export=view often breaks on mobile)
+                if "id=" in url:
+                    file_id = url.split("id=")[-1].split("&")[0].split("#")[0].strip()
+                    if file_id:
+                        url_thumb = "https://drive.google.com/thumbnail?id=" + file_id + "&sz=w800"
+                    else:
+                        url_thumb = url
+                else:
+                    url_thumb = url
+                html_body += f'<p style="margin: 16px 0;"><img src="{_html_escape(url_thumb)}" alt="Design preview {i + 1}" width="600" style="display: block; max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px;" /></p>\n'
     else:
         html_body += "<p><em>Design preview is being prepared.</em></p>\n"
     html_body += """<p><em>Please review the preview(s) above to confirm everything looks correct.</em></p>
@@ -9171,26 +9180,24 @@ def shopify_webhook_orders_create():
             headers = header_row[0] if header_row else []
             shopify_id_col_idx = None
             for i, h in enumerate(headers):
-                if (str(h or "").strip().lower() in ("shopify order id", "shopify order number")):
+                if (str(h or "").strip().lower() in ("shopify order id", "shopify order number", "shopify id")):
                     shopify_id_col_idx = i
                     break
-            if shopify_id_col_idx is not None:
-                def _letter(col_idx):
-                    n = col_idx + 1
-                    s = ""
-                    while n:
-                        n, rem = divmod(n - 1, 26)
-                        s = chr(65 + rem) + s
-                    return s
-                last_col_letter = _letter(shopify_id_col_idx)
-                existing = sheets.get(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A2:{last_col_letter}201",
-                ).execute().get("values", [])
-                for r in (existing or []):
-                    if len(r) > shopify_id_col_idx and (r[shopify_id_col_idx] or "").strip() == shopify_order_id:
+            existing = sheets.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A2:AZ201",
+            ).execute().get("values", [])
+            for r in (existing or []):
+                if shopify_id_col_idx is not None and len(r) > shopify_id_col_idx:
+                    if (r[shopify_id_col_idx] or "").strip() == shopify_order_id:
                         logger.info("[ShopifyWebhook] Skipping duplicate order %s (already in sheet)", shopify_order_id)
                         return jsonify({"status": "ok", "created": []}), 200
+                else:
+                    # No matching header: scan entire row for this Shopify order ID
+                    for cell in r:
+                        if str(cell or "").strip() == shopify_order_id:
+                            logger.info("[ShopifyWebhook] Skipping duplicate order %s (already in sheet)", shopify_order_id)
+                            return jsonify({"status": "ok", "created": []}), 200
         except Exception as e:
             logger.warning("[ShopifyWebhook] Dedupe check failed: %s", e)
 
@@ -9364,6 +9371,7 @@ def shopify_webhook_orders_create():
             _set("Order Folder Link", order_folder_link or "")
             _set("Folder Link", order_folder_link or "")
             _set("Shopify Order ID", shopify_order_id or "")
+            _set("Shopify ID", shopify_order_id or "")
             if pb_ph.get("Order #") is None:
                 fixed_preview = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & REGEXEXTRACT(D' + str(next_row) + ', "file/d/([^/]+)")), "No preview available")'
                 fixed = [
