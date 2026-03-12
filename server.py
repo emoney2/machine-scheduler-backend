@@ -8938,6 +8938,17 @@ def _get_prop(properties, name):
     return ""
 
 
+def _material_color_to_display(code):
+    """
+    Convert materialColor code (e.g. luscious-original-red) to sheet display name (e.g. Luscious Original Red).
+    Replace hyphens with spaces and title-case each word.
+    """
+    if not code or not str(code).strip():
+        return ""
+    s = str(code).strip().replace("-", " ")
+    return " ".join(w.capitalize() for w in s.split())
+
+
 def _is_product_builder_line_item(line_item):
     """True if this line item has product builder properties (Material, Fur, or _builder_config)."""
     props = line_item.get("properties") or []
@@ -8973,11 +8984,13 @@ def _send_design_confirmation_email(
     product_name,
     quantity,
     design_image_url,
+    design_image_urls=None,
     logger_=None,
 ):
     """
     Send the JR & Co. design confirmation email (from info@jrco.us) with order details
-    and design preview image. Uses SMTP env vars; no-op if not configured.
+    and design preview image(s). Uses SMTP env vars; no-op if not configured.
+    If design_image_urls (list) is provided, all URLs are shown; otherwise design_image_url is used.
     """
     log = logger_ or logger
     from_email = (os.environ.get("DESIGN_CONFIRMATION_FROM_EMAIL") or "info@jrco.us").strip()
@@ -9000,6 +9013,10 @@ def _send_design_confirmation_email(
     product_name = (product_name or "").strip() or "—"
     quantity = (quantity or "").strip() or "—"
     design_image_url = (design_image_url or "").strip()
+    urls = design_image_urls if isinstance(design_image_urls, list) else []
+    if not urls and design_image_url:
+        urls = [design_image_url]
+    design_image_urls_plain = "\n".join(urls) if urls else (design_image_url or "(see link in email)")
 
     html_body = f"""<!DOCTYPE html>
 <html>
@@ -9013,13 +9030,15 @@ def _send_design_confirmation_email(
 <strong>Customer:</strong> {_html_escape(customer_name)}</p>
 <p><strong>Product:</strong> {_html_escape(product_name)}<br>
 <strong>Quantity:</strong> {_html_escape(quantity)}</p>
-<p><strong>Design Preview</strong></p>
+<p><strong>Design Preview(s)</strong></p>
 """
-    if design_image_url:
-        html_body += f'<p style="margin: 16px 0;"><img src="{_html_escape(design_image_url)}" alt="Your design preview" style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px;" /></p>\n'
+    if urls:
+        for i, url in enumerate(urls):
+            if url and str(url).strip():
+                html_body += f'<p style="margin: 16px 0;"><img src="{_html_escape(url)}" alt="Design preview {i + 1}" style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px;" /></p>\n'
     else:
         html_body += "<p><em>Design preview is being prepared.</em></p>\n"
-    html_body += """<p><em>Please review the preview above to confirm everything looks correct.</em></p>
+    html_body += """<p><em>Please review the preview(s) above to confirm everything looks correct.</em></p>
 <p>If anything needs to be adjusted, reply to this email as soon as possible and we'll take care of it before production begins.</p>
 <p><strong>Production Timeline</strong></p>
 <p>Most custom orders ship within <strong>3 weeks</strong> from the time the order is approved.</p>
@@ -9042,9 +9061,9 @@ Customer: {customer_name}
 Product: {product_name}
 Quantity: {quantity}
 
-Design Preview: {design_image_url or '(see link in email)'}
+Design Preview(s): {design_image_urls_plain}
 
-Please review the preview above to confirm everything looks correct.
+Please review the preview(s) above to confirm everything looks correct.
 
 If anything needs to be adjusted, reply to this email as soon as possible and we'll take care of it before production begins.
 
@@ -9140,68 +9159,53 @@ def shopify_webhook_orders_create():
     if shopify_order_id is not None:
         shopify_order_id = str(shopify_order_id).strip()
 
-    # Dedupe: if we already processed this Shopify order, skip (avoid duplicate rows from webhook retries)
     sheets = get_sheets_service().spreadsheets().values()
+
+    # Dedupe: if we already processed this Shopify order, skip (avoid duplicate rows/emails from webhook retries)
     if shopify_order_id:
         try:
-            existing = sheets.get(
+            header_row = sheets.get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A2:U201",
-            ).execute().get("values", [])
-            shopify_id_col_idx = 20  # column U for Shopify order ID (dedupe)
-            for r in (existing or []):
-                if len(r) > shopify_id_col_idx and (r[shopify_id_col_idx] or "").strip() == shopify_order_id:
-                    logger.info("[ShopifyWebhook] Skipping duplicate order %s (already in sheet)", shopify_order_id)
-                    return jsonify({"status": "ok", "created": []}), 200
+                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!1:1",
+            ).execute().get("values", [[]])
+            headers = header_row[0] if header_row else []
+            shopify_id_col_idx = None
+            for i, h in enumerate(headers):
+                if (str(h or "").strip().lower() in ("shopify order id", "shopify order number")):
+                    shopify_id_col_idx = i
+                    break
+            if shopify_id_col_idx is not None:
+                def _letter(col_idx):
+                    n = col_idx + 1
+                    s = ""
+                    while n:
+                        n, rem = divmod(n - 1, 26)
+                        s = chr(65 + rem) + s
+                    return s
+                last_col_letter = _letter(shopify_id_col_idx)
+                existing = sheets.get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A2:{last_col_letter}201",
+                ).execute().get("values", [])
+                for r in (existing or []):
+                    if len(r) > shopify_id_col_idx and (r[shopify_id_col_idx] or "").strip() == shopify_order_id:
+                        logger.info("[ShopifyWebhook] Skipping duplicate order %s (already in sheet)", shopify_order_id)
+                        return jsonify({"status": "ok", "created": []}), 200
         except Exception as e:
             logger.warning("[ShopifyWebhook] Dedupe check failed: %s", e)
-
-    first = pb_lines[0]
-    props = first.get("properties") or []
-    prop = lambda n: _get_prop(props, n)
-    material1 = prop("Material")
-    fur_color = prop("Fur")
-    print_val = prop("Print")
-    print_cell = "YES" if print_val and str(print_val).upper() in ("YES", "TRUE", "1") else "NO"
-    total_qty = sum(int(li.get("quantity") or 1) for li in pb_lines)
-    price = float(first.get("price") or 0)
 
     billing = order.get("billing_address") or {}
     company = (billing.get("company") or order.get("customer", {}).get("default_address", {}).get("company") or "").strip() or "Shopify"
     order_name = (order.get("name") or str(order.get("order_number") or "")).strip()
     order_notes = (order.get("note") or "").strip()
     design = order_name
-    # Notes: prefer product-builder line item property _notes, then order note
-    notes_val = (prop("_notes") or prop("Notes") or order_notes or "").strip()[:500]
-
-    pt_lower = (prop("_productType") or "driver").strip().lower()
-    never_two = pt_lower in ("blade", "mid-mallet", "mallet")
-    back_has_content_val = (prop("_back_has_content") or "").strip().lower()
-    needs_front_back = False
-    if not never_two and back_has_content_val in ("true", "1", "yes"):
-        needs_front_back = True
-    preview_data_url = prop("_preview_image")
-
-    num_rows = 2 if needs_front_back else 1
-    base_name = _product_type_display(prop, needs_front_back=False, is_back=False)
-    if needs_front_back:
-        product_names = [base_name.replace(" Full", " Front"), base_name.replace(" Full", " Back")]
-    else:
-        product_names = [base_name]
+    total_qty = sum(int(li.get("quantity") or 1) for li in pb_lines)
 
     ts = datetime.now(ZoneInfo("America/New_York"))
     ts_str = ts.strftime("%-m/%-d/%Y %H:%M:%S")
     due_dt = ts + timedelta(days=21)
     due_str_sheet = due_dt.strftime("%-m/%-d/%Y")
     due_str_supabase = due_dt.strftime("%Y-%m-%d")
-
-    def _pb_tpl_formula(col_letter, target_row):
-        raw = sheets.get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{col_letter}2",
-            valueRenderOption="FORMULA",
-        ).execute().get("values", [[""]])[0][0] or ""
-        return re.sub(r"(\b[A-Z]+)2\b", lambda m: f"{m.group(1)}{target_row}", raw)
 
     DRIVE_PARENT_ID = "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
     created = []
@@ -9245,126 +9249,161 @@ def shopify_webhook_orders_create():
             logger.warning("[ShopifyWebhook] make_public failed for %s: %s", file_id, e)
 
     start_row = next_row
-    first_preview_file_id = None  # for design confirmation email image URL
-    for idx in range(num_rows):
-        new_order = prev_order + 1 + idx
-        product_title = product_names[idx] if idx < len(product_names) else product_names[0]
-        order_folder_link = ""
-        preview_link = ""
-        folder_id = None
+    all_preview_urls = []  # one image URL per line item for the single confirmation email
+    product_name_parts = []  # for email summary
 
-        if drive:
-            try:
-                meta = {"name": str(new_order), "mimeType": "application/vnd.google-apps.folder", "parents": [DRIVE_PARENT_ID]}
-                folder = drive.files().create(body=meta, fields="id,webViewLink").execute()
-                folder_id = folder.get("id")
-                order_folder_link = folder.get("webViewLink", "")
-                _make_public_safe(drive, folder_id)
+    for line_item in pb_lines:
+        props = line_item.get("properties") or []
+        def _prop(n):
+            return _get_prop(props, n)
+        material_color_code = _prop("_materialColor") or _prop("materialColor") or ""
+        material1 = _material_color_to_display(material_color_code) if material_color_code else (_prop("Material") or "")
+        fur_color = _prop("Fur")
+        print_val = _prop("Print")
+        print_cell = "YES" if print_val and str(print_val).upper() in ("YES", "TRUE", "1") else "NO"
+        line_qty = int(line_item.get("quantity") or 1)
+        line_price = float(line_item.get("price") or 0)
+        notes_val = (_prop("_notes") or _prop("Notes") or order_notes or "").strip()[:500]
+        pt_lower = (_prop("_productType") or "driver").strip().lower()
+        never_two = pt_lower in ("blade", "mid-mallet", "mallet")
+        back_has_content_val = (_prop("_back_has_content") or "").strip().lower()
+        needs_front_back = not never_two and back_has_content_val in ("true", "1", "yes")
+        num_rows = 2 if needs_front_back else 1
+        base_name = _product_type_display(_prop, needs_front_back=False, is_back=False)
+        if needs_front_back:
+            product_names_line = [base_name.replace(" Full", " Front"), base_name.replace(" Full", " Back")]
+        else:
+            product_names_line = [base_name]
+        preview_data_url = _prop("_preview_image")
+        line_preview_file_id = None
 
-                uploads = []
-                if preview_data_url:
-                    uploads.append(("preview.jpg", preview_data_url, "image/jpeg"))
-                for i in range(1, 11):
-                    v = prop(f"_logo_file_{i}")
-                    if v:
-                        uploads.append((f"logo_{i}.png", v, "image/png"))
+        for idx in range(num_rows):
+            new_order = prev_order + 1
+            prev_order = new_order
+            product_title = product_names_line[idx] if idx < len(product_names_line) else product_names_line[0]
+            order_folder_link = ""
+            preview_link = ""
+            folder_id = None
 
-                for fname, data_url, default_mime in uploads:
-                    if not data_url or not isinstance(data_url, str) or not data_url.startswith("data:image"):
-                        continue
-                    try:
-                        header, b64 = data_url.split(",", 1) if "," in data_url else (None, None)
-                        if not b64:
+            if drive:
+                try:
+                    meta = {"name": str(new_order), "mimeType": "application/vnd.google-apps.folder", "parents": [DRIVE_PARENT_ID]}
+                    folder = drive.files().create(body=meta, fields="id,webViewLink").execute()
+                    folder_id = folder.get("id")
+                    order_folder_link = folder.get("webViewLink", "")
+                    _make_public_safe(drive, folder_id)
+
+                    uploads = []
+                    if preview_data_url:
+                        uploads.append(("preview.jpg", preview_data_url, "image/jpeg"))
+                    for i in range(1, 11):
+                        v = _prop(f"_logo_file_{i}")
+                        if v:
+                            uploads.append((f"logo_{i}.png", v, "image/png"))
+
+                    for fname, data_url, default_mime in uploads:
+                        if not data_url or not isinstance(data_url, str) or not data_url.startswith("data:image"):
                             continue
-                        raw = base64.b64decode(b64)
-                        mime = default_mime
-                        if "preview" in fname and default_mime == "image/jpeg":
-                            try:
-                                from PIL import Image
-                                img = Image.open(io.BytesIO(raw))
-                                if img.mode in ("RGBA", "P"):
-                                    img = img.convert("RGB")
-                                buf = io.BytesIO()
-                                img.save(buf, "JPEG", quality=90)
-                                raw = buf.getvalue()
-                            except Exception:
-                                pass
-                        if header and ("jpeg" in header or "jpg" in header):
-                            mime = "image/jpeg"
-                        m = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=False)
-                        up = drive.files().create(body={"name": fname, "parents": [folder_id]}, media_body=m, fields="id,webViewLink").execute()
-                        _make_public_safe(drive, up["id"])
-                        if "preview" in fname:
-                            preview_link = up.get("webViewLink", "")
-                            if first_preview_file_id is None:
-                                first_preview_file_id = up.get("id")
-                    except Exception as e:
-                        logger.warning("[ShopifyWebhook] Failed to upload %s: %s", fname, e)
-            except Exception as e:
-                logger.warning("[ShopifyWebhook] Drive folder/upload failed: %s", e)
+                        try:
+                            header, b64 = data_url.split(",", 1) if "," in data_url else (None, None)
+                            if not b64:
+                                continue
+                            raw = base64.b64decode(b64)
+                            mime = default_mime
+                            if "preview" in fname and default_mime == "image/jpeg":
+                                try:
+                                    from PIL import Image
+                                    img = Image.open(io.BytesIO(raw))
+                                    if img.mode in ("RGBA", "P"):
+                                        img = img.convert("RGB")
+                                    buf = io.BytesIO()
+                                    img.save(buf, "JPEG", quality=90)
+                                    raw = buf.getvalue()
+                                except Exception:
+                                    pass
+                            if header and ("jpeg" in header or "jpg" in header):
+                                mime = "image/jpeg"
+                            m = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=False)
+                            up = drive.files().create(body={"name": fname, "parents": [folder_id]}, media_body=m, fields="id,webViewLink").execute()
+                            _make_public_safe(drive, up["id"])
+                            if "preview" in fname:
+                                preview_link = up.get("webViewLink", "")
+                                if line_preview_file_id is None:
+                                    line_preview_file_id = up.get("id")
+                        except Exception as e:
+                            logger.warning("[ShopifyWebhook] Failed to upload %s: %s", fname, e)
+                except Exception as e:
+                    logger.warning("[ShopifyWebhook] Drive folder/upload failed: %s", e)
 
-        preview_formula = _pb_tpl_formula("C", next_row)
-        num_cols = max(len(pb_headers), 38)
-        row = [""] * num_cols
+            num_cols = max(len(pb_headers), 38)
+            row = [""] * num_cols
 
-        def _set(col_name, value):
-            if col_name in pb_ph and pb_ph[col_name] < len(row):
-                row[pb_ph[col_name]] = value if value is not None else ""
+            def _set(col_name, value):
+                if col_name in pb_ph and pb_ph[col_name] < len(row):
+                    row[pb_ph[col_name]] = value if value is not None else ""
 
-        _set("Order #", new_order)
-        _set("Date", ts_str)
-        _set("Preview", "")  # Leave Preview empty; image link goes in Image column
-        _set("Image", preview_link or "")  # Image column gets the link
-        _set("Company Name", company)
-        _set("Design", design)
-        _set("Quantity", total_qty if num_rows == 1 else 1)
-        _set("Product", product_title)
-        _set("Stage", "ORDERED")
-        _set("Price", price if idx == 0 else 0)
-        _set("Due Date", due_str_sheet)
-        _set("Print", print_cell)
-        _set("Material 1", material1)
-        _set("Fur Color", fur_color)
-        _set("Notes", notes_val)  # Product builder notes from _notes property
-        _set("Order Folder Link", order_folder_link or "")
-        _set("Folder Link", order_folder_link or "")
-        _set("Shopify Order ID", shopify_order_id or "")
-        if pb_ph.get("Order #") is None:
-            # Fallback: no headers or unknown layout — use fixed order
-            fixed = [
-                new_order, ts_str, "", preview_link or "", company, design,
-                total_qty if num_rows == 1 else 1, "", product_title, "ORDERED",
-                price if idx == 0 else 0, due_str_sheet, print_cell, material1,
-                "", "", "", "", "", fur_color, "", shopify_order_id or "",
-                "", "", notes_val, order_folder_link or "",
-                "", "", "", "", "", "", "", "",
-            ]
-            row = (fixed + [""] * num_cols)[:num_cols]
+            image_col_idx = pb_ph.get("Image")
+            image_col_letter = _col_letter(image_col_idx) if image_col_idx is not None else "Y"
+            preview_formula = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & REGEXEXTRACT(' + image_col_letter + str(next_row) + ', "file/d/([^/]+)")), "No preview available")'
 
-        last_col_letter = _col_letter(len(row) - 1)
-        sheets.update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{next_row}:{last_col_letter}{next_row}",
-            valueInputOption="USER_ENTERED",
-            body={"values": [row]},
-        ).execute()
+            _set("Order #", new_order)
+            _set("Date", ts_str)
+            _set("Preview", preview_formula)
+            _set("Image", preview_link or "")
+            _set("Company Name", company)
+            _set("Design", design)
+            _set("Quantity", line_qty if num_rows == 1 else 1)
+            _set("Product", product_title)
+            _set("Stage", "ORDERED")
+            _set("Price", line_price if idx == 0 else 0)
+            _set("Due Date", due_str_sheet)
+            _set("Print", print_cell)
+            _set("Material 1", material1)
+            _set("Fur Color", fur_color)
+            _set("Notes", notes_val)
+            _set("Order Folder Link", order_folder_link or "")
+            _set("Folder Link", order_folder_link or "")
+            _set("Shopify Order ID", shopify_order_id or "")
+            if pb_ph.get("Order #") is None:
+                fixed_preview = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & REGEXEXTRACT(D' + str(next_row) + ', "file/d/([^/]+)")), "No preview available")'
+                fixed = [
+                    new_order, ts_str, fixed_preview, preview_link or "", company, design,
+                    line_qty if num_rows == 1 else 1, "", product_title, "ORDERED",
+                    line_price if idx == 0 else 0, due_str_sheet, print_cell, material1,
+                    "", "", "", "", "", fur_color, "", shopify_order_id or "",
+                    "", "", notes_val, order_folder_link or "",
+                    "", "", "", "", "", "", "", "",
+                ]
+                row = (fixed + [""] * num_cols)[:num_cols]
 
-        if supabase:
-            supabase.table(SUPABASE_PB_ORDERS_TABLE).insert({
-                "Order #": new_order,
-                "Date": ts_str,
-                "Company Name": company,
-                "Design": design,
-                "Quantity": total_qty if num_rows == 1 else 1,
-                "Product": product_title,
-                "Price": price if idx == 0 else 0,
-                "Due Date": due_str_supabase,
-                "Stage": "ORDERED",
-            }).execute()
+            last_col_letter = _col_letter(len(row) - 1)
+            sheets.update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{next_row}:{last_col_letter}{next_row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [row]},
+            ).execute()
 
-        created.append(new_order)
-        logger.info("[ShopifyWebhook] Created order %s '%s' (Material=%s, Fur=%s)", new_order, product_title, material1, fur_color)
-        next_row += 1
+            if supabase:
+                supabase.table(SUPABASE_PB_ORDERS_TABLE).insert({
+                    "Order #": new_order,
+                    "Date": ts_str,
+                    "Company Name": company,
+                    "Design": design,
+                    "Quantity": line_qty if num_rows == 1 else 1,
+                    "Product": product_title,
+                    "Price": line_price if idx == 0 else 0,
+                    "Due Date": due_str_supabase,
+                    "Stage": "ORDERED",
+                }).execute()
+
+            created.append(new_order)
+            logger.info("[ShopifyWebhook] Created order %s '%s' (Material=%s, Fur=%s)", new_order, product_title, material1, fur_color)
+            next_row += 1
+
+        if line_preview_file_id:
+            all_preview_urls.append("https://drive.google.com/uc?export=view&id=" + line_preview_file_id)
+        product_name_parts.extend(product_names_line)
 
     # Center all text in the newly written cells
     if created and start_row < next_row:
@@ -9406,25 +9445,24 @@ def shopify_webhook_orders_create():
         except Exception as e:
             logger.warning("[ShopifyWebhook] Could not center align cells: %s", e)
 
-    # Send design confirmation email to customer (from info@jrco.us) with order details and design preview
+    # Send one design confirmation email with all design previews (from info@jrco.us)
     if created:
         billing = order.get("billing_address") or {}
         to_email = (order.get("email") or billing.get("email") or "").strip()
         first_name = (billing.get("first_name") or order.get("customer", {}).get("first_name") or "").strip()
         last_name = (billing.get("last_name") or order.get("customer", {}).get("last_name") or "").strip()
         customer_name = (f"{first_name} {last_name}".strip() or company or "Customer").strip()
-        design_image_url = ""
-        if first_preview_file_id:
-            design_image_url = f"https://drive.google.com/uc?export=view&id={first_preview_file_id}"
+        product_summary = ", ".join(product_name_parts) if product_name_parts else "Custom product(s)"
         _send_design_confirmation_email(
             to_email=to_email,
             first_name=first_name or "Customer",
             order_number=str(created[0]) if created else order_name,
             order_date=ts_str,
             customer_name=customer_name,
-            product_name=base_name,
+            product_name=product_summary,
             quantity=str(total_qty),
-            design_image_url=design_image_url,
+            design_image_url="",
+            design_image_urls=all_preview_urls,
             logger_=logger,
         )
 
