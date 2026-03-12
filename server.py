@@ -9040,6 +9040,8 @@ def shopify_webhook_orders_create():
     order_name = (order.get("name") or str(order.get("order_number") or "")).strip()
     order_notes = (order.get("note") or "").strip()
     design = order_name
+    # Notes: prefer product-builder line item property _notes, then order note
+    notes_val = (prop("_notes") or prop("Notes") or order_notes or "").strip()[:500]
 
     pt_lower = (prop("_productType") or "driver").strip().lower()
     never_two = pt_lower in ("blade", "mid-mallet", "mallet")
@@ -9061,7 +9063,6 @@ def shopify_webhook_orders_create():
     due_dt = ts + timedelta(days=21)
     due_str_sheet = due_dt.strftime("%-m/%-d/%Y")
     due_str_supabase = due_dt.strftime("%Y-%m-%d")
-    notes_val = (order_notes[:500] if order_notes else "").strip()
 
     def _pb_tpl_formula(col_letter, target_row):
         raw = sheets.get(
@@ -9077,6 +9078,27 @@ def shopify_webhook_orders_create():
     next_row = len(col_a) + 1
     prev_order = int(col_a[-1][0]) if len(col_a) > 1 and col_a[-1] else 0
 
+    # Get header row to map column names to indices (for Image, Preview, Notes)
+    try:
+        header_row = sheets.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!1:1",
+        ).execute().get("values", [[]])
+        pb_headers = header_row[0] if header_row else []
+        pb_ph = {str(h).strip(): i for i, h in enumerate(pb_headers)}
+    except Exception as e:
+        logger.warning("[ShopifyWebhook] Could not read sheet headers: %s", e)
+        pb_headers = []
+        pb_ph = {}
+
+    def _col_letter(idx0):
+        n = idx0 + 1
+        s = ""
+        while n:
+            n, rem = divmod(n - 1, 26)
+            s = chr(65 + rem) + s
+        return s
+
     try:
         drive = get_drive_service()
     except Exception as e:
@@ -9091,6 +9113,7 @@ def shopify_webhook_orders_create():
         except Exception as e:
             logger.warning("[ShopifyWebhook] make_public failed for %s: %s", file_id, e)
 
+    start_row = next_row
     for idx in range(num_rows):
         new_order = prev_order + 1 + idx
         product_title = product_names[idx] if idx < len(product_names) else product_names[0]
@@ -9147,39 +9170,47 @@ def shopify_webhook_orders_create():
                 logger.warning("[ShopifyWebhook] Drive folder/upload failed: %s", e)
 
         preview_formula = _pb_tpl_formula("C", next_row)
-        row = [
-            new_order,
-            ts_str,
-            preview_link or preview_formula,
-            company,
-            design,
-            total_qty if num_rows == 1 else 1,
-            "",
-            product_title,
-            "ORDERED",
-            price if idx == 0 else 0,
-            due_str_sheet,
-            print_cell,
-            material1,
-            "", "", "", "",
-            "",
-            fur_color,
-            "",
-            shopify_order_id or "",  # column U (index 20) for dedupe
-            "", "", notes_val,
-            order_folder_link or "",
-            "",
-            "",
-            "",
-            "",
-            "", "", "", "", "",
-        ]
-        target_len = 37
-        row = (row + [""] * target_len)[:target_len]
+        num_cols = max(len(pb_headers), 38)
+        row = [""] * num_cols
 
+        def _set(col_name, value):
+            if col_name in pb_ph and pb_ph[col_name] < len(row):
+                row[pb_ph[col_name]] = value if value is not None else ""
+
+        _set("Order #", new_order)
+        _set("Date", ts_str)
+        _set("Preview", "")  # Leave Preview empty; image link goes in Image column
+        _set("Image", preview_link or "")  # Image column gets the link
+        _set("Company Name", company)
+        _set("Design", design)
+        _set("Quantity", total_qty if num_rows == 1 else 1)
+        _set("Product", product_title)
+        _set("Stage", "ORDERED")
+        _set("Price", price if idx == 0 else 0)
+        _set("Due Date", due_str_sheet)
+        _set("Print", print_cell)
+        _set("Material 1", material1)
+        _set("Fur Color", fur_color)
+        _set("Notes", notes_val)  # Product builder notes from _notes property
+        _set("Order Folder Link", order_folder_link or "")
+        _set("Folder Link", order_folder_link or "")
+        _set("Shopify Order ID", shopify_order_id or "")
+        if pb_ph.get("Order #") is None:
+            # Fallback: no headers or unknown layout — use fixed order
+            fixed = [
+                new_order, ts_str, "", preview_link or "", company, design,
+                total_qty if num_rows == 1 else 1, "", product_title, "ORDERED",
+                price if idx == 0 else 0, due_str_sheet, print_cell, material1,
+                "", "", "", "", "", fur_color, "", shopify_order_id or "",
+                "", "", notes_val, order_folder_link or "",
+                "", "", "", "", "", "", "", "",
+            ]
+            row = (fixed + [""] * num_cols)[:num_cols]
+
+        last_col_letter = _col_letter(len(row) - 1)
         sheets.update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{next_row}:AK{next_row}",
+            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{next_row}:{last_col_letter}{next_row}",
             valueInputOption="USER_ENTERED",
             body={"values": [row]},
         ).execute()
@@ -9200,6 +9231,46 @@ def shopify_webhook_orders_create():
         created.append(new_order)
         logger.info("[ShopifyWebhook] Created order %s '%s' (Material=%s, Fur=%s)", new_order, product_title, material1, fur_color)
         next_row += 1
+
+    # Center all text in the newly written cells
+    if created and start_row < next_row:
+        try:
+            sheet_metadata = get_sheets_service().spreadsheets().get(
+                spreadsheetId=SPREADSHEET_ID
+            ).execute()
+            sheet_id = None
+            for s in sheet_metadata.get("sheets", []):
+                if (s.get("properties", {}).get("title")) == PRODUCTION_ORDERS_PB_SHEET_TAB:
+                    sheet_id = s["properties"]["sheetId"]
+                    break
+            if sheet_id is not None:
+                num_cols = max(len(pb_headers), 38)
+                body = {
+                    "requests": [{
+                        "repeatCell": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": start_row - 1,
+                                "endRowIndex": next_row,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": num_cols,
+                            },
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "horizontalAlignment": "CENTER",
+                                    "verticalAlignment": "MIDDLE",
+                                }
+                            },
+                            "fields": "userEnteredFormat.horizontalAlignment,userEnteredFormat.verticalAlignment",
+                        }
+                    }]
+                }
+                get_sheets_service().spreadsheets().batchUpdate(
+                    spreadsheetId=SPREADSHEET_ID,
+                    body=body,
+                ).execute()
+        except Exception as e:
+            logger.warning("[ShopifyWebhook] Could not center align cells: %s", e)
 
     return jsonify({"status": "ok", "created": created}), 200
 
