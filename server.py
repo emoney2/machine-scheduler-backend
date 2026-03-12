@@ -8986,96 +8986,166 @@ def shopify_webhook_orders_create():
         logger.info("[ShopifyWebhook] No product-builder line items in order %s", order.get("id") or order.get("order_number"))
         return jsonify({"status": "ok", "created": 0}), 200
 
-    # Order-level fields
+    shopify_order_id = order.get("id")
+    if shopify_order_id is not None:
+        shopify_order_id = str(shopify_order_id).strip()
+
+    # Dedupe: if we already processed this Shopify order, skip (avoid duplicate rows from webhook retries)
+    sheets = get_sheets_service().spreadsheets().values()
+    if shopify_order_id:
+        try:
+            existing = sheets.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A2:X201",
+            ).execute().get("values", [])
+            notes_col_idx = 23  # 0-based: notes is column X (24th col)
+            for r in (existing or []):
+                if len(r) > notes_col_idx and shopify_order_id in (r[notes_col_idx] or ""):
+                    logger.info("[ShopifyWebhook] Skipping duplicate order %s (already in sheet)", shopify_order_id)
+                    return jsonify({"status": "ok", "created": []}), 200
+        except Exception as e:
+            logger.warning("[ShopifyWebhook] Dedupe check failed: %s", e)
+
+    # One row per order: merge all PB line items
+    first = pb_lines[0]
+    props = first.get("properties") or []
+    prop = lambda n: _get_prop(props, n)
+    material1 = prop("Material")
+    fur_color = prop("Fur")
+    print_val = prop("Print")
+    print_cell = "YES" if print_val and str(print_val).upper() in ("YES", "TRUE", "1") else "NO"
+    product_title = (first.get("title") or "").strip() or "Headcover"
+    total_qty = sum(int(li.get("quantity") or 1) for li in pb_lines)
+    price = float(first.get("price") or 0)
+
     billing = order.get("billing_address") or {}
     company = (billing.get("company") or order.get("customer", {}).get("default_address", {}).get("company") or "").strip() or "Shopify"
     order_name = (order.get("name") or str(order.get("order_number") or "")).strip()
     order_notes = (order.get("note") or "").strip()
+    design = order_name or product_title
 
-    sheets = get_sheets_service().spreadsheets().values()
-    created = []
+    # Next row and order # from PB sheet (once per order)
+    col_a = sheets.get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A:A",
+    ).execute().get("values", [])
+    next_row = len(col_a) + 1
+    prev_order = int(col_a[-1][0]) if len(col_a) > 1 and col_a[-1] else 0
+    new_order = prev_order + 1
 
-    for line in pb_lines:
-        props = line.get("properties") or []
-        prop = lambda n: _get_prop(props, n)
+    ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
 
-        material1 = prop("Material")
-        fur_color = prop("Fur")
-        print_val = prop("Print")
-        print_cell = "YES" if print_val and str(print_val).upper() in ("YES", "TRUE", "1") else "NO"
-        product_title = (line.get("title") or "").strip() or "Headcover"
-        qty = int(line.get("quantity") or 1)
-        price = float(line.get("price") or 0)
-        design = order_name or product_title
+    # Create Drive folder and upload images from first line item properties
+    order_folder_link = ""
+    preview_link = ""
+    DRIVE_PARENT_ID = "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
+    try:
+        drive = get_drive_service()
+        from googleapiclient.http import MediaIoBaseUpload
 
-        # Next row and order # from PB sheet
-        col_a = sheets.get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A:A",
-        ).execute().get("values", [])
-        next_row = len(col_a) + 1
-        prev_order = int(col_a[-1][0]) if len(col_a) > 1 and col_a[-1] else 0
-        new_order = prev_order + 1
+        def _create_folder(name, parent_id):
+            meta = {"name": str(name), "mimeType": "application/vnd.google-apps.folder"}
+            if parent_id:
+                meta["parents"] = [parent_id]
+            folder = drive.files().create(body=meta, fields="id,webViewLink").execute()
+            return folder.get("id"), folder.get("webViewLink", "")
 
-        ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
-        # No file uploads: preview and formula columns left blank; no prod/print links
-        notes_val = (order_notes[:500] if order_notes else "").strip()
-        row = [
-            new_order,
-            ts,
-            "",  # preview
-            company,
-            design,
-            qty,
-            "",
-            product_title,
-            "ORDERED",
-            price,
-            "",  # due date
-            print_cell,
-            material1,
-            "", "", "", "",  # material 2-5
-            "",  # back material
-            fur_color,
-            "",
-            "",
-            "", "", notes_val,  # ship_date, stitch_count, notes
-            "",
-            "",  # prod_links, print_links
-            "",
-            "",  # dateType
-            "",  # schedule_str
-            "", "", "",
-            "", "", "", "", "",  # material percents
-        ]
-        target_len = 37
-        row = (row + [""] * target_len)[:target_len]
+        def _make_public(file_id):
+            drive.permissions().create(fileId=file_id, body={"role": "reader", "type": "anyone"}).execute()
 
-        sheets.update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{next_row}:AK{next_row}",
-            valueInputOption="USER_ENTERED",
-            body={"values": [row]},
-        ).execute()
+        folder_id, order_folder_link = _create_folder(new_order, DRIVE_PARENT_ID)
+        _make_public(folder_id)
 
-        if supabase:
-            # Match columns from Production Orders TEST (no Fur Color / Material 1 in schema)
-            supabase.table(SUPABASE_PB_ORDERS_TABLE).insert({
-                "Order #": new_order,
-                "Date": ts,
-                "Company Name": company,
-                "Design": design,
-                "Quantity": qty,
-                "Product": product_title,
-                "Price": price,
-                "Due Date": "",
-                "Stage": "ORDERED",
-            }).execute()
+        # Collect and upload images: _preview_image, _logo_file_1, _logo_file_2, ...
+        uploads = []
+        if prop("_preview_image"):
+            uploads.append(("preview.png", prop("_preview_image")))
+        for i in range(1, 11):
+            v = prop(f"_logo_file_{i}")
+            if v:
+                uploads.append((f"logo_{i}.png", v))
 
-        created.append(new_order)
-        logger.info("[ShopifyWebhook] Created order %s for line '%s' (Material=%s, Fur=%s)", new_order, product_title, material1, fur_color)
+        for fname, data_url in uploads:
+            if not data_url or not isinstance(data_url, str) or not data_url.startswith("data:image"):
+                continue
+            try:
+                header, b64 = data_url.split(",", 1) if "," in data_url else (None, None)
+                if not b64:
+                    continue
+                raw = base64.b64decode(b64)
+                mime = "image/png"
+                if header and ("jpeg" in header or "jpg" in header):
+                    mime = "image/jpeg"
+                m = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=False)
+                up = drive.files().create(
+                    body={"name": fname, "parents": [folder_id]},
+                    media_body=m,
+                    fields="id,webViewLink",
+                ).execute()
+                _make_public(up["id"])
+                if not preview_link and "preview" in fname:
+                    preview_link = up.get("webViewLink", "")
+            except Exception as e:
+                logger.warning("[ShopifyWebhook] Failed to upload %s: %s", fname, e)
+    except Exception as e:
+        logger.warning("[ShopifyWebhook] Drive folder/upload failed: %s", e)
 
-    return jsonify({"status": "ok", "created": created}), 200
+    notes_val = (order_notes[:500] if order_notes else "").strip()
+    if shopify_order_id:
+        notes_val = ("Shopify order: " + shopify_order_id + (" | " + notes_val if notes_val else "")).strip()
+    row = [
+        new_order,
+        ts,
+        preview_link or "",
+        company,
+        design,
+        total_qty,
+        "",
+        product_title,
+        "ORDERED",
+        price,
+        "",
+        print_cell,
+        material1,
+        "", "", "", "",
+        "",
+        fur_color,
+        "",
+        "",
+        "", "", notes_val,
+        order_folder_link or "",
+        "",
+        "",
+        "",
+        "",
+        "", "", "",
+        "", "", "", "", "",
+    ]
+    target_len = 37
+    row = (row + [""] * target_len)[:target_len]
+
+    sheets.update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{next_row}:AK{next_row}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [row]},
+    ).execute()
+
+    if supabase:
+        supabase.table(SUPABASE_PB_ORDERS_TABLE).insert({
+            "Order #": new_order,
+            "Date": ts,
+            "Company Name": company,
+            "Design": design,
+            "Quantity": total_qty,
+            "Product": product_title,
+            "Price": price,
+            "Due Date": "",
+            "Stage": "ORDERED",
+        }).execute()
+
+    logger.info("[ShopifyWebhook] Created order %s for '%s' (Material=%s, Fur=%s), folder=%s", new_order, product_title, material1, fur_color, order_folder_link or "none")
+    return jsonify({"status": "ok", "created": [new_order]}), 200
 
 
 @app.route("/api/directory", methods=["GET"])
