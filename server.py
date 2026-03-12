@@ -54,7 +54,10 @@ from requests.exceptions import (
     RequestException,
 )
 
-import hashlib, json, time
+import hashlib
+import hmac
+import json
+import time
 from flask import request, jsonify, Response, make_response, redirect
 
 from supabase import create_client
@@ -5189,6 +5192,10 @@ sheet_lock = Semaphore(3)
 SHEET_LOCK_TIMEOUT = 30  # seconds - timeout for acquiring the lock
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 ORDERS_RANGE = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AM")
+# Sheet tab for product-builder (Shopify) orders; same workbook, different tab for testing
+PRODUCTION_ORDERS_PB_SHEET_TAB = os.environ.get("PRODUCTION_ORDERS_PB_SHEET_TAB", "Production Orders - PB Test")
+# Supabase table for Shopify product-builder orders
+SUPABASE_PB_ORDERS_TABLE = os.environ.get("SUPABASE_PB_ORDERS_TABLE", "Production Orders Shopify")
 FUR_RANGE = os.environ.get("FUR_RANGE", "Fur List!A1:Z")
 CUT_RANGE = os.environ.get("CUT_RANGE", "Cut List!A1:Z")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
@@ -8618,7 +8625,9 @@ def submit_order():
 
         # ─── CREATE FIRST ORDER (FRONT) FOLDER ───────────────────────────────────
         from io import BytesIO
-        reorder_from = data.get("reorderFrom")
+        reorder_from_raw = (data.get("reorderFrom") or "").strip()
+        is_reorder = str(data.get("isReorder") or "").strip().lower() in ("true", "yes", "1")
+        reorder_from = reorder_from_raw if (reorder_from_raw and is_reorder) else None
         order_folder_id = create_folder(
             new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
         )
@@ -8916,6 +8925,158 @@ def reorder():
         jsonify({"status": "ok", "message": f"Reorder initiated for #{prev_id}"}),
         200,
     )
+
+
+# ─── Shopify Product Builder orders → Google Sheets (PB Test tab) + Supabase ───
+def _get_prop(properties, name):
+    """Get line item property value by name. properties is list of {name, value}."""
+    if not properties:
+        return ""
+    for p in properties:
+        if (p.get("name") or "").strip() == name:
+            return (p.get("value") or "").strip()
+    return ""
+
+
+def _is_product_builder_line_item(line_item):
+    """True if this line item has product builder properties (Material, Fur, or _builder_config)."""
+    props = line_item.get("properties") or []
+    prop_names = { (p.get("name") or "").strip() for p in props }
+    return bool(prop_names & {"Material", "Fur", "_builder_config", "_productType"})
+
+
+@app.route("/api/shopify/webhook/orders/create", methods=["POST"], strict_slashes=False)
+def shopify_webhook_orders_create():
+    """
+    Shopify orders/create webhook. For each line item that has product builder
+    properties (Material, Fur, etc.), creates one row in the PB Test sheet and
+    one row in Supabase table "Production Orders Shopify".
+    Fur → Fur Color column, Material → Material 1. Does not touch manual /submit.
+    """
+    raw = request.get_data()
+    if not raw:
+        return jsonify({"error": "Empty body"}), 400
+
+    secret = (os.environ.get("SHOPIFY_WEBHOOK_SECRET") or "").strip()
+    if secret:
+        sig = (request.headers.get("X-Shopify-Hmac-Sha256") or "").strip()
+        if not sig:
+            logger.warning("[ShopifyWebhook] Missing X-Shopify-Hmac-Sha256 header")
+            return jsonify({"error": "Missing HMAC header"}), 401
+        computed = base64.b64encode(
+            hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).digest()
+        ).decode("utf-8")
+        if not hmac.compare_digest(computed, sig):
+            logger.warning("[ShopifyWebhook] HMAC verification failed")
+            return jsonify({"error": "Invalid signature"}), 401
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        logger.warning("[ShopifyWebhook] Invalid JSON: %s", e)
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    order = payload.get("order") or payload
+    if not order:
+        return jsonify({"error": "Missing order"}), 400
+
+    line_items = order.get("line_items") or []
+    pb_lines = [li for li in line_items if _is_product_builder_line_item(li)]
+    if not pb_lines:
+        logger.info("[ShopifyWebhook] No product-builder line items in order %s", order.get("id") or order.get("order_number"))
+        return jsonify({"status": "ok", "created": 0}), 200
+
+    # Order-level fields
+    billing = order.get("billing_address") or {}
+    company = (billing.get("company") or order.get("customer", {}).get("default_address", {}).get("company") or "").strip() or "Shopify"
+    order_name = (order.get("name") or str(order.get("order_number") or "")).strip()
+    order_notes = (order.get("note") or "").strip()
+
+    sheets = get_sheets_service().spreadsheets().values()
+    created = []
+
+    for line in pb_lines:
+        props = line.get("properties") or []
+        prop = lambda n: _get_prop(props, n)
+
+        material1 = prop("Material")
+        fur_color = prop("Fur")
+        print_val = prop("Print")
+        print_cell = "YES" if print_val and str(print_val).upper() in ("YES", "TRUE", "1") else "NO"
+        product_title = (line.get("title") or "").strip() or "Headcover"
+        qty = int(line.get("quantity") or 1)
+        price = float(line.get("price") or 0)
+        design = order_name or product_title
+
+        # Next row and order # from PB sheet
+        col_a = sheets.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A:A",
+        ).execute().get("values", [])
+        next_row = len(col_a) + 1
+        prev_order = int(col_a[-1][0]) if len(col_a) > 1 and col_a[-1] else 0
+        new_order = prev_order + 1
+
+        ts = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+        # No file uploads: preview and formula columns left blank; no prod/print links
+        notes_val = (order_notes[:500] if order_notes else "").strip()
+        row = [
+            new_order,
+            ts,
+            "",  # preview
+            company,
+            design,
+            qty,
+            "",
+            product_title,
+            "ORDERED",
+            price,
+            "",  # due date
+            print_cell,
+            material1,
+            "", "", "", "",  # material 2-5
+            "",  # back material
+            fur_color,
+            "",
+            "",
+            "", "", notes_val,  # ship_date, stitch_count, notes
+            "",
+            "",  # prod_links, print_links
+            "",
+            "",  # dateType
+            "",  # schedule_str
+            "", "", "",
+            "", "", "", "", "",  # material percents
+        ]
+        target_len = 37
+        row = (row + [""] * target_len)[:target_len]
+
+        sheets.update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{next_row}:AK{next_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [row]},
+        ).execute()
+
+        if supabase:
+            supabase.table(SUPABASE_PB_ORDERS_TABLE).insert({
+                "Order #": new_order,
+                "Date": ts,
+                "Company Name": company,
+                "Design": design,
+                "Quantity": qty,
+                "Product": product_title,
+                "Price": price,
+                "Due Date": "",
+                "Stage": "ORDERED",
+                "Fur Color": fur_color or None,
+                "Material 1": material1 or None,
+            }).execute()
+
+        created.append(new_order)
+        logger.info("[ShopifyWebhook] Created order %s for line '%s' (Material=%s, Fur=%s)", new_order, product_title, material1, fur_color)
+
+    return jsonify({"status": "ok", "created": created}), 200
 
 
 @app.route("/api/directory", methods=["GET"])
