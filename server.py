@@ -5740,7 +5740,7 @@ def build_overview_payload():
             .select(
                 '"Order #", "Company Name", "Design", "Quantity", "Product", '
                 '"Stage", "Due Date", "Ship Date", "Hard Date/Soft Date", '
-                '"Preview", "Image", "Art Link", "Print"'
+                '"Preview", "Image", "Print"'
             )
             .order("Due Date", desc=False)
             .limit(200)  # Fetch more to allow for filtering and sorting
@@ -8964,6 +8964,137 @@ def _product_type_display(prop, needs_front_back=False, is_back=False):
     return name + " Front"
 
 
+def _send_design_confirmation_email(
+    to_email,
+    first_name,
+    order_number,
+    order_date,
+    customer_name,
+    product_name,
+    quantity,
+    design_image_url,
+    logger_=None,
+):
+    """
+    Send the JR & Co. design confirmation email (from info@jrco.us) with order details
+    and design preview image. Uses SMTP env vars; no-op if not configured.
+    """
+    log = logger_ or logger
+    from_email = (os.environ.get("DESIGN_CONFIRMATION_FROM_EMAIL") or "info@jrco.us").strip()
+    smtp_host = (os.environ.get("SMTP_HOST") or "").strip()
+    smtp_port = int(os.environ.get("SMTP_PORT") or "587")
+    smtp_user = (os.environ.get("SMTP_USER") or "").strip()
+    smtp_password = (os.environ.get("SMTP_PASSWORD") or "").strip()
+    if not smtp_host or not smtp_user or not smtp_password:
+        log.info("[DesignConfirmation] SMTP not configured (SMTP_HOST, SMTP_USER, SMTP_PASSWORD) — skipping email")
+        return
+    if not to_email or not str(to_email).strip():
+        log.warning("[DesignConfirmation] No recipient email — skipping")
+        return
+
+    to_email = str(to_email).strip()
+    first_name = (first_name or "").strip() or "Customer"
+    order_number = (order_number or "").strip() or "—"
+    order_date = (order_date or "").strip() or "—"
+    customer_name = (customer_name or "").strip() or "—"
+    product_name = (product_name or "").strip() or "—"
+    quantity = (quantity or "").strip() or "—"
+    design_image_url = (design_image_url or "").strip()
+
+    html_body = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+<p>Hi {_html_escape(first_name)},</p>
+<p>Thank you for your order with <strong>JR &amp; Co.</strong> — we've received your submission and our team will begin preparing your order for production.</p>
+<p><strong>Order Details</strong></p>
+<p><strong>Order #:</strong> {_html_escape(order_number)}<br>
+<strong>Date:</strong> {_html_escape(order_date)}<br>
+<strong>Customer:</strong> {_html_escape(customer_name)}</p>
+<p><strong>Product:</strong> {_html_escape(product_name)}<br>
+<strong>Quantity:</strong> {_html_escape(quantity)}</p>
+<p><strong>Design Preview</strong></p>
+"""
+    if design_image_url:
+        html_body += f'<p style="margin: 16px 0;"><img src="{_html_escape(design_image_url)}" alt="Your design preview" style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px;" /></p>\n'
+    else:
+        html_body += "<p><em>Design preview is being prepared.</em></p>\n"
+    html_body += """<p><em>Please review the preview above to confirm everything looks correct.</em></p>
+<p>If anything needs to be adjusted, reply to this email as soon as possible and we'll take care of it before production begins.</p>
+<p><strong>Production Timeline</strong></p>
+<p>Most custom orders ship within <strong>3 weeks</strong> from the time the order is approved.</p>
+<p>Once your order ships, you'll receive a <strong>tracking number and shipment confirmation</strong>.</p>
+<p>If you have any questions in the meantime, feel free to reply directly to this email.</p>
+<p>We appreciate the opportunity to make something for you.</p>
+<p>Thanks,<br>JR &amp; Co. Production Team<br><a href="https://jrcogolf.com">https://jrcogolf.com</a></p>
+</body>
+</html>
+"""
+    plain_body = f"""Hi {first_name},
+
+Thank you for your order with JR & Co. — we've received your submission and our team will begin preparing your order for production.
+
+Order Details
+Order #: {order_number}
+Date: {order_date}
+Customer: {customer_name}
+
+Product: {product_name}
+Quantity: {quantity}
+
+Design Preview: {design_image_url or '(see link in email)'}
+
+Please review the preview above to confirm everything looks correct.
+
+If anything needs to be adjusted, reply to this email as soon as possible and we'll take care of it before production begins.
+
+Production Timeline
+Most custom orders ship within 3 weeks from the time the order is approved.
+
+Once your order ships, you'll receive a tracking number and shipment confirmation.
+
+If you have any questions in the meantime, feel free to reply directly to this email.
+
+We appreciate the opportunity to make something for you.
+
+Thanks,
+JR & Co. Production Team
+https://jrcogolf.com
+"""
+    try:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"Your JR & Co. Order #{order_number} — Design Confirmation"
+        msg["From"] = from_email
+        msg["To"] = to_email
+        msg.attach(MIMEText(plain_body, "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.sendmail(from_email, [to_email], msg.as_string())
+        log.info("[DesignConfirmation] Sent design confirmation to %s for order #%s", to_email, order_number)
+    except Exception as e:
+        log.warning("[DesignConfirmation] Failed to send email to %s: %s", to_email, e)
+
+
+def _html_escape(s):
+    """Escape for HTML text content."""
+    if not s:
+        return ""
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
 @app.route("/api/shopify/webhook/orders/create", methods=["POST"], strict_slashes=False)
 def shopify_webhook_orders_create():
     """
@@ -9114,6 +9245,7 @@ def shopify_webhook_orders_create():
             logger.warning("[ShopifyWebhook] make_public failed for %s: %s", file_id, e)
 
     start_row = next_row
+    first_preview_file_id = None  # for design confirmation email image URL
     for idx in range(num_rows):
         new_order = prev_order + 1 + idx
         product_title = product_names[idx] if idx < len(product_names) else product_names[0]
@@ -9164,6 +9296,8 @@ def shopify_webhook_orders_create():
                         _make_public_safe(drive, up["id"])
                         if "preview" in fname:
                             preview_link = up.get("webViewLink", "")
+                            if first_preview_file_id is None:
+                                first_preview_file_id = up.get("id")
                     except Exception as e:
                         logger.warning("[ShopifyWebhook] Failed to upload %s: %s", fname, e)
             except Exception as e:
@@ -9271,6 +9405,28 @@ def shopify_webhook_orders_create():
                 ).execute()
         except Exception as e:
             logger.warning("[ShopifyWebhook] Could not center align cells: %s", e)
+
+    # Send design confirmation email to customer (from info@jrco.us) with order details and design preview
+    if created:
+        billing = order.get("billing_address") or {}
+        to_email = (order.get("email") or billing.get("email") or "").strip()
+        first_name = (billing.get("first_name") or order.get("customer", {}).get("first_name") or "").strip()
+        last_name = (billing.get("last_name") or order.get("customer", {}).get("last_name") or "").strip()
+        customer_name = (f"{first_name} {last_name}".strip() or company or "Customer").strip()
+        design_image_url = ""
+        if first_preview_file_id:
+            design_image_url = f"https://drive.google.com/uc?export=view&id={first_preview_file_id}"
+        _send_design_confirmation_email(
+            to_email=to_email,
+            first_name=first_name or "Customer",
+            order_number=str(created[0]) if created else order_name,
+            order_date=ts_str,
+            customer_name=customer_name,
+            product_name=base_name,
+            quantity=str(total_qty),
+            design_image_url=design_image_url,
+            logger_=logger,
+        )
 
     return jsonify({"status": "ok", "created": created}), 200
 
@@ -11835,6 +11991,29 @@ def _find_best_file(vendor_dir: str, name_raw: str) -> tuple[str, str] | None:
     if best and best_score >= 60:  # require decent similarity for safety
         return vendor_dir, best
     return None
+
+
+@app.route("/api/material-image", methods=["GET"])
+@app.route("/material-image", methods=["GET"])
+def api_material_image_vendor_name():
+    """
+    Serve material images by vendor and name (fuzzy match under static/material-images).
+    Example: /api/material-image?vendor=Carroll%20Leathers&name=Cheyenne%20Long%20Rifle
+    """
+    vendor = (request.args.get("vendor") or "").strip()
+    name = (request.args.get("name") or "").strip()
+    if not vendor or not name:
+        return jsonify({"error": "vendor and name required"}), 400
+    vendor_dir = _pick_vendor_dir(vendor)
+    if not vendor_dir:
+        return jsonify({"error": "vendor not found"}), 404
+    result = _find_best_file(vendor_dir, name)
+    if not result:
+        return jsonify({"error": "material image not found"}), 404
+    dir_path, filename = result
+    if not os.path.isfile(os.path.join(dir_path, filename)):
+        return jsonify({"error": "file not found"}), 404
+    return send_from_directory(dir_path, filename, as_attachment=False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
