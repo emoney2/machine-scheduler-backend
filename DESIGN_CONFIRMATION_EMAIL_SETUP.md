@@ -64,9 +64,20 @@ The email is sent **once per order**, **after**:
 - All product-builder line items are written to the Production Orders (PB) sheet (one or two rows per line item for front/back)
 - Design preview images are uploaded to Google Drive
 
-For orders with **multiple custom products**, the single email includes **all** design preview images and a product summary (e.g. “Driver Front, Driver Back, Blade”).
+For orders with **multiple custom products**, the single email includes **all** design preview images and a product summary. The summary shows the **product type** only (e.g. “Driver” or “Driver, Fairway”), not internal labels like “Driver Front” or “Driver Back”.
 
 The recipient is the **customer email** on the Shopify order (or billing email). The design image in the email uses the **first** uploaded preview image (direct Google Drive view link).
+
+---
+
+## One email per order (avoid duplicates on webhook retries)
+
+Shopify may call the orders/create webhook more than once for the same order. To ensure the customer receives **only one** design confirmation email:
+
+1. In your **Production Orders** Google Sheet (the tab used by the product-builder webhook), add a column with header **`Design confirmation sent`** or **`Design Email Sent`** (e.g. in column **AP**).
+2. The backend will set this to **Yes** on the first row of the order when it sends the design confirmation. On later webhook deliveries (retries), it checks this column and **skips sending** if it is already **Yes**.
+
+If you do not add this column, the customer may receive multiple design confirmation emails when Shopify retries the webhook.
 
 ---
 

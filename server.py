@@ -9189,18 +9189,32 @@ def shopify_webhook_orders_create():
                 range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A2:AZ201",
             ).execute().get("values", [])
             duplicate_rows = []
-            for r in (existing or []):
+            duplicate_row_indices = []
+            for row_idx, r in enumerate(existing or []):
                 if shopify_id_col_idx is not None and len(r) > shopify_id_col_idx:
                     if (r[shopify_id_col_idx] or "").strip() == shopify_order_id:
                         duplicate_rows.append(r)
+                        duplicate_row_indices.append(2 + row_idx)
                 else:
                     for cell in r:
                         if str(cell or "").strip() == shopify_order_id:
                             duplicate_rows.append(r)
+                            duplicate_row_indices.append(2 + row_idx)
                             break
             if duplicate_rows:
+                design_sent_col_idx = next((i for i, x in enumerate(hdr) if str(x).strip().lower() in ("design confirmation sent", "design email sent")), None)
+                first_row = duplicate_rows[0]
+                if design_sent_col_idx is not None and len(first_row) > design_sent_col_idx and str(first_row[design_sent_col_idx] or "").strip().upper() == "YES":
+                    logger.info("[ShopifyWebhook] Skipping duplicate order %s (design confirmation already sent)", shopify_order_id)
+                    return jsonify({"status": "ok", "created": []}), 200
                 logger.info("[ShopifyWebhook] Skipping duplicate order %s (already in sheet), sending design confirmation email", shopify_order_id)
-                # Send design confirmation from sheet data + order payload so customer gets email even if first run died before sending
+                def _col_letter_dedup(idx0):
+                    n = idx0 + 1
+                    s = ""
+                    while n:
+                        n, rem = divmod(n - 1, 26)
+                        s = chr(65 + rem) + s
+                    return s
                 order_col = next((i for i, x in enumerate(hdr) if str(x).lower() in ("order #", "order number", "order")), 0)
                 image_col = next((i for i, x in enumerate(hdr) if str(x).lower() in ("image", "preview", "image link")), None)
                 product_col = next((i for i, x in enumerate(hdr) if str(x).lower() == "product"), None)
@@ -9220,14 +9234,13 @@ def shopify_webhook_orders_create():
                                     file_id = link.split("id=")[-1].split("&")[0].split("#")[0].strip()
                             if file_id and file_id != "anyoneWithLink":
                                 preview_urls.append("https://drive.google.com/thumbnail?id=" + file_id + "&sz=w800")
-                first_row = duplicate_rows[0]
                 order_num = str(first_row[order_col]).strip() if len(first_row) > order_col else order.get("name") or ""
                 order_date = str(first_row[date_col]).strip() if date_col is not None and len(first_row) > date_col else ""
                 product_summary = "Custom product(s)"
                 if product_col is not None:
-                    parts = [str(r[product_col]).strip() for r in duplicate_rows if len(r) > product_col and r[product_col]]
+                    parts = [str(r[product_col]).strip().replace(" Front", "").replace(" Back", "").strip() for r in duplicate_rows if len(r) > product_col and r[product_col]]
                     if parts:
-                        product_summary = ", ".join(parts)
+                        product_summary = ", ".join(dict.fromkeys(parts))
                 billing = order.get("billing_address") or {}
                 to_email = (order.get("email") or billing.get("email") or "").strip()
                 first_name = (billing.get("first_name") or order.get("customer", {}).get("first_name") or "").strip()
@@ -9248,6 +9261,18 @@ def shopify_webhook_orders_create():
                     logger_=logger,
                 )
                 logger.info("[ShopifyWebhook] Design confirmation email sent for duplicate order %s (to %s)", shopify_order_id, to_email)
+                if design_sent_col_idx is not None and duplicate_row_indices:
+                    try:
+                        col_letter = _col_letter_dedup(design_sent_col_idx)
+                        first_dup_row = duplicate_row_indices[0]
+                        sheets.update(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{col_letter}{first_dup_row}",
+                            body={"values": [["Yes"]]},
+                            valueInputOption="USER_ENTERED",
+                        ).execute()
+                    except Exception as e:
+                        logger.warning("[ShopifyWebhook] Could not set Design confirmation sent on dedupe: %s", e)
                 return jsonify({"status": "ok", "created": []}), 200
         except Exception as e:
             logger.warning("[ShopifyWebhook] Dedupe check failed: %s", e)
@@ -9334,6 +9359,7 @@ def shopify_webhook_orders_create():
             product_names_line = [base_name]
         preview_data_url = _prop("_preview_image")
         line_preview_file_id = None
+        line_item_preview_link = None  # same preview image link for both front and back rows
 
         for idx in range(num_rows):
             new_order = prev_order + 1
@@ -9393,6 +9419,10 @@ def shopify_webhook_orders_create():
                 except Exception as e:
                     logger.warning("[ShopifyWebhook] Drive folder/upload failed: %s", e)
 
+            if idx == 0 and preview_link:
+                line_item_preview_link = preview_link
+            image_link_for_row = (line_item_preview_link or preview_link) if idx == 1 else preview_link
+
             num_cols = max(len(pb_headers), 38)
             row = [""] * num_cols
 
@@ -9407,7 +9437,7 @@ def shopify_webhook_orders_create():
             _set("Order #", new_order)
             _set("Date", ts_str)
             _set("Preview", preview_formula)
-            _set("Image", preview_link or "")
+            _set("Image", image_link_for_row or "")
             _set("Company Name", company)
             _set("Design", design)
             _set("Quantity", line_qty if num_rows == 1 else 1)
@@ -9417,6 +9447,7 @@ def shopify_webhook_orders_create():
             _set("Due Date", due_str_sheet)
             _set("Print", print_cell)
             _set("Material 1", material1)
+            _set("Material1", material1)
             _set("Fur Color", fur_color)
             _set("Notes", notes_val)
             _set("Order Folder Link", order_folder_link or "")
@@ -9426,7 +9457,7 @@ def shopify_webhook_orders_create():
             if pb_ph.get("Order #") is None:
                 fixed_preview = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & REGEXEXTRACT(D' + str(next_row) + ', "file/d/([^/]+)")), "No preview available")'
                 fixed = [
-                    new_order, ts_str, fixed_preview, preview_link or "", company, design,
+                    new_order, ts_str, fixed_preview, image_link_for_row or "", company, design,
                     line_qty if num_rows == 1 else 1, "", product_title, "ORDERED",
                     line_price if idx == 0 else 0, due_str_sheet, print_cell, material1,
                     "", "", "", "", "", fur_color, "", shopify_order_id or "",
@@ -9462,7 +9493,7 @@ def shopify_webhook_orders_create():
 
         if line_preview_file_id:
             all_preview_urls.append("https://drive.google.com/uc?export=view&id=" + line_preview_file_id)
-        product_name_parts.extend(product_names_line)
+        product_name_parts.append(base_name)
 
     # Center all text in the newly written cells
     if created and start_row < next_row:
@@ -9511,7 +9542,7 @@ def shopify_webhook_orders_create():
         first_name = (billing.get("first_name") or order.get("customer", {}).get("first_name") or "").strip()
         last_name = (billing.get("last_name") or order.get("customer", {}).get("last_name") or "").strip()
         customer_name = (f"{first_name} {last_name}".strip() or company or "Customer").strip()
-        product_summary = ", ".join(product_name_parts) if product_name_parts else "Custom product(s)"
+        product_summary = ", ".join(dict.fromkeys(product_name_parts)) if product_name_parts else "Custom product(s)"
         _send_design_confirmation_email(
             to_email=to_email,
             first_name=first_name or "Customer",
@@ -9524,6 +9555,18 @@ def shopify_webhook_orders_create():
             design_image_urls=all_preview_urls,
             logger_=logger,
         )
+        design_sent_col = pb_ph.get("Design confirmation sent") or pb_ph.get("Design Email Sent")
+        if design_sent_col is not None:
+            try:
+                col_letter = _col_letter(design_sent_col)
+                sheets.update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{col_letter}{start_row}",
+                    body={"values": [["Yes"]]},
+                    valueInputOption="USER_ENTERED",
+                ).execute()
+            except Exception as e:
+                logger.warning("[ShopifyWebhook] Could not set Design confirmation sent: %s", e)
 
     return jsonify({"status": "ok", "created": created}), 200
 
