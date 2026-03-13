@@ -4045,6 +4045,73 @@ def api_ping():
     return jsonify({"ok": True}), 200
 
 
+@app.route("/api/upload-email-preview", methods=["POST", "OPTIONS"])
+def api_upload_email_preview():
+    """
+    Accept base64 design preview image (data URL or raw base64), upload to Google Drive,
+    return a public URL suitable for use in Shopify order confirmation emails.
+    Desktop email clients often block data URLs; this URL works on both desktop and mobile.
+    JSON body: { "image": "data:image/jpeg;base64,..." or "data:image/png;base64,..." }
+    Returns: { "url": "https://drive.google.com/thumbnail?id=...&sz=w600" }
+    """
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+    data = request.get_json(silent=True) or {}
+    image_data = (data.get("image") or "").strip()
+    if not image_data:
+        return jsonify({"error": "missing image"}), 400
+    raw = None
+    if image_data.startswith("data:image"):
+        if "," not in image_data:
+            return jsonify({"error": "invalid data URL"}), 400
+        header, b64 = image_data.split(",", 1)
+        try:
+            raw = base64.b64decode(b64)
+        except Exception as e:
+            return jsonify({"error": "invalid base64: " + str(e)}), 400
+    else:
+        try:
+            raw = base64.b64decode(image_data)
+        except Exception as e:
+            return jsonify({"error": "invalid base64: " + str(e)}), 400
+    if not raw or len(raw) > 10 * 1024 * 1024:
+        return jsonify({"error": "image too large or empty"}), 400
+    try:
+        drive = get_drive_service()
+    except Exception as e:
+        logger.warning("[upload-email-preview] Drive not available: %s", e)
+        return jsonify({"error": "Drive not available"}), 503
+    parent_id = (os.environ.get("EMAIL_PREVIEW_DRIVE_FOLDER_ID") or "").strip() or "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=92)
+        raw = buf.getvalue()
+    except Exception:
+        pass
+    name = "email-preview-" + str(uuid4()) + ".jpg"
+    from googleapiclient.http import MediaIoBaseUpload
+    meta = {"name": name, "mimeType": "image/jpeg", "parents": [parent_id]}
+    media = MediaIoBaseUpload(io.BytesIO(raw), mimetype="image/jpeg", resumable=False)
+    try:
+        up = drive.files().create(body=meta, media_body=media, fields="id").execute()
+        file_id = up.get("id")
+        if not file_id:
+            return jsonify({"error": "no file id returned"}), 500
+        try:
+            drive.permissions().create(fileId=file_id, body={"role": "reader", "type": "anyone"}).execute()
+        except Exception as e:
+            logger.warning("[upload-email-preview] make_public failed for %s: %s", file_id, e)
+        url = "https://drive.google.com/thumbnail?id=" + file_id + "&sz=w600"
+        return jsonify({"url": url})
+    except Exception as e:
+        logger.exception("[upload-email-preview] upload failed")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/labels/<path:filename>")
 def serve_label(filename):
     # Serve tmp label files (PDF/PNG/ZPL) written by ups_service
@@ -9013,10 +9080,20 @@ def _send_design_confirmation_email(
     product_name = (product_name or "").strip() or "—"
     quantity = (quantity or "").strip() or "—"
     design_image_url = (design_image_url or "").strip()
-    urls = design_image_urls if isinstance(design_image_urls, list) else []
-    if not urls and design_image_url:
-        urls = [design_image_url]
-    design_image_urls_plain = "\n".join(urls) if urls else (design_image_url or "(see link in email)")
+    raw_urls = design_image_urls if isinstance(design_image_urls, list) else []
+    if not raw_urls and design_image_url:
+        raw_urls = [design_image_url]
+    entries = []
+    for i, item in enumerate(raw_urls):
+        if isinstance(item, dict):
+            url = (item.get("url") or "").strip()
+            label = (item.get("label") or "").strip() or ("Design preview " + str(i + 1))
+        else:
+            url = (item or "").strip() if isinstance(item, str) else ""
+            label = "Design preview " + str(i + 1)
+        if url:
+            entries.append({"url": url, "label": label})
+    design_image_urls_plain = "\n".join(e["url"] for e in entries) if entries else (design_image_url or "(see link in email)")
 
     html_body = f"""<!DOCTYPE html>
 <html>
@@ -9032,19 +9109,16 @@ def _send_design_confirmation_email(
 <strong>Quantity:</strong> {_html_escape(quantity)}</p>
 <p><strong>Design Preview(s)</strong></p>
 """
-    if urls:
-        for i, url in enumerate(urls):
-            if url and str(url).strip():
-                # Use Drive thumbnail URL for mobile/email clients (direct image; uc?export=view often breaks on mobile)
-                if "id=" in url:
-                    file_id = url.split("id=")[-1].split("&")[0].split("#")[0].strip()
-                    if file_id:
-                        url_thumb = "https://drive.google.com/thumbnail?id=" + file_id + "&sz=w1200"
-                    else:
-                        url_thumb = url
-                else:
-                    url_thumb = url
-                html_body += f'<p style="margin: 16px 0;"><img src="{_html_escape(url_thumb)}" alt="Design preview {i + 1}" width="600" style="display: block; max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px;" /></p>\n'
+    if entries:
+        for e in entries:
+            url = e["url"]
+            label = e["label"]
+            if "id=" in url:
+                file_id = url.split("id=")[-1].split("&")[0].split("#")[0].strip()
+                url_thumb = "https://drive.google.com/thumbnail?id=" + file_id + "&sz=w1200" if file_id else url
+            else:
+                url_thumb = url
+            html_body += f'<p style="margin: 16px 0;"><strong>{_html_escape(label)}</strong></p>\n<p style="margin: 8px 0 16px 0;"><img src="{_html_escape(url_thumb)}" alt="{_html_escape(label)}" width="600" style="display: block; max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px;" /></p>\n'
     else:
         html_body += "<p><em>Design preview is being prepared.</em></p>\n"
     html_body += """<p><em>Please review the preview(s) above to confirm everything looks correct.</em></p>
@@ -9164,6 +9238,9 @@ def shopify_webhook_orders_create():
         logger.info("[ShopifyWebhook] No product-builder line items in order %s", order.get("id") or order.get("order_number"))
         return jsonify({"status": "ok", "created": 0}), 200
 
+    _design_enabled = (os.environ.get("DESIGN_CONFIRMATION_EMAIL_ENABLED") or "").strip().lower() in ("1", "true", "yes")
+    _design_paused = (os.environ.get("PAUSE_DESIGN_CONFIRMATION_EMAIL") or "").strip().lower() in ("1", "true", "yes")
+    design_confirmation_enabled = _design_enabled and not _design_paused
     shopify_order_id = order.get("id")
     if shopify_order_id is not None:
         shopify_order_id = str(shopify_order_id).strip()
@@ -9207,6 +9284,9 @@ def shopify_webhook_orders_create():
                 if design_sent_col_idx is not None and len(first_row) > design_sent_col_idx and str(first_row[design_sent_col_idx] or "").strip().upper() == "YES":
                     logger.info("[ShopifyWebhook] Skipping duplicate order %s (design confirmation already sent)", shopify_order_id)
                     return jsonify({"status": "ok", "created": []}), 200
+                if not design_confirmation_enabled:
+                    logger.info("[ShopifyWebhook] Skipping duplicate order %s (design confirmation email is paused)", shopify_order_id)
+                    return jsonify({"status": "ok", "created": []}), 200
                 logger.info("[ShopifyWebhook] Skipping duplicate order %s (already in sheet), sending design confirmation email", shopify_order_id)
                 def _col_letter_dedup(idx0):
                     n = idx0 + 1
@@ -9234,6 +9314,18 @@ def shopify_webhook_orders_create():
                                     file_id = link.split("id=")[-1].split("&")[0].split("#")[0].strip()
                             if file_id and file_id != "anyoneWithLink":
                                 preview_urls.append("https://drive.google.com/thumbnail?id=" + file_id + "&sz=w1200")
+                if design_sent_col_idx is not None and duplicate_row_indices:
+                    try:
+                        col_letter = _col_letter_dedup(design_sent_col_idx)
+                        first_dup_row = duplicate_row_indices[0]
+                        sheets.update(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{col_letter}{first_dup_row}",
+                            body={"values": [["Yes"]]},
+                            valueInputOption="USER_ENTERED",
+                        ).execute()
+                    except Exception as e:
+                        logger.warning("[ShopifyWebhook] Could not set Design confirmation sent on dedupe (before send): %s", e)
                 shopify_order_num = (order.get("name") or str(order.get("order_number") or "")).strip()
                 order_date = str(first_row[date_col]).strip() if date_col is not None and len(first_row) > date_col else ""
                 product_summary = "Custom product(s)"
@@ -9264,18 +9356,6 @@ def shopify_webhook_orders_create():
                     logger_=logger,
                 )
                 logger.info("[ShopifyWebhook] Design confirmation email sent for duplicate order %s (to %s)", shopify_order_id, to_email)
-                if design_sent_col_idx is not None and duplicate_row_indices:
-                    try:
-                        col_letter = _col_letter_dedup(design_sent_col_idx)
-                        first_dup_row = duplicate_row_indices[0]
-                        sheets.update(
-                            spreadsheetId=SPREADSHEET_ID,
-                            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{col_letter}{first_dup_row}",
-                            body={"values": [["Yes"]]},
-                            valueInputOption="USER_ENTERED",
-                        ).execute()
-                    except Exception as e:
-                        logger.warning("[ShopifyWebhook] Could not set Design confirmation sent on dedupe: %s", e)
                 return jsonify({"status": "ok", "created": []}), 200
         except Exception as e:
             logger.warning("[ShopifyWebhook] Dedupe check failed: %s", e)
@@ -9335,7 +9415,7 @@ def shopify_webhook_orders_create():
             logger.warning("[ShopifyWebhook] make_public failed for %s: %s", file_id, e)
 
     start_row = next_row
-    all_preview_urls = []  # one image URL per line item for the single confirmation email
+    all_preview_urls = []  # list of {url, label} per line item for the single confirmation email
     product_quantities = {}  # display_name -> total qty for email "Driver (2), Fairway (1)"
 
     for line_item in pb_lines:
@@ -9365,7 +9445,8 @@ def shopify_webhook_orders_create():
             row_order = (0,)
         preview_data_url = _prop("_preview_image")
         line_preview_file_id = None
-        line_item_preview_link = None  # first row's preview link (fallback for second row if upload fails)
+        line_item_preview_link = None
+        row_image_links = []  # (sheet_row, image_link) to backfill empty Image cells
 
         for idx in row_order if num_rows == len(row_order) else range(num_rows):
             new_order = prev_order + 1
@@ -9418,14 +9499,14 @@ def shopify_webhook_orders_create():
                                 preview_link = up.get("webViewLink", "")
                                 if line_preview_file_id is None:
                                     line_preview_file_id = up.get("id")
-                                if idx == 0:
+                                if preview_link:
                                     line_item_preview_link = preview_link
                         except Exception as e:
                             logger.warning("[ShopifyWebhook] Failed to upload %s: %s", fname, e)
                 except Exception as e:
                     logger.warning("[ShopifyWebhook] Drive folder/upload failed: %s", e)
 
-            if idx == 1 and not preview_link and line_item_preview_link:
+            if not preview_link and line_item_preview_link:
                 preview_link = line_item_preview_link
             image_link_for_row = preview_link or line_item_preview_link or ""
 
@@ -9446,7 +9527,7 @@ def shopify_webhook_orders_create():
             _set("Image", image_link_for_row or "")
             _set("Company Name", company)
             _set("Design", design)
-            _set("Quantity", line_qty if num_rows == 1 else 1)
+            _set("Quantity", line_qty)
             _set("Product", product_title)
             _set("Stage", "ORDERED")
             _set("Price", line_price if idx == 0 else 0)
@@ -9464,7 +9545,7 @@ def shopify_webhook_orders_create():
                 fixed_preview = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & REGEXEXTRACT(D' + str(next_row) + ', "file/d/([^/]+)")), "No preview available")'
                 fixed = [
                     new_order, ts_str, fixed_preview, image_link_for_row or "", company, design,
-                    line_qty if num_rows == 1 else 1, "", product_title, "ORDERED",
+                    line_qty, "", product_title, "ORDERED",
                     line_price if idx == 0 else 0, due_str_sheet, print_cell, material1,
                     "", "", "", "", "", fur_color, "", shopify_order_id or "",
                     "", "", notes_val, order_folder_link or "",
@@ -9486,19 +9567,37 @@ def shopify_webhook_orders_create():
                     "Date": ts_str,
                     "Company Name": company,
                     "Design": design,
-                    "Quantity": line_qty if num_rows == 1 else 1,
+                    "Quantity": line_qty,
                     "Product": product_title,
                     "Price": line_price if idx == 0 else 0,
                     "Due Date": due_str_supabase,
                     "Stage": "ORDERED",
                 }).execute()
 
+            row_image_links.append((next_row, image_link_for_row))
             created.append(new_order)
             logger.info("[ShopifyWebhook] Created order %s '%s' (Material=%s, Fur=%s)", new_order, product_title, material1, fur_color)
             next_row += 1
 
+        first_link = next((link for _, link in row_image_links if link), None)
+        if first_link and pb_ph.get("Image") is not None:
+            col_letter = _col_letter(pb_ph["Image"])
+            for row_num, link in row_image_links:
+                if not link:
+                    try:
+                        sheets.update(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{col_letter}{row_num}",
+                            body={"values": [[first_link]]},
+                            valueInputOption="USER_ENTERED",
+                        ).execute()
+                    except Exception as e:
+                        logger.warning("[ShopifyWebhook] Backfill Image for row %s failed: %s", row_num, e)
+
         if line_preview_file_id:
-            all_preview_urls.append("https://drive.google.com/uc?export=view&id=" + line_preview_file_id)
+            display_name = base_name.replace(" Full", "").replace(" Front", "").replace(" Back", "").strip()
+            label = f"{display_name} ({line_qty})" if display_name else f"Design ({line_qty})"
+            all_preview_urls.append({"url": "https://drive.google.com/uc?export=view&id=" + line_preview_file_id, "label": label})
         display_name = base_name.replace(" Full", "").replace(" Front", "").replace(" Back", "").strip()
         product_quantities[display_name] = product_quantities.get(display_name, 0) + line_qty
 
@@ -9543,7 +9642,20 @@ def shopify_webhook_orders_create():
             logger.warning("[ShopifyWebhook] Could not center align cells: %s", e)
 
     # Send one design confirmation email with all design previews (from info@jrco.us)
-    if created:
+    # Only when DESIGN_CONFIRMATION_EMAIL_ENABLED is set to true/1/yes (currently paused by default)
+    if created and design_confirmation_enabled:
+        design_sent_col = pb_ph.get("Design confirmation sent") or pb_ph.get("Design Email Sent")
+        if design_sent_col is not None:
+            try:
+                col_letter = _col_letter(design_sent_col)
+                sheets.update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{col_letter}{start_row}",
+                    body={"values": [["Yes"]]},
+                    valueInputOption="USER_ENTERED",
+                ).execute()
+            except Exception as e:
+                logger.warning("[ShopifyWebhook] Could not set Design confirmation sent: %s", e)
         billing = order.get("billing_address") or {}
         to_email = (order.get("email") or billing.get("email") or "").strip()
         first_name = (billing.get("first_name") or order.get("customer", {}).get("first_name") or "").strip()
@@ -9562,18 +9674,6 @@ def shopify_webhook_orders_create():
             design_image_urls=all_preview_urls,
             logger_=logger,
         )
-        design_sent_col = pb_ph.get("Design confirmation sent") or pb_ph.get("Design Email Sent")
-        if design_sent_col is not None:
-            try:
-                col_letter = _col_letter(design_sent_col)
-                sheets.update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{col_letter}{start_row}",
-                    body={"values": [["Yes"]]},
-                    valueInputOption="USER_ENTERED",
-                ).execute()
-            except Exception as e:
-                logger.warning("[ShopifyWebhook] Could not set Design confirmation sent: %s", e)
 
     return jsonify({"status": "ok", "created": created}), 200
 
