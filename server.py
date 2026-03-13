@@ -9033,7 +9033,7 @@ def _product_type_display(prop, needs_front_back=False, is_back=False):
         "hybrid": "Hybrid",
         "blade": "Blade",
         "mid-mallet": "Mid Mallet",
-        "mallet": "Center Shafted Mallet" if mallet == "center-shafted" else "Standard Mallet",
+        "mallet": "Center Shafted Mallet" if mallet == "center-shafted" else "Mallet",
     }.get(pt, pt.capitalize())
     if not needs_front_back:
         return name + " Full" if pt in ("driver", "fairway", "hybrid") else name
@@ -9448,6 +9448,21 @@ def shopify_webhook_orders_create():
         line_item_preview_link = None
         row_image_links = []  # (sheet_row, image_link) to backfill empty Image cells
 
+        # Use _preview_image_url (public URL from add-to-cart upload) when present so Image column is always filled
+        preview_url_prop = (_prop("_preview_image_url") or _prop("preview_image_url") or "").strip()
+        if preview_url_prop and "drive.google.com" in preview_url_prop:
+            file_id = None
+            if "id=" in preview_url_prop:
+                file_id = re.search(r"[?&]id=([^&\s/#]+)", preview_url_prop)
+                file_id = file_id.group(1) if file_id else None
+            if not file_id and "file/d/" in preview_url_prop:
+                file_id = re.search(r"file/d/([^/]+)", preview_url_prop)
+                file_id = file_id.group(1) if file_id else None
+            if file_id:
+                line_item_preview_link = "https://drive.google.com/file/d/" + file_id + "/view"
+                if line_preview_file_id is None:
+                    line_preview_file_id = file_id
+
         for idx in row_order if num_rows == len(row_order) else range(num_rows):
             new_order = prev_order + 1
             prev_order = new_order
@@ -9486,7 +9501,7 @@ def shopify_webhook_orders_create():
                                     if img.mode in ("RGBA", "P"):
                                         img = img.convert("RGB")
                                     buf = io.BytesIO()
-                                    img.save(buf, "JPEG", quality=95)
+                                    img.save(buf, "JPEG", quality=98)
                                     raw = buf.getvalue()
                                 except Exception:
                                     pass
