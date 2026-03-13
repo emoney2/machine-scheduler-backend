@@ -9170,7 +9170,7 @@ def shopify_webhook_orders_create():
 
     sheets = get_sheets_service().spreadsheets().values()
 
-    # Dedupe: if we already processed this Shopify order, skip (avoid duplicate rows/emails from webhook retries)
+    # Dedupe: if we already processed this Shopify order, skip new rows but still send design confirmation email (in case first run died before sending)
     if shopify_order_id:
         try:
             header_row = sheets.get(
@@ -9178,6 +9178,7 @@ def shopify_webhook_orders_create():
                 range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!1:1",
             ).execute().get("values", [[]])
             headers = header_row[0] if header_row else []
+            hdr = [str(x or "").strip() for x in headers]
             shopify_id_col_idx = None
             for i, h in enumerate(headers):
                 if (str(h or "").strip().lower() in ("shopify order id", "shopify order number", "shopify id")):
@@ -9187,17 +9188,67 @@ def shopify_webhook_orders_create():
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A2:AZ201",
             ).execute().get("values", [])
+            duplicate_rows = []
             for r in (existing or []):
                 if shopify_id_col_idx is not None and len(r) > shopify_id_col_idx:
                     if (r[shopify_id_col_idx] or "").strip() == shopify_order_id:
-                        logger.info("[ShopifyWebhook] Skipping duplicate order %s (already in sheet)", shopify_order_id)
-                        return jsonify({"status": "ok", "created": []}), 200
+                        duplicate_rows.append(r)
                 else:
-                    # No matching header: scan entire row for this Shopify order ID
                     for cell in r:
                         if str(cell or "").strip() == shopify_order_id:
-                            logger.info("[ShopifyWebhook] Skipping duplicate order %s (already in sheet)", shopify_order_id)
-                            return jsonify({"status": "ok", "created": []}), 200
+                            duplicate_rows.append(r)
+                            break
+            if duplicate_rows:
+                logger.info("[ShopifyWebhook] Skipping duplicate order %s (already in sheet), sending design confirmation email", shopify_order_id)
+                # Send design confirmation from sheet data + order payload so customer gets email even if first run died before sending
+                order_col = next((i for i, x in enumerate(hdr) if str(x).lower() in ("order #", "order number", "order")), 0)
+                image_col = next((i for i, x in enumerate(hdr) if str(x).lower() in ("image", "preview", "image link")), None)
+                product_col = next((i for i, x in enumerate(hdr) if str(x).lower() == "product"), None)
+                date_col = next((i for i, x in enumerate(hdr) if str(x).lower() in ("date", "order date")), 1)
+                preview_urls = []
+                if image_col is not None:
+                    for r in duplicate_rows:
+                        if len(r) > image_col and r[image_col]:
+                            link = str(r[image_col]).strip()
+                            file_id = None
+                            if "drive.google.com" in link:
+                                if "file/d/" in link:
+                                    m = re.search(r"file/d/([a-zA-Z0-9_-]+)", link)
+                                    if m:
+                                        file_id = m.group(1)
+                                elif "id=" in link:
+                                    file_id = link.split("id=")[-1].split("&")[0].split("#")[0].strip()
+                            if file_id and file_id != "anyoneWithLink":
+                                preview_urls.append("https://drive.google.com/thumbnail?id=" + file_id + "&sz=w800")
+                first_row = duplicate_rows[0]
+                order_num = str(first_row[order_col]).strip() if len(first_row) > order_col else order.get("name") or ""
+                order_date = str(first_row[date_col]).strip() if date_col is not None and len(first_row) > date_col else ""
+                product_summary = "Custom product(s)"
+                if product_col is not None:
+                    parts = [str(r[product_col]).strip() for r in duplicate_rows if len(r) > product_col and r[product_col]]
+                    if parts:
+                        product_summary = ", ".join(parts)
+                billing = order.get("billing_address") or {}
+                to_email = (order.get("email") or billing.get("email") or "").strip()
+                first_name = (billing.get("first_name") or order.get("customer", {}).get("first_name") or "").strip()
+                last_name = (billing.get("last_name") or order.get("customer", {}).get("last_name") or "").strip()
+                company = (billing.get("company") or "").strip() or "Customer"
+                customer_name = (f"{first_name} {last_name}".strip() or company).strip()
+                total_qty = sum(int(li.get("quantity") or 1) for li in pb_lines)
+                _send_design_confirmation_email(
+                    to_email=to_email,
+                    first_name=first_name or "Customer",
+                    order_number=order_num or order.get("name") or "",
+                    order_date=order_date,
+                    customer_name=customer_name,
+                    product_name=product_summary,
+                    quantity=str(total_qty),
+                    design_image_url="",
+                    design_image_urls=preview_urls,
+                    logger_=logger,
+                )
+                logger.info("[ShopifyWebhook] Design confirmation email sent for duplicate order %s (to %s)", shopify_order_id, to_email)
+                return jsonify({"status": "ok", "created": []}), 200
         except Exception as e:
             logger.warning("[ShopifyWebhook] Dedupe check failed: %s", e)
 
