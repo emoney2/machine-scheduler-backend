@@ -9039,7 +9039,7 @@ def _send_design_confirmation_email(
                 if "id=" in url:
                     file_id = url.split("id=")[-1].split("&")[0].split("#")[0].strip()
                     if file_id:
-                        url_thumb = "https://drive.google.com/thumbnail?id=" + file_id + "&sz=w800"
+                        url_thumb = "https://drive.google.com/thumbnail?id=" + file_id + "&sz=w1200"
                     else:
                         url_thumb = url
                 else:
@@ -9233,14 +9233,17 @@ def shopify_webhook_orders_create():
                                 elif "id=" in link:
                                     file_id = link.split("id=")[-1].split("&")[0].split("#")[0].strip()
                             if file_id and file_id != "anyoneWithLink":
-                                preview_urls.append("https://drive.google.com/thumbnail?id=" + file_id + "&sz=w800")
-                order_num = str(first_row[order_col]).strip() if len(first_row) > order_col else order.get("name") or ""
+                                preview_urls.append("https://drive.google.com/thumbnail?id=" + file_id + "&sz=w1200")
+                shopify_order_num = (order.get("name") or str(order.get("order_number") or "")).strip()
                 order_date = str(first_row[date_col]).strip() if date_col is not None and len(first_row) > date_col else ""
                 product_summary = "Custom product(s)"
                 if product_col is not None:
-                    parts = [str(r[product_col]).strip().replace(" Front", "").replace(" Back", "").strip() for r in duplicate_rows if len(r) > product_col and r[product_col]]
+                    parts = [str(r[product_col]).strip().replace(" Full", "").replace(" Front", "").replace(" Back", "").strip() for r in duplicate_rows if len(r) > product_col and r[product_col]]
                     if parts:
-                        product_summary = ", ".join(dict.fromkeys(parts))
+                        counts = {}
+                        for p in parts:
+                            counts[p] = counts.get(p, 0) + 1
+                        product_summary = ", ".join(f"{name} ({qty})" for name, qty in sorted(counts.items()))
                 billing = order.get("billing_address") or {}
                 to_email = (order.get("email") or billing.get("email") or "").strip()
                 first_name = (billing.get("first_name") or order.get("customer", {}).get("first_name") or "").strip()
@@ -9251,7 +9254,7 @@ def shopify_webhook_orders_create():
                 _send_design_confirmation_email(
                     to_email=to_email,
                     first_name=first_name or "Customer",
-                    order_number=order_num or order.get("name") or "",
+                    order_number=shopify_order_num,
                     order_date=order_date,
                     customer_name=customer_name,
                     product_name=product_summary,
@@ -9333,7 +9336,7 @@ def shopify_webhook_orders_create():
 
     start_row = next_row
     all_preview_urls = []  # one image URL per line item for the single confirmation email
-    product_name_parts = []  # for email summary
+    product_quantities = {}  # display_name -> total qty for email "Driver (2), Fairway (1)"
 
     for line_item in pb_lines:
         props = line_item.get("properties") or []
@@ -9354,14 +9357,17 @@ def shopify_webhook_orders_create():
         num_rows = 2 if needs_front_back else 1
         base_name = _product_type_display(_prop, needs_front_back=False, is_back=False)
         if needs_front_back:
+            # Front first, then Back (index 0 = Front, index 1 = Back)
             product_names_line = [base_name.replace(" Full", " Front"), base_name.replace(" Full", " Back")]
+            row_order = (0, 1)  # guarantee Front row written first, then Back
         else:
             product_names_line = [base_name]
+            row_order = (0,)
         preview_data_url = _prop("_preview_image")
         line_preview_file_id = None
-        line_item_preview_link = None  # same preview image link for both front and back rows
+        line_item_preview_link = None  # first row's preview link (fallback for second row if upload fails)
 
-        for idx in range(num_rows):
+        for idx in row_order if num_rows == len(row_order) else range(num_rows):
             new_order = prev_order + 1
             prev_order = new_order
             product_title = product_names_line[idx] if idx < len(product_names_line) else product_names_line[0]
@@ -9376,7 +9382,6 @@ def shopify_webhook_orders_create():
                     folder_id = folder.get("id")
                     order_folder_link = folder.get("webViewLink", "")
                     _make_public_safe(drive, folder_id)
-
                     uploads = []
                     if preview_data_url:
                         uploads.append(("preview.jpg", preview_data_url, "image/jpeg"))
@@ -9384,7 +9389,6 @@ def shopify_webhook_orders_create():
                         v = _prop(f"_logo_file_{i}")
                         if v:
                             uploads.append((f"logo_{i}.png", v, "image/png"))
-
                     for fname, data_url, default_mime in uploads:
                         if not data_url or not isinstance(data_url, str) or not data_url.startswith("data:image"):
                             continue
@@ -9401,7 +9405,7 @@ def shopify_webhook_orders_create():
                                     if img.mode in ("RGBA", "P"):
                                         img = img.convert("RGB")
                                     buf = io.BytesIO()
-                                    img.save(buf, "JPEG", quality=90)
+                                    img.save(buf, "JPEG", quality=95)
                                     raw = buf.getvalue()
                                 except Exception:
                                     pass
@@ -9414,14 +9418,16 @@ def shopify_webhook_orders_create():
                                 preview_link = up.get("webViewLink", "")
                                 if line_preview_file_id is None:
                                     line_preview_file_id = up.get("id")
+                                if idx == 0:
+                                    line_item_preview_link = preview_link
                         except Exception as e:
                             logger.warning("[ShopifyWebhook] Failed to upload %s: %s", fname, e)
                 except Exception as e:
                     logger.warning("[ShopifyWebhook] Drive folder/upload failed: %s", e)
 
-            if idx == 0 and preview_link:
-                line_item_preview_link = preview_link
-            image_link_for_row = (line_item_preview_link or preview_link) if idx == 1 else preview_link
+            if idx == 1 and not preview_link and line_item_preview_link:
+                preview_link = line_item_preview_link
+            image_link_for_row = preview_link or line_item_preview_link or ""
 
             num_cols = max(len(pb_headers), 38)
             row = [""] * num_cols
@@ -9493,7 +9499,8 @@ def shopify_webhook_orders_create():
 
         if line_preview_file_id:
             all_preview_urls.append("https://drive.google.com/uc?export=view&id=" + line_preview_file_id)
-        product_name_parts.append(base_name)
+        display_name = base_name.replace(" Full", "").replace(" Front", "").replace(" Back", "").strip()
+        product_quantities[display_name] = product_quantities.get(display_name, 0) + line_qty
 
     # Center all text in the newly written cells
     if created and start_row < next_row:
@@ -9542,11 +9549,11 @@ def shopify_webhook_orders_create():
         first_name = (billing.get("first_name") or order.get("customer", {}).get("first_name") or "").strip()
         last_name = (billing.get("last_name") or order.get("customer", {}).get("last_name") or "").strip()
         customer_name = (f"{first_name} {last_name}".strip() or company or "Customer").strip()
-        product_summary = ", ".join(dict.fromkeys(product_name_parts)) if product_name_parts else "Custom product(s)"
+        product_summary = ", ".join(f"{name} ({qty})" for name, qty in sorted(product_quantities.items())) if product_quantities else "Custom product(s)"
         _send_design_confirmation_email(
             to_email=to_email,
             first_name=first_name or "Customer",
-            order_number=str(created[0]) if created else order_name,
+            order_number=order_name,
             order_date=ts_str,
             customer_name=customer_name,
             product_name=product_summary,
