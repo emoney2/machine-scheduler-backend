@@ -4105,17 +4105,21 @@ def api_upload_email_preview():
             drive.permissions().create(fileId=file_id, body={"role": "reader", "type": "anyone"}).execute()
         except Exception as e:
             logger.warning("[upload-email-preview] make_public failed for %s: %s", file_id, e)
-        # Return proxy URL for email so desktop Gmail loads (Drive direct often blocked). Set EMAIL_PREVIEW_BASE_URL in production.
+        # Prefer proxy URL when EMAIL_PREVIEW_BASE_URL is set (best for Gmail desktop). Else use thumbnail URL (works in more clients than uc?export=view).
         direct_url = "https://drive.google.com/uc?export=view&id=" + file_id
+        thumbnail_url = "https://drive.google.com/thumbnail?id=" + file_id + "&sz=w800"
         base = (os.environ.get("EMAIL_PREVIEW_BASE_URL") or "").strip().rstrip("/")
         if not base:
             try:
                 base = (request.url_root or "").rstrip("/")
             except Exception:
                 base = ""
-        proxy_url = (base + "/api/email-preview-image/" + file_id) if base else direct_url
-        # Use proxy when base is set (production), else direct so add-to-cart still gets a URL
-        return jsonify({"url": proxy_url if base else direct_url, "direct_url": direct_url})
+        proxy_url = (base + "/api/email-preview-image/" + file_id) if base else None
+        if proxy_url:
+            url_for_email = proxy_url
+        else:
+            url_for_email = thumbnail_url
+        return jsonify({"url": url_for_email, "direct_url": direct_url, "thumbnail_url": thumbnail_url})
     except Exception as e:
         logger.exception("[upload-email-preview] upload failed")
         return jsonify({"error": str(e)}), 500
@@ -4125,24 +4129,42 @@ def api_upload_email_preview():
 def api_serve_email_preview_image(file_id):
     """
     Proxy a Google Drive image by file_id so order confirmation emails can display
-    the design preview in clients that block direct Drive links. Serves with correct
-    Content-Type and no redirect so images load in Gmail desktop/Outlook.
+    the design preview. Serves with Content-Type image/jpeg and no redirect so
+    Gmail desktop and other clients can load the image. Set EMAIL_PREVIEW_BASE_URL
+    so the builder stores this URL in the cart for the confirmation email.
     """
     if not file_id or not re.match(r"^[A-Za-z0-9_-]+$", file_id):
         return "", 404
-    import urllib.request
-    url = "https://drive.google.com/uc?export=view&id=" + file_id
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0"})
+    from flask import make_response
+    data = None
     try:
+        import urllib.request
+        url = "https://drive.google.com/uc?export=view&id=" + file_id
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = resp.read()
-            ctype = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
+            if not data or len(data) < 100:
+                data = None
     except Exception as e:
-        logger.warning("[email-preview-image] fetch failed for %s: %s", file_id, e)
+        logger.warning("[email-preview-image] urlopen failed for %s: %s", file_id, e)
+    if not data:
+        try:
+            drive = get_drive_service()
+            request_drive = drive.files().get_media(fileId=file_id)
+            from io import BytesIO
+            buf = BytesIO()
+            from googleapiclient.http import MediaIoBaseDownload
+            downloader = MediaIoBaseDownload(buf, request_drive)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            data = buf.getvalue()
+        except Exception as e:
+            logger.warning("[email-preview-image] Drive API fallback failed for %s: %s", file_id, e)
+    if not data:
         return "", 404
-    from flask import make_response
     r = make_response(data)
-    r.headers["Content-Type"] = ctype if ctype and "image" in ctype else "image/jpeg"
+    r.headers["Content-Type"] = "image/jpeg"
     r.headers["Cache-Control"] = "public, max-age=86400"
     r.headers["Content-Disposition"] = "inline; filename=preview.jpg"
     return r
@@ -9461,21 +9483,6 @@ def shopify_webhook_orders_create():
             return m.group(1)
         return None
 
-    # One folder per order (not per row): create once, then add all row previews and logos into it
-    order_folder_id = None
-    order_folder_link = ""
-    first_order_num = prev_order + 1
-    if drive:
-        try:
-            meta = {"name": str(first_order_num), "mimeType": "application/vnd.google-apps.folder", "parents": [DRIVE_PARENT_ID]}
-            folder = drive.files().create(body=meta, fields="id,webViewLink").execute()
-            order_folder_id = folder.get("id")
-            order_folder_link = folder.get("webViewLink", "")
-            _make_public_safe(drive, order_folder_id)
-            logger.info("[ShopifyWebhook] Created single order folder %s for order batch", first_order_num)
-        except Exception as e:
-            logger.warning("[ShopifyWebhook] Failed to create order folder: %s", e)
-
     start_row = next_row
     all_preview_urls = []  # list of {url, label} per line item for the single confirmation email
     product_quantities = {}  # display_name -> total qty for email "Driver (2), Fairway (1)"
@@ -9521,7 +9528,18 @@ def shopify_webhook_orders_create():
             prev_order = new_order
             product_title = product_names_line[idx] if idx < len(product_names_line) else product_names_line[0]
             preview_link = ""
-            folder_id = order_folder_id
+            order_folder_link = ""
+            folder_id = None
+            # One folder per sheet row (e.g. 1033, 1034); put this row's preview and logos in it
+            if drive:
+                try:
+                    meta = {"name": str(new_order), "mimeType": "application/vnd.google-apps.folder", "parents": [DRIVE_PARENT_ID]}
+                    folder = drive.files().create(body=meta, fields="id,webViewLink").execute()
+                    folder_id = folder.get("id")
+                    order_folder_link = folder.get("webViewLink", "")
+                    _make_public_safe(drive, folder_id)
+                except Exception as e:
+                    logger.warning("[ShopifyWebhook] Failed to create folder %s: %s", new_order, e)
 
             if drive and folder_id:
                 try:
