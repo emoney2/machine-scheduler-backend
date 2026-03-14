@@ -4105,14 +4105,17 @@ def api_upload_email_preview():
             drive.permissions().create(fileId=file_id, body={"role": "reader", "type": "anyone"}).execute()
         except Exception as e:
             logger.warning("[upload-email-preview] make_public failed for %s: %s", file_id, e)
-        # Use direct view URL; also provide proxy URL so email clients that block Drive can load the image
+        # Return proxy URL for email so desktop Gmail loads (Drive direct often blocked). Set EMAIL_PREVIEW_BASE_URL in production.
         direct_url = "https://drive.google.com/uc?export=view&id=" + file_id
-        try:
-            base = (request.url_root or "").rstrip("/")
-            proxy_url = base + "/api/email-preview-image/" + file_id
-        except Exception:
-            proxy_url = direct_url
-        return jsonify({"url": proxy_url, "direct_url": direct_url})
+        base = (os.environ.get("EMAIL_PREVIEW_BASE_URL") or "").strip().rstrip("/")
+        if not base:
+            try:
+                base = (request.url_root or "").rstrip("/")
+            except Exception:
+                base = ""
+        proxy_url = (base + "/api/email-preview-image/" + file_id) if base else direct_url
+        # Use proxy when base is set (production), else direct so add-to-cart still gets a URL
+        return jsonify({"url": proxy_url if base else direct_url, "direct_url": direct_url})
     except Exception as e:
         logger.exception("[upload-email-preview] upload failed")
         return jsonify({"error": str(e)}), 500
@@ -4123,24 +4126,25 @@ def api_serve_email_preview_image(file_id):
     """
     Proxy a Google Drive image by file_id so order confirmation emails can display
     the design preview in clients that block direct Drive links. Serves with correct
-    Content-Type and no redirect so images load in Gmail/Outlook.
+    Content-Type and no redirect so images load in Gmail desktop/Outlook.
     """
     if not file_id or not re.match(r"^[A-Za-z0-9_-]+$", file_id):
         return "", 404
+    import urllib.request
+    url = "https://drive.google.com/uc?export=view&id=" + file_id
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0"})
     try:
-        import urllib.request
-        url = "https://drive.google.com/uc?export=view&id=" + file_id
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; EmailPreview/1.0)"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = resp.read()
-            ctype = resp.headers.get("Content-Type", "image/jpeg")
+            ctype = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
     except Exception as e:
         logger.warning("[email-preview-image] fetch failed for %s: %s", file_id, e)
         return "", 404
     from flask import make_response
     r = make_response(data)
-    r.headers["Content-Type"] = ctype if "image" in ctype else "image/jpeg"
+    r.headers["Content-Type"] = ctype if ctype and "image" in ctype else "image/jpeg"
     r.headers["Cache-Control"] = "public, max-age=86400"
+    r.headers["Content-Disposition"] = "inline; filename=preview.jpg"
     return r
 
 
@@ -9502,72 +9506,81 @@ def shopify_webhook_orders_create():
             product_names_line = [base_name]
             row_order = (0,)
         preview_data_url = _prop("_preview_image")
+        preview_url_prop = (_prop("_preview_image_url") or _prop("preview_image_url") or "").strip()
         line_preview_file_id = None
         line_item_preview_link = None
-        row_image_links = []  # (sheet_row, image_link) to backfill empty Image cells
-
-        # Use _preview_image_url (public URL from add-to-cart upload) when present so Image column is always filled
-        preview_url_prop = (_prop("_preview_image_url") or _prop("preview_image_url") or "").strip()
         if preview_url_prop:
-            file_id = _extract_drive_file_id(preview_url_prop)
-            if file_id:
-                line_item_preview_link = "https://drive.google.com/file/d/" + file_id + "/view"
-                if line_preview_file_id is None:
-                    line_preview_file_id = file_id
+            fid = _extract_drive_file_id(preview_url_prop)
+            if fid:
+                line_item_preview_link = "https://drive.google.com/file/d/" + fid + "/view"
+                line_preview_file_id = fid
+        row_image_links = []  # (sheet_row, image_link) to backfill empty Image cells
 
         for idx in row_order if num_rows == len(row_order) else range(num_rows):
             new_order = prev_order + 1
             prev_order = new_order
             product_title = product_names_line[idx] if idx < len(product_names_line) else product_names_line[0]
             preview_link = ""
-            # Use single order folder for all rows; upload this row's preview and logos with unique names
             folder_id = order_folder_id
 
             if drive and folder_id:
                 try:
-                    uploads = []
-                    if preview_data_url:
-                        uploads.append((f"preview_{new_order}.jpg", preview_data_url, "image/jpeg"))
+                    # Always upload this row's preview into the order folder so Image column points to order-folder file
+                    preview_bytes = None
+                    if preview_data_url and isinstance(preview_data_url, str) and preview_data_url.startswith("data:image") and "," in preview_data_url:
+                        try:
+                            _, b64 = preview_data_url.split(",", 1)
+                            preview_bytes = base64.b64decode(b64)
+                        except Exception:
+                            pass
+                    if not preview_bytes and preview_url_prop:
+                        try:
+                            import urllib.request
+                            req = urllib.request.Request(preview_url_prop, headers={"User-Agent": "Mozilla/5.0 (compatible; JRCo/1.0)"})
+                            with urllib.request.urlopen(req, timeout=15) as resp:
+                                preview_bytes = resp.read()
+                        except Exception as e:
+                            logger.warning("[ShopifyWebhook] Download preview for row %s: %s", new_order, e)
+                    if preview_bytes:
+                        try:
+                            from PIL import Image as PILImage
+                            img = PILImage.open(io.BytesIO(preview_bytes))
+                            if img.mode in ("RGBA", "P"):
+                                img = img.convert("RGB")
+                            buf = io.BytesIO()
+                            img.save(buf, "JPEG", quality=98)
+                            preview_bytes = buf.getvalue()
+                        except Exception:
+                            pass
+                        try:
+                            m = MediaIoBaseUpload(io.BytesIO(preview_bytes), mimetype="image/jpeg", resumable=False)
+                            up = drive.files().create(body={"name": f"preview_{new_order}.jpg", "parents": [folder_id]}, media_body=m, fields="id").execute()
+                            _make_public_safe(drive, up["id"])
+                            up_id = up.get("id")
+                            preview_link = "https://drive.google.com/file/d/" + up_id + "/view"
+                            if line_preview_file_id is None:
+                                line_preview_file_id = up_id
+                        except Exception as e:
+                            logger.warning("[ShopifyWebhook] Upload preview_%s.jpg failed: %s", new_order, e)
+
+                    # Logos for this row
                     for i in range(1, 11):
                         v = _prop(f"_logo_file_{i}")
-                        if v:
-                            uploads.append((f"order_{new_order}_logo_{i}.png", v, "image/png"))
-                    for fname, data_url, default_mime in uploads:
-                        if not data_url or not isinstance(data_url, str) or not data_url.startswith("data:image"):
+                        if not v or not isinstance(v, str) or not v.startswith("data:image"):
                             continue
                         try:
-                            header, b64 = data_url.split(",", 1) if "," in data_url else (None, None)
+                            _, b64 = v.split(",", 1) if "," in v else (None, None)
                             if not b64:
                                 continue
                             raw = base64.b64decode(b64)
-                            mime = default_mime
-                            if "preview" in fname and default_mime == "image/jpeg":
-                                try:
-                                    from PIL import Image
-                                    img = Image.open(io.BytesIO(raw))
-                                    if img.mode in ("RGBA", "P"):
-                                        img = img.convert("RGB")
-                                    buf = io.BytesIO()
-                                    img.save(buf, "JPEG", quality=98)
-                                    raw = buf.getvalue()
-                                except Exception:
-                                    pass
-                            if header and ("jpeg" in header or "jpg" in header):
-                                mime = "image/jpeg"
-                            m = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=False)
-                            up = drive.files().create(body={"name": fname, "parents": [folder_id]}, media_body=m, fields="id,webViewLink").execute()
-                            _make_public_safe(drive, up["id"])
-                            if "preview" in fname:
-                                up_id = up.get("id")
-                                preview_link = "https://drive.google.com/file/d/" + up_id + "/view"
-                                if line_preview_file_id is None:
-                                    line_preview_file_id = up_id
+                            m = MediaIoBaseUpload(io.BytesIO(raw), mimetype="image/png", resumable=False)
+                            up = drive.files().create(body={"name": f"order_{new_order}_logo_{i}.png", "parents": [folder_id]}, media_body=m, fields="id").execute()
+                            _make_public_safe(drive, up.get("id"))
                         except Exception as e:
-                            logger.warning("[ShopifyWebhook] Failed to upload %s: %s", fname, e)
+                            logger.warning("[ShopifyWebhook] Failed to upload logo %s for row %s: %s", i, new_order, e)
                 except Exception as e:
                     logger.warning("[ShopifyWebhook] Drive upload failed: %s", e)
 
-            # Image column must be the preview image file link (not folder link); use file/d/ID/view for sheet formula
             if not preview_link and line_item_preview_link:
                 preview_link = line_item_preview_link
             image_link_for_row = preview_link or line_item_preview_link or ""
