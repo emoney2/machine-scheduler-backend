@@ -4105,11 +4105,43 @@ def api_upload_email_preview():
             drive.permissions().create(fileId=file_id, body={"role": "reader", "type": "anyone"}).execute()
         except Exception as e:
             logger.warning("[upload-email-preview] make_public failed for %s: %s", file_id, e)
-        url = "https://drive.google.com/thumbnail?id=" + file_id + "&sz=w600"
-        return jsonify({"url": url})
+        # Use direct view URL; also provide proxy URL so email clients that block Drive can load the image
+        direct_url = "https://drive.google.com/uc?export=view&id=" + file_id
+        try:
+            base = (request.url_root or "").rstrip("/")
+            proxy_url = base + "/api/email-preview-image/" + file_id
+        except Exception:
+            proxy_url = direct_url
+        return jsonify({"url": proxy_url, "direct_url": direct_url})
     except Exception as e:
         logger.exception("[upload-email-preview] upload failed")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/email-preview-image/<file_id>", methods=["GET"])
+def api_serve_email_preview_image(file_id):
+    """
+    Proxy a Google Drive image by file_id so order confirmation emails can display
+    the design preview in clients that block direct Drive links. Serves with correct
+    Content-Type and no redirect so images load in Gmail/Outlook.
+    """
+    if not file_id or not re.match(r"^[A-Za-z0-9_-]+$", file_id):
+        return "", 404
+    try:
+        import urllib.request
+        url = "https://drive.google.com/uc?export=view&id=" + file_id
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; EmailPreview/1.0)"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read()
+            ctype = resp.headers.get("Content-Type", "image/jpeg")
+    except Exception as e:
+        logger.warning("[email-preview-image] fetch failed for %s: %s", file_id, e)
+        return "", 404
+    from flask import make_response
+    r = make_response(data)
+    r.headers["Content-Type"] = ctype if "image" in ctype else "image/jpeg"
+    r.headers["Cache-Control"] = "public, max-age=86400"
+    return r
 
 
 @app.route("/labels/<path:filename>")
@@ -9414,6 +9446,32 @@ def shopify_webhook_orders_create():
         except Exception as e:
             logger.warning("[ShopifyWebhook] make_public failed for %s: %s", file_id, e)
 
+    def _extract_drive_file_id(url):
+        if not url or "drive.google.com" not in url:
+            return None
+        m = re.search(r"[?&]id=([^&\s/#]+)", url)
+        if m:
+            return m.group(1)
+        m = re.search(r"file/d/([^/]+)", url)
+        if m:
+            return m.group(1)
+        return None
+
+    # One folder per order (not per row): create once, then add all row previews and logos into it
+    order_folder_id = None
+    order_folder_link = ""
+    first_order_num = prev_order + 1
+    if drive:
+        try:
+            meta = {"name": str(first_order_num), "mimeType": "application/vnd.google-apps.folder", "parents": [DRIVE_PARENT_ID]}
+            folder = drive.files().create(body=meta, fields="id,webViewLink").execute()
+            order_folder_id = folder.get("id")
+            order_folder_link = folder.get("webViewLink", "")
+            _make_public_safe(drive, order_folder_id)
+            logger.info("[ShopifyWebhook] Created single order folder %s for order batch", first_order_num)
+        except Exception as e:
+            logger.warning("[ShopifyWebhook] Failed to create order folder: %s", e)
+
     start_row = next_row
     all_preview_urls = []  # list of {url, label} per line item for the single confirmation email
     product_quantities = {}  # display_name -> total qty for email "Driver (2), Fairway (1)"
@@ -9450,14 +9508,8 @@ def shopify_webhook_orders_create():
 
         # Use _preview_image_url (public URL from add-to-cart upload) when present so Image column is always filled
         preview_url_prop = (_prop("_preview_image_url") or _prop("preview_image_url") or "").strip()
-        if preview_url_prop and "drive.google.com" in preview_url_prop:
-            file_id = None
-            if "id=" in preview_url_prop:
-                file_id = re.search(r"[?&]id=([^&\s/#]+)", preview_url_prop)
-                file_id = file_id.group(1) if file_id else None
-            if not file_id and "file/d/" in preview_url_prop:
-                file_id = re.search(r"file/d/([^/]+)", preview_url_prop)
-                file_id = file_id.group(1) if file_id else None
+        if preview_url_prop:
+            file_id = _extract_drive_file_id(preview_url_prop)
             if file_id:
                 line_item_preview_link = "https://drive.google.com/file/d/" + file_id + "/view"
                 if line_preview_file_id is None:
@@ -9467,24 +9519,19 @@ def shopify_webhook_orders_create():
             new_order = prev_order + 1
             prev_order = new_order
             product_title = product_names_line[idx] if idx < len(product_names_line) else product_names_line[0]
-            order_folder_link = ""
             preview_link = ""
-            folder_id = None
+            # Use single order folder for all rows; upload this row's preview and logos with unique names
+            folder_id = order_folder_id
 
-            if drive:
+            if drive and folder_id:
                 try:
-                    meta = {"name": str(new_order), "mimeType": "application/vnd.google-apps.folder", "parents": [DRIVE_PARENT_ID]}
-                    folder = drive.files().create(body=meta, fields="id,webViewLink").execute()
-                    folder_id = folder.get("id")
-                    order_folder_link = folder.get("webViewLink", "")
-                    _make_public_safe(drive, folder_id)
                     uploads = []
                     if preview_data_url:
-                        uploads.append(("preview.jpg", preview_data_url, "image/jpeg"))
+                        uploads.append((f"preview_{new_order}.jpg", preview_data_url, "image/jpeg"))
                     for i in range(1, 11):
                         v = _prop(f"_logo_file_{i}")
                         if v:
-                            uploads.append((f"logo_{i}.png", v, "image/png"))
+                            uploads.append((f"order_{new_order}_logo_{i}.png", v, "image/png"))
                     for fname, data_url, default_mime in uploads:
                         if not data_url or not isinstance(data_url, str) or not data_url.startswith("data:image"):
                             continue
@@ -9511,16 +9558,16 @@ def shopify_webhook_orders_create():
                             up = drive.files().create(body={"name": fname, "parents": [folder_id]}, media_body=m, fields="id,webViewLink").execute()
                             _make_public_safe(drive, up["id"])
                             if "preview" in fname:
-                                preview_link = up.get("webViewLink", "")
+                                up_id = up.get("id")
+                                preview_link = "https://drive.google.com/file/d/" + up_id + "/view"
                                 if line_preview_file_id is None:
-                                    line_preview_file_id = up.get("id")
-                                if preview_link:
-                                    line_item_preview_link = preview_link
+                                    line_preview_file_id = up_id
                         except Exception as e:
                             logger.warning("[ShopifyWebhook] Failed to upload %s: %s", fname, e)
                 except Exception as e:
-                    logger.warning("[ShopifyWebhook] Drive folder/upload failed: %s", e)
+                    logger.warning("[ShopifyWebhook] Drive upload failed: %s", e)
 
+            # Image column must be the preview image file link (not folder link); use file/d/ID/view for sheet formula
             if not preview_link and line_item_preview_link:
                 preview_link = line_item_preview_link
             image_link_for_row = preview_link or line_item_preview_link or ""
@@ -9534,7 +9581,8 @@ def shopify_webhook_orders_create():
 
             image_col_idx = pb_ph.get("Image")
             image_col_letter = _col_letter(image_col_idx) if image_col_idx is not None else "Y"
-            preview_formula = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & REGEXEXTRACT(' + image_col_letter + str(next_row) + ', "file/d/([^/]+)")), "No preview available")'
+            # Extract Drive file ID from either file/d/ID or id=ID so Preview works for both URL formats
+            preview_formula = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & IFERROR(REGEXEXTRACT(' + image_col_letter + str(next_row) + ',"file/d/([^/]+)"),REGEXEXTRACT(' + image_col_letter + str(next_row) + ',"[?&]id=([^&\\s]+)"))),"No preview available")'
 
             _set("Order #", new_order)
             _set("Date", ts_str)
@@ -9557,7 +9605,7 @@ def shopify_webhook_orders_create():
             _set("Shopify Order ID", shopify_order_id or "")
             _set("Shopify ID", shopify_order_id or "")
             if pb_ph.get("Order #") is None:
-                fixed_preview = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & REGEXEXTRACT(D' + str(next_row) + ', "file/d/([^/]+)")), "No preview available")'
+                fixed_preview = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & IFERROR(REGEXEXTRACT(D' + str(next_row) + ',"file/d/([^/]+)"),REGEXEXTRACT(D' + str(next_row) + ',"[?&]id=([^&\\s]+)"))),"No preview available")'
                 fixed = [
                     new_order, ts_str, fixed_preview, image_link_for_row or "", company, design,
                     line_qty, "", product_title, "ORDERED",
