@@ -4105,20 +4105,20 @@ def api_upload_email_preview():
             drive.permissions().create(fileId=file_id, body={"role": "reader", "type": "anyone"}).execute()
         except Exception as e:
             logger.warning("[upload-email-preview] make_public failed for %s: %s", file_id, e)
-        # Prefer proxy URL when EMAIL_PREVIEW_BASE_URL is set (best for Gmail desktop). Else use thumbnail URL (works in more clients than uc?export=view).
+        # Use proxy URL for email so Gmail desktop can load image (Drive links often blocked). Prefer env, then request host (e.g. Render).
         direct_url = "https://drive.google.com/uc?export=view&id=" + file_id
         thumbnail_url = "https://drive.google.com/thumbnail?id=" + file_id + "&sz=w800"
         base = (os.environ.get("EMAIL_PREVIEW_BASE_URL") or "").strip().rstrip("/")
         if not base:
             try:
                 base = (request.url_root or "").rstrip("/")
+                if not base and getattr(request, "host", None):
+                    h = request.host
+                    base = ("https://" + h.split(":")[0]) if h and "http" not in h[:5] else h
             except Exception:
                 base = ""
         proxy_url = (base + "/api/email-preview-image/" + file_id) if base else None
-        if proxy_url:
-            url_for_email = proxy_url
-        else:
-            url_for_email = thumbnail_url
+        url_for_email = proxy_url if proxy_url else thumbnail_url
         return jsonify({"url": url_for_email, "direct_url": direct_url, "thumbnail_url": thumbnail_url})
     except Exception as e:
         logger.exception("[upload-email-preview] upload failed")
@@ -4167,6 +4167,7 @@ def api_serve_email_preview_image(file_id):
     r.headers["Content-Type"] = "image/jpeg"
     r.headers["Cache-Control"] = "public, max-age=86400"
     r.headers["Content-Disposition"] = "inline; filename=preview.jpg"
+    r.headers["X-Content-Type-Options"] = "nosniff"
     return r
 
 
@@ -9305,36 +9306,55 @@ def shopify_webhook_orders_create():
 
     sheets = get_sheets_service().spreadsheets().values()
 
-    # Dedupe: if we already processed this Shopify order, skip new rows but still send design confirmation email (in case first run died before sending)
+    # Read sheet state first so we can check recent rows for duplicate and reserve rows
+    col_a = sheets.get(spreadsheetId=SPREADSHEET_ID, range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A:A").execute().get("values", [])
+    next_row = len(col_a) + 1
+    prev_order = int(col_a[-1][0]) if len(col_a) > 1 and col_a[-1] else 0
+    try:
+        header_row = sheets.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!1:1",
+        ).execute().get("values", [[]])
+        pb_headers = header_row[0] if header_row else []
+        pb_ph = {str(h).strip(): i for i, h in enumerate(pb_headers)}
+    except Exception as e:
+        logger.warning("[ShopifyWebhook] Could not read sheet headers: %s", e)
+        pb_headers = []
+        pb_ph = {}
+
+    # Dedupe: if we already processed this Shopify order (or reserved rows), skip
     if shopify_order_id:
         try:
-            header_row = sheets.get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!1:1",
-            ).execute().get("values", [[]])
-            headers = header_row[0] if header_row else []
+            headers = pb_headers
             hdr = [str(x or "").strip() for x in headers]
-            shopify_id_col_idx = None
-            for i, h in enumerate(headers):
-                if (str(h or "").strip().lower() in ("shopify order id", "shopify order number", "shopify id")):
-                    shopify_id_col_idx = i
-                    break
+            shopify_id_col_idx = pb_ph.get("Shopify Order ID")
+            if shopify_id_col_idx is None:
+                shopify_id_col_idx = pb_ph.get("Shopify ID")
+            if shopify_id_col_idx is None:
+                for i, h in enumerate(headers):
+                    if (str(h or "").strip().lower() in ("shopify order id", "shopify order number", "shopify id")):
+                        shopify_id_col_idx = i
+                        break
+            # Check last 500 rows so we see reserved rows from a concurrent webhook
+            start_check = max(2, next_row - 499)
+            end_check = next_row + 5
             existing = sheets.get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A2:AZ201",
+                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{start_check}:AZ{end_check}",
             ).execute().get("values", [])
             duplicate_rows = []
             duplicate_row_indices = []
             for row_idx, r in enumerate(existing or []):
+                sheet_row = start_check + row_idx
                 if shopify_id_col_idx is not None and len(r) > shopify_id_col_idx:
                     if (r[shopify_id_col_idx] or "").strip() == shopify_order_id:
                         duplicate_rows.append(r)
-                        duplicate_row_indices.append(2 + row_idx)
+                        duplicate_row_indices.append(sheet_row)
                 else:
                     for cell in r:
                         if str(cell or "").strip() == shopify_order_id:
                             duplicate_rows.append(r)
-                            duplicate_row_indices.append(2 + row_idx)
+                            duplicate_row_indices.append(sheet_row)
                             break
             if duplicate_rows:
                 design_sent_col_idx = next((i for i, x in enumerate(hdr) if str(x).strip().lower() in ("design confirmation sent", "design email sent")), None)
@@ -9433,22 +9453,6 @@ def shopify_webhook_orders_create():
 
     DRIVE_PARENT_ID = "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
     created = []
-    col_a = sheets.get(spreadsheetId=SPREADSHEET_ID, range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A:A").execute().get("values", [])
-    next_row = len(col_a) + 1
-    prev_order = int(col_a[-1][0]) if len(col_a) > 1 and col_a[-1] else 0
-
-    # Get header row to map column names to indices (for Image, Preview, Notes)
-    try:
-        header_row = sheets.get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!1:1",
-        ).execute().get("values", [[]])
-        pb_headers = header_row[0] if header_row else []
-        pb_ph = {str(h).strip(): i for i, h in enumerate(pb_headers)}
-    except Exception as e:
-        logger.warning("[ShopifyWebhook] Could not read sheet headers: %s", e)
-        pb_headers = []
-        pb_ph = {}
 
     def _col_letter(idx0):
         n = idx0 + 1
@@ -9486,6 +9490,38 @@ def shopify_webhook_orders_create():
     start_row = next_row
     all_preview_urls = []  # list of {url, label} per line item for the single confirmation email
     product_quantities = {}  # display_name -> total qty for email "Driver (2), Fairway (1)"
+
+    # Reserve rows immediately with Shopify Order ID so duplicate webhook runs see them and skip (prevents duplicate folders)
+    total_rows = 0
+    for _li in pb_lines:
+        _props = _li.get("properties") or []
+        _pt = (_get_prop(_props, "_productType") or "driver").strip().lower()
+        _never = _pt in ("blade", "mid-mallet", "mallet")
+        _back = (_get_prop(_props, "_back_has_content") or "").strip().lower() in ("true", "1", "yes")
+        total_rows += 2 if (not _never and _back) else 1
+    num_cols_reserve = max(len(pb_headers), 38)
+    shopify_col_idx = pb_ph.get("Shopify Order ID")
+    if shopify_col_idx is None:
+        shopify_col_idx = pb_ph.get("Shopify ID")
+    if total_rows > 0 and (shopify_col_idx is not None or True):
+        try:
+            placeholder_rows = []
+            for i in range(total_rows):
+                r = [""] * num_cols_reserve
+                r[0] = prev_order + 1 + i
+                if shopify_col_idx is not None:
+                    r[shopify_col_idx] = shopify_order_id or ""
+                placeholder_rows.append(r)
+            _last_letter = _col_letter(num_cols_reserve - 1)
+            sheets.update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{next_row}:{_last_letter}{next_row + total_rows - 1}",
+                valueInputOption="USER_ENTERED",
+                body={"values": placeholder_rows},
+            ).execute()
+            logger.info("[ShopifyWebhook] Reserved %s rows (Order # %s–%s) for Shopify order %s", total_rows, prev_order + 1, prev_order + total_rows, shopify_order_id)
+        except Exception as e:
+            logger.warning("[ShopifyWebhook] Reserve rows failed: %s", e)
 
     for line_item in pb_lines:
         props = line_item.get("properties") or []
@@ -9530,16 +9566,26 @@ def shopify_webhook_orders_create():
             preview_link = ""
             order_folder_link = ""
             folder_id = None
-            # One folder per sheet row (e.g. 1033, 1034); put this row's preview and logos in it
+            # One folder per sheet row; reuse existing folder with this name to avoid duplicates (e.g. duplicate webhook)
             if drive:
                 try:
-                    meta = {"name": str(new_order), "mimeType": "application/vnd.google-apps.folder", "parents": [DRIVE_PARENT_ID]}
-                    folder = drive.files().create(body=meta, fields="id,webViewLink").execute()
-                    folder_id = folder.get("id")
-                    order_folder_link = folder.get("webViewLink", "")
-                    _make_public_safe(drive, folder_id)
+                    existing = drive.files().list(
+                        q=f"name='{new_order}' and '{DRIVE_PARENT_ID}' in parents and mimeType='application/vnd.google-apps.folder'",
+                        fields="files(id,webViewLink)",
+                    ).execute()
+                    files = existing.get("files") or []
+                    if files:
+                        folder_id = files[0]["id"]
+                        order_folder_link = files[0].get("webViewLink", "")
+                        logger.info("[ShopifyWebhook] Reusing existing folder %s", new_order)
+                    else:
+                        meta = {"name": str(new_order), "mimeType": "application/vnd.google-apps.folder", "parents": [DRIVE_PARENT_ID]}
+                        folder = drive.files().create(body=meta, fields="id,webViewLink").execute()
+                        folder_id = folder.get("id")
+                        order_folder_link = folder.get("webViewLink", "")
+                        _make_public_safe(drive, folder_id)
                 except Exception as e:
-                    logger.warning("[ShopifyWebhook] Failed to create folder %s: %s", new_order, e)
+                    logger.warning("[ShopifyWebhook] Failed to create/reuse folder %s: %s", new_order, e)
 
             if drive and folder_id:
                 try:
@@ -9599,9 +9645,10 @@ def shopify_webhook_orders_create():
                 except Exception as e:
                     logger.warning("[ShopifyWebhook] Drive upload failed: %s", e)
 
-            if not preview_link and line_item_preview_link:
+            if not preview_link and line_item_preview_link and "file/d/" in (line_item_preview_link or "") and "/drive/folders/" not in (line_item_preview_link or ""):
                 preview_link = line_item_preview_link
-            image_link_for_row = preview_link or line_item_preview_link or ""
+            # Image column: preview file link only (never folder link)
+            image_link_for_row = (preview_link or "").strip()
 
             num_cols = max(len(pb_headers), 38)
             row = [""] * num_cols
@@ -9673,7 +9720,7 @@ def shopify_webhook_orders_create():
             logger.info("[ShopifyWebhook] Created order %s '%s' (Material=%s, Fur=%s)", new_order, product_title, material1, fur_color)
             next_row += 1
 
-        first_link = next((link for _, link in row_image_links if link), None)
+        first_link = next((link for _, link in row_image_links if link and "file/d/" in link and "/drive/folders/" not in link), None)
         if first_link and pb_ph.get("Image") is not None:
             col_letter = _col_letter(pb_ph["Image"])
             for row_num, link in row_image_links:
