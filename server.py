@@ -10372,15 +10372,25 @@ def get_thread_inventory_status():
         if not rows or len(rows) < 2:
             return jsonify({}), 200
         
-        headers = rows[0]
-        # Find column indices
-        try:
-            col_thread = headers.index("Thread Colors")
-            col_inventory = headers.index("Inventory..")
-            col_on_order = headers.index("On Order..")
-        except ValueError as e:
-            logger.error(f"Missing required column in Thread Inventory: {e}")
+        raw_headers = rows[0]
+        headers_lower = [str(h).strip().lower() for h in raw_headers]
+        # Flexible column matching (like Material Inventory): accept "Thread Colors", "Inventory"/"Inventory..", "On Order"/"On Order.."
+        col_thread = None
+        col_inventory = None
+        col_on_order = None
+        for i, h in enumerate(headers_lower):
+            if h in ("thread colors", "thread color") and col_thread is None:
+                col_thread = i
+            if h in ("inventory..", "inventory") and col_inventory is None:
+                col_inventory = i
+            if h in ("on order..", "on order") and col_on_order is None:
+                col_on_order = i
+        if col_thread is None or col_inventory is None:
+            logger.error("Thread Inventory: missing required column (Thread Colors or Inventory)")
             return jsonify({}), 200
+        # Default on-order column if not found (e.g. next column after inventory)
+        if col_on_order is None and col_inventory is not None:
+            col_on_order = col_inventory + 1 if col_inventory + 1 < len(raw_headers) else col_inventory
         
         status_map = {}
         
@@ -10393,16 +10403,22 @@ def get_thread_inventory_status():
             if not thread_color:
                 continue
             
-            # Parse inventory and on_order values
+            # Parse inventory
             try:
                 inventory = float(str(row[col_inventory]).replace(",", "").strip() or "0")
             except (ValueError, TypeError):
                 inventory = 0.0
             
-            try:
-                on_order = float(str(row[col_on_order]).replace(",", "").strip() or "0")
-            except (ValueError, TypeError):
-                on_order = 0.0
+            # Parse on_order: numeric value, or any non-empty text (e.g. "Yes", "Ordered") = treat as on order
+            on_order = 0.0
+            if col_on_order is not None and len(row) > col_on_order:
+                raw = str(row[col_on_order]).strip()
+                if raw:
+                    try:
+                        on_order = float(raw.replace(",", ""))
+                    except (ValueError, TypeError):
+                        # Non-numeric but non-empty (e.g. "Yes", "Ordered", "X") = on order
+                        on_order = 1.0
             
             # Determine status
             if inventory > 0:
