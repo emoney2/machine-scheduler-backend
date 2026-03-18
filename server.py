@@ -10353,9 +10353,9 @@ _thread_inventory_cache = {"ts": 0.0, "data": {}, "ttl": 45}  # 45 second TTL
 def get_thread_inventory_status():
     """
     Returns a map of thread color -> status ("green", "yellow", "red")
-    - green: Inventory.. > 0
-    - yellow: Inventory.. < 0 AND On Order.. > 0
-    - red: Inventory.. < 0 AND On Order.. <= 0
+    - green: Inventory > 0 (in stock)
+    - yellow: Inventory <= 0 AND On Order > 0 AND (Inventory + On Order) > 0 (on order brings total positive)
+    - red: No on order, or on order not enough to bring total positive
     
     Cached for 45 seconds to avoid excessive API calls.
     """
@@ -10420,14 +10420,14 @@ def get_thread_inventory_status():
                         # Non-numeric but non-empty (e.g. "Yes", "Ordered", "X") = on order
                         on_order = 1.0
             
-            # Determine status
+            # Determine status: green = in stock; yellow = on order and it brings total positive; red = on order not enough or none
+            total_after_order = inventory + on_order
             if inventory > 0:
                 status = "green"
-            elif inventory < 0 and on_order > 0:
-                status = "yellow"
-            else:  # inventory < 0 and on_order <= 0
-                status = "red"
-            
+            elif on_order > 0 and total_after_order > 0:
+                status = "yellow"  # on order is enough to bring inventory positive
+            else:
+                status = "red"  # no on order, or on order not enough to bring positive
             status_map[thread_color] = status
         
         # Update cache
