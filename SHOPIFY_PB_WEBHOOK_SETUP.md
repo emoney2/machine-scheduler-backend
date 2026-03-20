@@ -2,10 +2,10 @@
 
 When a customer places an order in Shopify that includes product-builder line items (custom Material/Fur, etc.), the backend creates one production order row per line item in:
 
-1. **Google Sheets** – tab `Production Orders - PB Test` (configurable)
-2. **Supabase** – table `Production Orders Shopify` (configurable)
+1. **Google Sheets** – tab **`Production Orders`** by default (override with `PRODUCTION_ORDERS_PB_SHEET_TAB`)
+2. **Supabase** – table **`Production Orders TEST`** by default (override with `SUPABASE_PB_ORDERS_TABLE`)
 
-Manual order entry via `/submit` is unchanged and still writes to the main Production Orders sheet and `Production Orders TEST` (or your existing table).
+Main scheduler reads use **`ORDERS_RANGE`** (default **`Production Orders!A1:AP`**). Manual order entry via `/submit` is unchanged.
 
 ---
 
@@ -27,14 +27,15 @@ Set on your backend (e.g. Render):
 | Variable | Description |
 |----------|-------------|
 | `SHOPIFY_WEBHOOK_SECRET` | Webhook signing secret from Shopify (required for HMAC verification). |
-| `PRODUCTION_ORDERS_PB_SHEET_TAB` | (Optional) Sheet tab for PB orders. Default: `Production Orders - PB Test`. For live, set to `Production Orders` if you want PB orders on the main tab. |
-| `SUPABASE_PB_ORDERS_TABLE` | (Optional) Supabase table for PB orders. Default: `Production Orders Shopify`. |
+| `ORDERS_RANGE` | (Optional) A1 range for Production Orders reads (default `Production Orders!A1:AP`). |
+| `PRODUCTION_ORDERS_PB_SHEET_TAB` | (Optional) Sheet tab for Shopify webhook rows. Default: **`Production Orders`**. |
+| `SUPABASE_PB_ORDERS_TABLE` | (Optional) Supabase table for PB webhook rows. Default: **`Production Orders TEST`**. |
 
 `SPREADSHEET_ID` and Supabase credentials are already used by the app.
 
 ---
 
-## 3. Supabase table: Production Orders Shopify
+## 3. Supabase table (default name: Production Orders TEST)
 
 Create a table with at least these columns (names and types that match the insert):
 
@@ -58,7 +59,7 @@ You can add more columns (e.g. Notes, Print) if you want; the code currently sen
 
 ## 4. Google Sheet tab
 
-- Ensure the workbook has a tab named **Production Orders - PB Test** (or the value of `PRODUCTION_ORDERS_PB_SHEET_TAB`).
+- Ensure the workbook has a tab named **`Production Orders`** (or the value of `PRODUCTION_ORDERS_PB_SHEET_TAB`). Row width through column **AP** matches the default `ORDERS_RANGE`.
 - Row 1 should be headers matching your main Production Orders sheet (Order #, Date, Preview, Company Name, Design, Quantity, … Material 1, … Fur Color, …).
 - New rows are appended; no formulas are written for preview/stage/ship date (those cells are left blank).
 
@@ -77,7 +78,7 @@ You can add more columns (e.g. Notes, Print) if you want; the code currently sen
 ## 6. Testing
 
 1. Place a test order in Shopify with the product builder (choose Material and Fur).
-2. Check the **Production Orders - PB Test** tab for a new row.
+2. Check the **Production Orders** tab (or your `PRODUCTION_ORDERS_PB_SHEET_TAB`) for a new row.
 3. Check Supabase table **Production Orders Shopify** for the same order.
 4. Delete the test row(s) from the sheet and Supabase if you don’t want them in real data.
 

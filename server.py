@@ -1443,7 +1443,7 @@ def _orders_list_for_changes():
     """
     rows = fetch_sheet(
         SPREADSHEET_ID,
-        "Production Orders!A1:ZZ",
+        ORDERS_RANGE,
         value_render_option="FORMATTED_VALUE",
     )
     return _rows_to_dicts(rows)
@@ -5317,17 +5317,20 @@ def drive_make_public():
 sheet_lock = Semaphore(3)
 SHEET_LOCK_TIMEOUT = 30  # seconds - timeout for acquiring the lock
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-ORDERS_RANGE = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AM")
-# Sheet tab for product-builder (Shopify) orders; same workbook, different tab for testing
-PRODUCTION_ORDERS_PB_SHEET_TAB = os.environ.get("PRODUCTION_ORDERS_PB_SHEET_TAB", "Production Orders - PB Test")
+ORDERS_RANGE = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AP")
+# Sheet tab for Shopify product-builder webhook rows (same tab as main Production Orders by default)
+PRODUCTION_ORDERS_PB_SHEET_TAB = os.environ.get("PRODUCTION_ORDERS_PB_SHEET_TAB", "Production Orders")
 # Supabase table for Shopify product-builder orders
-SUPABASE_PB_ORDERS_TABLE = os.environ.get("SUPABASE_PB_ORDERS_TABLE", "Production Orders Shopify")
+SUPABASE_PB_ORDERS_TABLE = os.environ.get("SUPABASE_PB_ORDERS_TABLE", "Production Orders TEST")
 FUR_RANGE = os.environ.get("FUR_RANGE", "Fur List!A1:Z")
 CUT_RANGE = os.environ.get("CUT_RANGE", "Cut List!A1:Z")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 BOM_TABLE_RANGE = os.environ.get("BOM_TABLE_RANGE", "Table!A1:AF")
+# Overview metrics: embroidery backlog from Google Sheets (fast: 2 cells). Set to "" to use Supabase actual_turnaround_time.
+OVERVIEW_EMBROIDERY_HOURS_CELL = (os.environ.get("OVERVIEW_EMBROIDERY_HOURS_CELL") or "Overview!E1").strip()
+OVERVIEW_EMBROIDERY_WEEKS_CELL = (os.environ.get("OVERVIEW_EMBROIDERY_WEEKS_CELL") or "Overview!F1").strip()
 
 # ── Legacy QuickBooks vars (still available if used elsewhere) ────
 QBO_CLIENT_ID = os.environ.get("QBO_CLIENT_ID")
@@ -5574,6 +5577,10 @@ _overview_upcoming_ts = 0.0
 # overview: materials-needed cache + timestamp
 _materials_needed_cache = None  # {"vendors": [...]}
 _materials_needed_ts = 0.0
+
+# overview metrics (sales + embroidery): in-memory cache
+_OVERVIEW_METRICS_CACHE = {"data": None, "ts": 0}
+OVERVIEW_METRICS_TTL = int(os.environ.get("OVERVIEW_METRICS_TTL", "60"))  # seconds
 
 # ─── Google client singletons ───────────────────────────────────────────────
 _sheets_service = None
@@ -6462,9 +6469,7 @@ def overview_materials_needed():
 @app.route("/overview/metrics", methods=["GET"])
 @login_required_session
 def overview_metrics():
-    print("🔥 OVERVIEW METRICS HIT — NEW CODE 🔥", flush=True)
-
-    """Fetch pre-calculated performance metrics from Supabase views."""
+    """Fetch performance metrics: sales from Supabase, embroidery backlog from Overview sheet cells (or Supabase fallback)."""
     now = time.time()
 
     # ✅ Return cached copy if still fresh
@@ -6483,16 +6488,46 @@ def overview_metrics():
 
         metrics_row = metrics_data[0]
 
-        # ─── 2️⃣ TURNAROUND METRICS ─────────────────────────
-        turnaround_resp = (
-            supabase
-            .table("actual_turnaround_time")
-            .select("hours, weeks")
-            .single()
-            .execute()
-        )
+        # ─── 2️⃣ EMBROIDERY BACKLOG: Google Sheets (2 cells) or Supabase fallback ──
+        emb_hours = None
+        emb_weeks = None
+        if OVERVIEW_EMBROIDERY_HOURS_CELL and OVERVIEW_EMBROIDERY_WEEKS_CELL:
+            try:
+                with sheet_lock:
+                    svc = get_sheets_service().spreadsheets().values()
+                    resp = svc.batchGet(
+                        spreadsheetId=SPREADSHEET_ID,
+                        ranges=[OVERVIEW_EMBROIDERY_HOURS_CELL, OVERVIEW_EMBROIDERY_WEEKS_CELL],
+                        valueRenderOption="UNFORMATTED_VALUE",
+                    ).execute()
+                value_ranges = resp.get("valueRanges", [])
+                if len(value_ranges) >= 2:
+                    vals0 = (value_ranges[0].get("values") or [[]])[0] if value_ranges[0].get("values") else []
+                    vals1 = (value_ranges[1].get("values") or [[]])[0] if value_ranges[1].get("values") else []
+                    v0 = (vals0[0] if vals0 else None)
+                    v1 = (vals1[0] if vals1 else None)
+                    try:
+                        f0 = float(v0) if v0 not in (None, "") else None
+                        f1 = float(v1) if v1 not in (None, "") else None
+                        if f0 is not None and f1 is not None:
+                            emb_hours = round(f0, 1)
+                            emb_weeks = round(f1, 2)
+                    except (TypeError, ValueError):
+                        pass
+            except Exception as e:
+                app.logger.warning("Overview embroidery cells fetch failed, using Supabase fallback: %s", e)
 
-        turnaround = turnaround_resp.data or {}
+        if emb_hours is None or emb_weeks is None:
+            turnaround_resp = (
+                supabase
+                .table("actual_turnaround_time")
+                .select("hours, weeks")
+                .single()
+                .execute()
+            )
+            turnaround = turnaround_resp.data or {}
+            emb_hours = round(float(turnaround.get("hours") or 0), 1)
+            emb_weeks = round(float(turnaround.get("weeks") or 0), 2)
 
         # ─── 3️⃣ MERGED METRICS (KEEP EXISTING KEYS) ───────
         metrics = {
@@ -6505,13 +6540,9 @@ def overview_metrics():
                 float(metrics_row.get("average_price_per_cover") or 0), 2
             ),
 
-            # 🧵 NEW (ONLY ADD THESE)
-            "embroidery_backlog_hours": round(
-                float(turnaround.get("hours") or 0), 1
-            ),
-            "embroidery_backlog_weeks": round(
-                float(turnaround.get("weeks") or 0), 2
-            ),
+            # 🧵 Embroidery backlog: from Overview sheet cells (open jobs) or Supabase fallback
+            "embroidery_backlog_hours": emb_hours,
+            "embroidery_backlog_weeks": emb_weeks,
         }
 
 
@@ -7497,7 +7528,7 @@ def prepare_shipment():
 
         # ── Fetch both tabs defensively ────────────────────────────────
         try:
-            prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM") or []
+            prod_data = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE) or []
             table_data = fetch_sheet(SPREADSHEET_ID, "Table!A1:Z") or []
         except Exception as e:
             logging.exception("prepare-shipment: sheets fetch failed")
@@ -7709,8 +7740,8 @@ def jobs_for_company():
         return jsonify(cached["data"])
 
     try:
-        # Narrow the range a bit if you like; A1:AM is fine but bigger = slower
-        prod_data = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:AM")
+        # Uses ORDERS_RANGE (default Production Orders!A1:AP)
+        prod_data = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
         if not prod_data or not prod_data[0]:
             return jsonify({"jobs": []}), 200
 
@@ -8345,7 +8376,7 @@ def write_material_log_for_order(order_number):
     try:
         # ───────────────────────────────────────────────────────────
         # 1) Fetch Production Orders
-        po = fetch_sheet(SPREADSHEET_ID, "Production Orders!A1:ZZ")
+        po = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
         if not po or len(po) < 2:
             logger.error("[MATLOG] Production Orders empty")
             return
@@ -9260,8 +9291,8 @@ def _html_escape(s):
 def shopify_webhook_orders_create():
     """
     Shopify orders/create webhook. For each line item that has product builder
-    properties (Material, Fur, etc.), creates one row in the PB Test sheet and
-    one row in Supabase table "Production Orders Shopify".
+    properties (Material, Fur, etc.), creates one row in PRODUCTION_ORDERS_PB_SHEET_TAB
+    and one row in Supabase (SUPABASE_PB_ORDERS_TABLE).
     Fur → Fur Color column, Material → Material 1. Does not touch manual /submit.
     """
     raw = request.get_data()
@@ -9340,7 +9371,7 @@ def shopify_webhook_orders_create():
             end_check = next_row + 5
             existing = sheets.get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{start_check}:AZ{end_check}",
+                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{start_check}:AP{end_check}",
             ).execute().get("values", [])
             duplicate_rows = []
             duplicate_row_indices = []
@@ -9499,7 +9530,7 @@ def shopify_webhook_orders_create():
         _never = _pt in ("blade", "mid-mallet", "mallet")
         _back = (_get_prop(_props, "_back_has_content") or "").strip().lower() in ("true", "1", "yes")
         total_rows += 2 if (not _never and _back) else 1
-    num_cols_reserve = max(len(pb_headers), 38)
+    num_cols_reserve = max(len(pb_headers), 42)  # at least through column AP
     shopify_col_idx = pb_ph.get("Shopify Order ID")
     if shopify_col_idx is None:
         shopify_col_idx = pb_ph.get("Shopify ID")
@@ -9650,7 +9681,7 @@ def shopify_webhook_orders_create():
             # Image column: preview file link only (never folder link)
             image_link_for_row = (preview_link or "").strip()
 
-            num_cols = max(len(pb_headers), 38)
+            num_cols = max(len(pb_headers), 42)  # at least through column AP
             row = [""] * num_cols
 
             def _set(col_name, value):
@@ -9754,7 +9785,7 @@ def shopify_webhook_orders_create():
                     sheet_id = s["properties"]["sheetId"]
                     break
             if sheet_id is not None:
-                num_cols = max(len(pb_headers), 38)
+                num_cols_align = max(len(pb_headers), 42)  # through column AP
                 body = {
                     "requests": [{
                         "repeatCell": {
@@ -9763,7 +9794,7 @@ def shopify_webhook_orders_create():
                                 "startRowIndex": start_row - 1,
                                 "endRowIndex": next_row,
                                 "startColumnIndex": 0,
-                                "endColumnIndex": num_cols,
+                                "endColumnIndex": num_cols_align,
                             },
                             "cell": {
                                 "userEnteredFormat": {
