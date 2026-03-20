@@ -70,6 +70,10 @@ You can add more columns (e.g. Notes, Print) if you want; the code currently sen
 - Cart property **Material** → **Material 1** (and Supabase `Material 1`).
 - Cart property **Fur** → **Fur Color** (and Supabase `Fur Color`).
 - **Print** property (Yes/true) → Print column `YES` in the sheet.
+- **Fur** display names are normalized (e.g. Black → **Black Fur**, Navy → **Navy Fur**, Light Grey/Gray → **Light Grey Fur**, Red → **Red Fur**).
+- **EMB Backing** → `Cut Away`; **Hard Date/Soft Date** → `Hard Date`; **Material1%** → `100` (numeric).
+- **Ship Date** → formula copied from **row 2** of the Ship Date column, with row references rewritten to the new row (row 2 must contain the template formula).
+- **Price** is written with `RAW` input so Sheets stores a number (avoids date mis-parse).
 - Company comes from billing address or “Shopify”.
 - Design = order name or line item title; Product = line item title.
 

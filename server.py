@@ -9106,6 +9106,61 @@ def _material_color_to_display(code):
     return " ".join(w.capitalize() for w in s.split())
 
 
+def _fur_color_to_sheet_display(fur_raw):
+    """
+    Map Shopify / builder fur labels to Material Inventory style names (e.g. Black → Black Fur).
+    """
+    if fur_raw is None or not str(fur_raw).strip():
+        return ""
+    s = str(fur_raw).strip()
+    if s.lower().endswith(" fur"):
+        return s
+    key = re.sub(r"\s+", " ", s.lower())
+    mapping = {
+        "black": "Black Fur",
+        "navy": "Navy Fur",
+        "navy fur": "Navy Fur",
+        "red": "Red Fur",
+        "light grey": "Light Grey Fur",
+        "light gray": "Light Grey Fur",
+    }
+    return mapping.get(key, s)
+
+
+def _rewrite_formula_row_refs(formula, from_row, to_row):
+    """
+    Rewrite A1-style cell references in a Sheets formula from one row index to another
+    (e.g. copy template from row 2 onto row 15). Avoids changing row numbers inside larger numbers (e.g. 12, 21).
+    """
+    if not formula or from_row == to_row:
+        return formula
+    fstr = str(formula).strip()
+    if not fstr.startswith("="):
+        return formula
+    old = str(from_row)
+    new = str(to_row)
+    s = fstr
+    # $H$2
+    s = re.sub(
+        r"(\$[A-Za-z]{1,3})\$" + re.escape(old) + r"(?!\d)",
+        r"\1$" + new,
+        s,
+    )
+    # H$2
+    s = re.sub(
+        r"(?<!\$)([A-Za-z]{1,3})\$" + re.escape(old) + r"(?!\d)",
+        r"\1$" + new,
+        s,
+    )
+    # H2 (cell ref row only)
+    s = re.sub(
+        r"(?<![\w$])([A-Za-z]{1,3})" + re.escape(old) + r"(?!\d)",
+        r"\1" + new,
+        s,
+    )
+    return s
+
+
 def _is_product_builder_line_item(line_item):
     """True if this line item has product builder properties (Material, Fur, or _builder_config)."""
     props = line_item.get("properties") or []
@@ -9353,6 +9408,31 @@ def shopify_webhook_orders_create():
         pb_headers = []
         pb_ph = {}
 
+    def _pb_col_letter(idx0):
+        n = idx0 + 1
+        s = ""
+        while n:
+            n, rem = divmod(n - 1, 26)
+            s = chr(65 + rem) + s
+        return s
+
+    ship_date_formula_row2 = None
+    try:
+        _sd_idx = pb_ph.get("Ship Date")
+        if _sd_idx is not None:
+            fr_sd = sheets.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{_pb_col_letter(_sd_idx)}2",
+                valueRenderOption="FORMULA",
+            ).execute()
+            _sd_vals = fr_sd.get("values") or []
+            if _sd_vals and _sd_vals[0]:
+                _cell = str(_sd_vals[0][0] or "").strip()
+                if _cell.startswith("="):
+                    ship_date_formula_row2 = _cell
+    except Exception as e:
+        logger.warning("[ShopifyWebhook] Could not read Ship Date formula from row 2: %s", e)
+
     # Dedupe: if we already processed this Shopify order (or reserved rows), skip
     if shopify_order_id:
         try:
@@ -9560,7 +9640,8 @@ def shopify_webhook_orders_create():
             return _get_prop(props, n)
         material_color_code = _prop("_materialColor") or _prop("materialColor") or ""
         material1 = _material_color_to_display(material_color_code) if material_color_code else (_prop("Material") or "")
-        fur_color = _prop("Fur")
+        fur_raw = _prop("Fur")
+        fur_display = _fur_color_to_sheet_display(fur_raw)
         print_val = _prop("Print")
         print_cell = "YES" if print_val and str(print_val).upper() in ("YES", "TRUE", "1") else "NO"
         line_qty = int(line_item.get("quantity") or 1)
@@ -9707,7 +9788,16 @@ def shopify_webhook_orders_create():
             _set("Print", print_cell)
             _set("Material 1", material1)
             _set("Material1", material1)
-            _set("Fur Color", fur_color)
+            _set("Material1%", 100)
+            _set("Material 1%", 100)
+            _set("Fur Color", fur_display)
+            _set("EMB Backing", "Cut Away")
+            _set("Hard Date/Soft Date", "Hard Date")
+            if ship_date_formula_row2:
+                _set(
+                    "Ship Date",
+                    _rewrite_formula_row_refs(ship_date_formula_row2, 2, next_row),
+                )
             _set("Notes", notes_val)
             _set("Order Folder Link", order_folder_link or "")
             _set("Folder Link", order_folder_link or "")
@@ -9719,7 +9809,7 @@ def shopify_webhook_orders_create():
                     new_order, ts_str, fixed_preview, image_link_for_row or "", company, design,
                     line_qty, "", product_title, "ORDERED",
                     line_price if idx == 0 else 0, due_str_sheet, print_cell, material1,
-                    "", "", "", "", "", fur_color, "", shopify_order_id or "",
+                    "", "", "", "", "", fur_display, "", shopify_order_id or "",
                     "", "", notes_val, order_folder_link or "",
                     "", "", "", "", "", "", "", "",
                 ]
@@ -9732,6 +9822,35 @@ def shopify_webhook_orders_create():
                 valueInputOption="USER_ENTERED",
                 body={"values": [row]},
             ).execute()
+
+            # Price must be a true number (USER_ENTERED can mis-parse some values as dates)
+            price_idx = pb_ph.get("Price")
+            if price_idx is not None:
+                try:
+                    pnum = float(line_price if idx == 0 else 0)
+                    sheets.update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{_col_letter(price_idx)}{next_row}",
+                        valueInputOption="RAW",
+                        body={"values": [[pnum]]},
+                    ).execute()
+                except Exception as e:
+                    logger.warning("[ShopifyWebhook] RAW Price write failed for row %s: %s", next_row, e)
+
+            # Material1% as numeric 100 (ensures cell is not left blank if row width skipped it)
+            for _mhdr in ("Material1%", "Material 1%"):
+                _m1p = pb_ph.get(_mhdr)
+                if _m1p is not None:
+                    try:
+                        sheets.update(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{_col_letter(_m1p)}{next_row}",
+                            valueInputOption="RAW",
+                            body={"values": [[100]]},
+                        ).execute()
+                        break
+                    except Exception as e:
+                        logger.warning("[ShopifyWebhook] RAW Material1%% write failed for row %s: %s", next_row, e)
 
             if supabase:
                 supabase.table(SUPABASE_PB_ORDERS_TABLE).insert({
@@ -9748,7 +9867,7 @@ def shopify_webhook_orders_create():
 
             row_image_links.append((next_row, image_link_for_row))
             created.append(new_order)
-            logger.info("[ShopifyWebhook] Created order %s '%s' (Material=%s, Fur=%s)", new_order, product_title, material1, fur_color)
+            logger.info("[ShopifyWebhook] Created order %s '%s' (Material=%s, Fur=%s)", new_order, product_title, material1, fur_display)
             next_row += 1
 
         first_link = next((link for _, link in row_image_links if link and "file/d/" in link and "/drive/folders/" not in link), None)
