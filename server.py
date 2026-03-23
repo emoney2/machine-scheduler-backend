@@ -5850,55 +5850,123 @@ def _extract_file_id(s: str) -> str:
 from datetime import date, timedelta
 
 
+def _overview_exclude_completed_or_shipped(order_row: dict) -> bool:
+    """
+    Drop rows that should not appear on the production overview.
+    Uses the same source as scheduling: Google Sheets. Supabase 'Production Orders TEST'
+    can lag behind the sheet, which caused stale Stage values in the Overview tab.
+    """
+    stage = str(order_row.get("Stage") or "").strip().upper()
+    if stage in ("COMPLETE", "COMPLETED", "SHIPPED"):
+        return True
+    shipped = order_row.get("Shipped")
+    if shipped is True:
+        return True
+    s = str(shipped).strip().upper() if shipped is not None and shipped != "" else ""
+    if s in ("YES", "Y", "TRUE", "1", "DONE", "SHIPPED"):
+        return True
+    try:
+        sq = float(shipped)
+        qty = float(order_row.get("Quantity") or 0)
+        if qty > 0 and sq >= qty - 1e-9:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
 def build_overview_payload():
     """
-    Returns upcoming + overdue job data from Supabase (incomplete + future)
-    AND materials-to-order grouped by vendor from the Overview sheet.
+    Returns upcoming + overdue job data from Google Sheets Production Orders
+    (same live data as /api/combined), not from Supabase — so Stage/Shipped match the sheet.
+
+    Materials-to-order still come from the Overview sheet (Overview!M3:M).
 
     This returns a plain dict; HTTP + caching is handled by overview_combined().
     """
     import traceback
     import json
 
-    # ── 1) Upcoming jobs from Supabase ───────────────────────────────────────
-    app.logger.info("🔍 build_overview_payload() — fetching jobs from Supabase")
+    # ── 1) Upcoming jobs from Google Sheets (authoritative for Stage / Shipped) ──
+    app.logger.info("🔍 build_overview_payload() — fetching jobs from Google Sheets")
 
     rows = []
     try:
-        # Query Supabase for incomplete jobs, including image fields
-        # Try case-insensitive filter - Supabase neq is case-sensitive, so we'll filter in Python
-        resp = (
-            supabase
-            .table("Production Orders TEST")
-            .select(
-                '"Order #", "Company Name", "Design", "Quantity", "Product", '
-                '"Stage", "Due Date", "Ship Date", "Hard Date/Soft Date", '
-                '"Preview", "Image", "Print"'
-            )
-            .order("Due Date", desc=False)
-            .limit(200)  # Fetch more to allow for filtering and sorting
-            .execute()
+        svc = get_sheets_service().spreadsheets().values()
+        with sheet_lock:
+            resp = svc.batchGet(
+                spreadsheetId=SPREADSHEET_ID,
+                ranges=[ORDERS_RANGE, FUR_RANGE, CUT_RANGE],
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+
+        vrs = resp.get("valueRanges", [])
+        orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
+        fur_rows = (vrs[1].get("values") if len(vrs) > 1 else []) or []
+        cut_rows = (vrs[2].get("values") if len(vrs) > 2 else []) or []
+
+        def _rows_to_dicts_local(rws):
+            if not rws:
+                return []
+            headers = [str(h).strip() for h in rws[0]]
+            out = []
+            for r in rws[1:]:
+                r = r or []
+                if len(r) < len(headers):
+                    r += [""] * (len(headers) - len(r))
+                out.append(dict(zip(headers, r)))
+            return out
+
+        orders_full = _rows_to_dicts_local(orders_rows)
+        fur_full = _rows_to_dicts_local(fur_rows)
+        cut_full = _rows_to_dicts_local(cut_rows)
+
+        fur_map = {
+            str(r.get("Order #", "")).strip(): r
+            for r in fur_full
+            if str(r.get("Order #", "")).strip()
+        }
+        cut_map = {
+            str(r.get("Order #", "")).strip(): r
+            for r in cut_full
+            if str(r.get("Order #", "")).strip()
+        }
+
+        for o in orders_full:
+            oid = str(o.get("Order #", "")).strip()
+            if not oid:
+                continue
+            fr = fur_map.get(oid)
+            if fr and "Status" in fr:
+                o["Status"] = fr.get("Status", "")
+                o["Fur Status"] = fr.get("Status", "")
+            cr = cut_map.get(oid)
+            if cr and "Status" in cr:
+                o["Cut Status"] = cr.get("Status", "")
+
+        for r in orders_full:
+            if not str(r.get("Order #", "")).strip():
+                continue
+            if _overview_exclude_completed_or_shipped(r):
+                continue
+            rows.append(r)
+
+        app.logger.info(
+            "📊 Overview jobs from Sheets: %d active rows (excluded shipped/complete) of %d total",
+            len(rows),
+            len(orders_full),
         )
 
-        if resp.data and isinstance(resp.data, list):
-            # Filter out COMPLETE jobs (case-insensitive)
-            rows = [
-                r for r in resp.data 
-                if r.get("Stage") 
-                and str(r.get("Stage", "")).strip().upper() not in ["COMPLETE", "COMPLETED"]
-            ]
-            app.logger.info("📊 Filtered to %d non-complete jobs from %d total", len(rows), len(resp.data))
-        else:
-            app.logger.warning("⚠️ Supabase returned no data or unexpected format: %s", type(resp.data))
-
     except Exception as e:
-        app.logger.exception("Failed to fetch upcoming jobs from Supabase: %s", str(e))
+        app.logger.exception(
+            "Failed to fetch overview jobs from Google Sheets: %s — returning empty upcoming (no Supabase fallback; sheet is source of truth)",
+            str(e),
+        )
         rows = []
 
-    # ✅ LOG OUTSIDE try/except
     app.logger.warning(
-        "🧪 Upcoming jobs pulled from Supabase: %d rows",
-        len(rows)
+        "🧪 Upcoming jobs for overview payload: %d rows (source=google_sheets)",
+        len(rows),
     )
 
     # Map fields to match frontend expectations (only filter out COMPLETE jobs, which is already done in query)
@@ -5907,13 +5975,20 @@ def build_overview_payload():
     
     def parse_date_fast(val):
         """Fast date parser - handles common formats without exceptions"""
-        if not val:
+        if not val and val != 0:
             return None
         if hasattr(val, 'year'):  # Already a date object
             return val
         if hasattr(val, 'date'):  # datetime object
             return val.date()
-        
+        # Google Sheets UNFORMATTED_VALUE often returns dates as serial numbers
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            try:
+                base = date(1899, 12, 30)
+                return base + timedelta(days=float(val))
+            except (ValueError, OverflowError, TypeError):
+                return None
+
         if isinstance(val, str):
             date_str = val.split()[0]  # Get date part only
             # Try ISO format first (most common from Supabase)
@@ -6095,6 +6170,8 @@ def build_overview_payload():
         "upcoming": upcoming,
         "materials": vendor_list,
         "daysWindow": "7",
+        # Debug / contract: Overview upcoming jobs always come from Google Sheets Production Orders, not Supabase.
+        "jobsSource": "google_sheets",
     }
 
 
