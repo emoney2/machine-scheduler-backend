@@ -6466,7 +6466,8 @@ def overview_materials_needed():
         return jsonify({"error": "materials-needed failed"}), 500
 
 
-@app.route("/overview/metrics", methods=["GET"])
+@app.route("/overview/metrics", methods=["GET"], endpoint="overview_metrics_plain")
+@app.route("/api/overview/metrics", methods=["GET"], endpoint="overview_metrics_api")
 @login_required_session
 def overview_metrics():
     """Fetch performance metrics: sales from Supabase, embroidery backlog from Overview sheet cells (or Supabase fallback)."""
