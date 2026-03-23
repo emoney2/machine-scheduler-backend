@@ -5962,7 +5962,8 @@ def build_overview_payload():
         return (ship_date or date.max, due_date or date.max)
     
     upcoming.sort(key=sort_key)
-    upcoming = upcoming[:25]  # Limit to 25 after sorting
+    # Do not truncate here: the frontend filters by ship/due window; slicing to 25 hid
+    # valid near-term jobs when many open orders existed with earlier sort keys.
 
     # ── 2) Materials section continues below (unchanged) ──
 
