@@ -5318,6 +5318,12 @@ sheet_lock = Semaphore(3)
 SHEET_LOCK_TIMEOUT = 30  # seconds - timeout for acquiring the lock
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 ORDERS_RANGE = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AP")
+# Overview “Upcoming Jobs” must read the Production Orders tab only. ORDERS_RANGE may be
+# overridden in env to another tab; this range is used only by build_overview_payload().
+OVERVIEW_PRODUCTION_ORDERS_RANGE = os.environ.get(
+    "OVERVIEW_PRODUCTION_ORDERS_RANGE",
+    "Production Orders!A1:AZ",
+)
 # Sheet tab for Shopify product-builder webhook rows (same tab as main Production Orders by default)
 PRODUCTION_ORDERS_PB_SHEET_TAB = os.environ.get("PRODUCTION_ORDERS_PB_SHEET_TAB", "Production Orders")
 # Supabase table for Shopify product-builder orders
@@ -5888,7 +5894,10 @@ def build_overview_payload():
     import json
 
     # ── 1) Upcoming jobs from Google Sheets (authoritative for Stage / Shipped) ──
-    app.logger.info("🔍 build_overview_payload() — fetching jobs from Google Sheets")
+    app.logger.info(
+        "🔍 build_overview_payload() — fetching jobs from Google Sheets range %s",
+        OVERVIEW_PRODUCTION_ORDERS_RANGE,
+    )
 
     rows = []
     try:
@@ -5896,7 +5905,7 @@ def build_overview_payload():
         with sheet_lock:
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
-                ranges=[ORDERS_RANGE, FUR_RANGE, CUT_RANGE],
+                ranges=[OVERVIEW_PRODUCTION_ORDERS_RANGE, FUR_RANGE, CUT_RANGE],
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
 
@@ -6170,8 +6179,8 @@ def build_overview_payload():
         "upcoming": upcoming,
         "materials": vendor_list,
         "daysWindow": "7",
-        # Debug / contract: Overview upcoming jobs always come from Google Sheets Production Orders, not Supabase.
-        "jobsSource": "google_sheets",
+        # Debug / contract: tab is Production Orders (see OVERVIEW_PRODUCTION_ORDERS_RANGE), not Supabase.
+        "jobsSource": "google_sheets:Production Orders",
     }
 
 
