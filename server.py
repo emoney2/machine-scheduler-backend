@@ -5330,6 +5330,8 @@ PRODUCTION_ORDERS_PB_SHEET_TAB = os.environ.get("PRODUCTION_ORDERS_PB_SHEET_TAB"
 SUPABASE_PB_ORDERS_TABLE = os.environ.get("SUPABASE_PB_ORDERS_TABLE", "Production Orders TEST")
 FUR_RANGE = os.environ.get("FUR_RANGE", "Fur List!A1:Z")
 CUT_RANGE = os.environ.get("CUT_RANGE", "Cut List!A1:Z")
+# Sewing Summary tab: Order # + Top (when Top >= order qty, overview shows sewing-complete check in Stage)
+SEWING_SUMMARY_RANGE = os.environ.get("SEWING_SUMMARY_RANGE", "Sewing Summary!A1:Z")
 EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
 MANUAL_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
@@ -5856,6 +5858,53 @@ def _extract_file_id(s: str) -> str:
 from datetime import date, timedelta
 
 
+def _parse_sewing_summary_top_by_order(values) -> dict:
+    """
+    Build Order # -> Top (numeric, max if duplicate order rows) from Sewing Summary sheet.
+    Expects row 0 = headers with 'Order #' and 'Top' columns (case-sensitive header match,
+    with fallbacks for minor naming variants).
+    """
+    if not values or len(values) < 2:
+        return {}
+    headers = [str(h).strip() for h in values[0]]
+    oid_idx = None
+    if "Order #" in headers:
+        oid_idx = headers.index("Order #")
+    else:
+        for i, h in enumerate(headers):
+            hl = h.lower().replace(" ", "")
+            if "order" in hl and "#" in h:
+                oid_idx = i
+                break
+    top_idx = None
+    if "Top" in headers:
+        top_idx = headers.index("Top")
+    else:
+        for i, h in enumerate(headers):
+            if str(h).strip().lower() == "top":
+                top_idx = i
+                break
+    if oid_idx is None or top_idx is None:
+        return {}
+    out = {}
+    for row in values[1:]:
+        row = row or []
+        if oid_idx >= len(row):
+            continue
+        oid = str(row[oid_idx] or "").strip()
+        if not oid:
+            continue
+        raw = row[top_idx] if top_idx < len(row) else ""
+        try:
+            top_val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        prev = out.get(oid)
+        if prev is None or top_val > prev:
+            out[oid] = top_val
+    return out
+
+
 def _overview_exclude_completed_or_shipped(order_row: dict) -> bool:
     """
     Drop rows that should not appear on the production overview.
@@ -5900,6 +5949,7 @@ def build_overview_payload():
     )
 
     rows = []
+    sewing_by_order = {}
     try:
         svc = get_sheets_service().spreadsheets().values()
         with sheet_lock:
@@ -5908,6 +5958,19 @@ def build_overview_payload():
                 ranges=[OVERVIEW_PRODUCTION_ORDERS_RANGE, FUR_RANGE, CUT_RANGE],
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
+
+            try:
+                sresp = svc.get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=SEWING_SUMMARY_RANGE,
+                    valueRenderOption="UNFORMATTED_VALUE",
+                ).execute()
+                sewing_by_order = _parse_sewing_summary_top_by_order(
+                    sresp.get("values") or []
+                )
+            except Exception as se:
+                app.logger.warning("Sewing Summary read failed (overview): %s", se)
+                sewing_by_order = {}
 
         vrs = resp.get("valueRanges", [])
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
@@ -6016,8 +6079,22 @@ def build_overview_payload():
                         pass
         return None
     
+    def _qty_float_safe(q):
+        try:
+            return float(q)
+        except (TypeError, ValueError):
+            return None
+
     upcoming = []
     for r in (rows or []):
+        oid = str(r.get("Order #") or "").strip()
+        qty = _qty_float_safe(r.get("Quantity"))
+        top = sewing_by_order.get(oid) if oid else None
+        sewing_summary_complete = (
+            qty is not None
+            and top is not None
+            and top >= qty - 1e-9
+        )
         # Map fields to match frontend expectations
         job = {
             "Order #": r.get("Order #"),
@@ -6035,6 +6112,8 @@ def build_overview_payload():
             "Image": r.get("Image") or r.get("Preview") or r.get("Art Link"),
             "Art Link": r.get("Art Link") or r.get("Preview") or r.get("Image"),
             "Print": r.get("Print"),
+            # True when Sewing Summary row for this Order # has Top >= Quantity
+            "sewingSummaryComplete": sewing_summary_complete,
         }
         upcoming.append(job)
     
