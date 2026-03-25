@@ -9328,6 +9328,89 @@ def _rewrite_formula_row_refs(formula, from_row, to_row):
     return s
 
 
+def _pb_stage_formula_for_row(row: int) -> str:
+    """Production Orders Stage; matches google-apps-script-webapp.js stageFormulaForRow_."""
+    r = str(int(row))
+    return (
+        '=IF(A'
+        + r
+        + '="","",'
+        + "IF(G"
+        + r
+        + ">=F"
+        + r
+        + ',"COMPLETE",'
+        + "IF(IFERROR(VLOOKUP(A"
+        + r
+        + ",'Embroidery List'!A:U,21,FALSE),\"NOT STARTED\")=\"COMPLETE\",\"SEWING\","
+        + "IF(IFERROR(VLOOKUP(A"
+        + r
+        + ",'Embroidery List'!A:U,21,FALSE),\"NOT STARTED\")=\"NEEDS WORK\",\"EMBROIDERY\","
+        + "IF(AND(IFERROR(VLOOKUP(A"
+        + r
+        + ",'Embroidery List'!A:U,21,FALSE),\"NOT STARTED\")=\"NOT STARTED\",L"
+        + r
+        + '="PRINT",IFERROR(VLOOKUP(A'
+        + r
+        + ",'Print List'!A:N,14,FALSE),\"NOT STARTED\")=\"COMPLETE\"),\"EMBROIDERY\","
+        + "IF(IFERROR(VLOOKUP(A"
+        + r
+        + ",'Cut List'!A:X,24,FALSE),\"NOT STARTED\")=\"NEEDS WORK\",\"CUT\","
+        + "IF(AND(L"
+        + r
+        + '="NO",IFERROR(VLOOKUP(A'
+        + r
+        + ",'Cut List'!A:X,24,FALSE),\"NOT STARTED\")=\"COMPLETE\"),\"EMBROIDERY\","
+        + "IF(AND(L"
+        + r
+        + '="PRINT",OR(IFERROR(VLOOKUP(A'
+        + r
+        + ",'Print List'!A:N,14,FALSE),\"NOT STARTED\")=\"NEEDS WORK\",IFERROR(VLOOKUP(A"
+        + r
+        + ",'Print List'!A:N,14,FALSE),\"NOT STARTED\")=\"NOT STARTED\"),IFERROR(VLOOKUP(A"
+        + r
+        + ",'Cut List'!A:X,24,FALSE),\"NOT STARTED\")=\"COMPLETE\"),\"PRINT\","
+        + "IF(IFERROR(VLOOKUP(A"
+        + r
+        + ",'Fur List'!A:K,11,FALSE),\"NOT STARTED\")=\"NEEDS WORK\",\"FUR\","
+        + "IF(IFERROR(VLOOKUP(A"
+        + r
+        + ",'Fur List'!A:K,11,FALSE),\"NOT STARTED\")=\"COMPLETE\",\"CUT\","
+        + "IF(W"
+        + r
+        + '<>"","FUR","ORDERED"))))))))))))'
+    )
+
+
+def _pb_stitch_count_formula_for_row(row: int) -> str:
+    """Stitch Count from Thread Data; matches google-apps-script-webapp.js stitchCountFormulaForRow_."""
+    r = str(int(row))
+    return (
+        "=IF(A"
+        + r
+        + '="","",IFNA(INDEX(\'Thread Data\'!F:F,MATCH(TRIM(TEXT(A'
+        + r
+        + ',"0")),ARRAYFORMULA(TRIM(\'Thread Data\'!B:B)),0)),""))'
+    )
+
+
+def _pb_threads_formula_for_row(row: int) -> str:
+    """Threads from Thread Data; matches google-apps-script-webapp.js threadsFormulaForRow_."""
+    r = str(int(row))
+    return (
+        '=IFERROR(TEXTJOIN(", ", TRUE, UNIQUE(FILTER(\'Thread Data\'!C:C, (\'Thread Data\'!B:B=$A'
+        + r
+        + ')*(LEN(\'Thread Data\'!C:C)>0)))), "")'
+    )
+
+
+def _pb_ship_date_formula_for_row(row: int, due_date_col_letter: str) -> str:
+    """Ship Date = 5 workdays before Due Date (same column as sheet Due Date header)."""
+    r = str(int(row))
+    c = (due_date_col_letter or "K").strip().upper()
+    return f'=IF({c}{r}="","",WORKDAY({c}{r},-5))'
+
+
 def _is_product_builder_line_item(line_item):
     """True if this line item has product builder properties (Material, Fur, or _builder_config)."""
     props = line_item.get("properties") or []
@@ -9575,31 +9658,6 @@ def shopify_webhook_orders_create():
         pb_headers = []
         pb_ph = {}
 
-    def _pb_col_letter(idx0):
-        n = idx0 + 1
-        s = ""
-        while n:
-            n, rem = divmod(n - 1, 26)
-            s = chr(65 + rem) + s
-        return s
-
-    ship_date_formula_row2 = None
-    try:
-        _sd_idx = pb_ph.get("Ship Date")
-        if _sd_idx is not None:
-            fr_sd = sheets.get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{_pb_col_letter(_sd_idx)}2",
-                valueRenderOption="FORMULA",
-            ).execute()
-            _sd_vals = fr_sd.get("values") or []
-            if _sd_vals and _sd_vals[0]:
-                _cell = str(_sd_vals[0][0] or "").strip()
-                if _cell.startswith("="):
-                    ship_date_formula_row2 = _cell
-    except Exception as e:
-        logger.warning("[ShopifyWebhook] Could not read Ship Date formula from row 2: %s", e)
-
     # Dedupe: if we already processed this Shopify order (or reserved rows), skip
     if shopify_order_id:
         try:
@@ -9739,6 +9797,10 @@ def shopify_webhook_orders_create():
             n, rem = divmod(n - 1, 26)
             s = chr(65 + rem) + s
         return s
+
+    _due_date_col_letter = (
+        _col_letter(pb_ph["Due Date"]) if pb_ph.get("Due Date") is not None else "K"
+    )
 
     try:
         drive = get_drive_service()
@@ -9949,7 +10011,7 @@ def shopify_webhook_orders_create():
             _set("Design", design)
             _set("Quantity", line_qty)
             _set("Product", product_title)
-            _set("Stage", "ORDERED")
+            _set("Stage", _pb_stage_formula_for_row(next_row))
             _set("Price", line_price if idx == 0 else 0)
             _set("Due Date", due_str_sheet)
             _set("Print", print_cell)
@@ -9957,14 +10019,13 @@ def shopify_webhook_orders_create():
             _set("Material1", material1)
             _set("Material1%", 100)
             _set("Material 1%", 100)
+            _set("Back Material", material1)
             _set("Fur Color", fur_display)
             _set("EMB Backing", "Cut Away")
             _set("Hard Date/Soft Date", "Hard Date")
-            if ship_date_formula_row2:
-                _set(
-                    "Ship Date",
-                    _rewrite_formula_row_refs(ship_date_formula_row2, 2, next_row),
-                )
+            _set("Ship Date", _pb_ship_date_formula_for_row(next_row, _due_date_col_letter))
+            _set("Stitch Count", _pb_stitch_count_formula_for_row(next_row))
+            _set("Threads", _pb_threads_formula_for_row(next_row))
             _set("Notes", notes_val)
             _set("Order Folder Link", order_folder_link or "")
             _set("Folder Link", order_folder_link or "")
@@ -9974,7 +10035,7 @@ def shopify_webhook_orders_create():
                 fixed_preview = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & IFERROR(REGEXEXTRACT(D' + str(next_row) + ',"file/d/([^/]+)"),REGEXEXTRACT(D' + str(next_row) + ',"[?&]id=([^&\\s]+)"))),"No preview available")'
                 fixed = [
                     new_order, ts_str, fixed_preview, image_link_for_row or "", company, design,
-                    line_qty, "", product_title, "ORDERED",
+                    line_qty, "", product_title, _pb_stage_formula_for_row(next_row),
                     line_price if idx == 0 else 0, due_str_sheet, print_cell, material1,
                     "", "", "", "", "", fur_display, "", shopify_order_id or "",
                     "", "", notes_val, order_folder_link or "",
