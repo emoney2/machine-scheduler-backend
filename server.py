@@ -1,5 +1,10 @@
 import eventlet
 import os, eventlet
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load backend/.env before any import that reads os.environ at module load (e.g. ups_service).
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 os.environ.setdefault("EVENTLET_NO_GREENDNS", "yes")
 eventlet.monkey_patch()
@@ -11,6 +16,8 @@ debug.hub_prevent_multiple_readers(False)
 import os
 import json
 import logging
+import shutil
+import subprocess
 import time
 import traceback
 import re
@@ -93,7 +100,6 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from ups_service import get_rate
 from functools import wraps
-from dotenv import load_dotenv
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
@@ -1511,8 +1517,8 @@ def _orders_get_by_id_cached(order_number: str):
     return by.get(order_number)
 
 
-# ─── Load .env & Logger ─────────────────────────────────────────────────────
-load_dotenv()
+# ─── Logger ─────────────────────────────────────────────────────────────────
+# (.env already loaded at startup via load_dotenv next to imports)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -4197,6 +4203,184 @@ def serve_slip(filename):
     return send_from_directory(tmp, safe, as_attachment=False)
 
 
+# ─── UPS ship-to + labels folder + packing-slip printer (Windows) ───────────
+_US_STATE_NAME_TO_ABBR = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE",
+    "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
+    "new mexico": "NM", "new york": "NY", "north carolina": "NC",
+    "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
+    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+    "district of columbia": "DC", "washington dc": "DC", "dc": "DC",
+}
+
+
+def _state_abbr_ups(val) -> str:
+    s = str(val or "").strip()
+    if len(s) == 2:
+        return s.upper()
+    return _US_STATE_NAME_TO_ABBR.get(s.lower(), s[:2].upper() if s else "")
+
+
+def _zip5_ups(val) -> str:
+    m = re.search(r"(\d{5})", str(val or ""))
+    return m.group(1) if m else ""
+
+
+def _fetch_directory_row_by_company(company_name: str):
+    if not company_name or not SPREADSHEET_ID:
+        return None
+    try:
+        sheet = get_sheets_service().spreadsheets().values()
+        resp = (
+            sheet.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Directory!A1:K10000",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        )
+    except Exception:
+        logging.exception("Directory read failed for UPS ship-to")
+        return None
+    rows = resp.get("values") or []
+    if len(rows) < 2:
+        return None
+    headers = rows[0]
+    target = company_name.strip().lower()
+    for r in rows[1:]:
+        row = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
+        name = str(row.get("Company Name", "")).strip().lower()
+        if name == target:
+            return row
+    return None
+
+
+def _normalize_ups_ship_to_from_directory_row(row: dict) -> dict:
+    cfn = str(row.get("Contact First Name", "") or "").strip()
+    cln = str(row.get("Contact Last Name", "") or "").strip()
+    phone = re.sub(r"\D", "", str(row.get("Phone Number", "") or ""))[:15]
+    if not phone:
+        phone = "0000000000"
+    a2 = str(row.get("Street Address 2", "") or "").strip()
+    return {
+        "name": (str(row.get("Company Name", "") or "Recipient").strip() or "Recipient")[
+            :35
+        ],
+        "phone": phone,
+        "addr1": str(row.get("Street Address 1", "") or "").strip(),
+        "addr2": a2 or None,
+        "city": str(row.get("City", "") or "").strip(),
+        "state": _state_abbr_ups(row.get("State", "")),
+        "zip": _zip5_ups(row.get("Zip Code", "")),
+        "country": "US",
+    }
+
+
+def _copy_ups_labels_to_output_dir(label_relative_paths) -> bool:
+    """
+    Copy label files from system temp into UPS_LABEL_OUTPUT_DIR (e.g. Google Drive sync folder).
+    label_relative_paths entries look like '/labels/ups_1Z....pdf'
+    """
+    out_dir = (os.environ.get("UPS_LABEL_OUTPUT_DIR") or r"G:\My Drive\Label Printer").strip()
+    if not out_dir:
+        return False
+    if not os.path.isdir(out_dir):
+        logging.warning("UPS_LABEL_OUTPUT_DIR is not a directory: %s", out_dir)
+        return False
+    tmp = tempfile.gettempdir()
+    copied = 0
+    for rel in label_relative_paths or []:
+        if not rel or not isinstance(rel, str):
+            continue
+        fname = os.path.basename(rel.replace("\\", "/"))
+        if not fname or ".." in fname:
+            continue
+        src = os.path.join(tmp, fname)
+        if os.path.isfile(src):
+            try:
+                shutil.copy2(src, os.path.join(out_dir, fname))
+                copied += 1
+            except Exception:
+                logging.exception("Failed to copy label %s → %s", src, out_dir)
+    return copied > 0
+
+
+def _print_packing_slip_pdf(pdf_path: str) -> None:
+    """Best-effort: send PDF to named Windows printer (PACKING_SLIP_PRINTER_NAME)."""
+    # Windows queue name is often "EPSONA0517C (WF-4830 Series)" — use exact name for printto.
+    printer = (
+        os.environ.get("PACKING_SLIP_PRINTER_NAME")
+        or "EPSONA0517C (WF-4830 Series)"
+    ).strip()
+    if not printer or not pdf_path or not os.path.isfile(pdf_path):
+        return
+    if sys.platform != "win32":
+        logging.info("Skipping direct print (not Windows): %s", pdf_path)
+        return
+    abs_path = os.path.abspath(pdf_path)
+    try:
+        import win32api  # type: ignore
+
+        win32api.ShellExecute(0, "printto", abs_path, printer, ".", 0)
+        logging.info("Sent packing slip to printer %s", printer)
+        return
+    except ImportError:
+        pass
+    except Exception:
+        logging.exception("win32 printto failed for packing slip")
+    try:
+        ps = (
+            f'Start-Process -FilePath "{abs_path}" -Verb PrintTo '
+            f"-ArgumentList '{printer.replace(chr(39), chr(39)+chr(39))}'"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            check=False,
+            timeout=120,
+            capture_output=True,
+        )
+        logging.info("Packing slip print via PowerShell → %s", printer)
+    except Exception:
+        logging.exception("PowerShell PrintTo failed for packing slip")
+
+
+def _packing_slip_num_copies(boxes_summary, boxes_legacy) -> int:
+    if boxes_summary and isinstance(boxes_summary, list):
+        t = 0
+        for b in boxes_summary:
+            if isinstance(b, dict):
+                try:
+                    t += int(b.get("qty", 1) or 1)
+                except (TypeError, ValueError):
+                    t += 1
+        return max(1, t)
+    return max(1, len(boxes_legacy or []))
+
+
+def _normalize_packages_for_ups(raw_list):
+    out = []
+    for p in raw_list or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            L = float(p.get("L") or p.get("Length") or p.get("l") or 10)
+            W = float(p.get("W") or p.get("Width") or p.get("w") or 10)
+            H = float(p.get("H") or p.get("Height") or p.get("h") or 10)
+            wt = float(p.get("weight") or p.get("Weight") or 1)
+        except (TypeError, ValueError):
+            continue
+        out.append({"L": L, "W": W, "H": H, "weight": max(0.1, wt)})
+    return out
+
+
 def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers, env_override=None):
     """
     Fetch the invoice PDF from QuickBooks (sandbox or production).
@@ -4932,6 +5116,9 @@ def create_consolidated_invoice_in_quickbooks(
 ):
     """
     Builds a single consolidated invoice in QuickBooks (sandbox or production).
+
+    base_shipping_cost: final USD amount for the Shipping line (already includes any per-box fee).
+    tracking_list: UPS tracking strings, joined with commas on Invoice.TrackingNum.
     """
 
     # ── 0) Pick sandbox vs. production base URL ─────────────────────
@@ -5010,6 +5197,28 @@ def create_consolidated_invoice_in_quickbooks(
     if not line_items:
         raise Exception("❌ No valid line items to invoice.")
 
+    try:
+        ship_amt = float(base_shipping_cost or 0)
+    except (TypeError, ValueError):
+        ship_amt = 0.0
+    if ship_amt > 0:
+        ship_item = get_or_create_item_ref(
+            "Shipping", headers, realm_id, env_override
+        )
+        ship_amt_r = round(ship_amt, 2)
+        line_items.append(
+            {
+                "DetailType": "SalesItemLineDetail",
+                "Amount": ship_amt_r,
+                "Description": f"Shipping — {shipping_method or 'UPS'}",
+                "SalesItemLineDetail": {
+                    "ItemRef": {"value": ship_item["value"], "name": ship_item["name"]},
+                    "Qty": 1,
+                    "UnitPrice": ship_amt_r,
+                },
+            }
+        )
+
     # ── 4) Build the invoice payload ────────────────────────────────
     txn_date_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -5041,11 +5250,16 @@ def create_consolidated_invoice_in_quickbooks(
         "BillEmail": {"Address": bill_email} if bill_email else None,
         "ShipMethodRef": ship_method_ref,
     }
+    track_parts = [
+        str(t).strip() for t in (tracking_list or []) if str(t).strip()
+    ]
+    if track_parts:
+        invoice_payload["TrackingNum"] = ", ".join(track_parts)
     # Drop any None values QBO might reject (e.g., missing BillEmail)
     invoice_payload = {k: v for k, v in invoice_payload.items() if v is not None}
 
     # ── 5) Send to QuickBooks ───────────────────────────────────────
-    url = f"{base}/v3/company/{realm_id}/invoice"
+    url = f"{base}/v3/company/{realm_id}/invoice?minorversion=65"
     logging.info("📦 Invoice payload:\n%s", json.dumps(invoice_payload, indent=2))
 
     res = requests.post(
@@ -5053,6 +5267,16 @@ def create_consolidated_invoice_in_quickbooks(
         headers={**headers, "Content-Type": "application/json"},
         json=invoice_payload,
     )
+    if res.status_code not in (200, 201):
+        err_txt = res.text or ""
+        if res.status_code == 400 and "TrackingNum" in err_txt:
+            inv2 = {k: v for k, v in invoice_payload.items() if k != "TrackingNum"}
+            logging.warning("Retrying QBO invoice create without TrackingNum")
+            res = requests.post(
+                url,
+                headers={**headers, "Content-Type": "application/json"},
+                json=inv2,
+            )
     if res.status_code not in (200, 201):
         logging.error("❌ QBO invoice creation failed: %s", res.text)
         raise Exception(f"QuickBooks invoice creation failed: {res.text}")
@@ -11813,8 +12037,15 @@ def process_shipment():
         str(k).strip(): v for k, v in data.get("shipped_quantities", {}).items()
     }
     boxes = data.get("boxes", [])
+    boxes_summary = data.get("boxes_summary") or boxes
     shipping_method = data.get("shipping_method", "")
     service_code = data.get("service_code")  # e.g., "03", "02", "01", etc.
+    packages_ups = _normalize_packages_for_ups(data.get("packages"))
+    try:
+        ups_purchased_rate = float(data.get("ups_purchased_rate") or 0)
+    except (TypeError, ValueError):
+        ups_purchased_rate = 0.0
+    skip_ups = bool(data.get("skip_ups"))
 
     print("🔍 order_ids:", order_ids)
     print("🔍 shipped_quantities:", shipped_quantities)
@@ -11880,18 +12111,64 @@ def process_shipment():
                 order_dict["ShippedQty"] = parsed_qty
                 all_order_data.append(order_dict)
 
-        # 4) Create invoice in QBO (headers/realm_id already validated)
+        if not all_order_data:
+            return jsonify({"error": "No matching orders in sheet for given order_ids"}), 400
+
+        # 4) UPS labels (before invoice so we have tracking numbers)
+        tracking_list = []
+        label_relative_urls = []
+        labels_copied_ok = False
+        do_ups = (
+            (not skip_ups)
+            and bool(service_code and str(service_code).strip())
+            and bool(packages_ups)
+        )
+        if do_ups:
+            company = str(all_order_data[0].get("Company Name", "") or "").strip()
+            drow = _fetch_directory_row_by_company(company)
+            if not drow:
+                raise Exception(
+                    "Company not found in Directory; cannot create UPS labels."
+                )
+            ship_to = _normalize_ups_ship_to_from_directory_row(drow)
+            if (
+                not ship_to["addr1"]
+                or not ship_to["city"]
+                or len(ship_to.get("state") or "") != 2
+                or len(ship_to.get("zip") or "") != 5
+            ):
+                raise Exception(
+                    "Incomplete ship-to address in Directory for UPS "
+                    "(need street, city, 2-letter state, 5-digit ZIP)."
+                )
+            sc = str(service_code).strip()
+            if len(sc) > 2:
+                sc = sc[:2]
+            elif len(sc) == 1:
+                sc = sc.zfill(2)
+            label_relative_urls, tracking_list = ups_create_shipment(
+                ship_to, packages_ups, sc
+            )
+            labels_copied_ok = _copy_ups_labels_to_output_dir(label_relative_urls)
+
+        n_pkg = len(packages_ups)
+        if do_ups and n_pkg:
+            shipping_line_amt = round(float(ups_purchased_rate) + 5.0 * n_pkg, 2)
+        else:
+            shipping_line_amt = 0.0
+
+        # 5) Create invoice in QBO
         invoice_url = create_consolidated_invoice_in_quickbooks(
             all_order_data,
-            shipping_method,
-            tracking_list=[],
-            base_shipping_cost=0.0,
+            shipping_method or ("UPS" if do_ups else "Manual"),
+            tracking_list=tracking_list,
+            base_shipping_cost=shipping_line_amt,
             sheet=service,
             env_override=env_override,
         )
         print("✅ Invoice created:", invoice_url)
 
-        # 5) Build packing slip PDF (always create, even if empty)
+        # 6) Build packing slip PDF (always create, even if empty)
         try:
             company_info = fetch_company_info(headers, realm_id, env_override)
             pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
@@ -11916,12 +12193,14 @@ def process_shipment():
                 print(f"❌ Failed to create fallback packing slip: {e2}")
                 raise
 
-        # 6) Build a public URL for the front-end
+        _print_packing_slip_pdf(tmp_path)
+
+        # 7) Build a public URL for the front-end
         slip_url = url_for("serve_slip", filename=filename, _external=True)
 
-        # 7) Upload packing slip to Drive for shop printer/watcher
+        # 8) Upload packing slip to Drive for shop printer/watcher
         order_ids_str = "-".join(order_ids)
-        num_slips = max(1, len(boxes or []))
+        num_slips = _packing_slip_num_copies(boxes_summary, boxes)
         pdf_filename = f"{order_ids_str}_copies_{num_slips}_packing_slip.pdf"
         media = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
         drive = get_drive_service()
@@ -11968,7 +12247,7 @@ def process_shipment():
             ).execute()
         print("✅ Packing slip copied into each order folder.")
 
-        # 8) Only after invoice + slips succeed, write Shipped to the sheet
+        # 9) Only after invoice + slips succeed, write Shipped to the sheet
         if updates:
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=sheet_id,
@@ -11978,8 +12257,28 @@ def process_shipment():
         else:
             print("⚠️ No updates to push—check order_ids match sheet.")
 
-        # 9) Respond with CORS headers
-        resp = jsonify({"labels": [], "invoice": invoice_url, "slips": [slip_url]})
+        # 10) Respond with CORS headers
+        full_label_urls = [
+            url_for(
+                "serve_label",
+                filename=os.path.basename(str(u).replace("\\", "/")),
+                _external=True,
+            )
+            for u in (label_relative_urls or [])
+            if u
+        ]
+        # Open label PDFs in browser only if we did not copy to the label-printer folder (or no labels).
+        open_lbl = len(full_label_urls) == 0 or (not labels_copied_ok)
+        resp = jsonify(
+            {
+                "labels": full_label_urls,
+                "invoice": invoice_url,
+                "slips": [slip_url],
+                "open_label_windows": open_lbl,
+                "labels_copied_to_folder": bool(labels_copied_ok),
+                "tracking_numbers": tracking_list,
+            }
+        )
         resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         return resp

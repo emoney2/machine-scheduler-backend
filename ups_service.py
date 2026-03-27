@@ -3,21 +3,20 @@ import base64, os, time, uuid, tempfile, json
 from typing import List, Dict, Any, Tuple
 import requests
 
-UPS_ENV = (os.getenv("UPS_ENV") or "sandbox").lower()
-CLIENT_ID = os.getenv("UPS_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("UPS_CLIENT_SECRET", "")
+# Note: read ID/secret inside get_access_token() so they pick up .env after load_dotenv() in server.py.
 SHIPPER_NUMBER = os.getenv("UPS_ACCOUNT_NUMBER", "")
 NEGOTIATED = (os.getenv("UPS_NEGOTIATED_RATES", "true").lower() == "true")
 
-# Ship-from defaults
+# Ship-from defaults (override any field with SHIP_FROM_* in .env)
+_a2 = (os.getenv("SHIP_FROM_ADDRESS2", "Suite 300") or "").strip()
 FROM = {
     "name":   os.getenv("SHIP_FROM_NAME", "JR & Co."),
     "phone":  os.getenv("SHIP_FROM_PHONE", "0000000000"),
-    "addr1":  os.getenv("SHIP_FROM_ADDRESS1", ""),
-    "addr2":  os.getenv("SHIP_FROM_ADDRESS2", "") or None,
-    "city":   os.getenv("SHIP_FROM_CITY", ""),
-    "state":  os.getenv("SHIP_FROM_STATE", ""),
-    "zip":    os.getenv("SHIP_FROM_ZIP", ""),
+    "addr1":  os.getenv("SHIP_FROM_ADDRESS1", "1384 Buford Business Blvd"),
+    "addr2":  _a2 or None,
+    "city":   os.getenv("SHIP_FROM_CITY", "Buford"),
+    "state":  os.getenv("SHIP_FROM_STATE", "GA"),
+    "zip":    os.getenv("SHIP_FROM_ZIP", "30518"),
     "country":os.getenv("SHIP_FROM_COUNTRY", "US"),
 }
 
@@ -29,7 +28,15 @@ PICKUP_TYPE = os.getenv("UPS_PICKUP_TYPE", "DailyPickup")
 LABEL_FORMAT = os.getenv("UPS_LABEL_FORMAT", "PDF").upper()
 LABEL_SIZE = os.getenv("UPS_LABEL_SIZE", "4x6")
 
-HOST = "https://onlinetools.ups.com" if UPS_ENV == "production" else "https://wwwcie.ups.com"
+
+def _ups_base_url() -> str:
+    """Production: onlinetools.ups.com. Sandbox: wwwcie.ups.com. Set UPS_ENV=production for live."""
+    env = (os.getenv("UPS_ENV") or "sandbox").lower()
+    return (
+        "https://onlinetools.ups.com"
+        if env == "production"
+        else "https://wwwcie.ups.com"
+    )
 
 # Known service codes you likely want visible; we'll loop to “shop” rates
 UPS_SERVICES = [
@@ -52,10 +59,17 @@ def get_access_token() -> str:
     if _token_cache["access_token"] and _token_cache["exp"] - 60 > now:
         return _token_cache["access_token"]
 
-    url = f"{HOST}/security/v1/oauth/token"
+    client_id = os.getenv("UPS_CLIENT_ID", "").strip()
+    client_secret = os.getenv("UPS_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        raise RuntimeError(
+            "UPS OAuth: set UPS_CLIENT_ID and UPS_CLIENT_SECRET in the environment or backend .env"
+        )
+
+    url = f"{_ups_base_url()}/security/v1/oauth/token"
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": "Basic " + _b64(f"{CLIENT_ID}:{CLIENT_SECRET}"),
+        "Authorization": "Basic " + _b64(f"{client_id}:{client_secret}"),
     }
     data = "grant_type=client_credentials"
     r = requests.post(url, headers=headers, data=data, timeout=20)
@@ -129,7 +143,7 @@ def get_rate(
     returns: [{code, method, rate, currency, delivery}, ...]
     """
     token = get_access_token()
-    url = f"{HOST}/api/rating/v1/Rate"
+    url = f"{_ups_base_url()}/api/rating/v1/Rate"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -243,7 +257,7 @@ def create_shipment(
     Returns (label_urls, tracking_numbers)
     """
     token = get_access_token()
-    url = f"{HOST}/api/shipments/v1/shipments"
+    url = f"{_ups_base_url()}/api/shipments/v1/shipments"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
