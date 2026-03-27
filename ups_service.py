@@ -248,14 +248,23 @@ def get_rate(
             gd = rated.get("GuaranteedDelivery") or {}
             tit = rated.get("TimeInTransit") or {}
             eta = gd.get("BusinessDaysInTransit") or tit.get("DaysInTransit")
+            sched = gd.get("ScheduledDeliveryDate") or tit.get("Date") or None
 
-            results.append({
+            row: Dict[str, Any] = {
                 "code": code,
                 "method": name,
                 "rate": money_f,
                 "currency": curr or "USD",
-                "delivery": f"{eta} business days" if eta else None
-            })
+                "delivery": f"{eta} business days" if eta is not None else None,
+            }
+            try:
+                if eta is not None:
+                    row["business_days"] = int(eta)
+            except (TypeError, ValueError):
+                pass
+            if sched:
+                row["scheduled_delivery_date"] = str(sched)
+            results.append(row)
 
     if ask_all_services:
         _loop_services(NEGOTIATED)
@@ -289,13 +298,22 @@ def get_rate(
         gd = rated.get("GuaranteedDelivery") or {}
         tit = rated.get("TimeInTransit") or {}
         eta = gd.get("BusinessDaysInTransit") or tit.get("DaysInTransit")
-        results.append({
+        sched = gd.get("ScheduledDeliveryDate") or tit.get("Date")
+        row2: Dict[str, Any] = {
             "code": code,
             "method": name,
             "rate": money_f,
             "currency": curr or "USD",
-            "delivery": f"{eta} business days" if eta else None
-        })
+            "delivery": f"{eta} business days" if eta is not None else None,
+        }
+        try:
+            if eta is not None:
+                row2["business_days"] = int(eta)
+        except (TypeError, ValueError):
+            pass
+        if sched:
+            row2["scheduled_delivery_date"] = str(sched)
+        results.append(row2)
 
     # Sort by price ascending, put None at end
     results.sort(key=lambda x: (x["rate"] is None, x["rate"] if x["rate"] is not None else 1e9))

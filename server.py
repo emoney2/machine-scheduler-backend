@@ -12049,6 +12049,7 @@ def process_shipment():
     except (TypeError, ValueError):
         ups_purchased_rate = 0.0
     skip_ups = bool(data.get("skip_ups"))
+    skip_invoice = bool(data.get("skip_invoice"))
 
     print("🔍 order_ids:", order_ids)
     print("🔍 shipped_quantities:", shipped_quantities)
@@ -12160,16 +12161,20 @@ def process_shipment():
         else:
             shipping_line_amt = 0.0
 
-        # 5) Create invoice in QBO
-        invoice_url = create_consolidated_invoice_in_quickbooks(
-            all_order_data,
-            shipping_method or ("UPS" if do_ups else "Manual"),
-            tracking_list=tracking_list,
-            base_shipping_cost=shipping_line_amt,
-            sheet=service,
-            env_override=env_override,
-        )
-        print("✅ Invoice created:", invoice_url)
+        # 5) Create invoice in QBO (optional — e.g. free samples)
+        invoice_url = None
+        if skip_invoice:
+            print("⏭️ skip_invoice: skipping QuickBooks invoice")
+        else:
+            invoice_url = create_consolidated_invoice_in_quickbooks(
+                all_order_data,
+                shipping_method or ("UPS" if do_ups else "Manual"),
+                tracking_list=tracking_list,
+                base_shipping_cost=shipping_line_amt,
+                sheet=service,
+                env_override=env_override,
+            )
+            print("✅ Invoice created:", invoice_url)
 
         # 6) Build packing slip PDF (always create, even if empty)
         try:
