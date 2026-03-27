@@ -144,6 +144,57 @@ def _first_rated_shipment(data: Dict[str, Any]):
     return None
 
 
+def _transit_and_schedule_from_rated(rated: Dict[str, Any]) -> Tuple[Any, Any]:
+    """
+    Business days and calendar ETA from RatedShipment.
+
+    Air services often put days at TimeInTransit.DaysInTransit or GuaranteedDelivery.
+    Ground typically nests under TimeInTransit.ServiceSummary.EstimatedArrival.
+    """
+    if not rated:
+        return None, None
+    gd = rated.get("GuaranteedDelivery") or {}
+    tit = rated.get("TimeInTransit") or {}
+    eta = gd.get("BusinessDaysInTransit") or tit.get("DaysInTransit")
+    sched = gd.get("ScheduledDeliveryDate") or tit.get("Date")
+
+    ss = tit.get("ServiceSummary")
+    summaries = ss if isinstance(ss, list) else ([ss] if isinstance(ss, dict) else [])
+    for ssum in summaries:
+        if not isinstance(ssum, dict):
+            continue
+        ea = ssum.get("EstimatedArrival") or {}
+        if not isinstance(ea, dict):
+            continue
+        if eta in (None, ""):
+            eta = ea.get("BusinessDaysInTransit")
+        arr = ea.get("Arrival") or {}
+        if isinstance(arr, dict) and sched in (None, ""):
+            sched = arr.get("Date")
+        if sched in (None, ""):
+            sched = ea.get("Date")
+
+    if (eta in (None, "") or sched in (None, "")) and isinstance(
+        rated.get("RatedPackage"), list
+    ):
+        for rp in rated["RatedPackage"]:
+            if not isinstance(rp, dict):
+                continue
+            tit2 = rp.get("TimeInTransit") or {}
+            if eta in (None, ""):
+                eta = tit2.get("DaysInTransit") or tit2.get("BusinessDaysInTransit")
+            if sched in (None, ""):
+                sched = tit2.get("Date")
+            if eta not in (None, "") and sched not in (None, ""):
+                break
+
+    if eta == "":
+        eta = None
+    if sched == "":
+        sched = None
+    return eta, sched
+
+
 def _money_and_currency_from_rated(rated: Dict[str, Any]) -> Tuple[Any, str]:
     """Pull published or negotiated total from RatedShipment."""
     if not rated:
@@ -245,10 +296,7 @@ def get_rate(
                 money_f = None
             if money_f is None:
                 continue
-            gd = rated.get("GuaranteedDelivery") or {}
-            tit = rated.get("TimeInTransit") or {}
-            eta = gd.get("BusinessDaysInTransit") or tit.get("DaysInTransit")
-            sched = gd.get("ScheduledDeliveryDate") or tit.get("Date") or None
+            eta, sched = _transit_and_schedule_from_rated(rated)
 
             row: Dict[str, Any] = {
                 "code": code,
@@ -295,10 +343,7 @@ def get_rate(
             raise RuntimeError(f"UPS Rate: missing RatedShipment in {json.dumps(data)[:600]}")
         money, curr = _money_and_currency_from_rated(rated)
         money_f = float(money) if money not in (None, "") else None
-        gd = rated.get("GuaranteedDelivery") or {}
-        tit = rated.get("TimeInTransit") or {}
-        eta = gd.get("BusinessDaysInTransit") or tit.get("DaysInTransit")
-        sched = gd.get("ScheduledDeliveryDate") or tit.get("Date")
+        eta, sched = _transit_and_schedule_from_rated(rated)
         row2: Dict[str, Any] = {
             "code": code,
             "method": name,
