@@ -5637,9 +5637,12 @@ def rate_all_services():
       [ { code, method, rate, currency, delivery }, ... ]
     """
     p = request.get_json(force=True) or {}
-    to = p.get("to", {})
-    pkgs = p.get("packages", [])
+    raw_to = p.get("to") or p.get("recipient") or {}
+    to = _normalize_rate_ship_to(raw_to)
+    pkgs = _normalize_rate_packages(p.get("packages"))
     try:
+        if not to.get("addr1") or not pkgs:
+            raise ValueError("missing address or packages")
         options = ups_get_rate(to, pkgs, ask_all_services=True)
         return jsonify(options)  # an array that your Ship.jsx already expects
     except Exception as e:
@@ -12391,6 +12394,104 @@ def logout_all():
     return jsonify({"status": "ok"}), 200
 
 
+def _normalize_rate_ship_to(raw) -> dict:
+    """Build ship_to dict for ups_service.get_rate from mega/legacy JSON."""
+    if not isinstance(raw, dict):
+        return {}
+    nested = raw.get("Address") or raw.get("address") or {}
+
+    def first(*vals):
+        for v in vals:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                return s
+        return ""
+
+    name = first(raw.get("name"), raw.get("Name")) or "Recipient"
+    phone = first(raw.get("phone"), raw.get("Phone")) or "0000000000"
+    addr1 = first(
+        raw.get("addr1"),
+        raw.get("addressLine1"),
+        nested.get("AddressLine1"),
+        nested.get("addressLine1"),
+    )
+    addr2 = first(
+        raw.get("addr2"),
+        raw.get("addressLine2"),
+        nested.get("AddressLine2"),
+        nested.get("addressLine2"),
+    )
+    city = first(raw.get("city"), raw.get("City"), nested.get("City"), nested.get("city"))
+    state = first(
+        raw.get("state"),
+        raw.get("State"),
+        nested.get("StateProvinceCode"),
+        nested.get("state"),
+    )
+    zipc = first(
+        raw.get("zip"),
+        raw.get("postalCode"),
+        raw.get("PostalCode"),
+        nested.get("PostalCode"),
+        nested.get("postalCode"),
+    )
+    country = first(
+        raw.get("country"),
+        raw.get("countryCode"),
+        nested.get("CountryCode"),
+        nested.get("countryCode"),
+    ) or "US"
+    return {
+        "name": name[:200],
+        "phone": phone,
+        "addr1": addr1,
+        "addr2": addr2 or None,
+        "city": city,
+        "state": state,
+        "zip": zipc,
+        "country": country,
+    }
+
+
+def _normalize_rate_packages(raw_list):
+    out = []
+    for p in raw_list or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            L = float(
+                p.get("L")
+                or p.get("Length")
+                or p.get("length")
+                or p.get("Dimensions", {}).get("Length")
+                or 1
+            )
+            W = float(
+                p.get("W")
+                or p.get("Width")
+                or p.get("width")
+                or p.get("Dimensions", {}).get("Width")
+                or 1
+            )
+            H = float(
+                p.get("H")
+                or p.get("Height")
+                or p.get("height")
+                or p.get("Dimensions", {}).get("Height")
+                or 1
+            )
+            w = p.get("weight")
+            if w is None:
+                w = p.get("Weight")
+            wt = float(w) if w is not None else 1.0
+        except (TypeError, ValueError):
+            continue
+        out.append({"L": L, "W": W, "H": H, "weight": wt})
+    return out
+
+
 @app.route("/api/rate", methods=["POST"])
 @login_required_session
 def api_rate():
@@ -12403,9 +12504,31 @@ def api_rate():
     Returns list of options: [{code, method, rate, currency, delivery}, ...]
     """
     try:
-        payload = request.get_json(force=True)
-        to = payload.get("to", {})
-        packages = payload.get("packages", [])
+        payload = request.get_json(force=True) or {}
+        raw_to = (
+            payload.get("to")
+            or payload.get("recipient")
+            or payload.get("shipTo")
+            or {}
+        )
+        to = _normalize_rate_ship_to(raw_to)
+        if not to.get("addr1") or not to.get("city") or not to.get("zip"):
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "Incomplete ship-to address for rating (need street, city, ZIP).",
+                        "detail": to,
+                    }
+                ),
+                400,
+            )
+        packages = _normalize_rate_packages(payload.get("packages"))
+        if not packages:
+            return (
+                jsonify({"ok": False, "error": "No valid packages for UPS rating."}),
+                400,
+            )
         options = ups_get_rate(to, packages, ask_all_services=True)
         return jsonify({"ok": True, "options": options})
     except Exception as e:

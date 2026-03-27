@@ -131,6 +131,46 @@ def _label_spec() -> Dict[str, Any]:
         "LabelStockSize": {"Height": "4", "Width": "6"} if LABEL_SIZE == "4x6" else None
     }
 
+def _first_rated_shipment(data: Dict[str, Any]):
+    """UPS returns RatedShipment as either one object or a list of objects."""
+    rr = data.get("RateResponse") or {}
+    rs = rr.get("RatedShipment")
+    if rs is None:
+        return None
+    if isinstance(rs, list):
+        return rs[0] if rs else None
+    if isinstance(rs, dict):
+        return rs
+    return None
+
+
+def _money_and_currency_from_rated(rated: Dict[str, Any]) -> Tuple[Any, str]:
+    """Pull published or negotiated total from RatedShipment."""
+    if not rated:
+        return None, "USD"
+    tc = rated.get("TotalCharges")
+    if isinstance(tc, dict) and tc.get("MonetaryValue") not in (None, ""):
+        return tc.get("MonetaryValue"), (tc.get("CurrencyCode") or "USD")
+    nrc = rated.get("NegotiatedRateCharges")
+    if isinstance(nrc, dict):
+        inner = nrc.get("TotalCharge") or nrc.get("TotalCharges")
+        if isinstance(inner, dict) and inner.get("MonetaryValue") not in (None, ""):
+            return inner.get("MonetaryValue"), (inner.get("CurrencyCode") or "USD")
+        if nrc.get("MonetaryValue") not in (None, ""):
+            return nrc.get("MonetaryValue"), (nrc.get("CurrencyCode") or "USD")
+    return None, "USD"
+
+
+def _package_weight_lb(p: Dict[str, Any]) -> float:
+    w = p.get("weight")
+    if w is None:
+        w = p.get("Weight")
+    try:
+        return float(w) if w is not None else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+
+
 # ------- Rating -------
 def get_rate(
     ship_to: Dict[str, str],
@@ -166,14 +206,13 @@ def get_rate(
                 "BillShipper": {"AccountNumber": SHIPPER_NUMBER}
             }]
         },
-        "Package": [_pkg(p, p.get("weight", 1.0)) for p in packages],
+        "Package": [_pkg(p, _package_weight_lb(p)) for p in packages],
         "DeliveryTimeInformation": {"PackageBillType": "03"}  # DAP (shipper pays)
     }
 
     results: List[Dict[str, Any]] = []
 
-    if ask_all_services:
-        # Loop through common services (works like "shop" rates)
+    def _loop_services(use_negotiated: bool) -> None:
         for code, name in UPS_SERVICES:
             body = {
                 "RateRequest": {
@@ -184,32 +223,45 @@ def get_rate(
                     "Request": {"SubVersion": "1707"}
                 }
             }
-            if NEGOTIATED:
-                body["RateRequest"]["Shipment"]["ShipmentRatingOptions"] = {"NegotiatedRatesIndicator": "Y"}
+            if use_negotiated:
+                body["RateRequest"]["Shipment"]["ShipmentRatingOptions"] = {
+                    "NegotiatedRatesIndicator": "Y"
+                }
 
             resp = requests.post(url, headers=headers, json=body, timeout=25)
             if resp.status_code >= 400:
-                # Skip services UPS doesn’t allow for this route/package
                 continue
-            data = resp.json()
             try:
-                rated = data["RateResponse"]["RatedShipment"][0]
+                data = resp.json()
             except Exception:
                 continue
-
-            total = rated.get("TotalCharges", rated.get("NegotiatedRateCharges", {}))
-            money = total.get("MonetaryValue") or rated.get("TotalCharges", {}).get("MonetaryValue")
-            curr = total.get("CurrencyCode") or rated.get("TotalCharges", {}).get("CurrencyCode")
-            eta  = rated.get("GuaranteedDelivery", {}).get("BusinessDaysInTransit") \
-                   or rated.get("TimeInTransit", {}).get("DaysInTransit")
+            rated = _first_rated_shipment(data)
+            if not rated:
+                continue
+            money, curr = _money_and_currency_from_rated(rated)
+            try:
+                money_f = float(money) if money not in (None, "") else None
+            except (TypeError, ValueError):
+                money_f = None
+            if money_f is None:
+                continue
+            gd = rated.get("GuaranteedDelivery") or {}
+            tit = rated.get("TimeInTransit") or {}
+            eta = gd.get("BusinessDaysInTransit") or tit.get("DaysInTransit")
 
             results.append({
                 "code": code,
                 "method": name,
-                "rate": float(money) if money else None,
+                "rate": money_f,
                 "currency": curr or "USD",
                 "delivery": f"{eta} business days" if eta else None
             })
+
+    if ask_all_services:
+        _loop_services(NEGOTIATED)
+        # Negotiated-only failures often return 200 with no usable charge, or skip all services.
+        if NEGOTIATED and not results:
+            _loop_services(False)
     else:
         # Single service expected in ship_to["service_code"]
         code = ship_to.get("service_code", "03")
@@ -229,16 +281,18 @@ def get_rate(
         resp = requests.post(url, headers=headers, json=body, timeout=25)
         resp.raise_for_status()
         data = resp.json()
-        rated = data["RateResponse"]["RatedShipment"][0]
-        total = rated.get("TotalCharges", rated.get("NegotiatedRateCharges", {}))
-        money = total.get("MonetaryValue") or rated.get("TotalCharges", {}).get("MonetaryValue")
-        curr = total.get("CurrencyCode") or rated.get("TotalCharges", {}).get("CurrencyCode")
-        eta  = rated.get("GuaranteedDelivery", {}).get("BusinessDaysInTransit") \
-               or rated.get("TimeInTransit", {}).get("DaysInTransit")
+        rated = _first_rated_shipment(data)
+        if not rated:
+            raise RuntimeError(f"UPS Rate: missing RatedShipment in {json.dumps(data)[:600]}")
+        money, curr = _money_and_currency_from_rated(rated)
+        money_f = float(money) if money not in (None, "") else None
+        gd = rated.get("GuaranteedDelivery") or {}
+        tit = rated.get("TimeInTransit") or {}
+        eta = gd.get("BusinessDaysInTransit") or tit.get("DaysInTransit")
         results.append({
             "code": code,
             "method": name,
-            "rate": float(money) if money else None,
+            "rate": money_f,
             "currency": curr or "USD",
             "delivery": f"{eta} business days" if eta else None
         })
