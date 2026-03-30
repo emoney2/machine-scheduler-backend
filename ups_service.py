@@ -1,5 +1,6 @@
 # ups_service.py
 import base64, os, time, uuid, tempfile, json
+from datetime import datetime
 from typing import List, Dict, Any, Tuple
 import requests
 
@@ -27,6 +28,14 @@ WT_UNIT  = "LBS" if UNITS == "IN_LBS" else "KGS"
 PICKUP_TYPE = os.getenv("UPS_PICKUP_TYPE", "DailyPickup")
 LABEL_FORMAT = os.getenv("UPS_LABEL_FORMAT", "PDF").upper()
 LABEL_SIZE = os.getenv("UPS_LABEL_SIZE", "4x6")
+
+# "Rate" = price only (Ground often omits TimeInTransit). "Ratetimeintransit" = rates + transit (needed for Ground ETA).
+_RATING_REQ_OPT = (os.getenv("UPS_RATING_REQUEST_OPTION") or "Ratetimeintransit").strip() or "Rate"
+
+
+def _pickup_date_ymd() -> str:
+    """YYYYMMDD for Rating API; required for transit with Ratetimeintransit."""
+    return datetime.now().strftime("%Y%m%d")
 
 
 def _ups_base_url() -> str:
@@ -167,12 +176,17 @@ def _transit_and_schedule_from_rated(rated: Dict[str, Any]) -> Tuple[Any, Any]:
         if not isinstance(ea, dict):
             continue
         if eta in (None, ""):
-            eta = ea.get("BusinessDaysInTransit")
-        arr = ea.get("Arrival") or {}
+            eta = (
+                ea.get("BusinessDaysInTransit")
+                or ea.get("TotalTransitDays")
+                or ea.get("businessDaysInTransit")
+                or ea.get("totalTransitDays")
+            )
+        arr = ea.get("Arrival") or ea.get("arrival") or {}
         if isinstance(arr, dict) and sched in (None, ""):
-            sched = arr.get("Date")
+            sched = arr.get("Date") or arr.get("date")
         if sched in (None, ""):
-            sched = ea.get("Date")
+            sched = ea.get("Date") or ea.get("date")
 
     if (eta in (None, "") or sched in (None, "")) and isinstance(
         rated.get("RatedPackage"), list
@@ -234,7 +248,7 @@ def get_rate(
     returns: [{code, method, rate, currency, delivery}, ...]
     """
     token = get_access_token()
-    url = f"{_ups_base_url()}/api/rating/v1/Rate"
+    url = f"{_ups_base_url()}/api/rating/v1/{_RATING_REQ_OPT}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -243,6 +257,10 @@ def get_rate(
     }
 
     # Build base shipment body
+    dti: Dict[str, Any] = {"PackageBillType": "03"}  # DAP (shipper pays)
+    if "timeintransit" in _RATING_REQ_OPT.lower():
+        dti["Pickup"] = {"Date": _pickup_date_ymd()}
+
     base_shipment = {
         "Shipper": _shipper(),
         "ShipTo": _addr(
@@ -258,7 +276,7 @@ def get_rate(
             }]
         },
         "Package": [_pkg(p, _package_weight_lb(p)) for p in packages],
-        "DeliveryTimeInformation": {"PackageBillType": "03"}  # DAP (shipper pays)
+        "DeliveryTimeInformation": dti,
     }
 
     results: List[Dict[str, Any]] = []
