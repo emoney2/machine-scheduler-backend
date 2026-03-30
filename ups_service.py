@@ -47,6 +47,31 @@ def _ups_base_url() -> str:
         else "https://wwwcie.ups.com"
     )
 
+
+def _ups_ship_endpoint() -> str:
+    """
+    Create-shipment URL. UPS returns 404 for removed paths like /api/shipments/v1/shipments.
+    Current REST shape: POST /api/shipments/{version}/ship (see UPS Shipping.yaml).
+    Override with UPS_SHIP_API_VERSION (default v2409).
+    """
+    ver = (os.getenv("UPS_SHIP_API_VERSION") or "v2409").strip()
+    if ver and not ver.startswith("v"):
+        ver = f"v{ver}"
+    return f"{_ups_base_url()}/api/shipments/{ver}/ship"
+
+
+def _ups_error_snippet(resp: requests.Response) -> str:
+    t = (resp.text or "").strip()
+    if t:
+        return t[:800] + ("…" if len(t) > 800 else "")
+    return (resp.reason or "").strip() or "empty response body"
+
+
+def _trans_id_header() -> str:
+    """UPS transId header max length 32 (UUID string is 36 with hyphens)."""
+    return uuid.uuid4().hex
+
+
 # Known service codes you likely want visible; we'll loop to “shop” rates
 UPS_SERVICES = [
     ("01", "Next Day Air"),
@@ -397,11 +422,11 @@ def create_shipment(
     Returns (label_urls, tracking_numbers)
     """
     token = get_access_token()
-    url = f"{_ups_base_url()}/api/shipments/v1/shipments"
+    url = _ups_ship_endpoint()
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "transId": str(uuid.uuid4()),
+        "transId": _trans_id_header(),
         "transactionSrc": "JRCO",
     }
 
@@ -438,8 +463,9 @@ def create_shipment(
     try:
         resp.raise_for_status()
     except Exception as e:
-        # Bubble up a readable error
-        raise RuntimeError(f"UPS Ship error {resp.status_code}: {resp.text[:500]}") from e
+        raise RuntimeError(
+            f"UPS Ship error {resp.status_code}: {_ups_error_snippet(resp)}"
+        ) from e
 
     data = resp.json()
     # Collect labels & tracking
