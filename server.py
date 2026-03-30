@@ -10784,6 +10784,39 @@ def get_materials():
     return resp
 
 
+@app.route("/api/material-inventory/colors", methods=["GET"])
+@login_required_session
+def material_inventory_colors():
+    """
+    JSON map: material name (lowercase) -> Color cell from Material Inventory
+    (columns Materials + Color). Used by Digitizing tab chips.
+    """
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:Z") or []
+        if len(rows) < 2:
+            return jsonify({})
+        headers = [str(h or "").strip() for h in rows[0]]
+        if "Materials" not in headers or "Color" not in headers:
+            return jsonify({})
+        name_i = headers.index("Materials")
+        color_i = headers.index("Color")
+        out = {}
+        for r in rows[1:]:
+            r = r or []
+            if len(r) <= max(name_i, color_i):
+                continue
+            name = str(r[name_i]).strip() if r[name_i] is not None else ""
+            color = str(r[color_i]).strip() if color_i < len(r) and r[color_i] is not None else ""
+            if name and color:
+                out[name.lower()] = color
+        resp = make_response(jsonify(out), 200)
+        resp.headers["Cache-Control"] = "public, max-age=60"
+        return resp
+    except Exception:
+        logging.exception("material_inventory_colors")
+        return jsonify({})
+
+
 # 3) POST new material(s) into Material Inventory!A–H
 @app.route("/api/materials", methods=["POST"])
 @login_required_session
