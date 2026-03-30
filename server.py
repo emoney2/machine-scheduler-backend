@@ -1891,6 +1891,42 @@ def fetch_company_info(headers, realm_id, env_override=None):
     }
 
 
+def default_packing_slip_company_info():
+    """
+    Header block for packing slips when skip_invoice=True (no QuickBooks session).
+    Uses PACKING_SLIP_* env overrides if set, else same defaults as UPS ship-from.
+    """
+    name = (os.environ.get("PACKING_SLIP_COMPANY_NAME") or "").strip() or (
+        os.environ.get("SHIP_FROM_NAME", "JR & Co.").strip() or "JR & Co."
+    )
+    a1 = (os.environ.get("PACKING_SLIP_ADDRESS1") or "").strip() or (
+        os.environ.get("SHIP_FROM_ADDRESS1", "1384 Buford Business Blvd").strip()
+        or "1384 Buford Business Blvd"
+    )
+    a2 = (os.environ.get("SHIP_FROM_ADDRESS2", "Suite 300") or "").strip()
+    line1 = f"{a1}, {a2}" if a2 else a1
+    city = (os.environ.get("PACKING_SLIP_CITY") or "").strip() or (
+        os.environ.get("SHIP_FROM_CITY", "Buford").strip() or "Buford"
+    )
+    state = (os.environ.get("PACKING_SLIP_STATE") or "").strip() or (
+        os.environ.get("SHIP_FROM_STATE", "GA").strip() or "GA"
+    )
+    postal = (os.environ.get("PACKING_SLIP_ZIP") or "").strip() or (
+        os.environ.get("SHIP_FROM_ZIP", "30518").strip() or "30518"
+    )
+    phone = (os.environ.get("PACKING_SLIP_PHONE") or "").strip() or (
+        os.environ.get("SHIP_FROM_PHONE", "678-294-5350").strip() or ""
+    )
+    return {
+        "CompanyName": name,
+        "AddrLine1": line1,
+        "City": city,
+        "CountrySubDivisionCode": state,
+        "PostalCode": postal,
+        "Phone": phone,
+    }
+
+
 MADEIRA_BASE = "https://www.madeirausa.com"
 
 
@@ -12020,19 +12056,23 @@ def process_shipment():
     session["qboEnv"] = env_override or "production"
     print("📥 process-shipment received:", data)
 
+    skip_invoice = bool(data.get("skip_invoice"))
+
     # ──────────────────────────────────────────────────────────────────────────
-    # 0) STOP EARLY unless the user is signed into QuickBooks
-    #    If not authenticated, get_quickbooks_credentials() raises RedirectException,
-    #    which we catch below and return {"redirect": "..."} to the front-end.
+    # 0) QuickBooks only when creating an invoice. UPS-only (skip_invoice) still
+    #    needs labels + packing slip; slip header uses default_packing_slip_company_info().
     # ──────────────────────────────────────────────────────────────────────────
-    try:
-        headers, realm_id = get_quickbooks_credentials()
-    except RedirectException as e:
-        print("🔁 Redirecting to OAuth:", e.redirect_url)
-        resp = jsonify({"redirect": e.redirect_url})
-        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        return resp, 200
+    headers = None
+    realm_id = None
+    if not skip_invoice:
+        try:
+            headers, realm_id = get_quickbooks_credentials()
+        except RedirectException as e:
+            print("🔁 Redirecting to OAuth:", e.redirect_url)
+            resp = jsonify({"redirect": e.redirect_url})
+            resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            return resp, 200
 
     # 1) Parse incoming
     order_ids = [str(oid).strip() for oid in data.get("order_ids", [])]
@@ -12049,7 +12089,6 @@ def process_shipment():
     except (TypeError, ValueError):
         ups_purchased_rate = 0.0
     skip_ups = bool(data.get("skip_ups"))
-    skip_invoice = bool(data.get("skip_invoice"))
 
     print("🔍 order_ids:", order_ids)
     print("🔍 shipped_quantities:", shipped_quantities)
@@ -12178,7 +12217,11 @@ def process_shipment():
 
         # 6) Build packing slip PDF (always create, even if empty)
         try:
-            company_info = fetch_company_info(headers, realm_id, env_override)
+            company_info = (
+                default_packing_slip_company_info()
+                if skip_invoice
+                else fetch_company_info(headers, realm_id, env_override)
+            )
             pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
             filename = f"packing_slip_{int(time.time())}.pdf"
             tmp_path = os.path.join(tempfile.gettempdir(), filename)
@@ -12190,7 +12233,11 @@ def process_shipment():
             traceback.print_exc()
             # Still create a minimal packing slip to ensure it's always created
             try:
-                company_info = fetch_company_info(headers, realm_id, env_override)
+                company_info = (
+                    default_packing_slip_company_info()
+                    if skip_invoice
+                    else fetch_company_info(headers, realm_id, env_override)
+                )
                 pdf_bytes = build_packing_slip_pdf([], boxes, company_info)
                 filename = f"packing_slip_{int(time.time())}.pdf"
                 tmp_path = os.path.join(tempfile.gettempdir(), filename)
