@@ -4300,16 +4300,29 @@ def _fetch_directory_row_by_company(company_name: str):
 
 
 def _normalize_ups_ship_to_from_directory_row(row: dict) -> dict:
+    """
+    Build ShipTo for UPS REST Ship/Rating. UPS does not expose your ups.com / WorldShip
+    address book over this API: every request sends a full address. Reusing the same
+    company + street + ZIP as in your address book matches that saved entry in practice.
+    """
     cfn = str(row.get("Contact First Name", "") or "").strip()
     cln = str(row.get("Contact Last Name", "") or "").strip()
+    contact_line = " ".join(p for p in (cfn, cln) if p).strip()
+    attention_name = (contact_line[:35] if contact_line else None)
+    company = str(row.get("Company Name", "") or "").strip()
+    # UPS: Name = company; AttentionName = contact. If no company, use contact as Name.
+    if company:
+        name = company[:35]
+    else:
+        name = (contact_line[:35] if contact_line else "Recipient")
+        attention_name = None
     phone = re.sub(r"\D", "", str(row.get("Phone Number", "") or ""))[:15]
     if not phone:
         phone = "0000000000"
     a2 = str(row.get("Street Address 2", "") or "").strip()
     return {
-        "name": (str(row.get("Company Name", "") or "Recipient").strip() or "Recipient")[
-            :35
-        ],
+        "name": name,
+        "attention_name": attention_name,
         "phone": phone,
         "addr1": str(row.get("Street Address 1", "") or "").strip(),
         "addr2": a2 or None,
@@ -4318,35 +4331,6 @@ def _normalize_ups_ship_to_from_directory_row(row: dict) -> dict:
         "zip": _zip5_ups(row.get("Zip Code", "")),
         "country": "US",
     }
-
-
-def _copy_ups_labels_to_output_dir(label_relative_paths) -> bool:
-    """
-    Copy label files from system temp into UPS_LABEL_OUTPUT_DIR (e.g. Google Drive sync folder).
-    label_relative_paths entries look like '/labels/ups_1Z....pdf'
-    """
-    out_dir = (os.environ.get("UPS_LABEL_OUTPUT_DIR") or r"G:\My Drive\Label Printer").strip()
-    if not out_dir:
-        return False
-    if not os.path.isdir(out_dir):
-        logging.warning("UPS_LABEL_OUTPUT_DIR is not a directory: %s", out_dir)
-        return False
-    tmp = tempfile.gettempdir()
-    copied = 0
-    for rel in label_relative_paths or []:
-        if not rel or not isinstance(rel, str):
-            continue
-        fname = os.path.basename(rel.replace("\\", "/"))
-        if not fname or ".." in fname:
-            continue
-        src = os.path.join(tmp, fname)
-        if os.path.isfile(src):
-            try:
-                shutil.copy2(src, os.path.join(out_dir, fname))
-                copied += 1
-            except Exception:
-                logging.exception("Failed to copy label %s → %s", src, out_dir)
-    return copied > 0
 
 
 def _print_packing_slip_pdf(pdf_path: str) -> None:
@@ -12189,10 +12173,9 @@ def process_shipment():
                 sc = sc[:2]
             elif len(sc) == 1:
                 sc = sc.zfill(2)
-            label_relative_urls, tracking_list = ups_create_shipment(
+            label_relative_urls, tracking_list, labels_copied_ok = ups_create_shipment(
                 ship_to, packages_ups, sc
             )
-            labels_copied_ok = _copy_ups_labels_to_output_dir(label_relative_urls)
 
         n_pkg = len(packages_ups)
         if do_ups and n_pkg:
@@ -12462,6 +12445,13 @@ def _normalize_rate_ship_to(raw) -> dict:
         return ""
 
     name = first(raw.get("name"), raw.get("Name")) or "Recipient"
+    attention_name = first(
+        raw.get("attentionName"),
+        raw.get("AttentionName"),
+        raw.get("attention_name"),
+        raw.get("attention"),
+    )
+    attention_name = attention_name[:35] if attention_name else None
     phone = first(raw.get("phone"), raw.get("Phone")) or "0000000000"
     addr1 = first(
         raw.get("addr1"),
@@ -12497,6 +12487,7 @@ def _normalize_rate_ship_to(raw) -> dict:
     ) or "US"
     return {
         "name": name[:200],
+        "attention_name": attention_name,
         "phone": phone,
         "addr1": addr1,
         "addr2": addr2 or None,

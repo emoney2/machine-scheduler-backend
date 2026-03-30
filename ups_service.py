@@ -1,5 +1,5 @@
 # ups_service.py
-import base64, os, time, uuid, tempfile, json
+import base64, io, logging, os, shutil, time, uuid, tempfile, json
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
 import requests
@@ -114,7 +114,21 @@ def get_access_token() -> str:
     return _token_cache["access_token"]
 
 # ------- Helpers to build UPS address/package JSON -------
-def _addr(name: str, phone: str, a1: str, city: str, state: str, postal: str, country: str, a2: str|None=None) -> Dict[str, Any]:
+def _addr(
+    name: str,
+    phone: str,
+    a1: str,
+    city: str,
+    state: str,
+    postal: str,
+    country: str,
+    a2: str | None = None,
+    attention_name: str | None = None,
+) -> Dict[str, Any]:
+    """
+    UPS ShipTo/ShipFrom: Name = company (or person if no company); AttentionName = contact person.
+    Omitting AttentionName can make the label show odd lines (e.g. phone prominence).
+    """
     out = {
         "Name": name[:35] if name else "Recipient",
         "Phone": {"Number": phone or "0000000000"},
@@ -122,8 +136,11 @@ def _addr(name: str, phone: str, a1: str, city: str, state: str, postal: str, co
             "AddressLine": [a1] if not a2 else [a1, a2],
             "City": city, "StateProvinceCode": state,
             "PostalCode": postal, "CountryCode": country
-        }
+        },
     }
+    attn = (attention_name or "").strip()
+    if attn:
+        out["AttentionName"] = attn[:35]
     return out
 
 def _shipper() -> Dict[str, Any]:
@@ -185,6 +202,89 @@ def _label_spec() -> Dict[str, Any]:
         "HTTPUserAgent": "JRCO-App",
         "LabelStockSize": {"Height": "4", "Width": "6"} if LABEL_SIZE == "4x6" else None
     }
+
+
+def _label_printer_output_dir() -> str:
+    """Google Drive sync folder for the physical label printer watcher (Windows path default)."""
+    return (os.getenv("UPS_LABEL_OUTPUT_DIR") or r"G:\My Drive\Label Printer").strip()
+
+
+def _save_trimmed_label_to_printer_folder(fpath: str, fname: str) -> bool:
+    """
+    After the PDF is trimmed, copy it into UPS_LABEL_OUTPUT_DIR (default G:\\My Drive\\Label Printer).
+    No-op if the directory does not exist (e.g. Linux cloud host).
+    """
+    out_dir = _label_printer_output_dir()
+    if not out_dir:
+        return False
+    if not os.path.isdir(out_dir):
+        logging.warning(
+            "UPS_LABEL_OUTPUT_DIR is not a directory; label not saved there: %s",
+            out_dir,
+        )
+        return False
+    try:
+        shutil.copy2(fpath, os.path.join(out_dir, fname))
+        return True
+    except OSError as e:
+        logging.warning(
+            "Failed to save UPS label to Label Printer folder %s: %s",
+            out_dir,
+            e,
+        )
+        return False
+
+
+def _normalize_ups_label_pdf_bytes(raw_pdf: bytes) -> bytes:
+    """
+    UPS often returns (a) a multi-page PDF with instructions after the label, or
+    (b) one US Letter page with the scannable label on top and fold/instructions below.
+    Trim to label-only: keep first page only; optionally crop single letter pages to the top band.
+    Set UPS_LABEL_PDF_TRIM_MODE=off to disable. UPS_LABEL_LETTER_TOP_FRACTION=0.48 keeps top 48% of height.
+    """
+    mode = (os.getenv("UPS_LABEL_PDF_TRIM_MODE") or "auto").strip().lower()
+    if mode == "off" or not raw_pdf:
+        return raw_pdf
+    try:
+        from pypdf import PdfReader, PdfWriter
+        from pypdf.generic import RectangleObject
+    except ImportError:
+        return raw_pdf
+
+    try:
+        reader = PdfReader(io.BytesIO(raw_pdf))
+        n = len(reader.pages)
+        if n == 0:
+            return raw_pdf
+
+        writer = PdfWriter()
+        writer.add_page(reader.pages[0])
+        page = writer.pages[0]
+
+        # Single-page letter: label block is usually the upper portion
+        if n == 1 and mode in ("auto", "letter_crop"):
+            mb = page.mediabox
+            left, bottom, right, top = (
+                float(mb.left),
+                float(mb.bottom),
+                float(mb.right),
+                float(mb.top),
+            )
+            w, h = right - left, top - bottom
+            # ~US Letter in points (72 dpi): 612 x 792; allow small variance
+            if h >= 700 and 580 <= w <= 640 and h / max(w, 1) > 1.15:
+                frac = float(os.getenv("UPS_LABEL_LETTER_TOP_FRACTION") or "0.48")
+                frac = min(max(frac, 0.2), 0.85)
+                new_bottom = bottom + h * (1.0 - frac)
+                rect = RectangleObject([left, new_bottom, right, top])
+                page.mediabox = rect
+                page.cropbox = rect
+
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception:
+        return raw_pdf
 
 def _first_rated_shipment(data: Dict[str, Any]):
     """UPS returns RatedShipment as either one object or a list of objects."""
@@ -294,7 +394,7 @@ def get_rate(
     ask_all_services: bool = True
 ) -> List[Dict[str, Any]]:
     """
-    ship_to: { name, phone, addr1, addr2, city, state, zip, country }
+    ship_to: { name, phone, addr1, addr2, city, state, zip, country, attention_name? }
     packages: [{ L,W,H, weight }, ...]
     returns: [{code, method, rate, currency, delivery}, ...]
     """
@@ -317,7 +417,8 @@ def get_rate(
         "ShipTo": _addr(
             ship_to["name"], ship_to.get("phone",""),
             ship_to["addr1"], ship_to["city"], ship_to["state"], ship_to["zip"], ship_to.get("country","US"),
-            ship_to.get("addr2") or None
+            ship_to.get("addr2") or None,
+            ship_to.get("attention_name") or None,
         ),
         "ShipFrom": _ship_from(),
         "PaymentDetails": {
@@ -438,9 +539,10 @@ def create_shipment(
     ship_to: Dict[str, str],
     packages: List[Dict[str, Any]],
     service_code: str
-) -> Tuple[List[str], List[str]]:
+) -> Tuple[List[str], List[str], bool]:
     """
-    Returns (label_urls, tracking_numbers)
+    Returns (label_urls, tracking_numbers, saved_to_label_printer_folder).
+    Trimmed PDF/PNG/ZPL is written to temp for /labels/… and copied to UPS_LABEL_OUTPUT_DIR when that path exists.
     """
     token = get_access_token()
     url = _ups_ship_endpoint()
@@ -461,7 +563,8 @@ def create_shipment(
                 "ShipTo": _addr(
                     ship_to["name"], ship_to.get("phone",""),
                     ship_to["addr1"], ship_to["city"], ship_to["state"], ship_to["zip"], ship_to.get("country","US"),
-                    ship_to.get("addr2") or None
+                    ship_to.get("addr2") or None,
+                    ship_to.get("attention_name") or None,
                 ),
                 "Service": {"Code": service_code},
                 "PaymentInformation": {
@@ -492,6 +595,7 @@ def create_shipment(
     # Collect labels & tracking
     label_urls: List[str] = []
     tracking: List[str] = []
+    saved_to_printer = False
 
     try:
         results = data["ShipmentResponse"]["ShipmentResults"]["PackageResults"]
@@ -504,11 +608,16 @@ def create_shipment(
             fname = f"ups_{trk}.{ext}"
             fpath = os.path.join(tempfile.gettempdir(), fname)
             # For PDF/PNG UPS returns base64; write to tmp and expose via /labels/<file>
+            payload = base64.b64decode(img)
+            if ext == "pdf":
+                payload = _normalize_ups_label_pdf_bytes(payload)
             with open(fpath, "wb") as f:
-                f.write(base64.b64decode(img))
+                f.write(payload)
+            if _save_trimmed_label_to_printer_folder(fpath, fname):
+                saved_to_printer = True
             label_urls.append(f"/labels/{fname}")
             tracking.append(trk)
     except Exception as e:
         raise RuntimeError(f"Could not parse UPS label response: {json.dumps(data)[:800]}") from e
 
-    return label_urls, tracking
+    return label_urls, tracking, saved_to_printer

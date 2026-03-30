@@ -16,6 +16,7 @@ playwright==1.46.0
 httpx
 psutil==5.9.8
 requests
+pypdf>=4.0
 beautifulsoup4
 lxml
 supabase>=2.5.0
