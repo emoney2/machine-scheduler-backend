@@ -142,10 +142,31 @@ def _ship_from() -> Dict[str, Any]:
     return _addr(FROM["name"], FROM["phone"], FROM["addr1"], FROM["city"], FROM["state"], FROM["zip"], FROM["country"], FROM["addr2"])
 
 def _pkg(dim: Dict[str, Any], weight_lbs: float|int) -> Dict[str, Any]:
+    """Package node for Rating API (expects PackagingType)."""
     L, W, H = str(dim["L"]), str(dim["W"]), str(dim["H"])
     WGT = f"{float(weight_lbs):.2f}"
     return {
         "PackagingType": {"Code": "02"},  # Customer Supplied Package
+        "Dimensions": {
+            "UnitOfMeasurement": {"Code": DIM_UNIT},
+            "Length": L, "Width": W, "Height": H
+        },
+        "PackageWeight": {
+            "UnitOfMeasurement": {"Code": WT_UNIT},
+            "Weight": WGT
+        }
+    }
+
+
+def _pkg_ship(dim: Dict[str, Any], weight_lbs: float|int) -> Dict[str, Any]:
+    """
+    Package node for Ship API v2409+ (Shipping.yaml Shipment_Package).
+    Requires `Packaging` with `Code`, not `PackagingType` — otherwise 120600.
+    """
+    L, W, H = str(dim["L"]), str(dim["W"]), str(dim["H"])
+    WGT = f"{float(weight_lbs):.2f}"
+    return {
+        "Packaging": {"Code": "02"},
         "Dimensions": {
             "UnitOfMeasurement": {"Code": DIM_UNIT},
             "Length": L, "Width": W, "Height": H
@@ -449,7 +470,7 @@ def create_shipment(
                         "BillShipper": {"AccountNumber": SHIPPER_NUMBER}
                     }]
                 },
-                "Package": [_pkg(p, p.get("weight", 1.0)) for p in packages],
+                "Package": [_pkg_ship(p, p.get("weight", 1.0)) for p in packages],
                 "ShipmentServiceOptions": {}
             },
             "LabelSpecification": _label_spec()
