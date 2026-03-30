@@ -210,12 +210,14 @@ def _transit_and_schedule_from_rated(rated: Dict[str, Any]) -> Tuple[Any, Any]:
 
 
 def _money_and_currency_from_rated(rated: Dict[str, Any]) -> Tuple[Any, str]:
-    """Pull published or negotiated total from RatedShipment."""
+    """Pull total from RatedShipment.
+
+    When NegotiatedRatesIndicator was sent, UPS returns both TotalCharges (retail/list)
+    and NegotiatedRateCharges (account pricing). Prefer negotiated so the app matches
+    UPS.com logged-in / account quotes; otherwise we would show list price only.
+    """
     if not rated:
         return None, "USD"
-    tc = rated.get("TotalCharges")
-    if isinstance(tc, dict) and tc.get("MonetaryValue") not in (None, ""):
-        return tc.get("MonetaryValue"), (tc.get("CurrencyCode") or "USD")
     nrc = rated.get("NegotiatedRateCharges")
     if isinstance(nrc, dict):
         inner = nrc.get("TotalCharge") or nrc.get("TotalCharges")
@@ -223,6 +225,9 @@ def _money_and_currency_from_rated(rated: Dict[str, Any]) -> Tuple[Any, str]:
             return inner.get("MonetaryValue"), (inner.get("CurrencyCode") or "USD")
         if nrc.get("MonetaryValue") not in (None, ""):
             return nrc.get("MonetaryValue"), (nrc.get("CurrencyCode") or "USD")
+    tc = rated.get("TotalCharges")
+    if isinstance(tc, dict) and tc.get("MonetaryValue") not in (None, ""):
+        return tc.get("MonetaryValue"), (tc.get("CurrencyCode") or "USD")
     return None, "USD"
 
 
