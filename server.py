@@ -147,7 +147,11 @@ from reportlab.platypus import (
 )
 from reportlab.lib.utils import ImageReader
 from uuid import uuid4
-from ups_service import get_rate as ups_get_rate, create_shipment as ups_create_shipment
+from ups_service import (
+    get_rate as ups_get_rate,
+    create_shipment as ups_create_shipment,
+    _label_output_path_usable_on_this_host,
+)
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
@@ -4380,6 +4384,20 @@ def _print_packing_slip_pdf(pdf_path: str) -> None:
         logging.exception("PowerShell PrintTo failed for packing slip")
 
 
+def _packing_slip_open_in_browser_fallback() -> bool:
+    """
+    Server-side printing only works on Windows (local). On Render/Linux, open the slip PDF
+    in the browser so the user can print or save locally.
+    Override: PACKING_SLIP_OPEN_IN_BROWSER_FALLBACK=0|false|no to disable.
+    """
+    v = (os.getenv("PACKING_SLIP_OPEN_IN_BROWSER_FALLBACK") or "").strip().lower()
+    if v in ("0", "false", "no"):
+        return False
+    if v in ("1", "true", "yes"):
+        return True
+    return sys.platform != "win32"
+
+
 def _packing_slip_num_copies(boxes_summary, boxes_legacy) -> int:
     if boxes_summary and isinstance(boxes_summary, list):
         t = 0
@@ -4391,6 +4409,72 @@ def _packing_slip_num_copies(boxes_summary, boxes_legacy) -> int:
                     t += 1
         return max(1, t)
     return max(1, len(boxes_legacy or []))
+
+
+def _get_packing_slip_print_drive_folder_id(drive):
+    """
+    Drive folder where packing-slip PDFs are uploaded for a local watcher + printer.
+    With Google Drive for desktop, a folder named PackingSlipPrinter under My Drive
+    typically syncs to: G:\\My Drive\\PackingSlipPrinter
+
+    - If PACKING_SLIP_PRINT_FOLDER_ID is set, use that folder id (from Drive URL).
+    - Else find or create PACKING_SLIP_PRINT_FOLDER_NAME (default PackingSlipPrinter) under My Drive root.
+    """
+    explicit = (os.environ.get("PACKING_SLIP_PRINT_FOLDER_ID") or "").strip()
+    if explicit:
+        return explicit
+    folder_name = (os.environ.get("PACKING_SLIP_PRINT_FOLDER_NAME") or "PackingSlipPrinter").strip()
+    if not folder_name:
+        folder_name = "PackingSlipPrinter"
+    safe_name = folder_name.replace("'", "\\'")
+    q = (
+        f"name = '{safe_name}' and mimeType = 'application/vnd.google-apps.folder' "
+        f"and trashed = false and 'root' in parents"
+    )
+    res = drive.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
+    files = res.get("files", [])
+    if len(files) > 1:
+        logging.warning(
+            "Multiple Drive folders named %r under My Drive root; using first id=%s",
+            folder_name,
+            files[0]["id"],
+        )
+    if files:
+        return files[0]["id"]
+    meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
+    created = drive.files().create(body=meta, fields="id").execute()
+    fid = created["id"]
+    logging.info(
+        "Created packing slip print folder %r in My Drive (sync locally e.g. G:\\\\My Drive\\\\%s): %s",
+        folder_name,
+        folder_name,
+        fid,
+    )
+    return fid
+
+
+def _packing_slip_local_sync_dir() -> str:
+    """
+    Local Google Drive Desktop path for packing-slip PDFs (Windows default).
+    On Linux/cloud hosts this path is skipped; use Drive upload only.
+    """
+    return (os.getenv("PACKING_SLIP_LOCAL_SYNC_DIR") or r"G:\My Drive\PackingSlipPrinter").strip()
+
+
+def _try_copy_packing_slip_to_local_sync_folder(tmp_path: str, pdf_filename: str) -> None:
+    """Best-effort copy so a folder watcher sees the slip immediately on a Windows shop machine."""
+    slip_dir = _packing_slip_local_sync_dir()
+    if not tmp_path or not os.path.isfile(tmp_path) or not pdf_filename:
+        return
+    if not _label_output_path_usable_on_this_host(slip_dir):
+        return
+    try:
+        os.makedirs(slip_dir, exist_ok=True)
+        dest = os.path.join(slip_dir, pdf_filename)
+        shutil.copy2(tmp_path, dest)
+        logging.info("Packing slip saved to local sync folder: %s", dest)
+    except OSError as e:
+        logging.warning("Packing slip local sync copy failed (%s): %s", slip_dir, e)
 
 
 def _normalize_packages_for_ups(raw_list):
@@ -12245,6 +12329,13 @@ def process_shipment():
             label_relative_urls, tracking_list, labels_copied_ok = ups_create_shipment(
                 ship_to, packages_ups, sc
             )
+            _lbl_dir = (os.getenv("UPS_LABEL_OUTPUT_DIR") or r"G:\My Drive\Label Printer").strip()
+            logging.info(
+                "UPS shipment: label_files=%s copied_to_folder=%s label_dir=%s",
+                len(label_relative_urls or []),
+                bool(labels_copied_ok),
+                _lbl_dir,
+            )
 
         def _count_boxes_for_shipping_fee() -> int:
             # Preferred: wizard summary with explicit qty per box size.
@@ -12331,14 +12422,16 @@ def process_shipment():
         pdf_filename = f"{order_ids_str}_copies_{num_slips}_packing_slip.pdf"
         media = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
         drive = get_drive_service()
+        packing_slip_parent_id = _get_packing_slip_print_drive_folder_id(drive)
         drive.files().create(
             body={
                 "name": pdf_filename,
-                "parents": [os.environ["PACKING_SLIP_PRINT_FOLDER_ID"]],
+                "parents": [packing_slip_parent_id],
             },
             media_body=media,
         ).execute()
         print("✅ Packing slip uploaded to watcher folder.")
+        _try_copy_packing_slip_to_local_sync_folder(tmp_path, pdf_filename)
 
         # 7b) ALSO upload the packing slip into each order's Drive folder
         ORDERS_PARENT_FOLDER_ID = os.environ.get(
@@ -12394,15 +12487,25 @@ def process_shipment():
             for u in (label_relative_urls or [])
             if u
         ]
-        # Open label PDFs in browser only if we did not copy to the label-printer folder (or no labels).
-        open_lbl = len(full_label_urls) == 0 or (not labels_copied_ok)
+        # Open label PDF in browser when labels exist but were not copied to the shop folder
+        # (e.g. Render/Linux cannot see G:\\My Drive\\Label Printer).
+        open_lbl = len(full_label_urls) > 0 and (not labels_copied_ok)
+        open_slip = _packing_slip_open_in_browser_fallback()
+        logging.info(
+            "Shipment complete: platform=%s labels=%s labels_copied_to_folder=%s open_label_windows=%s open_slip_windows=%s",
+            sys.platform,
+            len(full_label_urls),
+            bool(labels_copied_ok),
+            open_lbl,
+            open_slip,
+        )
         resp = jsonify(
             {
                 "labels": full_label_urls,
                 "invoice": invoice_url,
                 "slips": [slip_url],
                 "open_label_windows": open_lbl,
-                "open_slip_windows": False,
+                "open_slip_windows": open_slip,
                 "labels_copied_to_folder": bool(labels_copied_ok),
                 "tracking_numbers": tracking_list,
             }

@@ -1,5 +1,5 @@
 # ups_service.py
-import base64, io, logging, os, re, shutil, time, uuid, tempfile, json
+import base64, io, logging, os, re, shutil, sys, time, uuid, tempfile, json
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
 import requests
@@ -7,6 +7,9 @@ import requests
 # Note: read ID/secret inside get_access_token() so they pick up .env after load_dotenv() in server.py.
 SHIPPER_NUMBER = os.getenv("UPS_ACCOUNT_NUMBER", "")
 NEGOTIATED = (os.getenv("UPS_NEGOTIATED_RATES", "true").lower() == "true")
+
+# Default folder synced by Google Drive for desktop (Windows): G:\My Drive\Label Printer
+_DEFAULT_UPS_LABEL_OUTPUT_DIR = r"G:\My Drive\Label Printer"
 
 # Ship-from defaults (override any field with SHIP_FROM_* in .env)
 _a2 = (os.getenv("SHIP_FROM_ADDRESS2", "Suite 300") or "").strip()
@@ -205,21 +208,52 @@ def _label_spec() -> Dict[str, Any]:
 
 
 def _label_printer_output_dir() -> str:
-    """Google Drive sync folder for the physical label printer watcher (Windows path default)."""
-    return (os.getenv("UPS_LABEL_OUTPUT_DIR") or r"G:\My Drive\Label Printer").strip()
+    """Google Drive sync folder for the label printer watcher (override with UPS_LABEL_OUTPUT_DIR)."""
+    return (os.getenv("UPS_LABEL_OUTPUT_DIR") or _DEFAULT_UPS_LABEL_OUTPUT_DIR).strip()
+
+
+def _label_output_path_usable_on_this_host(out_dir: str) -> bool:
+    """
+    On Render/Linux, a default like G:\\My Drive\\Label Printer is not a real mount.
+    os.makedirs/copy2 can still "succeed" under a bogus relative path, which hides labels
+    from users and disables browser fallback. Skip copy unless the path makes sense here.
+    Set UPS_LABEL_OUTPUT_DIR to a POSIX absolute path if the cloud host has that mount.
+    """
+    if not out_dir or not str(out_dir).strip():
+        return False
+    s = str(out_dir).strip()
+    if sys.platform == "win32":
+        return True
+    if re.match(r"^[A-Za-z]:[/\\]", s) or s.startswith("\\\\"):
+        logging.info(
+            "UPS label folder skipped on non-Windows host (Windows-only path): %s",
+            s,
+        )
+        return False
+    if s.startswith("/"):
+        return True
+    logging.info(
+        "UPS label folder skipped on non-Windows host (set UPS_LABEL_OUTPUT_DIR to an absolute POSIX path): %s",
+        s,
+    )
+    return False
 
 
 def _save_trimmed_label_to_printer_folder(fpath: str, fname: str) -> bool:
     """
     After the PDF is trimmed, copy it into UPS_LABEL_OUTPUT_DIR (default G:\\My Drive\\Label Printer).
-    No-op if the directory does not exist (e.g. Linux cloud host).
+    On Linux cloud hosts the default Windows path is skipped so the API can return open_label_windows=true.
     """
     out_dir = _label_printer_output_dir()
     if not out_dir:
         return False
+    if not _label_output_path_usable_on_this_host(out_dir):
+        return False
     try:
         os.makedirs(out_dir, exist_ok=True)
-        shutil.copy2(fpath, os.path.join(out_dir, fname))
+        dest = os.path.join(out_dir, fname)
+        shutil.copy2(fpath, dest)
+        logging.info("UPS label copied to label output folder: %s", dest)
         return True
     except OSError as e:
         logging.warning(
