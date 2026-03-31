@@ -4453,6 +4453,91 @@ def _get_packing_slip_print_drive_folder_id(drive):
     return fid
 
 
+def _get_label_print_drive_folder_id(drive):
+    """
+    Drive folder where UPS label files are uploaded (works on Render; mirrors packing-slip flow).
+
+    - If UPS_LABEL_PRINT_FOLDER_ID is set, use that folder id (from Drive URL).
+    - Else find or create UPS_LABEL_PRINT_FOLDER_NAME (default Label Printer) under My Drive root.
+    With Google Drive for desktop, that folder often syncs to G:\\My Drive\\Label Printer.
+    """
+    explicit = (os.environ.get("UPS_LABEL_PRINT_FOLDER_ID") or "").strip()
+    if explicit:
+        return explicit
+    folder_name = (os.environ.get("UPS_LABEL_PRINT_FOLDER_NAME") or "Label Printer").strip()
+    if not folder_name:
+        folder_name = "Label Printer"
+    safe_name = folder_name.replace("'", "\\'")
+    q = (
+        f"name = '{safe_name}' and mimeType = 'application/vnd.google-apps.folder' "
+        f"and trashed = false and 'root' in parents"
+    )
+    res = drive.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
+    files = res.get("files", [])
+    if len(files) > 1:
+        logging.warning(
+            "Multiple Drive folders named %r under My Drive root; using first id=%s",
+            folder_name,
+            files[0]["id"],
+        )
+    if files:
+        return files[0]["id"]
+    meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
+    created = drive.files().create(body=meta, fields="id").execute()
+    fid = created["id"]
+    logging.info(
+        "Created UPS label print folder %r in My Drive (sync locally e.g. G:\\\\My Drive\\\\%s): %s",
+        folder_name,
+        folder_name,
+        fid,
+    )
+    return fid
+
+
+def _upload_ups_labels_to_drive_folder(label_relative_urls) -> bool:
+    """
+    Upload each label file from the temp dir into the Drive label folder.
+    Returns True only if every list entry had a temp file and every upload succeeded.
+    """
+    if not label_relative_urls:
+        return False
+    drive = get_drive_service()
+    parent_id = _get_label_print_drive_folder_id(drive)
+    all_ok = True
+    for u in label_relative_urls:
+        fname = os.path.basename(str(u).replace("\\", "/"))
+        if not fname:
+            all_ok = False
+            continue
+        fpath = os.path.join(tempfile.gettempdir(), fname)
+        if not os.path.isfile(fpath):
+            logging.warning("UPS label Drive upload: temp file missing: %s", fpath)
+            all_ok = False
+            continue
+        ext = (os.path.splitext(fname)[1] or ".pdf").lower()
+        if ext == ".pdf":
+            mime = "application/pdf"
+        elif ext == ".png":
+            mime = "image/png"
+        elif ext in (".jpg", ".jpeg"):
+            mime = "image/jpeg"
+        else:
+            mime = "application/octet-stream"
+        try:
+            with open(fpath, "rb") as f:
+                body = f.read()
+            media = MediaIoBaseUpload(BytesIO(body), mimetype=mime, resumable=False)
+            drive.files().create(
+                body={"name": fname, "parents": [parent_id]},
+                media_body=media,
+            ).execute()
+            logging.info("UPS label uploaded to Drive: %s", fname)
+        except Exception as e:
+            logging.warning("UPS label Drive upload failed for %s: %s", fname, e)
+            all_ok = False
+    return all_ok
+
+
 def _packing_slip_local_sync_dir() -> str:
     """
     Local Google Drive Desktop path for packing-slip PDFs (Windows default).
@@ -12326,14 +12411,22 @@ def process_shipment():
                 sc = sc[:2]
             elif len(sc) == 1:
                 sc = sc.zfill(2)
-            label_relative_urls, tracking_list, labels_copied_ok = ups_create_shipment(
+            label_relative_urls, tracking_list, labels_local_ok = ups_create_shipment(
                 ship_to, packages_ups, sc
             )
+            labels_drive_ok = False
+            if label_relative_urls:
+                try:
+                    labels_drive_ok = _upload_ups_labels_to_drive_folder(label_relative_urls)
+                except Exception as e:
+                    logging.warning("UPS label Google Drive upload batch failed: %s", e)
+            labels_copied_ok = bool(labels_local_ok) or bool(labels_drive_ok)
             _lbl_dir = (os.getenv("UPS_LABEL_OUTPUT_DIR") or r"G:\My Drive\Label Printer").strip()
             logging.info(
-                "UPS shipment: label_files=%s copied_to_folder=%s label_dir=%s",
+                "UPS shipment: label_files=%s local_folder_copy=%s drive_upload=%s label_dir=%s",
                 len(label_relative_urls or []),
-                bool(labels_copied_ok),
+                bool(labels_local_ok),
+                bool(labels_drive_ok),
                 _lbl_dir,
             )
 
