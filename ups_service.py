@@ -1,5 +1,5 @@
 # ups_service.py
-import base64, io, logging, os, shutil, time, uuid, tempfile, json
+import base64, io, logging, os, re, shutil, time, uuid, tempfile, json
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
 import requests
@@ -217,13 +217,8 @@ def _save_trimmed_label_to_printer_folder(fpath: str, fname: str) -> bool:
     out_dir = _label_printer_output_dir()
     if not out_dir:
         return False
-    if not os.path.isdir(out_dir):
-        logging.warning(
-            "UPS_LABEL_OUTPUT_DIR is not a directory; label not saved there: %s",
-            out_dir,
-        )
-        return False
     try:
+        os.makedirs(out_dir, exist_ok=True)
         shutil.copy2(fpath, os.path.join(out_dir, fname))
         return True
     except OSError as e:
@@ -235,12 +230,14 @@ def _save_trimmed_label_to_printer_folder(fpath: str, fname: str) -> bool:
         return False
 
 
-def _normalize_ups_label_pdf_bytes(raw_pdf: bytes) -> bytes:
+def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None = None) -> bytes:
     """
     UPS often returns (a) a multi-page PDF with instructions after the label, or
     (b) one US Letter page with the scannable label on top and fold/instructions below.
-    Trim to label-only: keep first page only; optionally crop single letter pages to the top band.
-    Set UPS_LABEL_PDF_TRIM_MODE=off to disable. UPS_LABEL_LETTER_TOP_FRACTION=0.48 keeps top 48% of height.
+    Trim to label-only:
+      - Keep the page that best matches the tracking number (if available), else first page.
+      - Optional single-page letter crop only in letter_crop mode.
+    Set UPS_LABEL_PDF_TRIM_MODE=off to disable. UPS_LABEL_LETTER_TOP_FRACTION defaults to 0.48.
     """
     mode = (os.getenv("UPS_LABEL_PDF_TRIM_MODE") or "auto").strip().lower()
     if mode == "off" or not raw_pdf:
@@ -257,12 +254,25 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes) -> bytes:
         if n == 0:
             return raw_pdf
 
+        wanted = re.sub(r"[^A-Za-z0-9]", "", str(expected_tracking or "")).upper()
+        best_idx = 0
+        if wanted:
+            for idx, p in enumerate(reader.pages):
+                try:
+                    txt = p.extract_text() or ""
+                except Exception:
+                    txt = ""
+                normalized = re.sub(r"[^A-Za-z0-9]", "", txt).upper()
+                if wanted in normalized:
+                    best_idx = idx
+                    break
+
         writer = PdfWriter()
-        writer.add_page(reader.pages[0])
+        writer.add_page(reader.pages[best_idx])
         page = writer.pages[0]
 
-        # Single-page letter: label block is usually the upper portion
-        if n == 1 and mode in ("auto", "letter_crop"):
+        # Single-page letter: optional top crop if explicitly enabled.
+        if n == 1 and mode == "letter_crop":
             mb = page.mediabox
             left, bottom, right, top = (
                 float(mb.left),
@@ -271,7 +281,7 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes) -> bytes:
                 float(mb.top),
             )
             w, h = right - left, top - bottom
-            # ~US Letter in points (72 dpi): 612 x 792; allow small variance
+            # ~US Letter in points (72 dpi): 612 x 792; allow small variance.
             if h >= 700 and 580 <= w <= 640 and h / max(w, 1) > 1.15:
                 frac = float(os.getenv("UPS_LABEL_LETTER_TOP_FRACTION") or "0.48")
                 frac = min(max(frac, 0.2), 0.85)
@@ -610,7 +620,7 @@ def create_shipment(
             # For PDF/PNG UPS returns base64; write to tmp and expose via /labels/<file>
             payload = base64.b64decode(img)
             if ext == "pdf":
-                payload = _normalize_ups_label_pdf_bytes(payload)
+                payload = _normalize_ups_label_pdf_bytes(payload, expected_tracking=trk)
             with open(fpath, "wb") as f:
                 f.write(payload)
             if _save_trimmed_label_to_printer_folder(fpath, fname):

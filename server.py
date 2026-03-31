@@ -4335,12 +4335,8 @@ def _normalize_ups_ship_to_from_directory_row(row: dict) -> dict:
 
 def _print_packing_slip_pdf(pdf_path: str) -> None:
     """Best-effort: send PDF to named Windows printer (PACKING_SLIP_PRINTER_NAME)."""
-    # Windows queue name is often "EPSONA0517C (WF-4830 Series)" — use exact name for printto.
-    printer = (
-        os.environ.get("PACKING_SLIP_PRINTER_NAME")
-        or "EPSONA0517C (WF-4830 Series)"
-    ).strip()
-    if not printer or not pdf_path or not os.path.isfile(pdf_path):
+    printer = (os.environ.get("PACKING_SLIP_PRINTER_NAME") or "").strip()
+    if not pdf_path or not os.path.isfile(pdf_path):
         return
     if sys.platform != "win32":
         logging.info("Skipping direct print (not Windows): %s", pdf_path)
@@ -4349,25 +4345,37 @@ def _print_packing_slip_pdf(pdf_path: str) -> None:
     try:
         import win32api  # type: ignore
 
-        win32api.ShellExecute(0, "printto", abs_path, printer, ".", 0)
-        logging.info("Sent packing slip to printer %s", printer)
+        verb = "printto" if printer else "print"
+        args = printer if printer else None
+        win32api.ShellExecute(0, verb, abs_path, args, ".", 0)
+        logging.info(
+            "Sent packing slip using verb %s%s",
+            verb,
+            f" to printer {printer}" if printer else " (default printer)",
+        )
         return
     except ImportError:
         pass
     except Exception:
         logging.exception("win32 printto failed for packing slip")
     try:
-        ps = (
-            f'Start-Process -FilePath "{abs_path}" -Verb PrintTo '
-            f"-ArgumentList '{printer.replace(chr(39), chr(39)+chr(39))}'"
-        )
+        if printer:
+            ps = (
+                f'Start-Process -FilePath "{abs_path}" -Verb PrintTo '
+                f"-ArgumentList '{printer.replace(chr(39), chr(39)+chr(39))}'"
+            )
+        else:
+            ps = f'Start-Process -FilePath "{abs_path}" -Verb Print'
         subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
             check=False,
             timeout=120,
             capture_output=True,
         )
-        logging.info("Packing slip print via PowerShell → %s", printer)
+        logging.info(
+            "Packing slip print via PowerShell%s",
+            f" → {printer}" if printer else " → default printer",
+        )
     except Exception:
         logging.exception("PowerShell PrintTo failed for packing slip")
 
@@ -5122,8 +5130,8 @@ def create_invoice_in_quickbooks(
         if (env_override or QBO_ENV) == "production"
         else "https://app.sandbox.qbo.intuit.com"
     )
-    # Include name parameter to ensure QuickBooks opens existing invoice, not creates new one
-    return f"{app_url}/app/invoice?name=Invoice&txnId={invoice['Id']}"
+    # Open the existing invoice record directly by txnId.
+    return f"{app_url}/app/invoice?txnId={invoice['Id']}"
 
 
 def create_consolidated_invoice_in_quickbooks(
@@ -5156,6 +5164,17 @@ def create_consolidated_invoice_in_quickbooks(
     customer_ref = get_or_create_customer_ref(
         first_order.get("Company Name", ""), sheet, headers, realm_id, env_override
     )
+
+    def _normalize_ship_via_label(raw: str) -> str:
+        s = str(raw or "").strip()
+        if not s:
+            return "UPS"
+        low = s.lower()
+        if low.startswith("ups"):
+            return s
+        if "manual" in low:
+            return "Manual Shipping"
+        return f"UPS - {s}"
 
     # ── 3) Build line items ─────────────────────────────────────────
     line_items = []
@@ -5222,9 +5241,6 @@ def create_consolidated_invoice_in_quickbooks(
     except (TypeError, ValueError):
         ship_amt = 0.0
     if ship_amt > 0:
-        ship_item = get_or_create_item_ref(
-            "Shipping", headers, realm_id, env_override
-        )
         ship_amt_r = round(ship_amt, 2)
         line_items.append(
             {
@@ -5232,9 +5248,8 @@ def create_consolidated_invoice_in_quickbooks(
                 "Amount": ship_amt_r,
                 "Description": f"Shipping — {shipping_method or 'UPS'}",
                 "SalesItemLineDetail": {
-                    "ItemRef": {"value": ship_item["value"], "name": ship_item["name"]},
-                    "Qty": 1,
-                    "UnitPrice": ship_amt_r,
+                    # QBO special shipping item id: appears in shipping charge field, not product lines.
+                    "ItemRef": {"value": "SHIPPING_ITEM_ID"},
                 },
             }
         )
@@ -5251,9 +5266,10 @@ def create_consolidated_invoice_in_quickbooks(
         or ""
     )
 
-    # Force Ship Via = UPS
+    # Use selected service in Ship Via (e.g., UPS - Ground, UPS - 2 Day).
+    ship_via_label = _normalize_ship_via_label(shipping_method)
     ship_method_ref = get_or_create_ship_method_ref(
-        "UPS", headers, realm_id, env_override
+        ship_via_label, headers, realm_id, env_override
     )
 
     # Next DocNumber (+1 from last)
@@ -5310,8 +5326,8 @@ def create_consolidated_invoice_in_quickbooks(
         if (env_override or QBO_ENV) == "production"
         else "https://app.sandbox.qbo.intuit.com"
     )
-    # Include name parameter to ensure QuickBooks opens existing invoice, not creates new one
-    return f"{app_url}/app/invoice?name=Invoice&txnId={inv_id}"
+    # Open the existing invoice record directly by txnId.
+    return f"{app_url}/app/invoice?txnId={inv_id}"
 
 
 @app.route("/", methods=["GET"])
@@ -12230,10 +12246,30 @@ def process_shipment():
                 ship_to, packages_ups, sc
             )
 
-        n_pkg = len(packages_ups)
-        if do_ups and n_pkg:
-            shipping_line_amt = round(float(ups_purchased_rate) + 5.0 * n_pkg, 2)
-        else:
+        def _count_boxes_for_shipping_fee() -> int:
+            # Preferred: wizard summary with explicit qty per box size.
+            if isinstance(boxes_summary, list) and boxes_summary:
+                total = 0
+                for b in boxes_summary:
+                    if not isinstance(b, dict):
+                        continue
+                    try:
+                        total += int(float(b.get("qty", 0) or 0))
+                    except (TypeError, ValueError):
+                        pass
+                if total > 0:
+                    return total
+            # Fallbacks for legacy payload shapes.
+            if isinstance(packages_ups, list) and len(packages_ups) > 0:
+                return len(packages_ups)
+            if isinstance(boxes, list) and len(boxes) > 0:
+                return len(boxes)
+            return 0
+
+        box_count = _count_boxes_for_shipping_fee()
+        # Always honor selected rate + $5 per box for invoice shipping when an invoice is created.
+        shipping_line_amt = round(float(ups_purchased_rate or 0) + 5.0 * box_count, 2)
+        if shipping_line_amt < 0:
             shipping_line_amt = 0.0
 
         # 5) Create invoice in QBO (optional — e.g. free samples)
@@ -12366,6 +12402,7 @@ def process_shipment():
                 "invoice": invoice_url,
                 "slips": [slip_url],
                 "open_label_windows": open_lbl,
+                "open_slip_windows": False,
                 "labels_copied_to_folder": bool(labels_copied_ok),
                 "tracking_numbers": tracking_list,
             }
