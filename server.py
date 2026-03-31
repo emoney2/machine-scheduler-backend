@@ -12101,6 +12101,7 @@ def process_shipment():
     shipping_method = data.get("shipping_method", "")
     service_code = data.get("service_code")  # e.g., "03", "02", "01", etc.
     packages_ups = _normalize_packages_for_ups(data.get("packages"))
+    ship_to_override = _normalize_rate_ship_to(data.get("ship_to_override") or {})
     try:
         ups_purchased_rate = float(data.get("ups_purchased_rate") or 0)
     except (TypeError, ValueError):
@@ -12184,13 +12185,32 @@ def process_shipment():
             and bool(packages_ups)
         )
         if do_ups:
-            company = str(all_order_data[0].get("Company Name", "") or "").strip()
-            drow = _fetch_directory_row_by_company(company)
-            if not drow:
-                raise Exception(
-                    "Company not found in Directory; cannot create UPS labels."
-                )
-            ship_to = _normalize_ups_ship_to_from_directory_row(drow)
+            if (
+                ship_to_override
+                and ship_to_override.get("addr1")
+                and ship_to_override.get("city")
+                and len(str(ship_to_override.get("state") or "").strip()) == 2
+                and len(str(ship_to_override.get("zip") or "").strip()) == 5
+            ):
+                ship_to = {
+                    "name": (ship_to_override.get("name") or "Recipient")[:200],
+                    "attention_name": ship_to_override.get("attention_name"),
+                    "phone": ship_to_override.get("phone") or "0000000000",
+                    "addr1": ship_to_override.get("addr1"),
+                    "addr2": ship_to_override.get("addr2"),
+                    "city": ship_to_override.get("city"),
+                    "state": str(ship_to_override.get("state") or "").strip().upper(),
+                    "zip": str(ship_to_override.get("zip") or "").strip(),
+                    "country": ship_to_override.get("country") or "US",
+                }
+            else:
+                company = str(all_order_data[0].get("Company Name", "") or "").strip()
+                drow = _fetch_directory_row_by_company(company)
+                if not drow:
+                    raise Exception(
+                        "Company not found in Directory; cannot create UPS labels."
+                    )
+                ship_to = _normalize_ups_ship_to_from_directory_row(drow)
             if (
                 not ship_to["addr1"]
                 or not ship_to["city"]
