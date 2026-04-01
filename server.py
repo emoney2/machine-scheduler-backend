@@ -10362,22 +10362,39 @@ def shopify_webhook_orders_create():
 
             if drive and folder_id:
                 try:
-                    # Always upload this row's preview into the order folder so Image column points to order-folder file
+                    # Upload full design proof into the order folder. Prefer _preview_image_url (builder uploads
+                    # full-res JPEG/PNG) over inline _preview_image (Shopify line properties are size-capped → tiny).
                     preview_bytes = None
-                    if preview_data_url and isinstance(preview_data_url, str) and preview_data_url.startswith("data:image") and "," in preview_data_url:
+                    if preview_url_prop and preview_url_prop.startswith(("http://", "https://")):
+                        try:
+                            import urllib.request
+
+                            req = urllib.request.Request(
+                                preview_url_prop,
+                                headers={"User-Agent": "Mozilla/5.0 (compatible; JRCo/1.0)"},
+                            )
+                            with urllib.request.urlopen(req, timeout=45) as resp:
+                                preview_bytes = resp.read()
+                            if preview_bytes:
+                                logger.info(
+                                    "[ShopifyWebhook] Row %s: downloaded design preview from URL (%s bytes)",
+                                    new_order,
+                                    len(preview_bytes),
+                                )
+                        except Exception as e:
+                            logger.warning("[ShopifyWebhook] Download preview URL for row %s: %s", new_order, e)
+                    if not preview_bytes and preview_data_url and isinstance(preview_data_url, str) and preview_data_url.startswith("data:image") and "," in preview_data_url:
                         try:
                             _, b64 = preview_data_url.split(",", 1)
                             preview_bytes = base64.b64decode(b64)
+                            if preview_bytes:
+                                logger.info(
+                                    "[ShopifyWebhook] Row %s: using inline _preview_image fallback (%s bytes)",
+                                    new_order,
+                                    len(preview_bytes),
+                                )
                         except Exception:
                             pass
-                    if not preview_bytes and preview_url_prop:
-                        try:
-                            import urllib.request
-                            req = urllib.request.Request(preview_url_prop, headers={"User-Agent": "Mozilla/5.0 (compatible; JRCo/1.0)"})
-                            with urllib.request.urlopen(req, timeout=15) as resp:
-                                preview_bytes = resp.read()
-                        except Exception as e:
-                            logger.warning("[ShopifyWebhook] Download preview for row %s: %s", new_order, e)
                     if preview_bytes:
                         try:
                             from PIL import Image as PILImage
