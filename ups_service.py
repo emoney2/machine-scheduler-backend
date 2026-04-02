@@ -268,10 +268,14 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
     """
     UPS often returns (a) a multi-page PDF with instructions after the label, or
     (b) one US Letter page with the scannable label on top and fold/instructions below.
-    Trim to label-only:
+
+    We trim to label-only:
       - Keep the page that best matches the tracking number (if available), else first page.
-      - Optional single-page letter crop only in letter_crop mode.
-    Set UPS_LABEL_PDF_TRIM_MODE=off to disable. UPS_LABEL_LETTER_TOP_FRACTION defaults to 0.48.
+      - If that page looks like US Letter (label + print instructions on one sheet), crop to
+        the top portion (the actual label). This runs in default "auto" mode, not only letter_crop.
+
+    Set UPS_LABEL_PDF_TRIM_MODE=off to disable all trimming.
+    UPS_LABEL_LETTER_TOP_FRACTION (default 0.48) = fraction of page height kept from the top.
     """
     mode = (os.getenv("UPS_LABEL_PDF_TRIM_MODE") or "auto").strip().lower()
     if mode == "off" or not raw_pdf:
@@ -281,6 +285,26 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         from pypdf.generic import RectangleObject
     except ImportError:
         return raw_pdf
+
+    def _crop_us_letter_label_only(page):
+        """If page is tall US Letter with label in upper block, remove instructions below."""
+        mb = page.mediabox
+        left, bottom, right, top = (
+            float(mb.left),
+            float(mb.bottom),
+            float(mb.right),
+            float(mb.top),
+        )
+        w, h = right - left, top - bottom
+        # ~US Letter in points (72 dpi): 612 x 792; allow small variance.
+        if not (h >= 700 and 580 <= w <= 640 and h / max(w, 1) > 1.15):
+            return
+        frac = float(os.getenv("UPS_LABEL_LETTER_TOP_FRACTION") or "0.48")
+        frac = min(max(frac, 0.2), 0.85)
+        new_bottom = bottom + h * (1.0 - frac)
+        rect = RectangleObject([left, new_bottom, right, top])
+        page.mediabox = rect
+        page.cropbox = rect
 
     try:
         reader = PdfReader(io.BytesIO(raw_pdf))
@@ -305,24 +329,9 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         writer.add_page(reader.pages[best_idx])
         page = writer.pages[0]
 
-        # Single-page letter: optional top crop if explicitly enabled.
-        if n == 1 and mode == "letter_crop":
-            mb = page.mediabox
-            left, bottom, right, top = (
-                float(mb.left),
-                float(mb.bottom),
-                float(mb.right),
-                float(mb.top),
-            )
-            w, h = right - left, top - bottom
-            # ~US Letter in points (72 dpi): 612 x 792; allow small variance.
-            if h >= 700 and 580 <= w <= 640 and h / max(w, 1) > 1.15:
-                frac = float(os.getenv("UPS_LABEL_LETTER_TOP_FRACTION") or "0.48")
-                frac = min(max(frac, 0.2), 0.85)
-                new_bottom = bottom + h * (1.0 - frac)
-                rect = RectangleObject([left, new_bottom, right, top])
-                page.mediabox = rect
-                page.cropbox = rect
+        # Drop instructions: letter-sized combined label + "view/print" help in lower half.
+        if mode in ("auto", "letter_crop"):
+            _crop_us_letter_label_only(page)
 
         out = io.BytesIO()
         writer.write(out)

@@ -5000,6 +5000,71 @@ def get_or_create_customer_ref(
     raise Exception(f"❌ Failed to create customer in QuickBooks: {res.text}")
 
 
+_qbo_sales_income_ref_cache = {}
+
+
+def get_sales_of_product_income_account_ref(headers, realm_id, env_override=None):
+    """
+    Income account Ids are company-specific; hardcoding (e.g. sandbox 79) can map to
+    unrelated accounts (e.g. Property Tax) in production. Resolve via API or env.
+    """
+    env = (env_override or os.environ.get("QBO_ENV", "sandbox")).lower()
+    cache_key = f"{realm_id}:{env}"
+    if cache_key in _qbo_sales_income_ref_cache:
+        return _qbo_sales_income_ref_cache[cache_key]
+
+    acct_id = (os.environ.get("QBO_SALES_INCOME_ACCOUNT_ID") or "").strip()
+    if acct_id:
+        name = (
+            os.environ.get("QBO_SALES_INCOME_ACCOUNT_NAME") or "Sales of Product Income"
+        ).strip()
+        ref = {"value": acct_id, "name": name}
+        _qbo_sales_income_ref_cache[cache_key] = ref
+        return ref
+
+    base = get_base_qbo_url(env_override)
+    query_url = f"{base}/v3/company/{realm_id}/query"
+
+    q_subtype = (
+        "SELECT * FROM Account WHERE AccountSubType = 'SalesOfProductIncome' MAXRESULTS 5"
+    )
+    r = requests.get(query_url, headers=headers, params={"query": q_subtype})
+    if r.status_code == 200:
+        data = r.json().get("QueryResponse", {}).get("Account") or []
+        if isinstance(data, dict):
+            data = [data]
+        if data:
+            acct = data[0]
+            ref = {
+                "value": str(acct["Id"]),
+                "name": acct.get("Name") or "Sales of Product Income",
+            }
+            _qbo_sales_income_ref_cache[cache_key] = ref
+            return ref
+
+    q_name = f"SELECT * FROM Account WHERE Name = {json.dumps('Sales of Product Income')} MAXRESULTS 5"
+    r2 = requests.get(query_url, headers=headers, params={"query": q_name})
+    if r2.status_code == 200:
+        data = r2.json().get("QueryResponse", {}).get("Account") or []
+        if isinstance(data, dict):
+            data = [data]
+        for acct in data:
+            if acct.get("AccountType") == "Income":
+                ref = {
+                    "value": str(acct["Id"]),
+                    "name": acct.get("Name") or "Sales of Product Income",
+                }
+                _qbo_sales_income_ref_cache[cache_key] = ref
+                return ref
+
+    raise Exception(
+        "Could not resolve Sales of Product Income in QuickBooks "
+        "(tried AccountSubType SalesOfProductIncome and account name). "
+        "Set QBO_SALES_INCOME_ACCOUNT_ID to the correct income account Id, or ensure "
+        "that account exists in your chart of accounts."
+    )
+
+
 def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
     base = get_base_qbo_url(env_override)
     query_url = f"{base}/v3/company/{realm_id}/query"
@@ -5014,14 +5079,14 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
 
     print(f"⚠️ Item '{product_name}' not found. Attempting to create...")
 
+    income_ref = get_sales_of_product_income_account_ref(
+        headers, realm_id, env_override
+    )
     create_url = f"{base}/v3/company/{realm_id}/item?minorversion=65"
     payload = {
         "Name": product_name,
         "Type": "NonInventory",
-        "IncomeAccountRef": {
-            "name": "Sales of Product Income",
-            "value": "79",  # Use 79 for sandbox
-        },
+        "IncomeAccountRef": income_ref,
     }
 
     res = requests.post(create_url, headers=headers, json=payload)
@@ -5048,9 +5113,22 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
         raise Exception(f"❌ Failed to create item '{product_name}' in QBO: {res.text}")
 
 
+def _qbo_ship_methods_from_response(resp_json):
+    """Normalize QueryResponse ShipMethod to a list of dicts."""
+    sm = (resp_json or {}).get("QueryResponse", {}).get("ShipMethod")
+    if sm is None:
+        return []
+    if isinstance(sm, list):
+        return sm
+    return [sm]
+
+
 def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
     """
-    Ensure a ShipMethod (e.g., 'UPS') exists in QBO and return {"value": Id, "name": Name}.
+    Ensure a ShipMethod exists in QBO and return {"value": Id, "name": Name}.
+
+    QBO's invoice "Ship Via" needs a real ShipMethod Id; returning only {"name": ...}
+    leaves Ship Via blank in the UI.
     """
     import requests
 
@@ -5058,35 +5136,70 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
     query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
     create_url = f"{base}/v3/company/{realm_id}/shipmethod?minorversion=65"
 
-    # 1) Try to find it
-    escaped = name.replace("'", "''")
-    query = f"SELECT * FROM ShipMethod WHERE Name = '{escaped}'"
-    r = requests.get(query_url, headers=headers, params={"query": query})
-    if r.status_code == 200:
-        items = r.json().get("QueryResponse", {}).get("ShipMethod", [])
-        if items:
-            sm = items[0]
+    def _query(q):
+        r = requests.get(query_url, headers=headers, params={"query": q})
+        if r.status_code != 200:
+            return []
+        return _qbo_ship_methods_from_response(r.json())
+
+    def _find_exact(n):
+        escaped = str(n).replace("'", "''")
+        rows = _query(f"SELECT * FROM ShipMethod WHERE Name = '{escaped}'")
+        return rows[0] if rows else None
+
+    def _create(n):
+        # QBO ShipMethod name is limited (typically 31 chars); trim to avoid create failures.
+        label = str(n).strip()[:31] or "UPS"
+        r2 = requests.post(
+            create_url,
+            headers={**headers, "Content-Type": "application/json"},
+            json={"Name": label},
+        )
+        if r2.status_code in (200, 201):
+            sm = r2.json().get("ShipMethod", {})
+            if sm.get("Id"):
+                return {"value": sm["Id"], "name": sm.get("Name", label)}
+        return None
+
+    raw = str(name or "").strip() or "UPS"
+    candidates = []
+    for c in (raw, "UPS - Ground", "UPS Ground", "UPS"):
+        c = c.strip()[:31]
+        if c and c not in candidates:
+            candidates.append(c)
+
+    for cand in candidates:
+        sm = _find_exact(cand)
+        if sm and sm.get("Id"):
+            return {"value": sm["Id"], "name": sm["Name"]}
+        created = _create(cand)
+        if created:
+            return created
+        sm = _find_exact(cand)
+        if sm and sm.get("Id"):
             return {"value": sm["Id"], "name": sm["Name"]}
 
-    # 2) Create if missing
-    payload = {"Name": name}
-    r2 = requests.post(
-        create_url,
-        headers={**headers, "Content-Type": "application/json"},
-        json=payload,
-    )
-    if r2.status_code in (200, 201):
-        sm = r2.json().get("ShipMethod", {})
-        return {"value": sm["Id"], "name": sm["Name"]}
+    # Last resort: match any existing method case-insensitively, prefer UPS*
+    all_rows = _query("SELECT * FROM ShipMethod MAXRESULTS 100")
+    raw_l = raw.lower()
+    for sm in all_rows:
+        nm = str(sm.get("Name") or "")
+        if nm.lower() == raw_l and sm.get("Id"):
+            return {"value": sm["Id"], "name": nm}
+    for sm in all_rows:
+        nm = str(sm.get("Name") or "")
+        if nm.upper().startswith("UPS") and sm.get("Id"):
+            logging.warning(
+                "⚠️ Using existing ShipMethod %r as fallback for requested %r",
+                nm,
+                name,
+            )
+            return {"value": sm["Id"], "name": nm}
 
-    # 3) Fallback (name only) — QBO usually needs an Id, but we'll return name if creation fails
-    logging.warning(
-        "⚠️ Could not create/find ShipMethod '%s' (%s / %s). Falling back to name only.",
-        name,
-        r.status_code,
-        r2.status_code if "r2" in locals() else None,
+    raise Exception(
+        f"❌ Could not resolve QuickBooks Ship Via / ShipMethod for {name!r}. "
+        "Add a Ship Method in QuickBooks or check API permissions."
     )
-    return {"name": name}
 
 
 def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start=1001):
@@ -5110,6 +5223,20 @@ def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start
             if last.isdigit():
                 return str(int(last) + 1).zfill(4)
     return str(fallback_start).zfill(4)
+
+
+def _qbo_invoice_record_url(app_url, realm_id, invoice_id):
+    """
+    Browser deep link to a specific QBO invoice. Including deeplinkcompanyid (realm id)
+    ensures the correct company file opens; txnId alone often lands on a new/blank invoice.
+    """
+    rid = str(realm_id or "").strip()
+    iid = str(invoice_id or "").strip()
+    if not iid:
+        return ""
+    base = (app_url or "").rstrip("/")
+    q = urllib.parse.urlencode({"txnId": iid, "deeplinkcompanyid": rid})
+    return f"{base}/app/invoice?{q}"
 
 
 def fetch_customer_email_from_directory(sheet_service, company_name):
@@ -5299,8 +5426,8 @@ def create_invoice_in_quickbooks(
         if (env_override or QBO_ENV) == "production"
         else "https://app.sandbox.qbo.intuit.com"
     )
-    # Open the existing invoice record directly by txnId.
-    return f"{app_url}/app/invoice?txnId={invoice['Id']}"
+    # Open the existing invoice record directly by txnId (scoped to this QBO company).
+    return _qbo_invoice_record_url(app_url, realm_id, invoice["Id"])
 
 
 def create_consolidated_invoice_in_quickbooks(
@@ -5495,8 +5622,8 @@ def create_consolidated_invoice_in_quickbooks(
         if (env_override or QBO_ENV) == "production"
         else "https://app.sandbox.qbo.intuit.com"
     )
-    # Open the existing invoice record directly by txnId.
-    return f"{app_url}/app/invoice?txnId={inv_id}"
+    # Open the existing invoice record directly by txnId (scoped to this QBO company).
+    return _qbo_invoice_record_url(app_url, realm_id, inv_id)
 
 
 @app.route("/", methods=["GET"])
