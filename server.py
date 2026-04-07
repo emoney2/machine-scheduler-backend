@@ -5125,10 +5125,10 @@ def _qbo_ship_methods_from_response(resp_json):
 
 def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
     """
-    Ensure a ShipMethod exists in QBO and return {"value": Id, "name": Name}.
+    Return {"value": Id, "name": Name} for a QBO ShipMethod, or None if unresolved.
 
-    QBO's invoice "Ship Via" needs a real ShipMethod Id; returning only {"name": ...}
-    leaves Ship Via blank in the UI.
+    Invoices do not require ShipMethodRef; callers omit the field when this returns None
+    so shipping / invoicing still succeeds (Ship Via may be blank in QBO).
     """
     import requests
 
@@ -5139,6 +5139,12 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
     def _query(q):
         r = requests.get(query_url, headers=headers, params={"query": q})
         if r.status_code != 200:
+            logging.warning(
+                "QBO ShipMethod query HTTP %s (query prefix %.100r): %s",
+                r.status_code,
+                q,
+                (r.text or "")[:800],
+            )
             return []
         return _qbo_ship_methods_from_response(r.json())
 
@@ -5146,6 +5152,12 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
         escaped = str(n).replace("'", "''")
         rows = _query(f"SELECT * FROM ShipMethod WHERE Name = '{escaped}'")
         return rows[0] if rows else None
+
+    def _sm_to_ref(sm, fallback_name=""):
+        if not sm or not sm.get("Id"):
+            return None
+        nm = sm.get("Name") or fallback_name or str(sm.get("Id"))
+        return {"value": str(sm["Id"]), "name": nm}
 
     def _create(n):
         # QBO ShipMethod name is limited (typically 31 chars); trim to avoid create failures.
@@ -5156,50 +5168,90 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
             json={"Name": label},
         )
         if r2.status_code in (200, 201):
-            sm = r2.json().get("ShipMethod", {})
-            if sm.get("Id"):
-                return {"value": sm["Id"], "name": sm.get("Name", label)}
+            sm = (r2.json() or {}).get("ShipMethod") or {}
+            ref = _sm_to_ref(sm, label)
+            if ref:
+                return ref
+        err = (r2.text or "").lower()
+        if r2.status_code == 400 and (
+            "duplicate" in err or "already exists" in err or "6240" in err
+        ):
+            sm = _find_exact(label)
+            ref = _sm_to_ref(sm, label)
+            if ref:
+                return ref
+        logging.warning(
+            "QBO ShipMethod create failed HTTP %s name=%r: %s",
+            r2.status_code,
+            label,
+            (r2.text or "")[:800],
+        )
         return None
 
     raw = str(name or "").strip() or "UPS"
     candidates = []
-    for c in (raw, "UPS - Ground", "UPS Ground", "UPS"):
-        c = c.strip()[:31]
+    for c in (
+        raw,
+        "UPS - Ground",
+        "UPS Ground",
+        "UPS",
+        "Ground",
+        "Standard",
+        "Shipping",
+    ):
+        c = str(c).strip()[:31]
         if c and c not in candidates:
             candidates.append(c)
 
     for cand in candidates:
         sm = _find_exact(cand)
-        if sm and sm.get("Id"):
-            return {"value": sm["Id"], "name": sm["Name"]}
+        ref = _sm_to_ref(sm)
+        if ref:
+            return ref
         created = _create(cand)
         if created:
             return created
         sm = _find_exact(cand)
-        if sm and sm.get("Id"):
-            return {"value": sm["Id"], "name": sm["Name"]}
+        ref = _sm_to_ref(sm)
+        if ref:
+            return ref
 
-    # Last resort: match any existing method case-insensitively, prefer UPS*
+    # Prefer UPS*, then any existing method
     all_rows = _query("SELECT * FROM ShipMethod MAXRESULTS 100")
     raw_l = raw.lower()
     for sm in all_rows:
         nm = str(sm.get("Name") or "")
-        if nm.lower() == raw_l and sm.get("Id"):
-            return {"value": sm["Id"], "name": nm}
+        if nm.lower() == raw_l:
+            ref = _sm_to_ref(sm, nm)
+            if ref:
+                return ref
     for sm in all_rows:
         nm = str(sm.get("Name") or "")
-        if nm.upper().startswith("UPS") and sm.get("Id"):
+        if nm.upper().startswith("UPS"):
             logging.warning(
                 "⚠️ Using existing ShipMethod %r as fallback for requested %r",
                 nm,
                 name,
             )
-            return {"value": sm["Id"], "name": nm}
+            ref = _sm_to_ref(sm, nm)
+            if ref:
+                return ref
+    for sm in all_rows:
+        nm = str(sm.get("Name") or "")
+        logging.warning(
+            "⚠️ Using first available ShipMethod %r as fallback for requested %r",
+            nm,
+            name,
+        )
+        ref = _sm_to_ref(sm, nm)
+        if ref:
+            return ref
 
-    raise Exception(
-        f"❌ Could not resolve QuickBooks Ship Via / ShipMethod for {name!r}. "
-        "Add a Ship Method in QuickBooks or check API permissions."
+    logging.warning(
+        "⚠️ No QuickBooks ShipMethod for %r; invoice will omit Ship Via (ShipMethodRef)",
+        name,
     )
+    return None
 
 
 def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start=1001):
