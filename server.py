@@ -5470,6 +5470,10 @@ def create_consolidated_invoice_in_quickbooks(
             return s
         if "manual" in low:
             return "Manual Shipping"
+        # Invoice-only / no carrier: avoid a synthetic QBO ShipMethod name like
+        # "UPS - Bill only (no UPS)" — use a generic method that exists or can be created.
+        if "bill only" in low or "(no ups)" in low:
+            return "UPS"
         return f"UPS - {s}"
 
     # ── 3) Build line items ─────────────────────────────────────────
