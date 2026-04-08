@@ -1066,6 +1066,8 @@ SCOPES = [
 
 QBO_SCOPE = ["com.intuit.quickbooks.accounting"]
 QBO_AUTH_BASE_URL = "https://appcenter.intuit.com/connect/oauth2"
+# Newer minors expose metadata for entities like ShipMethod; override with QBO_MINOR_VERSION if needed.
+QBO_MINOR_VERSION = int(os.environ.get("QBO_MINOR_VERSION", "73"))
 
 
 def get_oauth_credentials():
@@ -4468,11 +4470,17 @@ def _get_label_print_drive_folder_id(drive):
     if not folder_name:
         folder_name = "Label Printer"
     safe_name = folder_name.replace("'", "\\'")
-    q = (
+    list_kw = dict(
+        fields="files(id,name)",
+        pageSize=25,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    )
+    q_root = (
         f"name = '{safe_name}' and mimeType = 'application/vnd.google-apps.folder' "
         f"and trashed = false and 'root' in parents"
     )
-    res = drive.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
+    res = drive.files().list(q=q_root, **list_kw).execute()
     files = res.get("files", [])
     if len(files) > 1:
         logging.warning(
@@ -4482,8 +4490,32 @@ def _get_label_print_drive_folder_id(drive):
         )
     if files:
         return files[0]["id"]
+    q_any = (
+        f"name = '{safe_name}' and mimeType = 'application/vnd.google-apps.folder' "
+        f"and trashed = false"
+    )
+    res2 = drive.files().list(q=q_any, **list_kw).execute()
+    files2 = res2.get("files", []) or []
+    if len(files2) == 1:
+        logging.info(
+            "UPS label folder: using sole %r match id=%s (not under Drive root)",
+            folder_name,
+            files2[0]["id"],
+        )
+        return files2[0]["id"]
+    if len(files2) > 1:
+        logging.warning(
+            "Multiple %r folders in Drive (%s…); set UPS_LABEL_PRINT_FOLDER_ID to the "
+            "folder Google Drive Desktop syncs. Using first id=%s",
+            folder_name,
+            ", ".join(f["id"] for f in files2[:5]),
+            files2[0]["id"],
+        )
+        return files2[0]["id"]
     meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
-    created = drive.files().create(body=meta, fields="id").execute()
+    created = drive.files().create(
+        body=meta, fields="id", supportsAllDrives=True
+    ).execute()
     fid = created["id"]
     logging.info(
         "Created UPS label print folder %r in My Drive (sync locally e.g. G:\\\\My Drive\\\\%s): %s",
@@ -4526,10 +4558,14 @@ def _upload_ups_labels_to_drive_folder(label_relative_urls) -> bool:
         try:
             with open(fpath, "rb") as f:
                 body = f.read()
-            media = MediaIoBaseUpload(BytesIO(body), mimetype=mime, resumable=False)
+            buf = BytesIO(body)
+            buf.seek(0)
+            media = MediaIoBaseUpload(buf, mimetype=mime, resumable=False)
             drive.files().create(
                 body={"name": fname, "parents": [parent_id]},
                 media_body=media,
+                fields="id,name",
+                supportsAllDrives=True,
             ).execute()
             logging.info("UPS label uploaded to Drive: %s", fname)
         except Exception as e:
@@ -4919,7 +4955,7 @@ def get_or_create_customer_ref(
 
     # ── 1) Try to fetch from QuickBooks ───────────────────────────
     base = get_base_qbo_url(env_override)
-    query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
+    query_url = f"{base}/v3/company/{realm_id}/query?minorversion={QBO_MINOR_VERSION}"
     query = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
     response = requests.get(
         query_url, headers=quickbooks_headers, params={"query": query}
@@ -5082,7 +5118,7 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
     income_ref = get_sales_of_product_income_account_ref(
         headers, realm_id, env_override
     )
-    create_url = f"{base}/v3/company/{realm_id}/item?minorversion=65"
+    create_url = f"{base}/v3/company/{realm_id}/item?minorversion={QBO_MINOR_VERSION}"
     payload = {
         "Name": product_name,
         "Type": "NonInventory",
@@ -5133,8 +5169,8 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
     import requests
 
     base = get_base_qbo_url(env_override)
-    query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
-    create_url = f"{base}/v3/company/{realm_id}/shipmethod?minorversion=65"
+    query_url = f"{base}/v3/company/{realm_id}/query?minorversion={QBO_MINOR_VERSION}"
+    create_url = f"{base}/v3/company/{realm_id}/shipmethod?minorversion={QBO_MINOR_VERSION}"
 
     def _query(q):
         r = requests.get(query_url, headers=headers, params={"query": q})
@@ -5248,7 +5284,10 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
             return ref
 
     logging.warning(
-        "⚠️ No QuickBooks ShipMethod for %r; invoice will omit Ship Via (ShipMethodRef)",
+        "⚠️ No QuickBooks ShipMethod for %r; invoice will omit Ship Via (ShipMethodRef). "
+        "If queries return 'Metadata not found for Entity: ShipMethod', enable Shipping in "
+        "QuickBooks: Settings → Account and settings → Sales → Delivery method (Shipping). "
+        "CustomerMemo will still carry the carrier name when ShipMethodRef is omitted.",
         name,
     )
     return None
@@ -5262,7 +5301,7 @@ def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start
     import requests
 
     base = get_base_qbo_url(env_override)
-    query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
+    query_url = f"{base}/v3/company/{realm_id}/query?minorversion={QBO_MINOR_VERSION}"
     query = (
         "SELECT DocNumber FROM Invoice ORDER BY MetaData.CreateTime DESC MAXRESULTS 1"
     )
@@ -5303,7 +5342,7 @@ def _query_invoice_id_by_doc_number(
     if not dn:
         return None
     base = get_base_qbo_url(env_override)
-    query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
+    query_url = f"{base}/v3/company/{realm_id}/query?minorversion={QBO_MINOR_VERSION}"
     q = f"SELECT Id FROM Invoice WHERE DocNumber = '{dn}' MAXRESULTS 1"
     r = requests.get(query_url, headers=headers, params={"query": q})
     if r.status_code != 200:
@@ -5327,32 +5366,21 @@ def _query_invoice_id_by_doc_number(
     return s or None
 
 
-def _qbo_app_portal_base_url(env_override=None):
-    """QBO browser origin (production vs sandbox), independent of API base URL."""
-    e = str(env_override or QBO_ENV or "sandbox").strip().lower()
-    if e in ("production", "prod", "live"):
-        return "https://app.qbo.intuit.com"
-    return "https://app.sandbox.qbo.intuit.com"
-
-
-def _qbo_invoice_record_url(app_url, realm_id, invoice_id):
+def _qbo_invoice_record_url(realm_id, invoice_id, env_override=None):
     """
-    Browser deep link to a specific QBO invoice.
+    Browser link to open the invoice editor for an existing invoice.
 
-    Use /app/invoicing + txnId + company scope. The list route /app/invoices and the
-    singular /app/invoice editor often ignore txnId in newer QBO and open a blank
-    \"new invoice\" instead; /app/invoicing?txnId=… matches the transaction hub deep
-    links Intuit uses for invoices.
+    txnId must be the QuickBooks API entity Id for the Invoice (same as in API responses),
+    not the customer-facing DocNumber. Production uses qbo.intuit.com as in the live app.
     """
-    rid = str(realm_id or "").strip()
     iid = str(invoice_id or "").strip()
     if not iid:
         return ""
-    base = (app_url or "").rstrip("/")
-    q = urllib.parse.urlencode(
-        {"txnId": iid, "deeplinkcompanyid": rid, "companyId": rid}
-    )
-    return f"{base}/app/invoicing?{q}"
+    e = str(env_override or QBO_ENV or os.getenv("QBO_ENV") or "sandbox").strip().lower()
+    txn = urllib.parse.quote(iid, safe="")
+    if e in ("production", "prod", "live"):
+        return f"https://qbo.intuit.com/app/invoice?txnId={txn}"
+    return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={txn}"
 
 
 def fetch_customer_email_from_directory(sheet_service, company_name):
@@ -5477,9 +5505,10 @@ def create_invoice_in_quickbooks(
         )
         or ""
     )
-    # Force Ship Via = UPS
+    # Ship Via (dropdown) — requires ShipMethod in QBO + API metadata; see get_or_create_ship_method_ref.
+    ship_via_single = str(shipping_method or "UPS Ground").strip() or "UPS Ground"
     ship_method_ref = get_or_create_ship_method_ref(
-        "UPS", headers, realm_id, env_override
+        ship_via_single, headers, realm_id, env_override
     )
     # Next DocNumber (+1)
     doc_number = get_next_invoice_number(headers, realm_id, env_override)
@@ -5506,10 +5535,12 @@ def create_invoice_in_quickbooks(
         "BillEmail": {"Address": bill_email} if bill_email else None,
         "ShipMethodRef": ship_method_ref,
     }
+    if not ship_method_ref:
+        invoice_payload["CustomerMemo"] = f"Ship via: {ship_via_single}"
     # Remove any None values QBO might reject (e.g., missing BillEmail)
     invoice_payload = {k: v for k, v in invoice_payload.items() if v is not None}
 
-    invoice_url = f"{base}/v3/company/{realm_id}/invoice"
+    invoice_url = f"{base}/v3/company/{realm_id}/invoice?minorversion={QBO_MINOR_VERSION}"
     logging.info("📦 Invoice payload about to send to QuickBooks:")
     logging.info(json.dumps(invoice_payload, indent=2))
 
@@ -5543,9 +5574,7 @@ def create_invoice_in_quickbooks(
         raise Exception("❌ QuickBooks invoice creation response had no Id")
 
     print("✅ Invoice created:", body.get("Invoice"))
-    app_url = _qbo_app_portal_base_url(env_override)
-    # Open the existing invoice record directly by txnId (scoped to this QBO company).
-    return _qbo_invoice_record_url(app_url, realm_id, inv_id)
+    return _qbo_invoice_record_url(realm_id, inv_id, env_override)
 
 
 def create_consolidated_invoice_in_quickbooks(
@@ -5660,17 +5689,38 @@ def create_consolidated_invoice_in_quickbooks(
         ship_amt = 0.0
     if ship_amt > 0:
         ship_amt_r = round(ship_amt, 2)
-        line_items.append(
-            {
-                "DetailType": "SalesItemLineDetail",
-                "Amount": ship_amt_r,
-                "Description": f"Shipping — {shipping_method or 'UPS'}",
-                "SalesItemLineDetail": {
-                    # QBO special shipping item id: appears in shipping charge field, not product lines.
-                    "ItemRef": {"value": "SHIPPING_ITEM_ID"},
-                },
-            }
-        )
+        ship_item_ref = None
+        for _ship_name in ("Shipping", "Freight", "Shipping Charge"):
+            try:
+                ship_item_ref = get_or_create_item_ref(
+                    _ship_name, headers, realm_id, env_override
+                )
+                if ship_item_ref:
+                    break
+            except Exception:
+                continue
+        if ship_item_ref:
+            line_items.append(
+                {
+                    "DetailType": "SalesItemLineDetail",
+                    "Amount": ship_amt_r,
+                    "Description": f"Shipping — {shipping_method or 'UPS'}",
+                    "SalesItemLineDetail": {
+                        "ItemRef": {
+                            "value": ship_item_ref["value"],
+                            "name": ship_item_ref.get("name") or "Shipping",
+                        },
+                        "Qty": 1,
+                        "UnitPrice": ship_amt_r,
+                    },
+                }
+            )
+        else:
+            logging.warning(
+                "Could not resolve a QBO item for shipping charges; "
+                "shipping amount %.2f omitted from invoice lines.",
+                ship_amt_r,
+            )
 
     # ── 4) Build the invoice payload ────────────────────────────────
     txn_date_str = datetime.now().strftime("%Y-%m-%d")
@@ -5704,6 +5754,8 @@ def create_consolidated_invoice_in_quickbooks(
         "BillEmail": {"Address": bill_email} if bill_email else None,
         "ShipMethodRef": ship_method_ref,
     }
+    if not ship_method_ref:
+        invoice_payload["CustomerMemo"] = f"Ship via: {ship_via_label}"
     track_parts = [
         str(t).strip() for t in (tracking_list or []) if str(t).strip()
     ]
@@ -5713,7 +5765,7 @@ def create_consolidated_invoice_in_quickbooks(
     invoice_payload = {k: v for k, v in invoice_payload.items() if v is not None}
 
     # ── 5) Send to QuickBooks ───────────────────────────────────────
-    url = f"{base}/v3/company/{realm_id}/invoice?minorversion=65"
+    url = f"{base}/v3/company/{realm_id}/invoice?minorversion={QBO_MINOR_VERSION}"
     logging.info("📦 Invoice payload:\n%s", json.dumps(invoice_payload, indent=2))
 
     res = requests.post(
@@ -5750,9 +5802,7 @@ def create_consolidated_invoice_in_quickbooks(
             list(body.keys()) if isinstance(body, dict) else type(body),
         )
 
-    app_url = _qbo_app_portal_base_url(env_override)
-    # Open the existing invoice record directly by txnId (scoped to this QBO company).
-    return _qbo_invoice_record_url(app_url, realm_id, inv_id)
+    return _qbo_invoice_record_url(realm_id, inv_id, env_override)
 
 
 @app.route("/", methods=["GET"])
