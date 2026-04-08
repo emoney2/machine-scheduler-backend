@@ -5277,10 +5277,62 @@ def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start
     return str(fallback_start).zfill(4)
 
 
+def _extract_qbo_invoice_id(payload):
+    """Parse Invoice.Id from a QBO JSON body (create/read/query)."""
+    if not isinstance(payload, dict):
+        return None
+    inv = payload.get("Invoice") or payload.get("invoice")
+    if isinstance(inv, list) and inv:
+        inv = inv[0]
+    if not isinstance(inv, dict):
+        return None
+    iid = inv.get("Id") or inv.get("id")
+    if iid is None:
+        return None
+    s = str(iid).strip()
+    return s or None
+
+
+def _query_invoice_id_by_doc_number(
+    doc_number, headers, realm_id, env_override=None
+):
+    """Fallback: resolve API entity Id after create when the response omits Id."""
+    import requests
+
+    dn = str(doc_number or "").strip().replace("'", "''")
+    if not dn:
+        return None
+    base = get_base_qbo_url(env_override)
+    query_url = f"{base}/v3/company/{realm_id}/query?minorversion=65"
+    q = f"SELECT Id FROM Invoice WHERE DocNumber = '{dn}' MAXRESULTS 1"
+    r = requests.get(query_url, headers=headers, params={"query": q})
+    if r.status_code != 200:
+        logging.warning(
+            "QBO Invoice Id lookup by DocNumber failed HTTP %s: %s",
+            r.status_code,
+            (r.text or "")[:500],
+        )
+        return None
+    invs = (r.json() or {}).get("QueryResponse", {}).get("Invoice")
+    if invs is None:
+        return None
+    if not isinstance(invs, list):
+        invs = [invs]
+    if not invs:
+        return None
+    iid = invs[0].get("Id")
+    if iid is None:
+        return None
+    s = str(iid).strip()
+    return s or None
+
+
 def _qbo_invoice_record_url(app_url, realm_id, invoice_id):
     """
-    Browser deep link to a specific QBO invoice. Including deeplinkcompanyid (realm id)
-    ensures the correct company file opens; txnId alone often lands on a new/blank invoice.
+    Browser deep link to a specific QBO invoice.
+
+    Use /app/invoices (plural) + txnId + deeplinkcompanyid. The singular /app/invoice
+    route often opens an empty \"new invoice\" editor when used as a deep link.
     """
     rid = str(realm_id or "").strip()
     iid = str(invoice_id or "").strip()
@@ -5288,7 +5340,7 @@ def _qbo_invoice_record_url(app_url, realm_id, invoice_id):
         return ""
     base = (app_url or "").rstrip("/")
     q = urllib.parse.urlencode({"txnId": iid, "deeplinkcompanyid": rid})
-    return f"{base}/app/invoice?{q}"
+    return f"{base}/app/invoices?{q}"
 
 
 def fetch_customer_email_from_directory(sheet_service, company_name):
@@ -5455,7 +5507,7 @@ def create_invoice_in_quickbooks(
         json=invoice_payload,
     )
 
-    if invoice_resp.status_code != 200:
+    if invoice_resp.status_code not in (200, 201):
         try:
             error_detail = invoice_resp.json()
         except Exception:
@@ -5466,12 +5518,19 @@ def create_invoice_in_quickbooks(
         logging.error("📦 Invoice Payload:\n%s", json.dumps(invoice_payload, indent=2))
         raise Exception("Failed to create invoice in QuickBooks")
 
-    invoice = invoice_resp.json().get("Invoice")
+    try:
+        body = invoice_resp.json()
+    except Exception:
+        body = {}
+    inv_id = _extract_qbo_invoice_id(body)
+    if not inv_id:
+        inv_id = _query_invoice_id_by_doc_number(
+            doc_number, headers, realm_id, env_override
+        )
+    if not inv_id:
+        raise Exception("❌ QuickBooks invoice creation response had no Id")
 
-    if not invoice or "Id" not in invoice:
-        raise Exception("❌ QuickBooks invoice creation failed or response invalid")
-
-    print("✅ Invoice created:", invoice)
+    print("✅ Invoice created:", body.get("Invoice"))
     # ── Build link for sandbox vs. production UI ────────────
     app_url = (
         "https://app.qbo.intuit.com"
@@ -5479,7 +5538,7 @@ def create_invoice_in_quickbooks(
         else "https://app.sandbox.qbo.intuit.com"
     )
     # Open the existing invoice record directly by txnId (scoped to this QBO company).
-    return _qbo_invoice_record_url(app_url, realm_id, invoice["Id"])
+    return _qbo_invoice_record_url(app_url, realm_id, inv_id)
 
 
 def create_consolidated_invoice_in_quickbooks(
@@ -5669,8 +5728,20 @@ def create_consolidated_invoice_in_quickbooks(
         logging.error("❌ QBO invoice creation failed: %s", res.text)
         raise Exception(f"QuickBooks invoice creation failed: {res.text}")
 
-    invoice = res.json().get("Invoice", {})
-    inv_id = invoice.get("Id")
+    try:
+        body = res.json()
+    except Exception:
+        body = {}
+    inv_id = _extract_qbo_invoice_id(body)
+    if not inv_id:
+        inv_id = _query_invoice_id_by_doc_number(
+            doc_number, headers, realm_id, env_override
+        )
+    if not inv_id:
+        logging.error(
+            "QBO consolidated invoice: no Id in response and DocNumber lookup failed; keys=%s",
+            list(body.keys()) if isinstance(body, dict) else type(body),
+        )
 
     # ── 6) Build the UI link for sandbox vs. production ────────────
     app_url = (
