@@ -5530,7 +5530,6 @@ def create_invoice_in_quickbooks(
         "TxnDate": txn_date_str,
         "ShipDate": txn_date_str,
         "DocNumber": doc_number,
-        "TotalAmt": float(round(amount, 2)),
         "SalesTermRef": {"value": "3"},
         "BillEmail": {"Address": bill_email} if bill_email else None,
         "ShipMethodRef": ship_method_ref,
@@ -5544,11 +5543,26 @@ def create_invoice_in_quickbooks(
     logging.info("📦 Invoice payload about to send to QuickBooks:")
     logging.info(json.dumps(invoice_payload, indent=2))
 
-    invoice_resp = requests.post(
-        invoice_url,
-        headers={**headers, "Content-Type": "application/json"},
-        json=invoice_payload,
-    )
+    def _post_inv(payload):
+        return requests.post(
+            invoice_url,
+            headers={**headers, "Content-Type": "application/json"},
+            json=payload,
+        )
+
+    invoice_resp = _post_inv(invoice_payload)
+    err_body = (invoice_resp.text or "") if invoice_resp.status_code not in (200, 201) else ""
+    if err_body and "2010" in err_body and "CustomerMemo" in invoice_payload:
+        inv_strip = {k: v for k, v in invoice_payload.items() if k != "CustomerMemo"}
+        logging.warning("QBO invoice 2010: retrying without CustomerMemo")
+        invoice_resp = _post_inv(inv_strip)
+        invoice_payload = inv_strip
+        err_body = (invoice_resp.text or "") if invoice_resp.status_code not in (200, 201) else ""
+    if err_body and "2010" in err_body and "SalesTermRef" in invoice_payload:
+        inv_strip = {k: v for k, v in invoice_payload.items() if k != "SalesTermRef"}
+        logging.warning("QBO invoice 2010: retrying without SalesTermRef")
+        invoice_resp = _post_inv(inv_strip)
+        invoice_payload = inv_strip
 
     if invoice_resp.status_code not in (200, 201):
         try:
@@ -5706,10 +5720,7 @@ def create_consolidated_invoice_in_quickbooks(
                     "Amount": ship_amt_r,
                     "Description": f"Shipping — {shipping_method or 'UPS'}",
                     "SalesItemLineDetail": {
-                        "ItemRef": {
-                            "value": ship_item_ref["value"],
-                            "name": ship_item_ref.get("name") or "Shipping",
-                        },
+                        "ItemRef": {"value": str(ship_item_ref["value"])},
                         "Qty": 1,
                         "UnitPrice": ship_amt_r,
                     },
@@ -5749,7 +5760,6 @@ def create_consolidated_invoice_in_quickbooks(
         "TxnDate": txn_date_str,
         "ShipDate": txn_date_str,
         "DocNumber": doc_number,
-        "TotalAmt": round(sum(item["Amount"] for item in line_items), 2),
         "SalesTermRef": {"value": "3"},
         "BillEmail": {"Address": bill_email} if bill_email else None,
         "ShipMethodRef": ship_method_ref,
@@ -5768,21 +5778,33 @@ def create_consolidated_invoice_in_quickbooks(
     url = f"{base}/v3/company/{realm_id}/invoice?minorversion={QBO_MINOR_VERSION}"
     logging.info("📦 Invoice payload:\n%s", json.dumps(invoice_payload, indent=2))
 
-    res = requests.post(
-        url,
-        headers={**headers, "Content-Type": "application/json"},
-        json=invoice_payload,
-    )
+    def _post_inv(payload):
+        return requests.post(
+            url,
+            headers={**headers, "Content-Type": "application/json"},
+            json=payload,
+        )
+
+    res = _post_inv(invoice_payload)
+    err_txt = (res.text or "") if res.status_code not in (200, 201) else ""
+    if err_txt and "2010" in err_txt and "CustomerMemo" in invoice_payload:
+        invoice_payload = {k: v for k, v in invoice_payload.items() if k != "CustomerMemo"}
+        logging.warning("QBO invoice 2010: retrying without CustomerMemo")
+        res = _post_inv(invoice_payload)
+        err_txt = (res.text or "") if res.status_code not in (200, 201) else ""
+    if err_txt and "2010" in err_txt and "SalesTermRef" in invoice_payload:
+        invoice_payload = {k: v for k, v in invoice_payload.items() if k != "SalesTermRef"}
+        logging.warning("QBO invoice 2010: retrying without SalesTermRef")
+        res = _post_inv(invoice_payload)
+        err_txt = (res.text or "") if res.status_code not in (200, 201) else ""
+
     if res.status_code not in (200, 201):
         err_txt = res.text or ""
         if res.status_code == 400 and "TrackingNum" in err_txt:
             inv2 = {k: v for k, v in invoice_payload.items() if k != "TrackingNum"}
             logging.warning("Retrying QBO invoice create without TrackingNum")
-            res = requests.post(
-                url,
-                headers={**headers, "Content-Type": "application/json"},
-                json=inv2,
-            )
+            res = _post_inv(inv2)
+            invoice_payload = inv2
     if res.status_code not in (200, 201):
         logging.error("❌ QBO invoice creation failed: %s", res.text)
         raise Exception(f"QuickBooks invoice creation failed: {res.text}")
