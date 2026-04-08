@@ -5327,20 +5327,32 @@ def _query_invoice_id_by_doc_number(
     return s or None
 
 
+def _qbo_app_portal_base_url(env_override=None):
+    """QBO browser origin (production vs sandbox), independent of API base URL."""
+    e = str(env_override or QBO_ENV or "sandbox").strip().lower()
+    if e in ("production", "prod", "live"):
+        return "https://app.qbo.intuit.com"
+    return "https://app.sandbox.qbo.intuit.com"
+
+
 def _qbo_invoice_record_url(app_url, realm_id, invoice_id):
     """
     Browser deep link to a specific QBO invoice.
 
-    Use /app/invoices (plural) + txnId + deeplinkcompanyid. The singular /app/invoice
-    route often opens an empty \"new invoice\" editor when used as a deep link.
+    Use /app/invoicing + txnId + company scope. The list route /app/invoices and the
+    singular /app/invoice editor often ignore txnId in newer QBO and open a blank
+    \"new invoice\" instead; /app/invoicing?txnId=… matches the transaction hub deep
+    links Intuit uses for invoices.
     """
     rid = str(realm_id or "").strip()
     iid = str(invoice_id or "").strip()
     if not iid:
         return ""
     base = (app_url or "").rstrip("/")
-    q = urllib.parse.urlencode({"txnId": iid, "deeplinkcompanyid": rid})
-    return f"{base}/app/invoices?{q}"
+    q = urllib.parse.urlencode(
+        {"txnId": iid, "deeplinkcompanyid": rid, "companyId": rid}
+    )
+    return f"{base}/app/invoicing?{q}"
 
 
 def fetch_customer_email_from_directory(sheet_service, company_name):
@@ -5531,12 +5543,7 @@ def create_invoice_in_quickbooks(
         raise Exception("❌ QuickBooks invoice creation response had no Id")
 
     print("✅ Invoice created:", body.get("Invoice"))
-    # ── Build link for sandbox vs. production UI ────────────
-    app_url = (
-        "https://app.qbo.intuit.com"
-        if (env_override or QBO_ENV) == "production"
-        else "https://app.sandbox.qbo.intuit.com"
-    )
+    app_url = _qbo_app_portal_base_url(env_override)
     # Open the existing invoice record directly by txnId (scoped to this QBO company).
     return _qbo_invoice_record_url(app_url, realm_id, inv_id)
 
@@ -5743,12 +5750,7 @@ def create_consolidated_invoice_in_quickbooks(
             list(body.keys()) if isinstance(body, dict) else type(body),
         )
 
-    # ── 6) Build the UI link for sandbox vs. production ────────────
-    app_url = (
-        "https://app.qbo.intuit.com"
-        if (env_override or QBO_ENV) == "production"
-        else "https://app.sandbox.qbo.intuit.com"
-    )
+    app_url = _qbo_app_portal_base_url(env_override)
     # Open the existing invoice record directly by txnId (scoped to this QBO company).
     return _qbo_invoice_record_url(app_url, realm_id, inv_id)
 
