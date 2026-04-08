@@ -197,13 +197,26 @@ def _pkg_ship(dim: Dict[str, Any], weight_lbs: float|int) -> Dict[str, Any]:
         }
     }
 
+def _label_stock_size_for_request() -> Dict[str, str]:
+    """
+    UPS ShipmentRequest LabelSpecification requires LabelStockSize (see Shipping.yaml).
+    Do not send null — a missing stock size can yield Success + tracking but no ShippingLabel.
+    For 4×6 thermal stock: Width=4, Height=6 (YAML: width valid 4; height 6 or 8).
+    """
+    raw = (LABEL_SIZE or "4x6").strip().lower()
+    raw = re.sub(r"\s+", "", raw)
+    if raw in ("4x8", "4x8in"):
+        return {"Height": "8", "Width": "4"}
+    return {"Height": "6", "Width": "4"}
+
+
 def _label_spec() -> Dict[str, Any]:
     # PDF recommended for your print flow
     img_code = "PDF" if LABEL_FORMAT == "PDF" else ("PNG" if LABEL_FORMAT == "PNG" else "ZPL")
     return {
         "LabelImageFormat": {"Code": img_code},
         "HTTPUserAgent": "JRCO-App",
-        "LabelStockSize": {"Height": "4", "Width": "6"} if LABEL_SIZE == "4x6" else None
+        "LabelStockSize": _label_stock_size_for_request(),
     }
 
 
@@ -650,18 +663,41 @@ def create_shipment(
     tracking: List[str] = []
     saved_to_printer = False
 
+    def _graphic_from_package(pkg: Dict[str, Any]) -> str | None:
+        sl = pkg.get("ShippingLabel")
+        if not isinstance(sl, dict):
+            return None
+        img = sl.get("GraphicImage")
+        if isinstance(img, str) and img.strip():
+            return img
+        parts = sl.get("GraphicImagePart")
+        if isinstance(parts, list) and parts:
+            joined = "".join(p for p in parts if isinstance(p, str))
+            return joined if joined.strip() else None
+        return None
+
     try:
         results = data["ShipmentResponse"]["ShipmentResults"]["PackageResults"]
         if isinstance(results, dict):
             results = [results]
         for pkg in results:
             trk = pkg["TrackingNumber"]
-            img = pkg["ShippingLabel"]["GraphicImage"]  # base64 string
+            img = _graphic_from_package(pkg)
+            if not img:
+                sl = pkg.get("ShippingLabel")
+                raise KeyError(
+                    "ShippingLabel.GraphicImage missing on package "
+                    f"(have ShippingLabel keys: {list(sl.keys()) if isinstance(sl, dict) else sl!r})"
+                )
+            # UPS sometimes embeds CRLF in base64 streams; strict b64decode rejects them.
+            img_clean = re.sub(r"\s+", "", img.strip())
             ext = "pdf" if LABEL_FORMAT == "PDF" else ("png" if LABEL_FORMAT == "PNG" else "zpl")
             fname = f"ups_{trk}.{ext}"
             fpath = os.path.join(tempfile.gettempdir(), fname)
-            # For PDF/PNG UPS returns base64; write to tmp and expose via /labels/<file>
-            payload = base64.b64decode(img)
+            try:
+                payload = base64.b64decode(img_clean, validate=True)
+            except Exception:
+                payload = base64.b64decode(img_clean, validate=False)
             if ext == "pdf":
                 payload = _normalize_ups_label_pdf_bytes(payload, expected_tracking=trk)
             with open(fpath, "wb") as f:
@@ -671,6 +707,8 @@ def create_shipment(
             label_urls.append(f"/labels/{fname}")
             tracking.append(trk)
     except Exception as e:
-        raise RuntimeError(f"Could not parse UPS label response: {json.dumps(data)[:800]}") from e
+        raise RuntimeError(
+            f"Could not parse UPS label response: {e!s}; body_snippet={json.dumps(data)[:800]}"
+        ) from e
 
     return label_urls, tracking, saved_to_printer
