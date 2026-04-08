@@ -277,18 +277,29 @@ def _save_trimmed_label_to_printer_folder(fpath: str, fname: str) -> bool:
         return False
 
 
+# Phrases UPS puts on "how to print" / instruction pages (not on the thermal label itself).
+_LABEL_INSTRUX_PATTERNS = re.compile(
+    r"print\s+this\s+page|how\s+to\s+print|view\s+and\s+print|fold\s+(along|here)|"
+    r"shipping\s+label\s+instructions|packing\s+list(\s+included)?|"
+    r"adobe\s+acrobat|adobe\s+reader|download\s+the\s+label|"
+    r"laser\s+printer|inkjet|cut\s+along|do\s+not\s+scale|actual\s+size|"
+    r"^\s*instructions\s*$",
+    re.I | re.MULTILINE,
+)
+
+
 def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None = None) -> bytes:
     """
-    UPS often returns (a) a multi-page PDF with instructions after the label, or
+    UPS often returns (a) a multi-page PDF with instructions after (or before) the label, or
     (b) one US Letter page with the scannable label on top and fold/instructions below.
 
-    We trim to label-only:
-      - Keep the page that best matches the tracking number (if available), else first page.
-      - If that page looks like US Letter (label + print instructions on one sheet), crop to
-        the top portion (the actual label). This runs in default "auto" mode, not only letter_crop.
+    We output a single page with label only (no instruction sheets):
+      - Score each page: prefer 4×6-ish dimensions, tracking # in text, avoid instruction copy.
+      - If that page is US Letter, crop to the top band (actual label); default crop is
+        aggressive so "view/print" blocks below the barcode are removed.
 
-    Set UPS_LABEL_PDF_TRIM_MODE=off to disable all trimming.
-    UPS_LABEL_LETTER_TOP_FRACTION (default 0.48) = fraction of page height kept from the top.
+    Set UPS_LABEL_PDF_TRIM_MODE=off to disable trimming (not recommended for web printing).
+    UPS_LABEL_LETTER_TOP_FRACTION (default 0.40) = fraction of page height kept from the top.
     """
     mode = (os.getenv("UPS_LABEL_PDF_TRIM_MODE") or "auto").strip().lower()
     if mode == "off" or not raw_pdf:
@@ -299,8 +310,7 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
     except ImportError:
         return raw_pdf
 
-    def _crop_us_letter_label_only(page):
-        """If page is tall US Letter with label in upper block, remove instructions below."""
+    def _page_wh(page):
         mb = page.mediabox
         left, bottom, right, top = (
             float(mb.left),
@@ -309,15 +319,65 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
             float(mb.top),
         )
         w, h = right - left, top - bottom
-        # ~US Letter in points (72 dpi): 612 x 792; allow small variance.
-        if not (h >= 700 and 580 <= w <= 640 and h / max(w, 1) > 1.15):
+        return w, h, left, bottom, right, top
+
+    def _looks_like_thermal_4x6(w: float, h: float) -> bool:
+        """UPS thermal 4×6 ≈ 288×432 pt at 72 dpi; allow scaled PDFs."""
+        if w <= 0 or h <= 0:
+            return False
+        r = h / w
+        # portrait 6:4
+        if 1.2 <= r <= 1.75 and w <= 420 and h <= 700:
+            return True
+        return False
+
+    def _looks_like_us_letter(w: float, h: float) -> bool:
+        return h >= 700 and 580 <= w <= 640 and h / max(w, 1) > 1.15
+
+    def _crop_us_letter_label_only(page):
+        """If page is tall US Letter with label in upper block, remove instructions below."""
+        w, h, left, bottom, right, top = _page_wh(page)
+        if not _looks_like_us_letter(w, h):
             return
-        frac = float(os.getenv("UPS_LABEL_LETTER_TOP_FRACTION") or "0.48")
-        frac = min(max(frac, 0.2), 0.85)
+        # Default a bit tighter than before so folded / print-help text is excluded.
+        frac = float(os.getenv("UPS_LABEL_LETTER_TOP_FRACTION") or "0.40")
+        frac = min(max(frac, 0.22), 0.75)
         new_bottom = bottom + h * (1.0 - frac)
         rect = RectangleObject([left, new_bottom, right, top])
         page.mediabox = rect
         page.cropbox = rect
+
+    def _page_label_score(idx: int, p) -> float:
+        w, h, *_ = _page_wh(p)
+        score = 0.0
+        try:
+            txt = p.extract_text() or ""
+        except Exception:
+            txt = ""
+        low = txt.lower()
+        wanted = re.sub(r"[^A-Za-z0-9]", "", str(expected_tracking or "")).upper()
+        if wanted:
+            normalized = re.sub(r"[^A-Za-z0-9]", "", txt).upper()
+            if wanted in normalized:
+                score += 120.0
+        # Dedicated thermal page (no letter-sized instruction sheet)
+        if _looks_like_thermal_4x6(w, h):
+            score += 80.0
+        # Slightly prefer narrower pages (label) over full letter when tracking missing
+        if w > 0 and w < 400:
+            score += 25.0
+        # Penalize obvious instruction-only pages
+        hits = len(_LABEL_INSTRUX_PATTERNS.findall(txt))
+        if hits:
+            score -= min(40.0 + 25.0 * hits, 150.0)
+        # Letter-sized page with lots of prose, no tracking → likely instructions
+        if _looks_like_us_letter(w, h) and len(txt) > 400 and wanted and wanted not in re.sub(
+            r"[^A-Za-z0-9]", "", txt
+        ).upper():
+            score -= 60.0
+        # Prefer earlier pages when UPS puts label first (common)
+        score -= idx * 3.0
+        return score
 
     try:
         reader = PdfReader(io.BytesIO(raw_pdf))
@@ -325,24 +385,18 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         if n == 0:
             return raw_pdf
 
-        wanted = re.sub(r"[^A-Za-z0-9]", "", str(expected_tracking or "")).upper()
         best_idx = 0
-        if wanted:
-            for idx, p in enumerate(reader.pages):
-                try:
-                    txt = p.extract_text() or ""
-                except Exception:
-                    txt = ""
-                normalized = re.sub(r"[^A-Za-z0-9]", "", txt).upper()
-                if wanted in normalized:
-                    best_idx = idx
-                    break
+        if n > 1:
+            scores = [_page_label_score(i, reader.pages[i]) for i in range(n)]
+            best_idx = max(range(n), key=lambda i: scores[i])
+        else:
+            best_idx = 0
 
         writer = PdfWriter()
         writer.add_page(reader.pages[best_idx])
         page = writer.pages[0]
 
-        # Drop instructions: letter-sized combined label + "view/print" help in lower half.
+        # Same sheet: label on top, UPS help text below — crop to top band.
         if mode in ("auto", "letter_crop"):
             _crop_us_letter_label_only(page)
 
