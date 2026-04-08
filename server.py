@@ -8719,6 +8719,114 @@ def jobs_for_company():
         return resp
 
 
+def _ship_queue_parse_due(val):
+    """Parse Due Date from sheet (serial, datetime, or string) for sorting."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if type(val) is date:
+        return val
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        try:
+            return date(1899, 12, 30) + timedelta(days=float(val))
+        except (ValueError, OverflowError, TypeError):
+            return None
+    if isinstance(val, str):
+        ds = val.split()[0].strip()
+        if len(ds) == 10 and ds[4] == "-" and ds[7] == "-":
+            try:
+                return datetime.strptime(ds, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        if "/" in ds:
+            parts = ds.split("/")
+            if len(parts) == 3:
+                try:
+                    return datetime(int(parts[2]), int(parts[0]), int(parts[1])).date()
+                except (ValueError, TypeError):
+                    pass
+    return None
+
+
+def _ship_queue_order_sort_tuple(order_num_raw):
+    """Secondary sort: numeric order # when possible, else string."""
+    s = str(order_num_raw or "").strip().lstrip("#")
+    if s.isdigit():
+        return (0, int(s))
+    return (1, s.lower())
+
+
+@app.route("/api/ship-production-queue")
+@login_required_session
+def ship_production_queue():
+    """
+    Jobs in Embroidery or Sewing stage (not complete/shipped), for Ship tab quick picks.
+    Sorted by Due Date ascending, then Order #. Same image preview rules as jobs-for-company.
+    """
+    try:
+        prod_data = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+        if not prod_data or not prod_data[0]:
+            return jsonify({"jobs": []}), 200
+
+        headers = prod_data[0]
+        jobs = []
+        for r in prod_data[1:]:
+            row = dict(zip(headers, r))
+            if _overview_exclude_completed_or_shipped(row):
+                continue
+            stage = str(row.get("Stage") or "").strip().upper()
+            if stage not in ("EMBROIDERY", "SEWING"):
+                continue
+            image_link = str(row.get("Image", "")).strip()
+            file_id = ""
+            if "id=" in image_link:
+                file_id = image_link.split("id=")[-1].split("&")[0]
+            elif "file/d/" in image_link:
+                file_id = image_link.split("file/d/")[-1].split("/")[0]
+
+            preview_url = (
+                f"https://drive.google.com/thumbnail?id={file_id}"
+                if file_id
+                else ""
+            )
+
+            company = str(row.get("Company Name", "")).strip()
+            oid = str(row.get("Order #", "")).strip()
+            if not company or not oid:
+                continue
+
+            jobs.append(
+                {
+                    "Order #": row.get("Order #"),
+                    "Company Name": company,
+                    "Design": row.get("Design"),
+                    "Product": row.get("Product"),
+                    "Quantity": row.get("Quantity"),
+                    "Due Date": row.get("Due Date"),
+                    "Stage": row.get("Stage"),
+                    "Hard Date/Soft Date": row.get("Hard Date/Soft Date"),
+                    "image": preview_url,
+                    "orderId": oid,
+                }
+            )
+
+        jobs.sort(
+            key=lambda j: (
+                _ship_queue_parse_due(j.get("Due Date")) or date.max,
+                _ship_queue_order_sort_tuple(j.get("Order #")),
+            )
+        )
+        return jsonify({"jobs": jobs}), 200
+    except Exception as e:
+        logger.exception("ship-production-queue failed:")
+        resp = jsonify({"error": "ship-production-queue failed", "detail": str(e), "jobs": []})
+        resp.status_code = 500
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
+
+
 @app.route("/api/set-volume", methods=["POST"])
 def set_volume():
     global SPREADSHEET_ID
