@@ -16,6 +16,7 @@ debug.hub_prevent_multiple_readers(False)
 import os
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import shutil
 import subprocess
 import time
@@ -24,7 +25,6 @@ import re
 import requests
 import traceback
 import gspread
-import logging
 import urllib.parse
 import secrets
 import io
@@ -1525,11 +1525,64 @@ def _orders_get_by_id_cached(order_number: str):
 
 # ─── Logger ─────────────────────────────────────────────────────────────────
 # (.env already loaded at startup via load_dotenv next to imports)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+# Always write a persistent log next to this app (backend/) so issues can be diagnosed
+# without copying hosting console output. Optional: APP_LOG_FILE, APP_LOG_MAX_BYTES, APP_LOG_BACKUP_COUNT.
+_APP_LOG_ABS_PATH = ""
+
+
+def _configure_app_logging():
+    global _APP_LOG_ABS_PATH
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    backend_dir = Path(__file__).resolve().parent
+    raw_path = (os.environ.get("APP_LOG_FILE") or "").strip()
+    log_path = (
+        Path(raw_path).expanduser()
+        if raw_path
+        else (backend_dir / "app.log")
+    )
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        log_path = Path(tempfile.gettempdir()) / "machine-scheduler-app.log"
+    log_abs = str(log_path.resolve())
+    _APP_LOG_ABS_PATH = log_abs
+    for h in root.handlers:
+        if isinstance(h, RotatingFileHandler):
+            try:
+                if os.path.normcase(os.path.normpath(h.baseFilename)) == os.path.normcase(
+                    os.path.normpath(log_abs)
+                ):
+                    return
+            except Exception:
+                continue
+    try:
+        max_bytes = int(os.environ.get("APP_LOG_MAX_BYTES", "10485760"))
+        backups = int(os.environ.get("APP_LOG_BACKUP_COUNT", "5"))
+        fh = RotatingFileHandler(
+            log_abs,
+            maxBytes=max(1_048_576, max_bytes),
+            backupCount=max(1, backups),
+            encoding="utf-8",
+            delay=True,
+        )
+        fh.setFormatter(fmt)
+        fh.setLevel(logging.INFO)
+        root.addHandler(fh)
+    except OSError as e:
+        print(f"⚠️ Could not open app log file {log_abs}: {e}", file=sys.stderr)
+    if not any(type(h) is logging.StreamHandler for h in root.handlers):
+        ch = logging.StreamHandler(sys.stderr)
+        ch.setFormatter(fmt)
+        ch.setLevel(logging.INFO)
+        root.addHandler(ch)
+
+
+_configure_app_logging()
 logger = logging.getLogger(__name__)
+if _APP_LOG_ABS_PATH:
+    logger.info("Application log file: %s", _APP_LOG_ABS_PATH)
 
 # ─── Front-end URL & Flask Setup ─────────────────────────────────────────────
 raw_frontend = os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
@@ -5228,10 +5281,10 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
     candidates = []
     for c in (
         raw,
-        "UPS - Ground",
         "UPS Ground",
-        "UPS",
+        "UPS - Ground",
         "Ground",
+        "UPS",
         "Standard",
         "Shipping",
     ):
@@ -5332,6 +5385,99 @@ def _extract_qbo_invoice_id(payload):
     return s or None
 
 
+def _qbo_invoice_dict_from_payload(payload):
+    if not isinstance(payload, dict):
+        return {}
+    inv = payload.get("Invoice") or payload.get("invoice") or {}
+    if isinstance(inv, list) and inv:
+        inv = inv[0]
+    return inv if isinstance(inv, dict) else {}
+
+
+def _qbo_invoice_has_ship_method_ref(inv) -> bool:
+    if not isinstance(inv, dict):
+        return False
+    sm = inv.get("ShipMethodRef")
+    if not isinstance(sm, dict):
+        return False
+    return bool(str(sm.get("value") or "").strip())
+
+
+def _ensure_qbo_invoice_ship_via(
+    headers, realm_id, inv_id, ship_method_ref_payload, env_override=None
+):
+    """
+    QBO occasionally accepts invoice create without persisting ShipMethodRef (Ship Via stays blank).
+    After create, GET the invoice; if Ship Via is empty, sparse-update only ShipMethodRef.
+    """
+    if not ship_method_ref_payload or not str(
+        ship_method_ref_payload.get("value") or ""
+    ).strip():
+        return
+    iid = str(inv_id or "").strip()
+    if not iid:
+        return
+    base = get_base_qbo_url(env_override)
+    get_url = f"{base}/v3/company/{realm_id}/invoice/{iid}?minorversion={QBO_MINOR_VERSION}"
+    r = requests.get(get_url, headers=headers)
+    if r.status_code != 200:
+        logging.warning(
+            "QBO Ship Via check: GET invoice %s failed HTTP %s: %s",
+            iid,
+            r.status_code,
+            (r.text or "")[:600],
+        )
+        return
+    try:
+        jd = r.json()
+    except Exception:
+        jd = {}
+    inv = _qbo_invoice_dict_from_payload(jd)
+    if _qbo_invoice_has_ship_method_ref(inv):
+        return
+    sync = inv.get("SyncToken")
+    if sync is None:
+        logging.warning(
+            "QBO Ship Via fix: invoice %s missing SyncToken on GET; cannot sparse-update",
+            iid,
+        )
+        return
+    post_url = f"{base}/v3/company/{realm_id}/invoice?minorversion={QBO_MINOR_VERSION}"
+    patch = {
+        "sparse": True,
+        "Id": iid,
+        "SyncToken": str(sync).strip(),
+        "ShipMethodRef": dict(ship_method_ref_payload),
+    }
+    r2 = requests.post(
+        post_url,
+        headers={**headers, "Content-Type": "application/json"},
+        json=patch,
+    )
+    if r2.status_code not in (200, 201):
+        logging.warning(
+            "QBO Ship Via fix: sparse POST failed HTTP %s for invoice %s: %s",
+            r2.status_code,
+            iid,
+            (r2.text or "")[:1200],
+        )
+        return
+    try:
+        jd2 = r2.json()
+    except Exception:
+        jd2 = {}
+    inv2 = _qbo_invoice_dict_from_payload(jd2)
+    if _qbo_invoice_has_ship_method_ref(inv2):
+        logging.info("QBO Ship Via fix: sparse update succeeded for invoice %s", iid)
+    else:
+        logging.warning(
+            "QBO Ship Via fix: sparse POST OK but ShipMethodRef still missing in response — "
+            "enable Shipping under Sales settings and ensure ShipMethod API/metadata is available. "
+            "invoice_keys=%s",
+            list(inv2.keys()) if inv2 else [],
+        )
+
+
 def _query_invoice_id_by_doc_number(
     doc_number, headers, realm_id, env_override=None
 ):
@@ -5372,15 +5518,26 @@ def _qbo_invoice_record_url(realm_id, invoice_id, env_override=None):
 
     txnId must be the QuickBooks API entity Id for the Invoice (same as in API responses),
     not the customer-facing DocNumber. Production uses qbo.intuit.com as in the live app.
+
+    companyId / deeplinkcompanyid (realm id) help QBO open the correct company file so the
+    link does not fall through to a blank / new-invoice screen.
     """
     iid = str(invoice_id or "").strip()
     if not iid:
         return ""
     e = str(env_override or QBO_ENV or os.getenv("QBO_ENV") or "sandbox").strip().lower()
     txn = urllib.parse.quote(iid, safe="")
+    cid = urllib.parse.quote(str(realm_id or "").strip(), safe="")
     if e in ("production", "prod", "live"):
-        return f"https://qbo.intuit.com/app/invoice?txnId={txn}"
-    return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={txn}"
+        base = "https://qbo.intuit.com"
+    else:
+        base = "https://app.sandbox.qbo.intuit.com"
+    if cid:
+        return (
+            f"{base}/app/invoice?txnId={txn}"
+            f"&companyId={cid}&deeplinkcompanyid={cid}"
+        )
+    return f"{base}/app/invoice?txnId={txn}"
 
 
 def fetch_customer_email_from_directory(sheet_service, company_name):
@@ -5510,6 +5667,9 @@ def create_invoice_in_quickbooks(
     ship_method_ref = get_or_create_ship_method_ref(
         ship_via_single, headers, realm_id, env_override
     )
+    ship_method_ref_payload = None
+    if ship_method_ref and ship_method_ref.get("value"):
+        ship_method_ref_payload = {"value": str(ship_method_ref["value"])}
     # Next DocNumber (+1)
     doc_number = get_next_invoice_number(headers, realm_id, env_override)
 
@@ -5532,9 +5692,11 @@ def create_invoice_in_quickbooks(
         "DocNumber": doc_number,
         "SalesTermRef": {"value": "3"},
         "BillEmail": {"Address": bill_email} if bill_email else None,
-        "ShipMethodRef": ship_method_ref,
+        "ShipMethodRef": ship_method_ref_payload,
     }
-    if not ship_method_ref:
+    if shipping_total and float(shipping_total) > 0:
+        invoice_payload["ShipAmt"] = float(round(float(shipping_total), 2))
+    if not ship_method_ref_payload:
         invoice_payload["CustomerMemo"] = f"Ship via: {ship_via_single}"
     # Remove any None values QBO might reject (e.g., missing BillEmail)
     invoice_payload = {k: v for k, v in invoice_payload.items() if v is not None}
@@ -5635,7 +5797,9 @@ def create_consolidated_invoice_in_quickbooks(
         # "UPS - Bill only (no UPS)" — use a generic method that exists or can be created.
         if "bill only" in low or "(no ups)" in low:
             return "UPS"
-        return f"UPS - {s}"
+        if low == "ground":
+            return "UPS Ground"
+        return f"UPS {s}"
 
     # ── 3) Build line items ─────────────────────────────────────────
     line_items = []
@@ -5701,37 +5865,7 @@ def create_consolidated_invoice_in_quickbooks(
         ship_amt = float(base_shipping_cost or 0)
     except (TypeError, ValueError):
         ship_amt = 0.0
-    if ship_amt > 0:
-        ship_amt_r = round(ship_amt, 2)
-        ship_item_ref = None
-        for _ship_name in ("Shipping", "Freight", "Shipping Charge"):
-            try:
-                ship_item_ref = get_or_create_item_ref(
-                    _ship_name, headers, realm_id, env_override
-                )
-                if ship_item_ref:
-                    break
-            except Exception:
-                continue
-        if ship_item_ref:
-            line_items.append(
-                {
-                    "DetailType": "SalesItemLineDetail",
-                    "Amount": ship_amt_r,
-                    "Description": f"Shipping — {shipping_method or 'UPS'}",
-                    "SalesItemLineDetail": {
-                        "ItemRef": {"value": str(ship_item_ref["value"])},
-                        "Qty": 1,
-                        "UnitPrice": ship_amt_r,
-                    },
-                }
-            )
-        else:
-            logging.warning(
-                "Could not resolve a QBO item for shipping charges; "
-                "shipping amount %.2f omitted from invoice lines.",
-                ship_amt_r,
-            )
+    ship_amt_r = round(ship_amt, 2) if ship_amt > 0 else 0.0
 
     # ── 4) Build the invoice payload ────────────────────────────────
     txn_date_str = datetime.now().strftime("%Y-%m-%d")
@@ -5750,6 +5884,16 @@ def create_consolidated_invoice_in_quickbooks(
     ship_method_ref = get_or_create_ship_method_ref(
         ship_via_label, headers, realm_id, env_override
     )
+    # QBO is most reliable with value-only refs on create (name mismatch can drop Ship Via).
+    ship_method_ref_payload = None
+    if ship_method_ref and ship_method_ref.get("value"):
+        ship_method_ref_payload = {"value": str(ship_method_ref["value"])}
+        logging.info(
+            "Consolidated invoice: will set Ship Via using ShipMethodRef value=%s name=%r (requested %r)",
+            ship_method_ref_payload.get("value"),
+            (ship_method_ref.get("name") or ""),
+            ship_via_label,
+        )
 
     # Next DocNumber (+1 from last)
     doc_number = get_next_invoice_number(headers, realm_id, env_override)
@@ -5762,9 +5906,11 @@ def create_consolidated_invoice_in_quickbooks(
         "DocNumber": doc_number,
         "SalesTermRef": {"value": "3"},
         "BillEmail": {"Address": bill_email} if bill_email else None,
-        "ShipMethodRef": ship_method_ref,
+        "ShipMethodRef": ship_method_ref_payload,
     }
-    if not ship_method_ref:
+    if ship_amt_r > 0:
+        invoice_payload["ShipAmt"] = float(ship_amt_r)
+    if not ship_method_ref_payload:
         invoice_payload["CustomerMemo"] = f"Ship via: {ship_via_label}"
     track_parts = [
         str(t).strip() for t in (tracking_list or []) if str(t).strip()
@@ -5819,9 +5965,31 @@ def create_consolidated_invoice_in_quickbooks(
             doc_number, headers, realm_id, env_override
         )
     if not inv_id:
+        time.sleep(0.5)
+        inv_id = _query_invoice_id_by_doc_number(
+            doc_number, headers, realm_id, env_override
+        )
+    if not inv_id:
         logging.error(
             "QBO consolidated invoice: no Id in response and DocNumber lookup failed; keys=%s",
             list(body.keys()) if isinstance(body, dict) else type(body),
+        )
+        raise Exception(
+            "QuickBooks created the invoice but the app could not read its Id for the Open Invoice link. "
+            "Check server logs; verify QBO query access for Invoice."
+        )
+
+    if ship_method_ref_payload:
+        _ensure_qbo_invoice_ship_via(
+            headers, realm_id, inv_id, ship_method_ref_payload, env_override
+        )
+    else:
+        logging.warning(
+            "Consolidated invoice DocNumber=%s: no ShipMethodRef (Ship Via will be blank). "
+            "Could not resolve ship method for %r. In QBO: Settings → Account and settings → "
+            "Sales → Delivery method → turn Shipping on, then add a method such as UPS Ground.",
+            doc_number,
+            ship_via_label,
         )
 
     return _qbo_invoice_record_url(realm_id, inv_id, env_override)

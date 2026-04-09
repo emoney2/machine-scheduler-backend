@@ -252,6 +252,48 @@ def _label_output_path_usable_on_this_host(out_dir: str) -> bool:
     return False
 
 
+def _maybe_save_ups_label_debug_raw(tracking: str, ext: str, raw_bytes: bytes) -> None:
+    """
+    Save undecorated label bytes straight from UPS (before PDF trim / normalization).
+
+    Set UPS_LABEL_DEBUG_SAVE_RAW=1 (or true) to write next to normal temp files, or set
+    UPS_LABEL_DEBUG_DIR to an absolute folder to drop files there for easy sharing.
+
+    Output name: ups_<tracking>_api_raw.<ext> (e.g. ups_1Z999..._api_raw.pdf)
+    Trimmed file remains ups_<tracking>.<ext> in system temp (served as /labels/...).
+    """
+    flag = (os.getenv("UPS_LABEL_DEBUG_SAVE_RAW") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    dbg_dir = (os.getenv("UPS_LABEL_DEBUG_DIR") or "").strip()
+    if not flag and not dbg_dir:
+        return
+    out_dir = dbg_dir or tempfile.gettempdir()
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        logging.warning("UPS_LABEL_DEBUG: cannot create directory %s: %s", out_dir, e)
+        return
+    safe_trk = re.sub(r"[^\w.\-]+", "_", str(tracking or "unknown"))[:120]
+    raw_name = f"ups_{safe_trk}_api_raw.{ext}"
+    raw_path = os.path.join(out_dir, raw_name)
+    try:
+        with open(raw_path, "wb") as f:
+            f.write(raw_bytes)
+        logging.info(
+            "UPS label debug: raw API bytes → %s (trimmed for printing: %s/ups_%s.%s)",
+            raw_path,
+            tempfile.gettempdir(),
+            tracking,
+            ext,
+        )
+    except OSError as e:
+        logging.warning("UPS_LABEL_DEBUG: failed writing %s: %s", raw_path, e)
+
+
 def _save_trimmed_label_to_printer_folder(fpath: str, fname: str) -> bool:
     """
     After the PDF is trimmed, copy it into UPS_LABEL_OUTPUT_DIR (default G:\\My Drive\\Label Printer).
@@ -347,6 +389,40 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         page.mediabox = rect
         page.cropbox = rect
 
+    def _crop_us_letter_keep_bottom_band(page):
+        """US Letter where the scannable label is in the lower portion; strip instruction header."""
+        w, h, left, bottom, right, top = _page_wh(page)
+        if not _looks_like_us_letter(w, h):
+            return
+        frac = float(os.getenv("UPS_LABEL_LETTER_BOTTOM_FRACTION") or "0.48")
+        frac = min(max(frac, 0.22), 0.78)
+        new_top = bottom + h * frac
+        rect = RectangleObject([left, bottom, right, new_top])
+        page.mediabox = rect
+        page.cropbox = rect
+
+    def _prefer_bottom_letter_band(p, instrux_hits: int) -> bool:
+        """
+        When UPS puts 'how to print' copy above the label on one Letter page, extracted text order
+        often lists instructions first; tracking appears only in the lower half.
+        """
+        if instrux_hits < 2:
+            return False
+        wanted = re.sub(r"[^A-Za-z0-9]", "", str(expected_tracking or "")).upper()
+        if not wanted or len(wanted) < 8:
+            return False
+        try:
+            txt = p.extract_text() or ""
+        except Exception:
+            return False
+        if len(txt) < 100:
+            return False
+        mid = len(txt) // 2
+        nrm = lambda s: re.sub(r"[^A-Za-z0-9]", "", s).upper()
+        tail_has = wanted in nrm(txt[mid:])
+        head_has = wanted in nrm(txt[:mid])
+        return tail_has and not head_has
+
     def _page_label_score(idx: int, p) -> float:
         w, h, *_ = _page_wh(p)
         score = 0.0
@@ -366,10 +442,10 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         # Slightly prefer narrower pages (label) over full letter when tracking missing
         if w > 0 and w < 400:
             score += 25.0
-        # Penalize obvious instruction-only pages
+        # Penalize obvious instruction-only pages (stronger so Letter instruction sheets lose to labels)
         hits = len(_LABEL_INSTRUX_PATTERNS.findall(txt))
         if hits:
-            score -= min(40.0 + 25.0 * hits, 150.0)
+            score -= min(55.0 + 35.0 * hits, 200.0)
         # Letter-sized page with lots of prose, no tracking → likely instructions
         if _looks_like_us_letter(w, h) and len(txt) > 400 and wanted and wanted not in re.sub(
             r"[^A-Za-z0-9]", "", txt
@@ -385,20 +461,43 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         if n == 0:
             return raw_pdf
 
-        best_idx = 0
-        if n > 1:
+        def _dims_at(i: int):
+            w, h, *_ = _page_wh(reader.pages[i])
+            return w, h
+
+        thermal_pages = [i for i in range(n) if _looks_like_thermal_4x6(*_dims_at(i))]
+        if thermal_pages:
+            # Prefer real 4×6 label pages over separate instruction PDF pages.
+            best_idx = max(
+                thermal_pages, key=lambda i: _page_label_score(i, reader.pages[i])
+            )
+        elif n > 1:
             scores = [_page_label_score(i, reader.pages[i]) for i in range(n)]
             best_idx = max(range(n), key=lambda i: scores[i])
         else:
             best_idx = 0
 
+        src_page = reader.pages[best_idx]
+        try:
+            instrux_hits = len(
+                _LABEL_INSTRUX_PATTERNS.findall(src_page.extract_text() or "")
+            )
+        except Exception:
+            instrux_hits = 0
+
         writer = PdfWriter()
-        writer.add_page(reader.pages[best_idx])
+        writer.add_page(src_page)
         page = writer.pages[0]
 
-        # Same sheet: label on top, UPS help text below — crop to top band.
+        # Letter: label may be top band OR bottom band depending on UPS layout.
         if mode in ("auto", "letter_crop"):
-            _crop_us_letter_label_only(page)
+            w, h = _dims_at(best_idx)
+            if _looks_like_us_letter(w, h) and _prefer_bottom_letter_band(
+                src_page, instrux_hits
+            ):
+                _crop_us_letter_keep_bottom_band(page)
+            else:
+                _crop_us_letter_label_only(page)
 
         out = io.BytesIO()
         writer.write(out)
@@ -752,6 +851,7 @@ def create_shipment(
                 payload = base64.b64decode(img_clean, validate=True)
             except Exception:
                 payload = base64.b64decode(img_clean, validate=False)
+            _maybe_save_ups_label_debug_raw(trk, ext, payload)
             if ext == "pdf":
                 payload = _normalize_ups_label_pdf_bytes(payload, expected_tracking=trk)
             with open(fpath, "wb") as f:
