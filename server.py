@@ -117,6 +117,7 @@ from flask import (
     abort,
 )
 from flask import make_response
+from werkzeug.exceptions import HTTPException
 from flask_cors import CORS
 from flask_cors import CORS, cross_origin
 from flask_socketio import SocketIO
@@ -2257,37 +2258,45 @@ def _cors_allowed_origins():
     return allowed
 
 
+def _attach_cors_headers(response):
+    """
+    Single place for API CORS. Use on normal responses, preflight, and error handlers.
+    When Origin is allowed, echo it (required for credentialed requests); else FRONTEND_URL.
+    """
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    allowed = _cors_allowed_origins()
+    fallback = (
+        os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+        .strip()
+        .rstrip("/")
+    )
+    response.headers["Access-Control-Allow-Origin"] = (
+        origin if origin in allowed else fallback
+    )
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type,Authorization,X-Requested-With,Accept"
+    )
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+    )
+    return response
+
+
 # --- CORS: handle all OPTIONS preflight early; always send CORS so preflight never fails ---
 @app.before_request
 def handle_preflight():
     if request.method == "OPTIONS":
-        origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-        allowed = _cors_allowed_origins()
         # Always set CORS on preflight so browser gets valid response even under load
         resp = make_response("", 204)
-        resp.headers["Access-Control-Allow-Origin"] = origin if origin in allowed else (
-            os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")
-        )
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With,Accept"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-        resp.headers["Vary"] = "Origin"
-        return resp  # short-circuit OPTIONS
+        return _attach_cors_headers(resp)  # short-circuit OPTIONS
 
 
 @app.after_request
 def apply_cors(response):
     # Always attach CORS to every response so errors/timeouts still allow frontend to see body
-    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-    allowed = _cors_allowed_origins()
-    response.headers["Access-Control-Allow-Origin"] = origin if origin in allowed else (
-        os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")
-    )
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Vary"] = "Origin"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With,Accept"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-    return response
+    return _attach_cors_headers(response)
 
 
 # NEW: capture RSS before each request
@@ -2365,8 +2374,8 @@ def _mem_after(resp):
                 app.logger.warning(
                     f"[MEM] {request.method} {request.path} Δ={delta_mb:.2f}MB rss={rss_now/1024/1024:.2f}MB"
                 )
-        # Opportunistic GC to curb fragmentation during bursts
-        gc.collect()
+                # GC is expensive; only run after a large per-request RSS jump (not every request).
+                gc.collect()
     except Exception:
         pass
     return resp
@@ -6232,10 +6241,13 @@ def _allowed_ws_origins():
         .rstrip("/"),
         "https://machineschedule.netlify.app",
         "http://localhost:3000",
+        "http://127.0.0.1:3000",
     }
-    extra = os.environ.get("EXTRA_WS_ORIGINS", "").strip()
-    if extra:
-        for o in extra.split(","):
+    for env_name in ("ALLOWED_ORIGINS", "EXTRA_WS_ORIGINS"):
+        raw = os.environ.get(env_name, "").strip()
+        if not raw:
+            continue
+        for o in raw.split(","):
             o = o.strip().rstrip("/")
             if o:
                 origins.add(o)
@@ -10519,16 +10531,7 @@ def submit_order():
 
 @app.after_request
 def add_submit_cors_headers(resp):
-    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-    allowed = _cors_allowed_origins()
-    resp.headers["Access-Control-Allow-Origin"] = origin if origin in allowed else (
-        os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app").strip().rstrip("/")
-    )
-    resp.headers["Access-Control-Allow-Credentials"] = "true"
-    resp.headers["Vary"] = "Origin"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE, PATCH"
-    return resp
+    return _attach_cors_headers(resp)
 
 
 
@@ -13625,16 +13628,21 @@ def shipment_client_log():
     return resp
 
 
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    """401/404/etc. must keep correct status and CORS (generic Exception handler would not)."""
+    resp = e.get_response()
+    return _attach_cors_headers(resp)
+
+
 @app.errorhandler(Exception)
 def handle_exception(e):
     # Log the full stack for debugging
     logger.exception("Unhandled exception in request:")
-    # Return a JSON error and CORS
+    # Return a JSON error and CORS (echo Origin when allowed, same as after_request)
     resp = jsonify(error=str(e))
     resp.status_code = 500
-    resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
-    resp.headers["Access-Control-Allow-Credentials"] = "true"
-    return resp
+    return _attach_cors_headers(resp)
 
 
 @app.route("/api/product-specs", methods=["POST"])
@@ -15578,30 +15586,10 @@ def on_disconnect():
     logger.info(f"Client disconnected: {request.sid}")
 
 
-# Ensure all responses include CORS headers, even on errors
+# Ensure all responses include CORS headers, even on errors (runs after other hooks)
 @app.after_request
 def apply_cors_headers(response):
-    """Must always echo Allow-Origin (or FRONTEND_URL fallback) like apply_cors — omitting
-    it breaks credentialed fetches when this handler runs after other CORS hooks."""
-    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-    allowed = _cors_allowed_origins()
-    fallback = (
-        os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
-        .strip()
-        .rstrip("/")
-    )
-    response.headers["Access-Control-Allow-Origin"] = (
-        origin if origin in allowed else fallback
-    )
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Vary"] = "Origin"
-    response.headers["Access-Control-Allow-Headers"] = (
-        "Content-Type,Authorization,X-Requested-With,Accept"
-    )
-    response.headers["Access-Control-Allow-Methods"] = (
-        "GET,POST,OPTIONS,PUT,DELETE,PATCH"
-    )
-    return response
+    return _attach_cors_headers(response)
 
 
 # --- Public URL shortener (no auth, no app redirects) ---
