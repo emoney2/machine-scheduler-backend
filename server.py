@@ -5927,6 +5927,37 @@ def create_consolidated_invoice_in_quickbooks(
         ship_amt = 0.0
     ship_amt_r = round(ship_amt, 2) if ship_amt > 0 else 0.0
 
+    track_parts = [
+        str(t).strip() for t in (tracking_list or []) if str(t).strip()
+    ]
+
+    # UPS + QBO: do not use Invoice.ShipAmt or Invoice.TrackingNum — many QBO companies
+    # with Shipping disabled return 2010 on those fields. Bill-only flow never sends them
+    # (shipping_line_amt is often 0), which is why "QB only" worked. Use a normal line for
+    # freight and put tracking in CustomerMemo instead.
+    if ship_amt_r > 0:
+        try:
+            _svc_lbl = _normalize_ship_via_label(shipping_method)
+            ship_item = get_or_create_item_ref(
+                "Shipping", headers, realm_id, env_override
+            )
+            line_items.append(
+                {
+                    "DetailType": "SalesItemLineDetail",
+                    "Amount": float(ship_amt_r),
+                    "Description": f"Shipping ({_svc_lbl})",
+                    "SalesItemLineDetail": {
+                        "ItemRef": {"value": str(ship_item["value"])},
+                        "Qty": 1.0,
+                        "UnitPrice": float(ship_amt_r),
+                    },
+                }
+            )
+        except Exception as ex:
+            logging.warning(
+                "Consolidated invoice: could not add Shipping line item: %s", ex
+            )
+
     # ── 4) Build the invoice payload ────────────────────────────────
     txn_date_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -5958,6 +5989,13 @@ def create_consolidated_invoice_in_quickbooks(
     # Next DocNumber (+1 from last)
     doc_number = get_next_invoice_number(headers, realm_id, env_override)
 
+    memo_bits = []
+    if not ship_method_ref_payload:
+        memo_bits.append(f"Ship via: {ship_via_label}")
+    if track_parts:
+        memo_bits.append(f"Tracking: {', '.join(track_parts)}")
+    customer_memo = " | ".join(memo_bits)[:1000] if memo_bits else None
+
     invoice_payload = {
         "CustomerRef": customer_ref,
         "Line": line_items,
@@ -5968,15 +6006,8 @@ def create_consolidated_invoice_in_quickbooks(
         "BillEmail": {"Address": bill_email} if bill_email else None,
         "ShipMethodRef": ship_method_ref_payload,
     }
-    if ship_amt_r > 0:
-        invoice_payload["ShipAmt"] = float(ship_amt_r)
-    if not ship_method_ref_payload:
-        invoice_payload["CustomerMemo"] = f"Ship via: {ship_via_label}"
-    track_parts = [
-        str(t).strip() for t in (tracking_list or []) if str(t).strip()
-    ]
-    if track_parts:
-        invoice_payload["TrackingNum"] = ", ".join(track_parts)
+    if customer_memo:
+        invoice_payload["CustomerMemo"] = customer_memo
     # Drop any None values QBO might reject (e.g., missing BillEmail)
     invoice_payload = {k: v for k, v in invoice_payload.items() if v is not None}
 
