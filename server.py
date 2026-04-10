@@ -1594,6 +1594,31 @@ from flask_cors import CORS
 # ─── Flask + CORS + SocketIO ────────────────────────────────────────────────────
 app = Flask(__name__)
 
+
+def _flask_cors_static_origins():
+    """
+    Origins passed to flask_cors at init. Must include the live Netlify URL and any
+    FRONTEND_URL / ALLOWED_ORIGINS from the host (Render), or the extension can strip
+    CORS headers for cross-origin credentialed requests.
+    """
+    origins = {
+        "https://machineschedule.netlify.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    }
+    fe = os.environ.get("FRONTEND_URL", "").strip().rstrip("/")
+    if fe:
+        origins.add(fe)
+    for env_name in ("ALLOWED_ORIGINS", "EXTRA_WS_ORIGINS"):
+        raw = os.environ.get(env_name, "").strip()
+        if not raw:
+            continue
+        for o in raw.split(","):
+            o = o.strip().rstrip("/")
+            if o:
+                origins.add(o)
+    return sorted(origins)
+
 # Register Shopify integration routes
 try:
     from shopify_integration import register_shopify_routes
@@ -1619,24 +1644,20 @@ CORS(
     supports_credentials=True,
     resources={
         r"/*": {
-            "origins": [
-                "https://machineschedule.netlify.app",
-                "http://localhost:3000",
-                "http://127.0.0.1:3000"
-            ],
+            "origins": _flask_cors_static_origins(),
             "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             "allow_headers": [
                 "Content-Type",
                 "Authorization",
                 "X-Requested-With",
-                "Accept"
+                "Accept",
             ],
             "expose_headers": [
                 "ETag",
-                "Content-Type"
-            ]
+                "Content-Type",
+            ],
         }
-    }
+    },
 )
 
 app.secret_key = os.environ.get("SECRET_KEY", "dev-fallback-secret")
@@ -1840,15 +1861,20 @@ def login_required_session(f):
             )
 
             response = make_response("", 204)
-            if origin in allowed:
-                response.headers["Access-Control-Allow-Origin"] = origin
-                response.headers["Access-Control-Allow-Credentials"] = "true"
-                response.headers["Access-Control-Allow-Headers"] = (
-                    "Content-Type,Authorization"
-                )
-                response.headers["Access-Control-Allow-Methods"] = (
-                    "GET,POST,PUT,PATCH,OPTIONS"
-                )
+            fallback = (
+                os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+                .strip()
+                .rstrip("/")
+            )
+            response.headers["Access-Control-Allow-Origin"] = (
+                origin if origin in allowed else fallback
+            )
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+            response.headers["Access-Control-Allow-Methods"] = (
+                "GET,POST,PUT,PATCH,OPTIONS"
+            )
+            response.headers["Vary"] = "Origin"
             return response
 
         # 2) Must be logged in at all
@@ -6051,17 +6077,9 @@ app.config.update(
     SESSION_COOKIE_SECURE=True,
 )
 
-# only allow our Netlify front-end on /api/* and support cookies
-CORS(
-    app,
-    resources={
-        r"/": {"origins": FRONTEND_URL},
-        r"/api/*": {"origins": FRONTEND_URL},
-        r"/api/threads": {"origins": FRONTEND_URL},
-        r"/submit": {"origins": FRONTEND_URL},
-    },
-    supports_credentials=True,
-)
+# Do not call CORS(app) again here — a second registration narrows origins to FRONTEND_URL
+# only and breaks the browser if that env var does not exactly match Origin (or if
+# ALLOWED_ORIGINS / branch deploy URLs are needed). Global CORS is configured once above.
 
 
 # ─── Session & Auth Helpers ──────────────────────────────────────────────────
@@ -15361,31 +15379,26 @@ def on_disconnect():
 # Ensure all responses include CORS headers, even on errors
 @app.after_request
 def apply_cors_headers(response):
+    """Must always echo Allow-Origin (or FRONTEND_URL fallback) like apply_cors — omitting
+    it breaks credentialed fetches when this handler runs after other CORS hooks."""
     origin = (request.headers.get("Origin") or "").strip().rstrip("/")
-    # Env-driven allow-list + safe defaults
-    allowed_env = os.environ.get("ALLOWED_ORIGINS", "")
-    allowed = {o.strip().rstrip("/") for o in allowed_env.split(",") if o.strip()}
-    allowed.update(
-        {
-            (
-                os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
-                .strip()
-                .rstrip("/")
-            ),
-            "https://machineschedule.netlify.app",
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-        }
+    allowed = _cors_allowed_origins()
+    fallback = (
+        os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+        .strip()
+        .rstrip("/")
     )
-    
-    if origin in allowed:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Vary"] = "Origin"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With,Accept"
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,PUT,DELETE,PATCH"
+    response.headers["Access-Control-Allow-Origin"] = (
+        origin if origin in allowed else fallback
+    )
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type,Authorization,X-Requested-With,Accept"
+    )
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET,POST,OPTIONS,PUT,DELETE,PATCH"
+    )
     return response
 
 
