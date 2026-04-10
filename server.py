@@ -10054,6 +10054,44 @@ def log_material_to_google_sheets(order_number):
         logger.exception("[MaterialLog] Unexpected error calling Google Apps Script for order %s", order_number)
 
 
+def _last_order_num_from_col_a(col_values):
+    """Last numeric order # in column A; skips blank rows and non-numeric cells."""
+    for row in reversed(col_values or []):
+        if not row:
+            continue
+        raw = row[0]
+        if raw is None:
+            continue
+        s = str(raw).strip()
+        if not s:
+            continue
+        try:
+            return int(float(s.replace(",", "")))
+        except ValueError:
+            continue
+    return 0
+
+
+def _form_quantity_for_db(qraw):
+    """Multipart form quantity for DB (handles 1, '1', '1.0' from sheet reorders)."""
+    if qraw is None:
+        return 0
+    s = str(qraw).strip().replace(",", "")
+    if not s:
+        return 0
+    return int(float(s))
+
+
+def _form_price_for_db(praw):
+    """Multipart form price for DB."""
+    if praw is None:
+        return 0.0
+    s = str(praw).strip().replace(",", "").replace("$", "")
+    if not s:
+        return 0.0
+    return float(s)
+
+
 @app.route("/submit", methods=["OPTIONS", "POST"])
 @login_required_session
 def submit_order():
@@ -10113,6 +10151,15 @@ def submit_order():
                         "error": f'Material{idx+1} percentage ("{pct}") must be a number.'
                     }), 400
 
+        try:
+            qty_db = _form_quantity_for_db(data.get("quantity"))
+        except ValueError:
+            return jsonify({"error": "Quantity must be a valid number."}), 400
+        try:
+            price_db = _form_price_for_db(data.get("price"))
+        except ValueError:
+            return jsonify({"error": "Price must be a valid number."}), 400
+
         # ─── DETERMINE NEXT ROW & ORDER # ────────────────────────────────────
         col_a = sheets.values().get(
             spreadsheetId=SPREADSHEET_ID,
@@ -10120,7 +10167,7 @@ def submit_order():
         ).execute().get("values", [])
 
         next_row = len(col_a) + 1
-        prev_order = int(col_a[-1][0]) if len(col_a) > 1 else 0
+        prev_order = _last_order_num_from_col_a(col_a)
         new_order = prev_order + 1
         
         # For quilted front products, we'll create two orders (front and back)
@@ -10335,17 +10382,24 @@ def submit_order():
 
         # ─── WRITE PRODUCTION ORDER TO SUPABASE ──────────────────────────────
         if supabase:
-            supabase.table("Production Orders TEST").insert({
-                "Order #": new_order,
-                "Date": ts,
-                "Company Name": data.get("company"),
-                "Design": data.get("designName"),
-                "Quantity": int(data.get("quantity") or 0),
-                "Product": data.get("product"),
-                "Price": float(data.get("price") or 0),
-                "Due Date": data.get("dueDate"),
-                "Stage": "ORDERED",
-            }).execute()
+            try:
+                supabase.table("Production Orders TEST").insert({
+                    "Order #": new_order,
+                    "Date": ts,
+                    "Company Name": data.get("company"),
+                    "Design": data.get("designName"),
+                    "Quantity": qty_db,
+                    "Product": data.get("product"),
+                    "Price": price_db,
+                    "Due Date": data.get("dueDate"),
+                    "Stage": "ORDERED",
+                }).execute()
+            except Exception as sb_err:
+                logger.error(
+                    "[/submit] Supabase insert failed for order %s (sheet row still written): %s",
+                    new_order,
+                    sb_err,
+                )
 
         # ─────────────────────────────────────────────────────────────────────
         # ✅ NEW: WRITE MATERIAL LOG ROWS TO SUPABASE (OPTION B)
@@ -10419,17 +10473,24 @@ def submit_order():
 
             # Write back order to Supabase with price = 0
             if supabase:
-                supabase.table("Production Orders TEST").insert({
-                    "Order #": back_order,
-                    "Date": ts,
-                    "Company Name": data.get("company"),
-                    "Design": data.get("designName"),
-                    "Quantity": int(data.get("quantity") or 0),
-                    "Product": back_product,  # Product changed to Back
-                    "Price": 0.0,  # Price set to 0
-                    "Due Date": data.get("dueDate"),
-                    "Stage": "ORDERED",
-                }).execute()
+                try:
+                    supabase.table("Production Orders TEST").insert({
+                        "Order #": back_order,
+                        "Date": ts,
+                        "Company Name": data.get("company"),
+                        "Design": data.get("designName"),
+                        "Quantity": qty_db,
+                        "Product": back_product,  # Product changed to Back
+                        "Price": 0.0,  # Price set to 0
+                        "Due Date": data.get("dueDate"),
+                        "Stage": "ORDERED",
+                    }).execute()
+                except Exception as sb_err:
+                    logger.error(
+                        "[/submit] Supabase insert failed for back order %s: %s",
+                        back_order,
+                        sb_err,
+                    )
 
             # Write material log for back order
             try:
