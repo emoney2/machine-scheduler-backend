@@ -5910,7 +5910,8 @@ def create_consolidated_invoice_in_quickbooks(
                 "Amount": round(shipped_qty * price, 2),
                 "Description": design_name,
                 "SalesItemLineDetail": {
-                    "ItemRef": {"value": item_ref["value"], "name": item_ref["name"]},
+                    # value-only ItemRef avoids QBO 2010 when name does not exactly match QBO
+                    "ItemRef": {"value": str(item_ref["value"])},
                     "Qty": shipped_qty,
                     "UnitPrice": price,
                 },
@@ -6003,11 +6004,22 @@ def create_consolidated_invoice_in_quickbooks(
         res = _post_inv(invoice_payload)
         err_txt = (res.text or "") if res.status_code not in (200, 201) else ""
 
+    # TrackingNum often triggers 2010 when Shipping/ShipMethod is disabled in QBO (Intuit
+    # error text does not mention "TrackingNum", so do not require that substring).
+    if res.status_code not in (200, 201) and "2010" in err_txt and "TrackingNum" in invoice_payload:
+        invoice_payload = {k: v for k, v in invoice_payload.items() if k != "TrackingNum"}
+        logging.warning(
+            "QBO invoice 2010: retrying without TrackingNum "
+            "(common when Shipping is off in QBO Account and settings → Sales)"
+        )
+        res = _post_inv(invoice_payload)
+        err_txt = (res.text or "") if res.status_code not in (200, 201) else ""
+
     if res.status_code not in (200, 201):
         err_txt = res.text or ""
-        if res.status_code == 400 and "TrackingNum" in err_txt:
+        if res.status_code == 400 and "TrackingNum" in err_txt and "TrackingNum" in invoice_payload:
             inv2 = {k: v for k, v in invoice_payload.items() if k != "TrackingNum"}
-            logging.warning("Retrying QBO invoice create without TrackingNum")
+            logging.warning("Retrying QBO invoice create without TrackingNum (explicit fault text)")
             res = _post_inv(inv2)
             invoice_payload = inv2
     if res.status_code not in (200, 201):
