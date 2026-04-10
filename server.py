@@ -5907,13 +5907,13 @@ def create_consolidated_invoice_in_quickbooks(
         line_items.append(
             {
                 "DetailType": "SalesItemLineDetail",
-                "Amount": round(shipped_qty * price, 2),
+                "Amount": float(round(shipped_qty * price, 2)),
                 "Description": design_name,
                 "SalesItemLineDetail": {
                     # value-only ItemRef avoids QBO 2010 when name does not exactly match QBO
                     "ItemRef": {"value": str(item_ref["value"])},
-                    "Qty": shipped_qty,
-                    "UnitPrice": price,
+                    "Qty": float(shipped_qty),
+                    "UnitPrice": float(price),
                 },
             }
         )
@@ -5991,31 +5991,85 @@ def create_consolidated_invoice_in_quickbooks(
             json=payload,
         )
 
+    memo_fallback_parts = [f"Ship via: {ship_via_label}"]
+    if ship_amt_r > 0:
+        memo_fallback_parts.append(f"Shipping ${ship_amt_r:.2f}")
+    if track_parts:
+        memo_fallback_parts.append(f"Tracking: {', '.join(track_parts)}")
+    memo_fallback = " | ".join(memo_fallback_parts)
+
     res = _post_inv(invoice_payload)
-    err_txt = (res.text or "") if res.status_code not in (200, 201) else ""
+
+    def _qbo_still_bad():
+        return res.status_code not in (200, 201)
+
+    def _qbo_is_2010():
+        return "2010" in (res.text or "")
+
+    err_txt = (res.text or "") if _qbo_still_bad() else ""
     if err_txt and "2010" in err_txt and "CustomerMemo" in invoice_payload:
         invoice_payload = {k: v for k, v in invoice_payload.items() if k != "CustomerMemo"}
         logging.warning("QBO invoice 2010: retrying without CustomerMemo")
         res = _post_inv(invoice_payload)
-        err_txt = (res.text or "") if res.status_code not in (200, 201) else ""
+        err_txt = (res.text or "") if _qbo_still_bad() else ""
     if err_txt and "2010" in err_txt and "SalesTermRef" in invoice_payload:
         invoice_payload = {k: v for k, v in invoice_payload.items() if k != "SalesTermRef"}
         logging.warning("QBO invoice 2010: retrying without SalesTermRef")
         res = _post_inv(invoice_payload)
-        err_txt = (res.text or "") if res.status_code not in (200, 201) else ""
+        err_txt = (res.text or "") if _qbo_still_bad() else ""
 
-    # TrackingNum often triggers 2010 when Shipping/ShipMethod is disabled in QBO (Intuit
-    # error text does not mention "TrackingNum", so do not require that substring).
-    if res.status_code not in (200, 201) and "2010" in err_txt and "TrackingNum" in invoice_payload:
+    # TrackingNum often triggers 2010 when Shipping/ShipMethod is disabled in QBO.
+    if _qbo_still_bad() and _qbo_is_2010() and "TrackingNum" in invoice_payload:
         invoice_payload = {k: v for k, v in invoice_payload.items() if k != "TrackingNum"}
         logging.warning(
             "QBO invoice 2010: retrying without TrackingNum "
             "(common when Shipping is off in QBO Account and settings → Sales)"
         )
         res = _post_inv(invoice_payload)
-        err_txt = (res.text or "") if res.status_code not in (200, 201) else ""
+        err_txt = (res.text or "") if _qbo_still_bad() else ""
 
-    if res.status_code not in (200, 201):
+    # ShipAmt / ShipDate are invalid for some companies with Shipping disabled in QBO.
+    if _qbo_still_bad() and _qbo_is_2010() and (
+        "ShipAmt" in invoice_payload or "ShipDate" in invoice_payload
+    ):
+        invoice_payload = {
+            k: v for k, v in invoice_payload.items() if k not in ("ShipAmt", "ShipDate")
+        }
+        invoice_payload["CustomerMemo"] = memo_fallback[:1000]
+        # Keep revenue: add shipping as a normal line (ShipAmt field not supported).
+        if ship_amt_r > 0 and isinstance(invoice_payload.get("Line"), list):
+            try:
+                ship_item = get_or_create_item_ref(
+                    "Shipping", headers, realm_id, env_override
+                )
+                ship_line = {
+                    "DetailType": "SalesItemLineDetail",
+                    "Amount": float(ship_amt_r),
+                    "Description": f"Shipping ({ship_via_label})",
+                    "SalesItemLineDetail": {
+                        "ItemRef": {"value": str(ship_item["value"])},
+                        "Qty": 1.0,
+                        "UnitPrice": float(ship_amt_r),
+                    },
+                }
+                invoice_payload["Line"] = list(invoice_payload["Line"]) + [ship_line]
+            except Exception as ex:
+                logging.warning(
+                    "Could not add Shipping line item after ShipAmt strip: %s", ex
+                )
+        logging.warning(
+            "QBO invoice 2010: retrying without ShipAmt/ShipDate; "
+            "shipping moved to line item or memo only"
+        )
+        res = _post_inv(invoice_payload)
+        err_txt = (res.text or "") if _qbo_still_bad() else ""
+
+    if _qbo_still_bad() and _qbo_is_2010() and "BillEmail" in invoice_payload:
+        invoice_payload = {k: v for k, v in invoice_payload.items() if k != "BillEmail"}
+        logging.warning("QBO invoice 2010: retrying without BillEmail")
+        res = _post_inv(invoice_payload)
+
+    if _qbo_still_bad():
         err_txt = res.text or ""
         if res.status_code == 400 and "TrackingNum" in err_txt and "TrackingNum" in invoice_payload:
             inv2 = {k: v for k, v in invoice_payload.items() if k != "TrackingNum"}
