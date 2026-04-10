@@ -4,6 +4,8 @@ from datetime import datetime
 from typing import List, Dict, Any, Tuple
 import requests
 
+from ship_qbo_file_log import log_label
+
 # Note: read ID/secret inside get_access_token() so they pick up .env after load_dotenv() in server.py.
 SHIPPER_NUMBER = os.getenv("UPS_ACCOUNT_NUMBER", "")
 NEGOTIATED = (os.getenv("UPS_NEGOTIATED_RATES", "true").lower() == "true")
@@ -345,11 +347,23 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
     """
     mode = (os.getenv("UPS_LABEL_PDF_TRIM_MODE") or "auto").strip().lower()
     if mode == "off" or not raw_pdf:
+        log_label(
+            "pdf_normalize_skipped",
+            reason="trim_off_or_empty" if raw_pdf else "empty_pdf",
+            ups_label_pdf_trim_mode=mode,
+            expected_tracking=expected_tracking,
+            raw_bytes=len(raw_pdf or b""),
+        )
         return raw_pdf
     try:
         from pypdf import PdfReader, PdfWriter
         from pypdf.generic import RectangleObject
     except ImportError:
+        log_label(
+            "pdf_normalize_skipped",
+            reason="pypdf_missing",
+            expected_tracking=expected_tracking,
+        )
         return raw_pdf
 
     def _page_wh(page):
@@ -459,6 +473,11 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         reader = PdfReader(io.BytesIO(raw_pdf))
         n = len(reader.pages)
         if n == 0:
+            log_label(
+                "pdf_normalize_no_pages",
+                expected_tracking=expected_tracking,
+                raw_bytes=len(raw_pdf),
+            )
             return raw_pdf
 
         def _dims_at(i: int):
@@ -477,6 +496,42 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         else:
             best_idx = 0
 
+        per_page = []
+        try:
+            for i in range(n):
+                w_i, h_i = _dims_at(i)
+                sc_i = _page_label_score(i, reader.pages[i])
+                prev = ""
+                try:
+                    prev = (reader.pages[i].extract_text() or "").replace("\n", " ")
+                    prev = prev.strip()[:220]
+                except Exception:
+                    prev = ""
+                per_page.append(
+                    {
+                        "page": i,
+                        "w_pt": round(w_i, 1),
+                        "h_pt": round(h_i, 1),
+                        "score": round(sc_i, 2),
+                        "text_preview": prev,
+                    }
+                )
+            log_label(
+                "pdf_page_pick",
+                expected_tracking=expected_tracking,
+                page_count=n,
+                best_page_index=best_idx,
+                thermal_page_indexes=thermal_pages,
+                ups_label_pdf_trim_mode=mode,
+                per_page=per_page,
+            )
+        except Exception as ex:
+            log_label(
+                "pdf_page_pick_log_failed",
+                expected_tracking=expected_tracking,
+                error=str(ex),
+            )
+
         src_page = reader.pages[best_idx]
         try:
             instrux_hits = len(
@@ -490,19 +545,39 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         page = writer.pages[0]
 
         # Letter: label may be top band OR bottom band depending on UPS layout.
+        letter_crop = None
         if mode in ("auto", "letter_crop"):
             w, h = _dims_at(best_idx)
             if _looks_like_us_letter(w, h) and _prefer_bottom_letter_band(
                 src_page, instrux_hits
             ):
+                letter_crop = "bottom_band"
                 _crop_us_letter_keep_bottom_band(page)
             else:
+                letter_crop = "top_band_or_none"
                 _crop_us_letter_label_only(page)
 
         out = io.BytesIO()
         writer.write(out)
-        return out.getvalue()
-    except Exception:
+        final_b = out.getvalue()
+        try:
+            log_label(
+                "pdf_normalize_done",
+                expected_tracking=expected_tracking,
+                best_page_index=best_idx,
+                instruction_pattern_hits_on_chosen_page=instrux_hits,
+                letter_crop=letter_crop,
+                output_bytes=len(final_b),
+            )
+        except Exception:
+            pass
+        return final_b
+    except Exception as ex:
+        log_label(
+            "pdf_normalize_exception",
+            expected_tracking=expected_tracking,
+            error=str(ex),
+        )
         return raw_pdf
 
 def _first_rated_shipment(data: Dict[str, Any]):
@@ -856,6 +931,13 @@ def create_shipment(
                 payload = _normalize_ups_label_pdf_bytes(payload, expected_tracking=trk)
             with open(fpath, "wb") as f:
                 f.write(payload)
+            log_label(
+                "label_file_written",
+                tracking=trk,
+                ext=ext,
+                path_basename=fname,
+                byte_len=len(payload),
+            )
             if _save_trimmed_label_to_printer_folder(fpath, fname):
                 saved_to_printer = True
             label_urls.append(f"/labels/{fname}")

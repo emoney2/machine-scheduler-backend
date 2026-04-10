@@ -152,6 +152,7 @@ from ups_service import (
     create_shipment as ups_create_shipment,
     _label_output_path_usable_on_this_host,
 )
+import ship_qbo_file_log as sqlog
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
@@ -4279,7 +4280,28 @@ def serve_label(filename):
     safe = os.path.basename(filename)
     full = os.path.join(tmp, safe)
     if not os.path.exists(full):
+        try:
+            sqlog.log_label("serve_label_missing", filename=safe)
+        except Exception:
+            pass
         return abort(404)
+    try:
+        st = os.stat(full)
+        head = b""
+        with open(full, "rb") as lf:
+            head = lf.read(8)
+        sqlog.log_label(
+            "serve_label",
+            filename=safe,
+            bytes=st.st_size,
+            starts_with_pdf=head[:4] == b"%PDF",
+            head_hex=head.hex()[:24],
+        )
+    except Exception as ex:
+        try:
+            sqlog.log_label("serve_label_stat_failed", filename=safe, error=str(ex))
+        except Exception:
+            pass
     # Let browser open in a new tab for printing
     return send_from_directory(tmp, safe, as_attachment=False)
 
@@ -5750,7 +5772,18 @@ def create_invoice_in_quickbooks(
         raise Exception("❌ QuickBooks invoice creation response had no Id")
 
     print("✅ Invoice created:", body.get("Invoice"))
-    return _qbo_invoice_record_url(realm_id, inv_id, env_override)
+    out_url = _qbo_invoice_record_url(realm_id, inv_id, env_override)
+    try:
+        sqlog.log_qbo(
+            "invoice_created_single",
+            order_number=str(order_data.get("Order #", "")),
+            doc_number=str(doc_number),
+            invoice_api_id=str(inv_id),
+            open_invoice_url=out_url,
+        )
+    except Exception:
+        pass
+    return out_url
 
 
 def create_consolidated_invoice_in_quickbooks(
@@ -5992,7 +6025,19 @@ def create_consolidated_invoice_in_quickbooks(
             ship_via_label,
         )
 
-    return _qbo_invoice_record_url(realm_id, inv_id, env_override)
+    browser_url = _qbo_invoice_record_url(realm_id, inv_id, env_override)
+    try:
+        sqlog.log_qbo(
+            "invoice_created_consolidated",
+            doc_number=str(doc_number),
+            invoice_api_id=str(inv_id),
+            open_invoice_url=browser_url,
+            company_preview=str(first_order.get("Company Name", ""))[:120],
+            line_items=len(line_items),
+        )
+    except Exception:
+        pass
+    return browser_url
 
 
 @app.route("/", methods=["GET"])
@@ -12864,6 +12909,56 @@ def company_list():
     return jsonify({"companies": companies})
 
 
+def _sanitize_process_shipment_payload(data):
+    """Minimal summary for logs/ship_quickbooks.log (avoids full addresses)."""
+    if not isinstance(data, dict):
+        return {"payload_type": type(data).__name__}
+    pkgs = data.get("packages")
+    bs = (
+        data.get("boxes_summary")
+        if data.get("boxes_summary") is not None
+        else data.get("boxes")
+    )
+    out = {
+        "order_ids": data.get("order_ids"),
+        "skip_invoice": data.get("skip_invoice"),
+        "skip_ups": data.get("skip_ups"),
+        "qboEnv": data.get("qboEnv"),
+        "shipping_method": data.get("shipping_method"),
+        "service_code": data.get("service_code"),
+        "ups_purchased_rate": data.get("ups_purchased_rate"),
+        "packages_n": len(pkgs) if isinstance(pkgs, list) else None,
+        "boxes_summary_n": len(bs) if isinstance(bs, list) else None,
+    }
+    sto = data.get("ship_to_override")
+    if isinstance(sto, dict):
+        out["ship_to_override_hint"] = {
+            "has_addr1": bool(sto.get("addr1")),
+            "state": sto.get("state"),
+            "zip": sto.get("zip"),
+        }
+    return out
+
+
+def _invoice_url_parts_for_log(url):
+    if not url or not isinstance(url, str):
+        return {"invoice_in_response": False}
+    try:
+        u = urllib.parse.urlparse(url.strip())
+        q = urllib.parse.parse_qs(u.query)
+        txn = (q.get("txnId") or [""])[0]
+        cid = (q.get("deeplinkcompanyid") or q.get("companyId") or [""])[0]
+        return {
+            "invoice_in_response": True,
+            "open_invoice_host": u.hostname or "",
+            "open_invoice_path": u.path or "",
+            "txnId": txn,
+            "companyId_param": cid,
+        }
+    except Exception:
+        return {"invoice_in_response": True, "open_invoice_url_prefix": str(url)[:200]}
+
+
 @app.route("/api/process-shipment", methods=["OPTIONS", "POST"])
 @login_required_session
 def process_shipment():
@@ -12874,10 +12969,18 @@ def process_shipment():
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
         resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
         return resp
-    data = request.get_json()
+    data = request.get_json() or {}
     env_override = data.get("qboEnv")  # "sandbox" or "production"
     session["qboEnv"] = env_override or "production"
     print("📥 process-shipment received:", data)
+
+    try:
+        sqlog.log_ship(
+            "process_shipment_request",
+            **_sanitize_process_shipment_payload(data or {}),
+        )
+    except Exception:
+        pass
 
     skip_invoice = bool(data.get("skip_invoice"))
 
@@ -13213,6 +13316,24 @@ def process_shipment():
             open_lbl,
             open_slip,
         )
+        try:
+            inv_parts = _invoice_url_parts_for_log(invoice_url)
+            sqlog.log_ship(
+                "process_shipment_response",
+                order_ids=order_ids,
+                skip_invoice=skip_invoice,
+                do_ups=do_ups,
+                label_urls=full_label_urls,
+                label_count=len(full_label_urls),
+                open_label_windows=open_lbl,
+                open_slip_windows=open_slip,
+                labels_copied_to_folder=bool(labels_copied_ok),
+                tracking_numbers=tracking_list,
+                packing_slip_url=slip_url,
+                **inv_parts,
+            )
+        except Exception:
+            pass
         resp = jsonify(
             {
                 "labels": full_label_urls,
@@ -13238,10 +13359,50 @@ def process_shipment():
     except Exception as e:
         print("❌ Shipment error:", e)
         traceback.print_exc()
+        try:
+            sqlog.log_exception("SHIP", "process_shipment", e)
+        except Exception:
+            pass
         resp = jsonify({"error": str(e)})
         resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         return resp, 500
+
+
+@app.route("/api/shipment-client-log", methods=["OPTIONS", "POST"])
+@login_required_session
+def shipment_client_log():
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Requested-With, Accept"
+        )
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        body = {}
+    events = body.get("events")
+    if not isinstance(events, list):
+        msg = str(body.get("message") or body.get("event") or "client")
+        rest = {k: v for k, v in body.items() if k not in ("message", "event")}
+        events = [{"message": msg, **rest}]
+    for ev in events[:80]:
+        if not isinstance(ev, dict):
+            continue
+        msg = str(ev.get("message") or ev.get("event") or "client")
+        rest = {k: v for k, v in ev.items() if k not in ("message", "event")}
+        try:
+            sqlog.log_client(msg, **rest)
+        except Exception:
+            pass
+    resp = jsonify({"ok": True})
+    resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
 
 
 @app.errorhandler(Exception)
