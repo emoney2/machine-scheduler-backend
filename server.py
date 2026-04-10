@@ -5931,33 +5931,6 @@ def create_consolidated_invoice_in_quickbooks(
         str(t).strip() for t in (tracking_list or []) if str(t).strip()
     ]
 
-    # UPS + QBO: do not use Invoice.ShipAmt or Invoice.TrackingNum — many QBO companies
-    # with Shipping disabled return 2010 on those fields. Bill-only flow never sends them
-    # (shipping_line_amt is often 0), which is why "QB only" worked. Use a normal line for
-    # freight and put tracking in CustomerMemo instead.
-    if ship_amt_r > 0:
-        try:
-            _svc_lbl = _normalize_ship_via_label(shipping_method)
-            ship_item = get_or_create_item_ref(
-                "Shipping", headers, realm_id, env_override
-            )
-            line_items.append(
-                {
-                    "DetailType": "SalesItemLineDetail",
-                    "Amount": float(ship_amt_r),
-                    "Description": f"Shipping ({_svc_lbl})",
-                    "SalesItemLineDetail": {
-                        "ItemRef": {"value": str(ship_item["value"])},
-                        "Qty": 1.0,
-                        "UnitPrice": float(ship_amt_r),
-                    },
-                }
-            )
-        except Exception as ex:
-            logging.warning(
-                "Consolidated invoice: could not add Shipping line item: %s", ex
-            )
-
     # ── 4) Build the invoice payload ────────────────────────────────
     txn_date_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -5989,31 +5962,79 @@ def create_consolidated_invoice_in_quickbooks(
     # Next DocNumber (+1 from last)
     doc_number = get_next_invoice_number(headers, realm_id, env_override)
 
-    memo_bits = []
-    if not ship_method_ref_payload:
-        memo_bits.append(f"Ship via: {ship_via_label}")
-    if track_parts:
-        memo_bits.append(f"Tracking: {', '.join(track_parts)}")
-    customer_memo = " | ".join(memo_bits)[:1000] if memo_bits else None
+    def _invoice_drop_none(inv):
+        return {k: v for k, v in inv.items() if v is not None}
 
-    invoice_payload = {
-        "CustomerRef": customer_ref,
-        "Line": line_items,
-        "TxnDate": txn_date_str,
-        "ShipDate": txn_date_str,
-        "DocNumber": doc_number,
-        "SalesTermRef": {"value": "3"},
-        "BillEmail": {"Address": bill_email} if bill_email else None,
-        "ShipMethodRef": ship_method_ref_payload,
-    }
-    if customer_memo:
-        invoice_payload["CustomerMemo"] = customer_memo
-    # Drop any None values QBO might reject (e.g., missing BillEmail)
-    invoice_payload = {k: v for k, v in invoice_payload.items() if v is not None}
+    def _fallback_invoice_payload():
+        """Shipping as a line item + memo (works when QBO Sales → Shipping is off)."""
+        lines = list(line_items)
+        if ship_amt_r > 0:
+            try:
+                ship_item = get_or_create_item_ref(
+                    "Shipping", headers, realm_id, env_override
+                )
+                lines.append(
+                    {
+                        "DetailType": "SalesItemLineDetail",
+                        "Amount": float(ship_amt_r),
+                        "Description": f"Shipping ({ship_via_label})",
+                        "SalesItemLineDetail": {
+                            "ItemRef": {"value": str(ship_item["value"])},
+                            "Qty": 1.0,
+                            "UnitPrice": float(ship_amt_r),
+                        },
+                    }
+                )
+            except Exception as ex:
+                logging.warning(
+                    "Consolidated invoice: could not add Shipping line item: %s", ex
+                )
+        memo_bits_fb = []
+        if not ship_method_ref_payload:
+            memo_bits_fb.append(f"Ship via: {ship_via_label}")
+        if track_parts:
+            memo_bits_fb.append(f"Tracking: {', '.join(track_parts)}")
+        cm = " | ".join(memo_bits_fb)[:1000] if memo_bits_fb else None
+        inv = {
+            "CustomerRef": customer_ref,
+            "Line": lines,
+            "TxnDate": txn_date_str,
+            "ShipDate": txn_date_str,
+            "DocNumber": doc_number,
+            "SalesTermRef": {"value": "3"},
+            "BillEmail": {"Address": bill_email} if bill_email else None,
+            "ShipMethodRef": ship_method_ref_payload,
+        }
+        if cm:
+            inv["CustomerMemo"] = cm
+        return _invoice_drop_none(inv)
+
+    def _native_invoice_payload():
+        """Preferred for UPS+QBO: ShipAmt, TrackingNum, Ship Via ref on the invoice (no duplicate ship line)."""
+        memo_bits_n = []
+        if not ship_method_ref_payload:
+            memo_bits_n.append(f"Ship via: {ship_via_label}")
+        cm = " | ".join(memo_bits_n)[:1000] if memo_bits_n else None
+        inv = {
+            "CustomerRef": customer_ref,
+            "Line": list(line_items),
+            "TxnDate": txn_date_str,
+            "ShipDate": txn_date_str,
+            "DocNumber": doc_number,
+            "SalesTermRef": {"value": "3"},
+            "BillEmail": {"Address": bill_email} if bill_email else None,
+            "ShipMethodRef": ship_method_ref_payload,
+        }
+        if ship_amt_r > 0:
+            inv["ShipAmt"] = float(ship_amt_r)
+        if track_parts:
+            inv["TrackingNum"] = ", ".join(track_parts)
+        if cm:
+            inv["CustomerMemo"] = cm
+        return _invoice_drop_none(inv)
 
     # ── 5) Send to QuickBooks ───────────────────────────────────────
     url = f"{base}/v3/company/{realm_id}/invoice?minorversion={QBO_MINOR_VERSION}"
-    logging.info("📦 Invoice payload:\n%s", json.dumps(invoice_payload, indent=2))
 
     def _post_inv(payload):
         return requests.post(
@@ -6029,7 +6050,30 @@ def create_consolidated_invoice_in_quickbooks(
         memo_fallback_parts.append(f"Tracking: {', '.join(track_parts)}")
     memo_fallback = " | ".join(memo_fallback_parts)
 
-    res = _post_inv(invoice_payload)
+    wants_native_shipping = bool(ship_amt_r > 0 or track_parts)
+    if wants_native_shipping:
+        invoice_payload = _native_invoice_payload()
+        logging.info(
+            "📦 Invoice payload (native ship/tracking fields):\n%s",
+            json.dumps(invoice_payload, indent=2),
+        )
+        res = _post_inv(invoice_payload)
+        if res.status_code not in (200, 201) and "2010" in (res.text or ""):
+            logging.warning(
+                "QuickBooks returned 2010 on native ShipAmt/TrackingNum; "
+                "retrying with shipping line + memo. To use native fields, enable "
+                "Settings → Account and settings → Sales → Delivery method (Shipping)."
+            )
+            invoice_payload = _fallback_invoice_payload()
+            logging.info(
+                "📦 Invoice payload (fallback line+memo):\n%s",
+                json.dumps(invoice_payload, indent=2),
+            )
+            res = _post_inv(invoice_payload)
+    else:
+        invoice_payload = _fallback_invoice_payload()
+        logging.info("📦 Invoice payload:\n%s", json.dumps(invoice_payload, indent=2))
+        res = _post_inv(invoice_payload)
 
     def _qbo_still_bad():
         return res.status_code not in (200, 201)
@@ -6156,7 +6200,7 @@ def create_consolidated_invoice_in_quickbooks(
             invoice_api_id=str(inv_id),
             open_invoice_url=browser_url,
             company_preview=str(first_order.get("Company Name", ""))[:120],
-            line_items=len(line_items),
+            line_items=len(invoice_payload.get("Line") or []),
         )
     except Exception:
         pass
