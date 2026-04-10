@@ -82,9 +82,15 @@ else:
 
 
 from flask import g
-import psutil, tracemalloc, gc
+import psutil, gc
 
-tracemalloc.start()
+# tracemalloc adds significant interpreter overhead; enable only when debugging leaks locally.
+if os.environ.get("TRACE_MALLOC", "").strip().lower() in ("1", "true", "yes"):
+    import tracemalloc
+
+    tracemalloc.start()
+    print("TRACE_MALLOC=1: tracemalloc enabled")
+
 _process = psutil.Process(os.getpid())
 
 from copy import deepcopy
@@ -564,7 +570,7 @@ os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 # --- Tiny in-process cache for Drive thumbnails ---
 _drive_thumb_cache = {}  # key: f"{file_id}:{modified_time}" -> {'bytes': b, 'ts': float}
 _drive_thumb_ttl = 300  # seconds (5 min) - reduced from 10 min
-_drive_thumb_cache_max_size = 200  # Maximum number of entries - reduced from 1000 (images are large)
+_drive_thumb_cache_max_size = 120  # In-memory image bytes; keep modest for small Render RAM
 _drive_thumb_cache_last_cleanup = 0
 _drive_thumb_cache_cleanup_interval = 120  # Clean up every 2 minutes - more frequent
 
@@ -1670,11 +1676,14 @@ logout_all_ts = int(os.environ.get("LOGOUT_ALL_TS", "0"))
 import hashlib, threading
 
 _cache_lock = threading.Lock()
+# One stale-while-revalidate rebuild at a time per key (avoids overlapping huge payloads)
+_json_bg_inflight = set()
+_json_bg_inflight_lock = threading.Lock()
 # key -> {'ts': float, 'ttl': int, 'etag': str, 'data': bytes}
 _json_cache = {}
 _json_cache_last_cleanup = 0
 _json_cache_cleanup_interval = 120  # Clean up every 2 minutes - more frequent
-_json_cache_max_size = 500  # Maximum number of entries - reduced from 1000
+_json_cache_max_size = 300  # Cap JSON cache entries (large values = orders/combined)
 
 
 def _cache_cleanup():
@@ -1756,6 +1765,19 @@ def _maybe_304(etag):
     return bool(etag and inm and etag in inm)
 
 
+def _json_bg_refresh_try_acquire(cache_key):
+    with _json_bg_inflight_lock:
+        if cache_key in _json_bg_inflight:
+            return False
+        _json_bg_inflight.add(cache_key)
+        return True
+
+
+def _json_bg_refresh_release(cache_key):
+    with _json_bg_inflight_lock:
+        _json_bg_inflight.discard(cache_key)
+
+
 def send_cached_json(key, ttl, payload_obj_builder):
     """
     If cached and fresh, return cached (and 304 on ETag match).
@@ -1800,8 +1822,12 @@ def send_cached_json(key, ttl, payload_obj_builder):
                 _cache_set(key, payload_bytes, ttl)
             except Exception as e:
                 app.logger.warning("Background refresh failed for %s: %s", key, e)
+            finally:
+                _json_bg_refresh_release(key)
 
-        eventlet.spawn_n(_bg_refresh)
+        if _json_bg_refresh_try_acquire(key):
+            eventlet.spawn_n(_bg_refresh)
+        # else: a rebuild for this key is already running; serve stale only
 
         resp = Response(stale["data"], mimetype="application/json")
         etag = stale.get("etag")
