@@ -9438,7 +9438,9 @@ def get_combined():
 
     def build_payload():
         svc = get_sheets_service().spreadsheets().values()
-        with sheet_lock:
+        # Use acquire_sheet_lock (bounded wait) — raw sheet_lock can wait behind
+        # slow batchGets and contribute to Gunicorn worker timeout + restarts.
+        with acquire_sheet_lock():
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
                 ranges=[ORDERS_RANGE, FUR_RANGE, CUT_RANGE],
