@@ -1138,7 +1138,8 @@ def acquire_sheet_lock(timeout=None):
             
         def __enter__(self):
             try:
-                with Timeout(timeout_sec=self.timeout_sec):
+                # eventlet.Timeout(seconds) — not timeout_sec= (API changed / never valid).
+                with Timeout(self.timeout_sec):
                     self.lock.acquire()
                     self.acquired = True
                     return self
