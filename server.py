@@ -1498,6 +1498,8 @@ def _order_hash(obj: dict) -> str:
 # Cached snapshot of Production Orders (rows + by_id) with short TTL
 # ------------------------------------------------------------------------------
 _orders_rows_cache = {"ts": 0.0, "ttl": 15.0, "rows": None, "by_id": {}}
+# When Sheets is slow, return this from /api/changes so Render does not 502 (browser shows fake CORS).
+_changes_last_ok = {"data": None, "etag": "", "ts": 0.0}
 
 
 def _orders_rows_snapshot():
@@ -2629,12 +2631,17 @@ def api_kanban_mark_ordered():
 @login_required_session
 def api_changes():
     """
-    Fast diff endpoint used by Overview.jsx to detect changed orders.
-    Uses short in-memory cache to avoid repeated full-sheet reads.
+    Fast diff endpoint used by App.js polling to detect changed orders.
+    Shares Production Orders rows via _orders_rows_snapshot() (avoids duplicate
+    Sheet reads vs other endpoints). Longer HTTP cache + stale fallback avoid
+    Render 502s when Google Sheets is slow (browser reports those as CORS).
     """
+    from eventlet import Timeout
+
     now = time.time()
     key = "changes-v1"
-    ttl = 15  # seconds
+    ttl = int(os.environ.get("CHANGES_CACHE_TTL", "40"))
+    wait_sec = int(os.environ.get("CHANGES_SHEET_WAIT_SEC", "22"))
 
     # Serve from cache if fresh
     ent = _cache_get(key)
@@ -2646,8 +2653,32 @@ def api_changes():
         resp.headers["Cache-Control"] = f"public, max-age={ttl}"
         return resp
 
+    rows = None
     try:
-        rows = _orders_list_for_changes()
+        with Timeout(wait_sec):
+            rows, _ = _orders_rows_snapshot()
+    except Timeout:
+        current_app.logger.warning(
+            "api_changes: timed out after %ss waiting for orders snapshot",
+            wait_sec,
+        )
+    except Exception:
+        current_app.logger.exception("api_changes: orders snapshot failed")
+
+    if rows is None:
+        stale = _changes_last_ok.get("data")
+        if stale:
+            resp = Response(stale, mimetype="application/json")
+            resp.headers["ETag"] = _changes_last_ok.get("etag") or ""
+            resp.headers["Cache-Control"] = "public, max-age=5"
+            resp.headers["X-Scheduler-Changes-Stale"] = "1"
+            return resp
+        return (
+            jsonify({"error": "changes unavailable", "hashes": {}, "ts": time.time()}),
+            503,
+        )
+
+    try:
         mapping = {}
         for o in rows:
             oid = str(o.get("Order #", "")).strip()
@@ -2658,12 +2689,23 @@ def api_changes():
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         etag = _cache_set(key, data, ttl)
 
+        _changes_last_ok["data"] = data
+        _changes_last_ok["etag"] = etag
+        _changes_last_ok["ts"] = time.time()
+
         resp = Response(data, mimetype="application/json")
         resp.headers["ETag"] = etag
         resp.headers["Cache-Control"] = f"public, max-age={ttl}"
         return resp
     except Exception as e:
         current_app.logger.exception("api_changes failed: %s", e)
+        stale = _changes_last_ok.get("data")
+        if stale:
+            resp = Response(stale, mimetype="application/json")
+            resp.headers["ETag"] = _changes_last_ok.get("etag") or ""
+            resp.headers["Cache-Control"] = "public, max-age=5"
+            resp.headers["X-Scheduler-Changes-Stale"] = "1"
+            return resp
         return jsonify({"error": "changes failed"}), 500
 
 
@@ -15610,12 +15652,6 @@ def on_connect():
 @socketio.on("disconnect")
 def on_disconnect():
     logger.info(f"Client disconnected: {request.sid}")
-
-
-# Ensure all responses include CORS headers, even on errors (runs after other hooks)
-@app.after_request
-def apply_cors_headers(response):
-    return _attach_cors_headers(response)
 
 
 # --- Public URL shortener (no auth, no app redirects) ---
