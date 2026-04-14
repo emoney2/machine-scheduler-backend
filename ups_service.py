@@ -1,7 +1,8 @@
 # ups_service.py
 import base64, io, logging, os, re, shutil, sys, time, uuid, tempfile, json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple
+from zoneinfo import ZoneInfo
 import requests
 
 from ship_qbo_file_log import log_label
@@ -968,3 +969,299 @@ def create_shipment(
         ) from e
 
     return label_urls, tracking, saved_to_printer
+
+
+# ------- Quantum View (account shipment history) -------
+def _ups_quantum_view_endpoint() -> str:
+    ver = (os.getenv("UPS_QUANTUM_VIEW_API_VERSION") or "v3").strip()
+    if ver and not ver.startswith("v"):
+        ver = f"v{ver}"
+    return f"{_ups_base_url()}/api/quantumview/{ver}/events"
+
+
+def _qv_as_list(v: Any) -> List[Any]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    return [v]
+
+
+def _qv_walk_collect_manifest_dicts(node: Any, out: List[Dict[str, Any]]) -> None:
+    if isinstance(node, dict):
+        if "Manifest" in node:
+            for m in _qv_as_list(node.get("Manifest")):
+                if isinstance(m, dict):
+                    out.append(m)
+        for v in node.values():
+            _qv_walk_collect_manifest_dicts(v, out)
+    elif isinstance(node, list):
+        for item in node:
+            _qv_walk_collect_manifest_dicts(item, out)
+
+
+def _qv_response_root(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    return (
+        data.get("QuantumViewResponse")
+        or data.get("quantumViewResponse")
+        or data
+    )
+
+
+def _qv_response_errors(root: Dict[str, Any]) -> List[str]:
+    resp = root.get("Response")
+    if not isinstance(resp, dict):
+        return []
+    errs = _qv_as_list(resp.get("Error"))
+    messages = []
+    for e in errs:
+        if not isinstance(e, dict):
+            continue
+        desc = (e.get("ErrorDescription") or "").strip()
+        code = (e.get("ErrorCode") or "").strip()
+        if desc or code:
+            messages.append(f"{code}: {desc}".strip(": "))
+    return messages
+
+
+def _qv_is_response_success(root: Dict[str, Any]) -> bool:
+    resp = root.get("Response")
+    if not isinstance(resp, dict):
+        return True
+    code = str(resp.get("ResponseStatusCode", "")).strip()
+    return code in ("", "1")
+
+
+def _manifest_rows_from_quantum_view(manifests: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for manifest in manifests:
+        ship_to = manifest.get("ShipTo") if isinstance(manifest.get("ShipTo"), dict) else {}
+        company = (
+            (ship_to.get("CompanyName") or "").strip()
+            or (ship_to.get("AttentionName") or "").strip()
+            or (ship_to.get("ReceivingAddressName") or "").strip()
+        )
+        pickup = (manifest.get("PickupDate") or "").strip()
+        ship_date = pickup[:8] if len(pickup) >= 8 else ""
+        for pkg in _qv_as_list(manifest.get("Package")):
+            if not isinstance(pkg, dict):
+                continue
+            trk = (pkg.get("TrackingNumber") or "").strip()
+            if not trk:
+                continue
+            rows.append(
+                {
+                    "tracking_number": trk,
+                    "company": company or "—",
+                    "ship_date": ship_date,
+                }
+            )
+    return rows
+
+
+def _dedupe_tracking_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    best: Dict[str, Dict[str, str]] = {}
+    for r in rows:
+        t = r.get("tracking_number") or ""
+        if not t:
+            continue
+        prev = best.get(t)
+        if not prev or (r.get("ship_date") or "") > (prev.get("ship_date") or ""):
+            best[t] = r
+    out = list(best.values())
+    out.sort(key=lambda x: x.get("ship_date") or "", reverse=True)
+    return out
+
+
+def _qv_fetch_manifests_for_subscription(
+    subscription_name: str,
+    begin_s: str,
+    end_s: str,
+    token: str,
+    url: str,
+) -> Tuple[List[Dict[str, Any]], str | None, int]:
+    """
+    One subscription name: paginate by Bookmark until done.
+    Returns (manifest_dicts, error_message_or_none, total_rounds).
+    """
+    all_manifests: List[Dict[str, Any]] = []
+    bookmark: str | None = None
+    rounds = 0
+    max_rounds = 15
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "transId": _trans_id_header(),
+        "transactionSrc": "JRCO",
+    }
+
+    while rounds < max_rounds:
+        rounds += 1
+        body: Dict[str, Any] = {
+            "QuantumViewRequest": {
+                "Request": {
+                    "TransactionReference": {"CustomerContext": "jrco-ship-history"},
+                    "RequestAction": "QVEvents",
+                },
+                "SubscriptionRequest": [
+                    {
+                        "Name": subscription_name,
+                        "DateTimeRange": {
+                            "BeginDateTime": begin_s,
+                            "EndDateTime": end_s,
+                        },
+                    }
+                ],
+            }
+        }
+        if bookmark:
+            body["QuantumViewRequest"]["Bookmark"] = bookmark
+
+        resp = requests.post(url, headers=headers, json=body, timeout=45)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+
+        if not resp.ok:
+            snippet = _ups_error_snippet(resp)
+            return (
+                all_manifests,
+                f"HTTP {resp.status_code} for subscription {subscription_name!r}: {snippet}",
+                rounds,
+            )
+
+        root = _qv_response_root(data)
+        if not _qv_is_response_success(root):
+            err_txt = (
+                "; ".join(_qv_response_errors(root))
+                or "Quantum View request failed"
+            )
+            return (
+                all_manifests,
+                f"{subscription_name!r}: {err_txt}",
+                rounds,
+            )
+
+        chunk: List[Dict[str, Any]] = []
+        _qv_walk_collect_manifest_dicts(root, chunk)
+        all_manifests.extend(chunk)
+
+        next_bm = root.get("Bookmark") or root.get("bookmark")
+        if (
+            isinstance(next_bm, str)
+            and next_bm.strip()
+            and next_bm.strip() != (bookmark or "").strip()
+        ):
+            bookmark = next_bm.strip()
+            continue
+        break
+
+    return all_manifests, None, rounds
+
+
+def quantum_view_fetch_shipment_rows(days: int = 7) -> Dict[str, Any]:
+    """
+    Pull recent outbound shipment rows from UPS Quantum View (requires UPS-side subscription).
+
+    Env:
+      UPS_QUANTUM_VIEW_SUBSCRIPTION_NAME — optional. Comma-separated subscription names to query.
+        If unset, defaults to OutboundXML (UPS docs example: outbound + XML feed).
+        Your UPS Quantum View setup may use the same name, or a custom name from Manage Subscriptions.
+      UPS_QUANTUM_VIEW_TIMEZONE — IANA zone for date window (default America/New_York).
+      UPS_QUANTUM_VIEW_API_VERSION — default v3.
+
+    Returns:
+      dict with rows, error, message, subscription_names_tried, used_default_subscription_name, etc.
+    """
+    raw_names = (os.getenv("UPS_QUANTUM_VIEW_SUBSCRIPTION_NAME") or "").strip()
+    used_default = not bool(raw_names)
+    if not raw_names:
+        raw_names = "OutboundXML"
+    subscription_names = [x.strip() for x in raw_names.split(",") if x.strip()]
+
+    try:
+        d = max(1, min(int(days or 7), 7))
+    except (TypeError, ValueError):
+        d = 7
+
+    tz_name = (os.getenv("UPS_QUANTUM_VIEW_TIMEZONE") or "America/New_York").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+
+    end = datetime.now(tz)
+    begin = end - timedelta(days=d)
+    begin_s = begin.strftime("%Y%m%d%H%M%S")
+    end_s = end.strftime("%Y%m%d%H%M%S")
+
+    token = get_access_token()
+    url = _ups_quantum_view_endpoint()
+
+    all_manifests: List[Dict[str, Any]] = []
+    per_name_errors: List[str] = []
+    total_rounds = 0
+
+    for sub in subscription_names:
+        manifests, err, rounds = _qv_fetch_manifests_for_subscription(
+            sub, begin_s, end_s, token, url
+        )
+        total_rounds += rounds
+        if err:
+            per_name_errors.append(err)
+            continue
+        all_manifests.extend(manifests)
+
+    raw_rows = _manifest_rows_from_quantum_view(all_manifests)
+    rows = _dedupe_tracking_rows(raw_rows)
+
+    hint_default = None
+    if used_default:
+        hint_default = (
+            "No UPS_QUANTUM_VIEW_SUBSCRIPTION_NAME was set; used the UPS documentation default "
+            "OutboundXML. If the list is empty or you see errors, set the variable to the exact "
+            "subscription name from your UPS Quantum View subscription (UPS.com → Shipping → "
+            "Quantum View Manage Subscriptions), or try comma-separated names, e.g. "
+            "OutboundXML,YourCustomName."
+        )
+
+    if rows:
+        return {
+            "configured": True,
+            "rows": rows,
+            "message": hint_default,
+            "error": None,
+            "bookmark_rounds": total_rounds,
+            "subscription_names_tried": subscription_names,
+            "used_default_subscription_name": used_default,
+        }
+
+    if per_name_errors:
+        joined = " ".join(per_name_errors)
+        return {
+            "configured": True,
+            "rows": [],
+            "message": hint_default,
+            "error": joined,
+            "bookmark_rounds": total_rounds,
+            "subscription_names_tried": subscription_names,
+            "used_default_subscription_name": used_default,
+        }
+
+    return {
+        "configured": True,
+        "rows": [],
+        "message": hint_default
+        or (
+            "Quantum View returned no manifest rows in this date range for "
+            f"{subscription_names!r}. Confirm outbound shipments exist in the last {d} day(s) "
+            "and that the subscription name matches UPS (set UPS_QUANTUM_VIEW_SUBSCRIPTION_NAME if needed)."
+        ),
+        "error": None,
+        "bookmark_rounds": total_rounds,
+        "subscription_names_tried": subscription_names,
+        "used_default_subscription_name": used_default,
+    }

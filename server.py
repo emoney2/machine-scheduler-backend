@@ -158,6 +158,7 @@ from ups_service import (
     create_shipment as ups_create_shipment,
     _label_output_path_usable_on_this_host,
     _save_trimmed_label_to_printer_folder,
+    quantum_view_fetch_shipment_rows,
 )
 import ship_qbo_file_log as sqlog
 from google.oauth2.credentials import Credentials as OAuthCredentials
@@ -14177,6 +14178,60 @@ def reprint_label():
             "drive_uploaded": drive_ok,
             "local_copied": local_ok,
             "source": src,
+        }
+    )
+    resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
+
+@app.route("/api/shipping-history-ups", methods=["OPTIONS", "GET"])
+@login_required_session
+def shipping_history_ups():
+    """
+    Recent outbound shipments from UPS Quantum View (last N days, max 7 per UPS rules).
+    Query: days=1..7 (default 7).
+    Optional env UPS_QUANTUM_VIEW_SUBSCRIPTION_NAME (comma-separated); if unset, OutboundXML is used.
+    """
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Requested-With, Accept"
+        )
+        resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        return resp
+    try:
+        days = int(request.args.get("days", 7))
+    except (TypeError, ValueError):
+        days = 7
+    try:
+        qv = quantum_view_fetch_shipment_rows(days=days)
+    except Exception as e:
+        logging.warning("shipping_history_ups: %s", e)
+        resp = jsonify(
+            {
+                "success": False,
+                "configured": True,
+                "rows": [],
+                "error": str(e),
+            }
+        )
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp, 500
+
+    resp = jsonify(
+        {
+            "success": qv.get("error") is None,
+            "configured": bool(qv.get("configured")),
+            "rows": qv.get("rows") or [],
+            "message": qv.get("message"),
+            "error": qv.get("error"),
+            "bookmark_rounds": qv.get("bookmark_rounds"),
+            "subscription_names_tried": qv.get("subscription_names_tried"),
+            "used_default_subscription_name": qv.get("used_default_subscription_name"),
         }
     )
     resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
