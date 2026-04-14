@@ -1,5 +1,7 @@
-# Playwright is NOT listed here — it costs a lot of RAM/disk on 512MB Render.
-# For Madeira automation only: pip install -r requirements-playwright.txt (see that file).
+# Playwright is NOT in this file (saves RAM on 512MB). Optional: requirements-playwright.txt
+#
+# RENDER: Build Command must NOT run "playwright install" unless you install that file first.
+# Recommended: bash render-build.sh   (or: pip install --no-cache-dir -r requirements.txt)
 Flask
 flask-cors>=4.0.0
 flask-socketio
