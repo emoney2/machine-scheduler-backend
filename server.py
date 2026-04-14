@@ -157,6 +157,7 @@ from ups_service import (
     get_rate as ups_get_rate,
     create_shipment as ups_create_shipment,
     _label_output_path_usable_on_this_host,
+    _save_trimmed_label_to_printer_folder,
 )
 import ship_qbo_file_log as sqlog
 from google.oauth2.credentials import Credentials as OAuthCredentials
@@ -4773,6 +4774,65 @@ def _upload_ups_labels_to_drive_folder(label_relative_urls) -> bool:
             logging.warning("UPS label Drive upload failed for %s: %s", fname, e)
             all_ok = False
     return all_ok
+
+
+def _drive_query_escape_name(name: str) -> str:
+    """Escape a file name for use inside a Drive API q= string literal."""
+    return (name or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _fetch_ups_label_bytes_for_tracking(tracking: str):
+    """
+    Locate label bytes for a UPS tracking number: temp dir first, then Drive Label Printer folder.
+    Returns (body: bytes|None, ext: str, source: str) where ext is pdf|png|zpl and source is temp|drive|''.
+    """
+    t = str(tracking or "").strip()
+    if not t:
+        return None, "", ""
+    base = re.sub(r"[^\w.\-]+", "_", t)[:120]
+    if not base:
+        return None, "", ""
+    for ext in ("pdf", "png", "zpl"):
+        fname = f"ups_{base}.{ext}"
+        fpath = os.path.join(tempfile.gettempdir(), fname)
+        if os.path.isfile(fpath):
+            try:
+                with open(fpath, "rb") as lf:
+                    return lf.read(), ext, "temp"
+            except OSError as e:
+                logging.warning("reprint: could not read temp label %s: %s", fpath, e)
+    try:
+        drive = get_drive_service()
+        parent_id = _get_label_print_drive_folder_id(drive)
+        list_kw = dict(
+            fields="files(id,name)",
+            pageSize=10,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+        for ext in ("pdf", "png", "zpl"):
+            fname = f"ups_{base}.{ext}"
+            q = (
+                f"name = '{_drive_query_escape_name(fname)}' and "
+                f"'{parent_id}' in parents and trashed = false"
+            )
+            res = drive.files().list(q=q, **list_kw).execute()
+            files = res.get("files") or []
+            if not files:
+                continue
+            fid = files[0]["id"]
+            request_drive = drive.files().get_media(fileId=fid)
+            buf = BytesIO()
+            downloader = MediaIoBaseDownload(buf, request_drive)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            data = buf.getvalue()
+            if data:
+                return data, ext, "drive"
+    except Exception as e:
+        logging.warning("reprint: Drive lookup failed for tracking=%s: %s", t, e)
+    return None, "", ""
 
 
 def _packing_slip_local_sync_dir() -> str:
@@ -14013,6 +14073,115 @@ def process_shipment():
         resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         return resp, 500
+
+
+@app.route("/api/reprint-label", methods=["OPTIONS", "POST"])
+@login_required_session
+def reprint_label():
+    """
+    Re-save a UPS label to the Label Printer folder (Google Drive + local sync when configured).
+    Body JSON: { "tracking": "1Z..." }. Label bytes are read from server temp or from the Drive label folder.
+    """
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Requested-With, Accept"
+        )
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
+    data = request.get_json() or {}
+    tracking = str(data.get("tracking") or "").strip()
+    body, ext, src = _fetch_ups_label_bytes_for_tracking(tracking)
+    if not body or not ext:
+        resp = jsonify(
+            {
+                "success": False,
+                "error": (
+                    "Label not found for that tracking number. "
+                    "It may still be on this server’s temp disk, or in Drive as ups_<tracking>.pdf "
+                    "under your Label Printer folder."
+                ),
+            }
+        )
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp, 404
+    base = re.sub(r"[^\w.\-]+", "_", tracking)[:120]
+    out_fname = f"ups_{base}_reprint_{int(time.time())}.{ext}"
+    mime = (
+        "application/pdf"
+        if ext == "pdf"
+        else "image/png"
+        if ext == "png"
+        else "application/octet-stream"
+    )
+    tmp_reprint = os.path.join(tempfile.gettempdir(), out_fname)
+    try:
+        with open(tmp_reprint, "wb") as f:
+            f.write(body)
+    except OSError as e:
+        logging.warning("reprint: could not write temp file %s: %s", tmp_reprint, e)
+        resp = jsonify({"success": False, "error": "Could not write label file on server."})
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp, 500
+
+    drive_ok = False
+    try:
+        drive = get_drive_service()
+        parent_id = _get_label_print_drive_folder_id(drive)
+        buf = BytesIO(body)
+        buf.seek(0)
+        media = MediaIoBaseUpload(buf, mimetype=mime, resumable=False)
+        drive.files().create(
+            body={"name": out_fname, "parents": [parent_id]},
+            media_body=media,
+            fields="id,name",
+            supportsAllDrives=True,
+        ).execute()
+        drive_ok = True
+    except Exception as e:
+        logging.warning("reprint: Drive upload failed: %s", e)
+
+    local_ok = bool(_save_trimmed_label_to_printer_folder(tmp_reprint, out_fname))
+    try:
+        sqlog.log_ship(
+            "reprint_label",
+            tracking=tracking,
+            ext=ext,
+            source=src,
+            drive_upload=drive_ok,
+            local_copy=local_ok,
+            filename=out_fname,
+        )
+    except Exception:
+        pass
+
+    if not drive_ok and not local_ok:
+        resp = jsonify(
+            {
+                "success": False,
+                "error": "Could not copy label to Drive or local Label Printer path. Check Drive API and UPS_LABEL_OUTPUT_DIR.",
+            }
+        )
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp, 500
+
+    resp = jsonify(
+        {
+            "success": True,
+            "filename": out_fname,
+            "drive_uploaded": drive_ok,
+            "local_copied": local_ok,
+            "source": src,
+        }
+    )
+    resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
 
 
 @app.route("/api/shipment-client-log", methods=["OPTIONS", "POST"])
