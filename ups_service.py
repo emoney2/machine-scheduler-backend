@@ -254,46 +254,38 @@ def _label_output_path_usable_on_this_host(out_dir: str) -> bool:
     return False
 
 
-def _maybe_save_ups_label_debug_raw(tracking: str, ext: str, raw_bytes: bytes) -> None:
+def _save_ups_label_api_raw_copy(tracking: str, ext: str, raw_bytes: bytes) -> None:
     """
-    Save undecorated label bytes straight from UPS (before PDF trim / normalization).
+    Always save undecorated label bytes from UPS (before trim) for troubleshooting.
 
-    Set UPS_LABEL_DEBUG_SAVE_RAW=1 (or true) to write next to normal temp files, or set
-    UPS_LABEL_DEBUG_DIR to an absolute folder to drop files there for easy sharing.
-
-    Output name: ups_<tracking>_api_raw.<ext> (e.g. ups_1Z999..._api_raw.pdf)
-    Trimmed file remains ups_<tracking>.<ext> in system temp (served as /labels/...).
+    File: ups_<safe_tracking>_api_raw.<ext> in the system temp directory (served as /labels/...).
+    Set UPS_LABEL_DEBUG_DIR to also copy the raw file to that folder.
     """
-    flag = (os.getenv("UPS_LABEL_DEBUG_SAVE_RAW") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-    dbg_dir = (os.getenv("UPS_LABEL_DEBUG_DIR") or "").strip()
-    if not flag and not dbg_dir:
-        return
-    out_dir = dbg_dir or tempfile.gettempdir()
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-    except OSError as e:
-        logging.warning("UPS_LABEL_DEBUG: cannot create directory %s: %s", out_dir, e)
-        return
     safe_trk = re.sub(r"[^\w.\-]+", "_", str(tracking or "unknown"))[:120]
     raw_name = f"ups_{safe_trk}_api_raw.{ext}"
-    raw_path = os.path.join(out_dir, raw_name)
+    tmp_dir = tempfile.gettempdir()
+    raw_path = os.path.join(tmp_dir, raw_name)
     try:
         with open(raw_path, "wb") as f:
             f.write(raw_bytes)
-        logging.info(
-            "UPS label debug: raw API bytes → %s (trimmed for printing: %s/ups_%s.%s)",
-            raw_path,
-            tempfile.gettempdir(),
-            tracking,
-            ext,
+        log_label(
+            "label_api_raw_saved",
+            tracking=str(tracking or ""),
+            path_basename=raw_name,
+            byte_len=len(raw_bytes or b""),
         )
     except OSError as e:
-        logging.warning("UPS_LABEL_DEBUG: failed writing %s: %s", raw_path, e)
+        logging.warning("UPS label raw copy: failed writing %s: %s", raw_path, e)
+        return
+    dbg_dir = (os.getenv("UPS_LABEL_DEBUG_DIR") or "").strip()
+    if not dbg_dir:
+        return
+    try:
+        os.makedirs(dbg_dir, exist_ok=True)
+        shutil.copy2(raw_path, os.path.join(dbg_dir, raw_name))
+        logging.info("UPS label raw copy: also wrote %s", os.path.join(dbg_dir, raw_name))
+    except OSError as e:
+        logging.warning("UPS_LABEL_DEBUG_DIR copy failed: %s", e)
 
 
 def _save_trimmed_label_to_printer_folder(fpath: str, fname: str) -> bool:
@@ -414,6 +406,27 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         rect = RectangleObject([left, bottom, right, new_top])
         page.mediabox = rect
         page.cropbox = rect
+
+    def _letter_label_likely_lower_half(p, trk: str) -> bool:
+        """
+        When UPS puts instructions at the top of one US Letter page and the label below,
+        tracking text often appears only in the lower half of extracted lines.
+        """
+        wanted = re.sub(r"[^A-Za-z0-9]", "", str(trk or "")).upper()
+        if len(wanted) < 10:
+            return False
+        try:
+            lines = [ln for ln in (p.extract_text() or "").splitlines() if ln.strip()]
+        except Exception:
+            return False
+        if len(lines) < 8:
+            return False
+        mid = max(1, len(lines) // 2)
+        upper = "\n".join(lines[:mid])
+        lower = "\n".join(lines[mid:])
+        nu = re.sub(r"[^A-Za-z0-9]", "", upper).upper()
+        nl = re.sub(r"[^A-Za-z0-9]", "", lower).upper()
+        return wanted in nl and wanted not in nu
 
     def _prefer_bottom_letter_band(p, instrux_hits: int) -> bool:
         """
@@ -548,12 +561,18 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         letter_crop = None
         if mode in ("auto", "letter_crop"):
             w, h = _dims_at(best_idx)
-            if _looks_like_us_letter(w, h) and _prefer_bottom_letter_band(
-                src_page, instrux_hits
-            ):
+            use_bottom = False
+            if _looks_like_us_letter(w, h):
+                if _prefer_bottom_letter_band(src_page, instrux_hits):
+                    use_bottom = True
+                elif expected_tracking and _letter_label_likely_lower_half(
+                    src_page, expected_tracking
+                ):
+                    use_bottom = True
+            if use_bottom:
                 letter_crop = "bottom_band"
                 _crop_us_letter_keep_bottom_band(page)
-            else:
+            elif _looks_like_us_letter(w, h):
                 letter_crop = "top_band_or_none"
                 _crop_us_letter_label_only(page)
 
@@ -920,13 +939,14 @@ def create_shipment(
             # UPS sometimes embeds CRLF in base64 streams; strict b64decode rejects them.
             img_clean = re.sub(r"\s+", "", img.strip())
             ext = "pdf" if LABEL_FORMAT == "PDF" else ("png" if LABEL_FORMAT == "PNG" else "zpl")
-            fname = f"ups_{trk}.{ext}"
+            safe_trk = re.sub(r"[^\w.\-]+", "_", str(trk or "unknown"))[:120]
+            fname = f"ups_{safe_trk}.{ext}"
             fpath = os.path.join(tempfile.gettempdir(), fname)
             try:
                 payload = base64.b64decode(img_clean, validate=True)
             except Exception:
                 payload = base64.b64decode(img_clean, validate=False)
-            _maybe_save_ups_label_debug_raw(trk, ext, payload)
+            _save_ups_label_api_raw_copy(trk, ext, payload)
             if ext == "pdf":
                 payload = _normalize_ups_label_pdf_bytes(payload, expected_tracking=trk)
             with open(fpath, "wb") as f:
