@@ -41,7 +41,6 @@ from flask import request, make_response, jsonify, Response
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest, AuthorizedSession
 from math import ceil
-from playwright.async_api import async_playwright
 from functools import wraps
 from flask import request, session, jsonify, redirect, url_for, make_response
 from datetime import datetime, timedelta
@@ -569,8 +568,10 @@ os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
 # --- Tiny in-process cache for Drive thumbnails ---
 _drive_thumb_cache = {}  # key: f"{file_id}:{modified_time}" -> {'bytes': b, 'ts': float}
-_drive_thumb_ttl = 300  # seconds (5 min) - reduced from 10 min
-_drive_thumb_cache_max_size = 72  # In-memory image bytes; 512MB Render OOMs if too high
+_drive_thumb_ttl = int(os.environ.get("DRIVE_THUMB_TTL_SEC", "180"))  # shorter = less RAM on 512MB
+_drive_thumb_cache_max_size = int(
+    os.environ.get("DRIVE_THUMB_CACHE_MAX", "48")
+)  # In-memory image bytes
 _drive_thumb_cache_last_cleanup = 0
 _drive_thumb_cache_cleanup_interval = 120  # Clean up every 2 minutes - more frequent
 
@@ -1691,10 +1692,10 @@ _json_bg_inflight_lock = threading.Lock()
 # key -> {'ts': float, 'ttl': int, 'etag': str, 'data': bytes}
 _json_cache = {}
 _json_cache_last_cleanup = 0
-_json_cache_cleanup_interval = 120  # Clean up every 2 minutes - more frequent
+_json_cache_cleanup_interval = 45  # Evict expired JSON cache more often on small instances
 _json_cache_max_size = int(
-    os.environ.get("JSON_CACHE_MAX_ENTRIES", "120")
-)  # Large values = full /api/combined; keep low on 512MB Render
+    os.environ.get("JSON_CACHE_MAX_ENTRIES", "60")
+)  # full /api/combined per entry; keep very low on 512MB Render
 
 
 def _cache_cleanup():
@@ -1836,9 +1837,11 @@ def send_cached_json(key, ttl, payload_obj_builder):
             finally:
                 _json_bg_refresh_release(key)
 
-        if _json_bg_refresh_try_acquire(key):
+        # Skip background refresh for huge Sheet payloads — on 512MB Render it doubled RSS
+        # (foreground request + spawn_n rebuild). Stale is served until the next cache miss.
+        if key not in ("combined", "combined-v2") and _json_bg_refresh_try_acquire(key):
             eventlet.spawn_n(_bg_refresh)
-        # else: a rebuild for this key is already running; serve stale only
+        # else: combined keys refresh only on next direct build; or inflight already running
 
         resp = Response(stale["data"], mimetype="application/json")
         etag = stale.get("etag")
@@ -2060,6 +2063,9 @@ async def madeira_login_and_cart(items):
     Ensures login, then for each item visits page, sets qty if possible, otherwise clicks Add to Cart N times.
     Ends on cart page.
     """
+    # Lazy import: playwright is heavy (~100MB+ RSS); most requests never touch Madeira.
+    from playwright.async_api import async_playwright
+
     email = os.environ.get("MADEIRA_EMAIL")
     password = os.environ.get("MADEIRA_PASSWORD")
     if not email or not password:
