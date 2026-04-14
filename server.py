@@ -570,7 +570,7 @@ os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 # --- Tiny in-process cache for Drive thumbnails ---
 _drive_thumb_cache = {}  # key: f"{file_id}:{modified_time}" -> {'bytes': b, 'ts': float}
 _drive_thumb_ttl = 300  # seconds (5 min) - reduced from 10 min
-_drive_thumb_cache_max_size = 120  # In-memory image bytes; keep modest for small Render RAM
+_drive_thumb_cache_max_size = 72  # In-memory image bytes; 512MB Render OOMs if too high
 _drive_thumb_cache_last_cleanup = 0
 _drive_thumb_cache_cleanup_interval = 120  # Clean up every 2 minutes - more frequent
 
@@ -609,7 +609,7 @@ def _drive_thumb_cache_cleanup():
 
 # Cap parallel upstream thumbnail work (Overview loads many images at once → OOM/restarts).
 _drive_thumb_fetch_sem = Semaphore(
-    max(1, int(os.environ.get("DRIVE_THUMB_MAX_CONCURRENT", "4")))
+    max(1, int(os.environ.get("DRIVE_THUMB_MAX_CONCURRENT", "2")))
 )
 
 _matlog_cache = None  # {"by_order": {"123": [items...]}, "ts": float}
@@ -1692,7 +1692,9 @@ _json_bg_inflight_lock = threading.Lock()
 _json_cache = {}
 _json_cache_last_cleanup = 0
 _json_cache_cleanup_interval = 120  # Clean up every 2 minutes - more frequent
-_json_cache_max_size = 300  # Cap JSON cache entries (large values = orders/combined)
+_json_cache_max_size = int(
+    os.environ.get("JSON_CACHE_MAX_ENTRIES", "120")
+)  # Large values = full /api/combined; keep low on 512MB Render
 
 
 def _cache_cleanup():
