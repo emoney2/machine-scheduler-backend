@@ -7165,6 +7165,78 @@ def _overview_exclude_completed_or_shipped(order_row: dict) -> bool:
     return False
 
 
+def _overview_normalize_order_key(oid_raw) -> str:
+    """Stable string key for Order # (500 and 500.0 → '500')."""
+    if oid_raw is None:
+        return ""
+    s = str(oid_raw).strip()
+    if not s:
+        return ""
+    try:
+        f = float(s)
+        if abs(f - round(f)) < 1e-9:
+            return str(int(round(f)))
+        return s
+    except (TypeError, ValueError):
+        return s
+
+
+def _overview_order_int(oid_raw):
+    try:
+        f = float(str(oid_raw).strip())
+        i = int(round(f))
+        if abs(f - i) > 1e-9:
+            return None
+        return i
+    except (TypeError, ValueError):
+        return None
+
+
+def _overview_product_is_front_only(product) -> bool:
+    s = str(product or "").strip().lower()
+    if not s:
+        return False
+    s = re.sub(r"\s+", " ", s)
+    has_front = bool(re.search(r"\bfront\b", s))
+    has_back = bool(re.search(r"\bback\b", s))
+    return has_front and not has_back
+
+
+def _overview_product_is_back_only(product) -> bool:
+    s = str(product or "").strip().lower()
+    if not s:
+        return False
+    s = re.sub(r"\s+", " ", s)
+    has_front = bool(re.search(r"\bfront\b", s))
+    has_back = bool(re.search(r"\bback\b", s))
+    return has_back and not has_front
+
+
+def _overview_product_pair_base_key(product) -> str:
+    """Product text without 'front'/'back' for matching Fairway Front ↔ Fairway Back."""
+    s = str(product or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\bfront\b", "", s)
+    s = re.sub(r"\bback\b", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _overview_sewing_top_for_order(sewing_map: dict, oid_raw):
+    if not sewing_map or oid_raw is None:
+        return None
+    candidates = []
+    s = str(oid_raw).strip()
+    if s:
+        candidates.append(s)
+    nk = _overview_normalize_order_key(oid_raw)
+    if nk and nk not in candidates:
+        candidates.append(nk)
+    for c in candidates:
+        if c in sewing_map:
+            return sewing_map[c]
+    return None
+
+
 def build_overview_payload():
     """
     Returns upcoming + overdue job data from Google Sheets Production Orders
@@ -7185,6 +7257,7 @@ def build_overview_payload():
 
     rows = []
     sewing_by_order = {}
+    orders_full_for_pairing = []
     try:
         svc = get_sheets_service().spreadsheets().values()
         with sheet_lock:
@@ -7225,6 +7298,7 @@ def build_overview_payload():
             return out
 
         orders_full = _rows_to_dicts_local(orders_rows)
+        orders_full_for_pairing = orders_full
         fur_full = _rows_to_dicts_local(fur_rows)
         cut_full = _rows_to_dicts_local(cut_rows)
 
@@ -7276,6 +7350,19 @@ def build_overview_payload():
         len(rows),
     )
 
+    # Front row N + Back row N+1 (same product family): one sewing session — if Sewing Summary
+    # completes the front order, show the green check on the back line too.
+    panel_by_order_key = {}
+    for o in orders_full_for_pairing or []:
+        k = _overview_normalize_order_key(o.get("Order #"))
+        if not k:
+            continue
+        prod = o.get("Product")
+        if _overview_product_is_front_only(prod):
+            panel_by_order_key[k] = ("front", _overview_product_pair_base_key(prod))
+        elif _overview_product_is_back_only(prod):
+            panel_by_order_key[k] = ("back", _overview_product_pair_base_key(prod))
+
     # Map fields to match frontend expectations (only filter out COMPLETE jobs, which is already done in query)
     # Optimized date parsing helper
     from datetime import datetime
@@ -7322,14 +7409,47 @@ def build_overview_payload():
 
     upcoming = []
     for r in (rows or []):
-        oid = str(r.get("Order #") or "").strip()
+        oid_raw = r.get("Order #")
+        oid = str(oid_raw or "").strip()
         qty = _qty_float_safe(r.get("Quantity"))
-        top = sewing_by_order.get(oid) if oid else None
+        top = _overview_sewing_top_for_order(sewing_by_order, oid_raw)
         sewing_summary_complete = (
             qty is not None
             and top is not None
             and top >= qty - 1e-9
         )
+        if not sewing_summary_complete:
+            n = _overview_order_int(oid_raw)
+            if (
+                n is not None
+                and n > 1
+                and _overview_product_is_back_only(r.get("Product"))
+            ):
+                prev_key = str(n - 1)
+                prev_panel = panel_by_order_key.get(prev_key)
+                my_base = _overview_product_pair_base_key(r.get("Product"))
+                if (
+                    prev_panel
+                    and prev_panel[0] == "front"
+                    and my_base
+                    and prev_panel[1] == my_base
+                ):
+                    front_row = None
+                    for o in orders_full_for_pairing or []:
+                        if _overview_normalize_order_key(o.get("Order #")) == prev_key:
+                            front_row = o
+                            break
+                    if front_row is not None:
+                        fq = _qty_float_safe(front_row.get("Quantity"))
+                        ft = _overview_sewing_top_for_order(
+                            sewing_by_order, front_row.get("Order #")
+                        )
+                        if (
+                            fq is not None
+                            and ft is not None
+                            and ft >= fq - 1e-9
+                        ):
+                            sewing_summary_complete = True
         # Map fields to match frontend expectations
         job = {
             "Order #": r.get("Order #"),
