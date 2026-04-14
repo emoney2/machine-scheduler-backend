@@ -1,3 +1,5 @@
+# Playwright is NOT listed here — it costs a lot of RAM/disk on 512MB Render.
+# For Madeira automation only: pip install -r requirements-playwright.txt (see that file).
 Flask
 flask-cors>=4.0.0
 flask-socketio
@@ -12,10 +14,8 @@ python-dotenv
 xmltodict==0.14.2
 requests
 reportlab
-playwright==1.46.0
 httpx
 psutil==5.9.8
-requests
 pypdf>=4.0
 beautifulsoup4
 lxml

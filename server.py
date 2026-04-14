@@ -570,7 +570,7 @@ os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 _drive_thumb_cache = {}  # key: f"{file_id}:{modified_time}" -> {'bytes': b, 'ts': float}
 _drive_thumb_ttl = int(os.environ.get("DRIVE_THUMB_TTL_SEC", "180"))  # shorter = less RAM on 512MB
 _drive_thumb_cache_max_size = int(
-    os.environ.get("DRIVE_THUMB_CACHE_MAX", "48")
+    os.environ.get("DRIVE_THUMB_CACHE_MAX", "32")
 )  # In-memory image bytes
 _drive_thumb_cache_last_cleanup = 0
 _drive_thumb_cache_cleanup_interval = 120  # Clean up every 2 minutes - more frequent
@@ -610,7 +610,7 @@ def _drive_thumb_cache_cleanup():
 
 # Cap parallel upstream thumbnail work (Overview loads many images at once → OOM/restarts).
 _drive_thumb_fetch_sem = Semaphore(
-    max(1, int(os.environ.get("DRIVE_THUMB_MAX_CONCURRENT", "2")))
+    max(1, int(os.environ.get("DRIVE_THUMB_MAX_CONCURRENT", "1")))
 )
 
 _matlog_cache = None  # {"by_order": {"123": [items...]}, "ts": float}
@@ -1647,14 +1647,18 @@ except Exception as e:
     print(f"⚠️ Error registering Shopify routes: {e}")
 
 
-# Optional GZIP compression (safe if package missing)
-try:
-    from flask_compress import Compress
+# Compression loads brotli/zstd paths — skip on 512MB unless explicitly enabled.
+if os.environ.get("ENABLE_FLASK_COMPRESS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+):
+    try:
+        from flask_compress import Compress
 
-    Compress(app)
-except Exception:
-    # gzip not available; continue without it
-    pass
+        Compress(app)
+    except Exception:
+        pass
 
 CORS(
     app,
@@ -1694,7 +1698,7 @@ _json_cache = {}
 _json_cache_last_cleanup = 0
 _json_cache_cleanup_interval = 45  # Evict expired JSON cache more often on small instances
 _json_cache_max_size = int(
-    os.environ.get("JSON_CACHE_MAX_ENTRIES", "60")
+    os.environ.get("JSON_CACHE_MAX_ENTRIES", "36")
 )  # full /api/combined per entry; keep very low on 512MB Render
 
 
@@ -2063,8 +2067,14 @@ async def madeira_login_and_cart(items):
     Ensures login, then for each item visits page, sets qty if possible, otherwise clicks Add to Cart N times.
     Ends on cart page.
     """
-    # Lazy import: playwright is heavy (~100MB+ RSS); most requests never touch Madeira.
-    from playwright.async_api import async_playwright
+    # Playwright is optional (see requirements-playwright.txt). Omit on 512MB Render.
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as e:
+        raise RuntimeError(
+            "Playwright is not installed (removed from default requirements for memory). "
+            "Install requirements-playwright.txt on the server to enable Madeira automation."
+        ) from e
 
     email = os.environ.get("MADEIRA_EMAIL")
     password = os.environ.get("MADEIRA_PASSWORD")

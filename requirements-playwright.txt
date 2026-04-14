@@ -1,0 +1,4 @@
+# Optional: only if you use Madeira cart automation (adds significant RAM/disk).
+# Install after base: pip install -r requirements.txt && pip install -r requirements-playwright.txt
+# You may also need: playwright install chromium
+playwright==1.46.0
