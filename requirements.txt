@@ -1,7 +1,4 @@
-# Playwright is NOT in this file (saves RAM on 512MB). Optional: requirements-playwright.txt
-#
-# RENDER: Build Command must NOT run "playwright install" unless you install that file first.
-# Recommended: bash render-build.sh   (or: pip install --no-cache-dir -r requirements.txt)
+# RENDER: use `bash render-build.sh` so browsers install after pip (Madeira automation).
 Flask
 flask-cors>=4.0.0
 flask-socketio
@@ -22,3 +19,4 @@ pypdf>=4.0
 beautifulsoup4
 lxml
 supabase>=2.5.0
+playwright==1.46.0

@@ -568,9 +568,9 @@ os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
 # --- Tiny in-process cache for Drive thumbnails ---
 _drive_thumb_cache = {}  # key: f"{file_id}:{modified_time}" -> {'bytes': b, 'ts': float}
-_drive_thumb_ttl = int(os.environ.get("DRIVE_THUMB_TTL_SEC", "180"))  # shorter = less RAM on 512MB
+_drive_thumb_ttl = int(os.environ.get("DRIVE_THUMB_TTL_SEC", "300"))
 _drive_thumb_cache_max_size = int(
-    os.environ.get("DRIVE_THUMB_CACHE_MAX", "32")
+    os.environ.get("DRIVE_THUMB_CACHE_MAX", "120")
 )  # In-memory image bytes
 _drive_thumb_cache_last_cleanup = 0
 _drive_thumb_cache_cleanup_interval = 120  # Clean up every 2 minutes - more frequent
@@ -610,7 +610,7 @@ def _drive_thumb_cache_cleanup():
 
 # Cap parallel upstream thumbnail work (Overview loads many images at once → OOM/restarts).
 _drive_thumb_fetch_sem = Semaphore(
-    max(1, int(os.environ.get("DRIVE_THUMB_MAX_CONCURRENT", "1")))
+    max(1, int(os.environ.get("DRIVE_THUMB_MAX_CONCURRENT", "4")))
 )
 
 _matlog_cache = None  # {"by_order": {"123": [items...]}, "ts": float}
@@ -1595,6 +1595,8 @@ def _configure_app_logging():
         ch.setFormatter(fmt)
         ch.setLevel(logging.INFO)
         root.addHandler(ch)
+    for noisy in ("httpx", "httpcore", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 _configure_app_logging()
@@ -1647,18 +1649,12 @@ except Exception as e:
     print(f"⚠️ Error registering Shopify routes: {e}")
 
 
-# Compression loads brotli/zstd paths — skip on 512MB unless explicitly enabled.
-if os.environ.get("ENABLE_FLASK_COMPRESS", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-):
-    try:
-        from flask_compress import Compress
+try:
+    from flask_compress import Compress
 
-        Compress(app)
-    except Exception:
-        pass
+    Compress(app)
+except Exception:
+    pass
 
 CORS(
     app,
@@ -1696,10 +1692,10 @@ _json_bg_inflight_lock = threading.Lock()
 # key -> {'ts': float, 'ttl': int, 'etag': str, 'data': bytes}
 _json_cache = {}
 _json_cache_last_cleanup = 0
-_json_cache_cleanup_interval = 45  # Evict expired JSON cache more often on small instances
+_json_cache_cleanup_interval = 120
 _json_cache_max_size = int(
-    os.environ.get("JSON_CACHE_MAX_ENTRIES", "36")
-)  # full /api/combined per entry; keep very low on 512MB Render
+    os.environ.get("JSON_CACHE_MAX_ENTRIES", "200")
+)
 
 
 def _cache_cleanup():
@@ -1841,11 +1837,8 @@ def send_cached_json(key, ttl, payload_obj_builder):
             finally:
                 _json_bg_refresh_release(key)
 
-        # Skip background refresh for huge Sheet payloads — on 512MB Render it doubled RSS
-        # (foreground request + spawn_n rebuild). Stale is served until the next cache miss.
-        if key not in ("combined", "combined-v2") and _json_bg_refresh_try_acquire(key):
+        if _json_bg_refresh_try_acquire(key):
             eventlet.spawn_n(_bg_refresh)
-        # else: combined keys refresh only on next direct build; or inflight already running
 
         resp = Response(stale["data"], mimetype="application/json")
         etag = stale.get("etag")
@@ -2363,7 +2356,9 @@ def _mem_before():
 
 # Proactive cache cleanup - runs periodically
 _last_proactive_cleanup = 0
-_proactive_cleanup_interval = 60  # Run every 60 seconds
+_proactive_cleanup_interval = int(
+    os.environ.get("PROACTIVE_CACHE_CLEANUP_INTERVAL_SEC", "300")
+)
 
 def _proactive_cache_cleanup():
     """Clean up all caches proactively to prevent memory growth."""
@@ -2407,7 +2402,7 @@ def _proactive_cache_cleanup():
         # Clean up JSON cache (already has cleanup function)
         _cache_cleanup()
         
-        app.logger.info("[CACHE] Proactive cleanup completed")
+        app.logger.debug("[CACHE] Proactive cleanup completed")
     except Exception as e:
         app.logger.warning(f"[CACHE] Proactive cleanup failed: {e}")
 
@@ -3112,7 +3107,7 @@ def drive_thumbnail():
                 r = _http.get(
                     u, timeout=(3, 5), allow_redirects=True, headers={"Accept": "image/*"}
                 )
-                app.logger.info(
+                app.logger.debug(
                     "📸 classic %s → %s %s",
                     fid,
                     r.status_code,
@@ -3124,7 +3119,7 @@ def drive_thumbnail():
                     else None
                 )
             except requests.RequestException as e:
-                app.logger.info("📸 classic error %s: %s", fid, e)
+                app.logger.warning("📸 classic error %s: %s", fid, e)
                 return None
         
         r = _classic(file_id)
@@ -3234,9 +3229,11 @@ def drive_thumbnail():
                         "ts": time.time(),
                     }
                 else:
-                    app.logger.info("📸 meta status %s for %s", meta_r.status_code, file_id)
+                    app.logger.debug(
+                        "📸 meta status %s for %s", meta_r.status_code, file_id
+                    )
             except Exception as e:
-                app.logger.info("📸 meta error %s: %s", file_id, e)
+                app.logger.warning("📸 meta error %s: %s", file_id, e)
         
         def _lh3(u: str):
             try:
@@ -3249,7 +3246,7 @@ def drive_thumbnail():
                 rr = _http.get(
                     u, timeout=(3, 5), allow_redirects=True, headers={"Accept": "image/*"}
                 )
-                app.logger.info(
+                app.logger.debug(
                     "📸 lh3 %s → %s %s",
                     file_id,
                     rr.status_code,
@@ -3265,7 +3262,7 @@ def drive_thumbnail():
                     else None
                 )
             except requests.RequestException as e:
-                app.logger.info("📸 lh3 error %s: %s", file_id, e)
+                app.logger.warning("📸 lh3 error %s: %s", file_id, e)
                 return None
         
         lr = _lh3(thumb_url)
@@ -3349,7 +3346,7 @@ def drive_thumbnail():
                     f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
                     timeout=(3, 6),
                 )
-                app.logger.info(
+                app.logger.debug(
                     "📸 raw media → %s %s",
                     media.status_code,
                     media.headers.get("Content-Type", ""),
@@ -3425,7 +3422,7 @@ def drive_thumbnail():
                             headers={"Cache-Control": "public, max-age=86400"},
                         )
             except requests.RequestException as e:
-                app.logger.info("📸 raw media error %s: %s", file_id, e)
+                app.logger.warning("📸 raw media error %s: %s", file_id, e)
         
         # --- nothing worked
         return Response(status=204)
@@ -6469,12 +6466,12 @@ def _load_google_creds():
                     info, scopes=GOOGLE_SCOPES
                 )
             )
-            print("🔎 token (env) scopes:", token_scopes)
+            logger.debug("token (env) scopes: %s", token_scopes)
             # Don't refresh here - let get_google_credentials() handle it with caching
             # This avoids unnecessary refresh attempts on every credential load
             return creds
         except Exception as e:
-            print("❌ ENV token could not build OAuthCredentials:", repr(e))
+            logger.warning("ENV token could not build OAuthCredentials: %r", e)
             # fall through to file
 
     # 2) File next
@@ -6489,12 +6486,12 @@ def _load_google_creds():
                 creds = OAuthCredentials.from_authorized_user_info(
                     info, scopes=GOOGLE_SCOPES
                 )
-            print("🔎 token (file) scopes:", token_scopes)
+            logger.debug("token (file) scopes: %s", token_scopes)
             # Don't refresh here - let get_google_credentials() handle it with caching
             # This avoids unnecessary refresh attempts on every credential load
             return creds
     except Exception as e:
-        print("❌ FILE token could not build OAuthCredentials:", repr(e))
+        logger.warning("FILE token could not build OAuthCredentials: %r", e)
 
     # 3) Nothing worked
     return None
@@ -14486,7 +14483,7 @@ def order_madeira():
         result = asyncio.run(madeira_login_and_cart(items))
         return jsonify({"status": "ok", "count": len(items), **(result or {})}), 200
     except Exception as e:
-        print("🔥 madeira order error:", str(e))
+        app.logger.warning("madeira order error: %s", e)
         return jsonify({"error": "Failed to add to cart", "details": str(e)}), 500
 
 
