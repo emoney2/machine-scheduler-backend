@@ -73,6 +73,54 @@ def _ups_error_snippet(resp: requests.Response) -> str:
     return (resp.reason or "").strip() or "empty response body"
 
 
+def _qv_format_http_error_response(resp: requests.Response) -> str:
+    """
+    Quantum View often returns 400 with JSON:
+    {"response":{"errors":[{"code":"330052","message":"..."}]}}
+    """
+    try:
+        j = resp.json()
+    except Exception:
+        return _ups_error_snippet(resp)
+    err_list = None
+    if isinstance(j, dict):
+        r = j.get("response")
+        if isinstance(r, dict):
+            err_list = r.get("errors")
+        if err_list is None:
+            err_list = j.get("errors")
+    if not isinstance(err_list, list) or not err_list:
+        return _ups_error_snippet(resp)
+    lines: List[str] = []
+    codes_seen: List[str] = []
+    for e in err_list:
+        if not isinstance(e, dict):
+            continue
+        code = str(e.get("code") or "").strip()
+        msg = str(e.get("message") or "").strip()
+        if code:
+            codes_seen.append(code)
+        if code and msg:
+            lines.append(f"[{code}] {msg}")
+        elif msg:
+            lines.append(msg)
+    if not lines:
+        return _ups_error_snippet(resp)
+    out = " ".join(lines)
+    if "330052" in codes_seen:
+        out += (
+            " — What to do: UPS is blocking Quantum View **file downloads** until the right subscription "
+            "statuses are active. On **ups.com** (logged in as the shipping admin), open **Quantum View** "
+            "management / subscription services and enable **Quantum View Data** (outbound) for the "
+            "**company** and for **your user** (UPS maps those to CompanyQVD / UserQVD). The message also "
+            "mentions Inbound; if you only ship outbound, inbound can stay off, but outbound QVD must be "
+            "active (and any required Quantum View product must be on your UPS invoice). If you do not see "
+            "those options, contact **UPS account support** and ask them to activate Quantum View Data for "
+            "your shipper account."
+        )
+    return out
+
+
 def _trans_id_header() -> str:
     """UPS transId header max length 32 (UUID string is 36 with hyphens)."""
     return uuid.uuid4().hex
@@ -1126,10 +1174,10 @@ def _qv_fetch_manifests_for_subscription(
             data = {}
 
         if not resp.ok:
-            snippet = _ups_error_snippet(resp)
+            detail = _qv_format_http_error_response(resp)
             return (
                 all_manifests,
-                f"HTTP {resp.status_code} for subscription {subscription_name!r}: {snippet}",
+                f"HTTP {resp.status_code} for subscription {subscription_name!r}: {detail}",
                 rounds,
             )
 

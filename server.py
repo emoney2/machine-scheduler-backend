@@ -13978,6 +13978,71 @@ def process_shipment():
             ).execute()
         print("✅ Packing slip copied into each order folder.")
 
+        # 7c) Pre-trim (API raw) + post-trim UPS labels into each order # Drive folder
+        if do_ups and tracking_list and order_ids:
+            try:
+                for oid in order_ids:
+                    folder_id = _find_folder_by_name(str(oid), ORDERS_PARENT_FOLDER_ID)
+                    if not folder_id:
+                        meta = {
+                            "name": str(oid),
+                            "mimeType": "application/vnd.google-apps.folder",
+                            "parents": [ORDERS_PARENT_FOLDER_ID],
+                        }
+                        folder_id = drive.files().create(body=meta, fields="id").execute()[
+                            "id"
+                        ]
+                    for trk in tracking_list:
+                        safe = re.sub(r"[^\w.\-]+", "_", str(trk))[:120]
+                        for ext in ("pdf", "png", "zpl"):
+                            rpath = os.path.join(
+                                tempfile.gettempdir(), f"ups_{safe}_api_raw.{ext}"
+                            )
+                            tpath = os.path.join(
+                                tempfile.gettempdir(), f"ups_{safe}.{ext}"
+                            )
+                            if ext == "pdf":
+                                mime = "application/pdf"
+                            elif ext == "png":
+                                mime = "image/png"
+                            else:
+                                mime = "application/octet-stream"
+                            if os.path.isfile(rpath):
+                                with open(rpath, "rb") as rf:
+                                    raw_body = rf.read()
+                                drive.files().create(
+                                    body={
+                                        "name": f"{oid}_label_pretrim_{safe}.{ext}",
+                                        "parents": [folder_id],
+                                    },
+                                    media_body=MediaIoBaseUpload(
+                                        BytesIO(raw_body), mimetype=mime, resumable=False
+                                    ),
+                                    supportsAllDrives=True,
+                                ).execute()
+                            if os.path.isfile(tpath):
+                                with open(tpath, "rb") as tf:
+                                    trim_body = tf.read()
+                                drive.files().create(
+                                    body={
+                                        "name": f"{oid}_label_print_{safe}.{ext}",
+                                        "parents": [folder_id],
+                                    },
+                                    media_body=MediaIoBaseUpload(
+                                        BytesIO(trim_body), mimetype=mime, resumable=False
+                                    ),
+                                    supportsAllDrives=True,
+                                ).execute()
+                            if os.path.isfile(rpath) or os.path.isfile(tpath):
+                                break
+                logging.info(
+                    "UPS label pretrim/print uploaded to order folders orders=%s trackings=%s",
+                    order_ids,
+                    tracking_list,
+                )
+            except Exception as ex:
+                logging.warning("UPS label copies to order Drive folders failed: %s", ex)
+
         # 9) Only after invoice + slips succeed, write Shipped to the sheet
         if updates:
             service.spreadsheets().values().batchUpdate(
