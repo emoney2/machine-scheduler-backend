@@ -7489,12 +7489,99 @@ def _overview_sewing_top_for_order(sewing_map: dict, oid_raw):
     return None
 
 
+def _overview_material_column_lines(values):
+    """Flatten a Sheets column (rows of one cell) to trimmed non-empty strings."""
+    if not values:
+        return []
+    out = []
+    for r in values:
+        if not r:
+            continue
+        cell = r[0]
+        s = str(cell).strip() if cell is not None else ""
+        if s:
+            out.append(s)
+    return out
+
+
+def _overview_parse_material_lines_to_vendor_groups(lines, material_color_map):
+    """
+    Parse Overview sheet lines (material text + THREAD|... rows) into
+    [{ "vendor": str, "items": [...] }, ...] grouped like the Overview UI expects.
+    """
+    grouped = {}
+    for s in lines:
+        s = (s or "").strip()
+        if not s:
+            continue
+
+        if s.startswith("THREAD|"):
+            parts = s.split("|")
+            if len(parts) >= 4:
+                code = parts[1].strip()
+                try:
+                    qty = int(float(parts[2]))
+                except Exception:
+                    qty = 0
+                try:
+                    pct = int(float(parts[3]))
+                except Exception:
+                    pct = 0
+                vendor = "Madeira"
+                name = f"{code} (Polyneon)"
+                item = {
+                    "name": name,
+                    "qty": qty,
+                    "unit": "Cones",
+                    "type": "Thread",
+                    "code": code,
+                    "pct": pct,
+                }
+                if len(parts) >= 6 and str(parts[5]).strip():
+                    item["label"] = str(parts[5]).strip()
+                grouped.setdefault(vendor, []).append(item)
+            continue
+
+        vendor = "Misc."
+        left = s
+        if " - " in s:
+            left, vendor = s.rsplit(" - ", 1)
+            vendor = vendor.strip() or "Misc."
+
+        tokens = left.split()
+        if len(tokens) >= 3:
+            unit = tokens[-1]
+            qty_str = tokens[-2]
+            name = " ".join(tokens[:-2]).strip()
+            try:
+                qty = int(round(float(qty_str)))
+            except Exception:
+                qty = 0
+        else:
+            name, qty, unit = left, 0, ""
+
+        if not name:
+            continue
+
+        typ = "Thread" if unit.lower().startswith("cone") else "Material"
+        material_color = None
+        if typ == "Material" and material_color_map:
+            material_color = material_color_map.get(name.lower())
+
+        grouped.setdefault(vendor, []).append(
+            {"name": name, "qty": qty, "unit": unit, "type": typ, "color": material_color}
+        )
+
+    return [{"vendor": v, "items": items} for v, items in grouped.items()]
+
+
 def build_overview_payload():
     """
     Returns upcoming + overdue job data from Google Sheets Production Orders
     (same live data as /api/combined), not from Supabase — so Stage/Shipped match the sheet.
 
-    Materials-to-order still come from the Overview sheet (Overview!M3:M).
+    Materials-to-order come from the Overview sheet: column M (order soon) and
+    column N (due date more than ~60 days out), built by the JRCO Apps Script.
 
     This returns a plain dict; HTTP + caching is handled by overview_combined().
     """
@@ -7737,11 +7824,12 @@ def build_overview_payload():
 
     # ── 2) Materials section continues below (unchanged) ──
 
-    # ── 2) Materials-to-order grouped by vendor (Overview!M3:M) ──────────────
+    # ── 2) Materials-to-order grouped by vendor (Overview!M3:M = now, N3:N = 60+ days to due) ──
     vendor_list = []
+    vendor_list_future = []
     try:
         svc = get_sheets_service().spreadsheets().values()
-        
+
         # Fetch Material Inventory once for color lookups (optimization)
         material_color_map = {}
         try:
@@ -7755,7 +7843,7 @@ def build_overview_payload():
                 headers = [str(h).strip() for h in inv_rows[0]]
                 name_idx = headers.index("Materials") if "Materials" in headers else 0
                 color_idx = headers.index("Color") if "Color" in headers else None
-                
+
                 if color_idx is not None:
                     for row in inv_rows[1:]:
                         if len(row) > name_idx and len(row) > color_idx:
@@ -7765,105 +7853,47 @@ def build_overview_payload():
                                 material_color_map[mat_name] = mat_color
         except Exception as e:
             app.logger.warning(f"Failed to fetch Material Inventory for color lookup: {e}")
-        
-        resp = svc.get(
+
+        mat_resp = svc.batchGet(
             spreadsheetId=SPREADSHEET_ID,
-            range="Overview!M3:M",
+            ranges=["Overview!M3:M", "Overview!N3:N"],
             valueRenderOption="FORMATTED_VALUE",
         ).execute()
-        vals = resp.get("values", [])
-        lines = [str(r[0]).strip() for r in vals if r and str(r[0]).strip()]
-        app.logger.info(f"📦 Overview!M3:M returned {len(lines)} material lines")
+        vrs_mat = mat_resp.get("valueRanges", [])
+        vals_now = (vrs_mat[0].get("values") if len(vrs_mat) > 0 else []) or []
+        vals_future = (vrs_mat[1].get("values") if len(vrs_mat) > 1 else []) or []
+        lines_now = _overview_material_column_lines(vals_now)
+        lines_future = _overview_material_column_lines(vals_future)
+        app.logger.info(
+            "📦 Overview materials columns: M=%s lines, N=%s lines",
+            len(lines_now),
+            len(lines_future),
+        )
 
-        grouped = {}
-        for s in lines:
-            s = (s or "").strip()
-            if not s:
-                continue
-
-            # 🔹 Special handling for THREAD rows from Overview!M:
-            # Format from sheet (current): THREAD|<code>|<qtyCones>|<pct>|...
-            if s.startswith("THREAD|"):
-                parts = s.split("|")
-                if len(parts) >= 4:
-                    code = parts[1].strip()
-
-                    # cones to order
-                    try:
-                        qty = int(float(parts[2]))
-                    except Exception:
-                        qty = 0
-
-                    # percentage remaining (can be negative)
-                    try:
-                        pct = int(float(parts[3]))
-                    except Exception:
-                        pct = 0
-
-                    vendor = "Madeira"
-                    # What we show in the UI:
-                    name = f"{code} (Polyneon)"
-
-                    grouped.setdefault(vendor, []).append(
-                        {
-                            "name": name,       # "1800 (Polyneon)"
-                            "qty": qty,         # 12
-                            "unit": "Cones",
-                            "type": "Thread",
-                            "code": code,       # "1800" (in case we need it later)
-                            "pct": pct,         # -133, etc.
-                        }
-                    )
-                # Skip generic parsing for THREAD rows
-                continue
-
-            # 🔹 Generic material line: "Item Qty Unit - Vendor"
-            vendor = "Misc."
-            left = s
-            if " - " in s:
-                left, vendor = s.rsplit(" - ", 1)
-                vendor = vendor.strip() or "Misc."
-
-            tokens = left.split()
-            # Expect "... <qty> <unit>" at the end
-            if len(tokens) >= 3:
-                unit = tokens[-1]
-                qty_str = tokens[-2]
-                name = " ".join(tokens[:-2]).strip()
-                try:
-                    qty = int(round(float(qty_str)))
-                except Exception:
-                    qty = 0
-            else:
-                name, qty, unit = left, 0, ""
-
-            if not name:
-                continue
-
-            typ = "Thread" if unit.lower().startswith("cone") else "Material"
-            
-            # Look up color from pre-fetched Material Inventory map
-            material_color = None
-            if typ == "Material" and material_color_map:
-                material_color = material_color_map.get(name.lower())
-            
-            grouped.setdefault(vendor, []).append(
-                {"name": name, "qty": qty, "unit": unit, "type": typ, "color": material_color}
-            )
-
-
-        vendor_list = [{"vendor": v, "items": items} for v, items in grouped.items()]
-        app.logger.info(f"📦 Materials grouped: {len(vendor_list)} vendors, {sum(len(g['items']) for g in vendor_list)} total items")
+        vendor_list = _overview_parse_material_lines_to_vendor_groups(
+            lines_now, material_color_map
+        )
+        vendor_list_future = _overview_parse_material_lines_to_vendor_groups(
+            lines_future, material_color_map
+        )
+        app.logger.info(
+            "📦 Materials grouped: now=%s vendors (%s items), future=%s vendors (%s items)",
+            len(vendor_list),
+            sum(len(g["items"]) for g in vendor_list),
+            len(vendor_list_future),
+            sum(len(g["items"]) for g in vendor_list_future),
+        )
     except Exception as e:
         app.logger.exception(
             "materials-needed section inside build_overview_payload failed: %s", str(e)
         )
-        # leave vendor_list empty if it fails
         vendor_list = []
+        vendor_list_future = []
 
     return {
         "upcoming": upcoming,
         "materials": vendor_list,
+        "materialsFuture": vendor_list_future,
         "daysWindow": "7",
         # Debug / contract: tab is Production Orders (see OVERVIEW_PRODUCTION_ORDERS_RANGE), not Supabase.
         "jobsSource": "google_sheets:Production Orders",
@@ -7907,7 +7937,9 @@ def overview_combined():
         with _overview_payload_lock:
             payload = build_overview_payload()
             app.logger.info(
-                f"📦 Overview payload built: {len(payload.get('upcoming', []))} upcoming, {len(payload.get('materials', []))} material vendors"
+                f"📦 Overview payload built: {len(payload.get('upcoming', []))} upcoming, "
+                f"{len(payload.get('materials', []))} material vendor groups (now), "
+                f"{len(payload.get('materialsFuture', []))} (plan ahead)"
             )
             _overview_cache = payload
             _overview_ts = now
@@ -7916,6 +7948,7 @@ def overview_combined():
         payload = {
             "upcoming": [],
             "materials": [],
+            "materialsFuture": [],
             "daysWindow": "7",
             "error": str(e),
         }
