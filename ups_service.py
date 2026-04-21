@@ -337,6 +337,70 @@ def _save_ups_label_api_raw_copy(tracking: str, ext: str, raw_bytes: bytes) -> N
         logging.warning("UPS_LABEL_DEBUG_DIR copy failed: %s", e)
 
 
+def _repo_label_debug_dir() -> str:
+    """`<repo>/debug/shipping_labels` — repo root is parent of `backend/`."""
+    return os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "debug", "shipping_labels")
+    )
+
+
+def _ups_label_repo_debug_copies_enabled() -> bool:
+    raw = os.getenv("UPS_LABEL_REPO_DEBUG_COPIES")
+    if raw is None or not str(raw).strip():
+        return True
+    v = str(raw).strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _save_ups_label_repo_pre_post_crop(
+    tracking: str, ext: str, pre_bytes: bytes, post_bytes: bytes
+) -> None:
+    """
+    Write two files next to the codebase for before/after crop comparison:
+      debug/shipping_labels/<ts>_<tracking>_PRE_CROP.pdf
+      debug/shipping_labels/<ts>_<tracking>_POST_CROP.pdf
+
+    Only used for PDF (crop is PDF-specific). Disable with UPS_LABEL_REPO_DEBUG_COPIES=0
+    (recommended on cloud hosts).
+    """
+    if ext.lower() != "pdf" or not pre_bytes:
+        return
+    if not _ups_label_repo_debug_copies_enabled():
+        return
+    out_dir = _repo_label_debug_dir()
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        logging.warning("UPS repo label debug: mkdir %s: %s", out_dir, e)
+        return
+    safe_trk = re.sub(r"[^\w.\-]+", "_", str(tracking or "unknown"))[:80]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pre_name = f"{ts}_{safe_trk}_PRE_CROP.pdf"
+    post_name = f"{ts}_{safe_trk}_POST_CROP.pdf"
+    pre_path = os.path.join(out_dir, pre_name)
+    post_path = os.path.join(out_dir, post_name)
+    try:
+        with open(pre_path, "wb") as f:
+            f.write(pre_bytes)
+        with open(post_path, "wb") as f:
+            f.write(post_bytes or b"")
+        logging.info(
+            "UPS label repo debug: wrote pre/post crop — %s | %s",
+            pre_path,
+            post_path,
+        )
+        log_label(
+            "label_repo_debug_pre_post_saved",
+            tracking=str(tracking or ""),
+            pre_basename=pre_name,
+            post_basename=post_name,
+            pre_bytes=len(pre_bytes),
+            post_bytes=len(post_bytes or b""),
+        )
+    except OSError as e:
+        logging.warning("UPS repo label debug: write failed: %s", e)
+
+
 def _save_trimmed_label_to_printer_folder(fpath: str, fname: str) -> bool:
     """
     After the PDF is trimmed, copy it into UPS_LABEL_OUTPUT_DIR (default G:\\My Drive\\Label Printer).
@@ -364,7 +428,8 @@ def _save_trimmed_label_to_printer_folder(fpath: str, fname: str) -> bool:
 
 # Phrases UPS puts on "how to print" / instruction pages (not on the thermal label itself).
 _LABEL_INSTRUX_PATTERNS = re.compile(
-    r"print\s+this\s+page|how\s+to\s+print|view\s+and\s+print|fold\s+(along|here)|"
+    r"print\s+this\s+page|how\s+to\s+print|view\s+and\s+print|view\s+instructions|"
+    r"fold\s+(along|here)|"
     r"shipping\s+label\s+instructions|packing\s+list(\s+included)?|"
     r"adobe\s+acrobat|adobe\s+reader|download\s+the\s+label|"
     r"laser\s+printer|inkjet|cut\s+along|do\s+not\s+scale|actual\s+size|"
@@ -482,7 +547,7 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         When UPS puts 'how to print' copy above the label on one Letter page, extracted text order
         often lists instructions first; tracking appears only in the lower half.
         """
-        if instrux_hits < 2:
+        if instrux_hits < 1:
             return False
         wanted = re.sub(r"[^A-Za-z0-9]", "", str(expected_tracking or "")).upper()
         if not wanted or len(wanted) < 8:
@@ -497,7 +562,51 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
         nrm = lambda s: re.sub(r"[^A-Za-z0-9]", "", s).upper()
         tail_has = wanted in nrm(txt[mid:])
         head_has = wanted in nrm(txt[:mid])
-        return tail_has and not head_has
+        # At least one instruction phrase plus tracking only in the lower half → label is below.
+        return bool(tail_has and not head_has)
+
+    def _ups_letter_instructions_dominate_top(p) -> bool:
+        """
+        Letter PDFs often stack UPS help copy in the upper ~40% and the scannable label below.
+        If instruction phrases cluster in the top lines only, a top-band crop prints help text only.
+        """
+        try:
+            txt = p.extract_text() or ""
+        except Exception:
+            return False
+        lines = [ln for ln in txt.splitlines() if ln.strip()]
+        if len(lines) < 5:
+            return False
+        top_line_cut = max(2, int(len(lines) * 0.42) + 1)
+        top = "\n".join(lines[:top_line_cut])
+        rest = "\n".join(lines[top_line_cut:])
+        hits_top = len(_LABEL_INSTRUX_PATTERNS.findall(top))
+        hits_rest = len(_LABEL_INSTRUX_PATTERNS.findall(rest))
+        # Allow one stray phrase on the label (e.g. "do not scale") in the lower band.
+        if hits_top >= 2 and hits_rest <= 1:
+            return True
+        if hits_top >= 1 and not rest.strip():
+            return False
+        if hits_top >= 1 and hits_rest == 0 and len(top) >= 100:
+            return True
+        return False
+
+    def _tracking_first_line_in_lower_portion(p, trk: str) -> bool:
+        """True when the tracking # first appears well below the instruction header block."""
+        wanted = re.sub(r"[^A-Za-z0-9]", "", str(trk or "")).upper()
+        if len(wanted) < 10:
+            return False
+        try:
+            lines = [ln for ln in (p.extract_text() or "").splitlines() if ln.strip()]
+        except Exception:
+            return False
+        if len(lines) < 5:
+            return False
+        nrm_ln = lambda s: re.sub(r"[^A-Za-z0-9]", "", s).upper()
+        for i, ln in enumerate(lines):
+            if wanted in nrm_ln(ln):
+                return i >= max(2, int(len(lines) * 0.25))
+        return False
 
     def _page_label_score(idx: int, p) -> float:
         w, h, *_ = _page_wh(p)
@@ -614,7 +723,13 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
             if _looks_like_us_letter(w, h):
                 if _prefer_bottom_letter_band(src_page, instrux_hits):
                     use_bottom = True
+                elif _ups_letter_instructions_dominate_top(src_page):
+                    use_bottom = True
                 elif expected_tracking and _letter_label_likely_lower_half(
+                    src_page, expected_tracking
+                ):
+                    use_bottom = True
+                elif expected_tracking and _tracking_first_line_in_lower_portion(
                     src_page, expected_tracking
                 ):
                     use_bottom = True
@@ -997,7 +1112,11 @@ def create_shipment(
                 payload = base64.b64decode(img_clean, validate=False)
             _save_ups_label_api_raw_copy(trk, ext, payload)
             if ext == "pdf":
-                payload = _normalize_ups_label_pdf_bytes(payload, expected_tracking=trk)
+                pre_crop_pdf = payload
+                payload = _normalize_ups_label_pdf_bytes(
+                    payload, expected_tracking=trk
+                )
+                _save_ups_label_repo_pre_post_crop(trk, ext, pre_crop_pdf, payload)
             with open(fpath, "wb") as f:
                 f.write(payload)
             log_label(

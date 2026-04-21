@@ -5603,6 +5603,19 @@ def _qbo_invoice_dict_from_payload(payload):
     return inv if isinstance(inv, dict) else {}
 
 
+def _qbo_ref_value_only(ref):
+    """
+    QBO invoice create is most reliable with value-only ReferenceType dicts.
+    Including `name` can trigger 2010 when the label drifts from the stored entity.
+    """
+    if not isinstance(ref, dict):
+        return ref
+    v = ref.get("value")
+    if v is None or str(v).strip() == "":
+        return ref
+    return {"value": str(v).strip()}
+
+
 def _qbo_invoice_has_ship_method_ref(inv) -> bool:
     if not isinstance(inv, dict):
         return False
@@ -5985,8 +5998,10 @@ def create_invoice_in_quickbooks(
 
     # Step 1: Get or create customer
     sheet = sh
-    customer_ref = get_or_create_customer_ref(
-        order_data.get("Company Name", ""), sheet, headers, realm_id
+    customer_ref = _qbo_ref_value_only(
+        get_or_create_customer_ref(
+            order_data.get("Company Name", ""), sheet, headers, realm_id
+        )
     )
 
     # Step 2: Get item reference from QBO (look up or create if missing)
@@ -6031,14 +6046,13 @@ def create_invoice_in_quickbooks(
                 "Amount": float(round(amount, 2)),
                 "Description": order_data.get("Design", ""),
                 "SalesItemLineDetail": {
-                    "ItemRef": {"value": item_ref["value"]},
+                    "ItemRef": _qbo_ref_value_only(item_ref),
                     "Qty": float(qty),
                     "UnitPrice": float(round(unit_price, 2)),
                 },
             }
         ],
         "TxnDate": txn_date_str,
-        "ShipDate": txn_date_str,
         "DocNumber": doc_number,
         "SalesTermRef": {"value": "3"},
         "BillEmail": {"Address": bill_email} if bill_email else None,
@@ -6141,8 +6155,14 @@ def create_consolidated_invoice_in_quickbooks(
 
     # ── 2) Find or create the customer ──────────────────────────────
     first_order = order_data_list[0]
-    customer_ref = get_or_create_customer_ref(
-        first_order.get("Company Name", ""), sheet, headers, realm_id, env_override
+    customer_ref = _qbo_ref_value_only(
+        get_or_create_customer_ref(
+            first_order.get("Company Name", ""),
+            sheet,
+            headers,
+            realm_id,
+            env_override,
+        )
     )
 
     def _normalize_ship_via_label(raw: str) -> str:
@@ -6301,7 +6321,6 @@ def create_consolidated_invoice_in_quickbooks(
             "CustomerRef": customer_ref,
             "Line": lines,
             "TxnDate": txn_date_str,
-            "ShipDate": txn_date_str,
             "DocNumber": doc_number,
             "SalesTermRef": {"value": "3"},
             "BillEmail": {"Address": bill_email} if bill_email else None,
@@ -6311,9 +6330,11 @@ def create_consolidated_invoice_in_quickbooks(
             inv["CustomerMemo"] = cm
         return _invoice_drop_none(inv)
 
-    def _minimal_create_payload(include_ship_method_ref: bool, include_ship_date: bool):
+    def _minimal_create_payload(include_ship_method_ref: bool):
         """
         Create invoice without ShipAmt / TrackingNum / ShipDate (when those trigger 2010 on create).
+        Do not send ShipDate on POST — QBO often returns 2010 for ShipDate on create; sparse-patch
+        applies ShipDate after create in _qbo_patch_invoice_shipping_and_tracking.
         Caller should sparse-patch delivery fields afterward.
         """
         inv = {
@@ -6324,8 +6345,6 @@ def create_consolidated_invoice_in_quickbooks(
             "SalesTermRef": {"value": "3"},
             "BillEmail": {"Address": bill_email} if bill_email else None,
         }
-        if include_ship_date:
-            inv["ShipDate"] = txn_date_str
         if include_ship_method_ref and ship_method_ref_payload:
             inv["ShipMethodRef"] = ship_method_ref_payload
         memo_bits = []
@@ -6346,7 +6365,6 @@ def create_consolidated_invoice_in_quickbooks(
             "CustomerRef": customer_ref,
             "Line": list(line_items),
             "TxnDate": txn_date_str,
-            "ShipDate": txn_date_str,
             "DocNumber": doc_number,
             "SalesTermRef": {"value": "3"},
             "BillEmail": {"Address": bill_email} if bill_email else None,
@@ -6423,28 +6441,22 @@ def create_consolidated_invoice_in_quickbooks(
         res = _post_inv(invoice_payload)
         err_txt = (res.text or "") if _qbo_still_bad() else ""
 
-    # ShipAmt / ShipDate on create often yield 2010; create lines-only then sparse-patch.
-    if _qbo_still_bad() and _qbo_is_2010() and (
-        "ShipAmt" in invoice_payload
-        or "ShipDate" in invoice_payload
-        or "TrackingNum" in invoice_payload
-    ):
+    # ShipAmt / TrackingNum (and historically ShipDate) on create often yield 2010; create
+    # lines-only then sparse-patch. Without ShipDate on native POST, still downgrade to
+    # minimal on any remaining 2010 so SalesTermRef / ShipMethodRef / memo issues can clear.
+    if _qbo_still_bad() and _qbo_is_2010():
         logging.warning(
             "QBO invoice 2010: minimal create (no ShipAmt/ShipDate/Tracking on POST), "
             "then sparse-patch delivery fields"
         )
-        invoice_payload = _minimal_create_payload(
-            include_ship_method_ref=True, include_ship_date=False
-        )
+        invoice_payload = _minimal_create_payload(include_ship_method_ref=True)
         logging.info(
             "📦 Invoice payload (minimal create):\n%s",
             json.dumps(invoice_payload, indent=2),
         )
         res = _post_inv(invoice_payload)
         if _qbo_still_bad() and _qbo_is_2010() and ship_method_ref_payload:
-            invoice_payload = _minimal_create_payload(
-                include_ship_method_ref=False, include_ship_date=False
-            )
+            invoice_payload = _minimal_create_payload(include_ship_method_ref=False)
             invoice_payload = {
                 k: v for k, v in invoice_payload.items() if k != "CustomerMemo"
             }
@@ -6453,6 +6465,22 @@ def create_consolidated_invoice_in_quickbooks(
                 json.dumps(invoice_payload, indent=2),
             )
             res = _post_inv(invoice_payload)
+
+    # Minimal payloads reintroduce SalesTermRef / CustomerMemo; strip again if QBO still returns 2010.
+    err_txt = (res.text or "") if _qbo_still_bad() else ""
+    if err_txt and _qbo_is_2010() and "CustomerMemo" in invoice_payload:
+        invoice_payload = {
+            k: v for k, v in invoice_payload.items() if k != "CustomerMemo"
+        }
+        logging.warning("QBO invoice 2010: retrying without CustomerMemo (post-minimal)")
+        res = _post_inv(invoice_payload)
+        err_txt = (res.text or "") if _qbo_still_bad() else ""
+    if err_txt and _qbo_is_2010() and "SalesTermRef" in invoice_payload:
+        invoice_payload = {
+            k: v for k, v in invoice_payload.items() if k != "SalesTermRef"
+        }
+        logging.warning("QBO invoice 2010: retrying without SalesTermRef (post-minimal)")
+        res = _post_inv(invoice_payload)
 
     if (
         _qbo_still_bad()
