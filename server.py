@@ -5421,6 +5421,20 @@ def _qbo_ship_methods_from_response(resp_json):
     return [sm]
 
 
+def _qbo_invoice_ship_method_ref_payload(ship_method_ref):
+    """
+    ShipMethodRef for Invoice create/sparse: always include value; include name when known.
+    Value-only refs sometimes leave Ship Via blank in the QBO UI after create/patch.
+    """
+    if not ship_method_ref or not str(ship_method_ref.get("value") or "").strip():
+        return None
+    out = {"value": str(ship_method_ref["value"]).strip()}
+    nm = str(ship_method_ref.get("name") or "").strip()
+    if nm:
+        out["name"] = nm[:31]
+    return out
+
+
 def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
     """
     Return {"value": Id, "name": Name} for a QBO ShipMethod, or None if unresolved.
@@ -5796,7 +5810,11 @@ def _qbo_patch_invoice_shipping_and_tracking(
     if wanted_track and cur_track != wanted_track:
         patch["TrackingNum"] = wanted_track
     if want_sm_val and cur_sm_val != want_sm_val:
-        patch["ShipMethodRef"] = {"value": want_sm_val}
+        patch["ShipMethodRef"] = (
+            dict(ship_method_ref_payload)
+            if isinstance(ship_method_ref_payload, dict)
+            else {"value": want_sm_val}
+        )
     if txn_date_str and str(inv.get("ShipDate") or "").strip() != str(txn_date_str).strip():
         patch["ShipDate"] = str(txn_date_str).strip()
 
@@ -6032,9 +6050,7 @@ def create_invoice_in_quickbooks(
     ship_method_ref = get_or_create_ship_method_ref(
         ship_via_single, headers, realm_id, env_override
     )
-    ship_method_ref_payload = None
-    if ship_method_ref and ship_method_ref.get("value"):
-        ship_method_ref_payload = {"value": str(ship_method_ref["value"])}
+    ship_method_ref_payload = _qbo_invoice_ship_method_ref_payload(ship_method_ref)
     # Next DocNumber (+1)
     doc_number = get_next_invoice_number(headers, realm_id, env_override)
 
@@ -6270,14 +6286,12 @@ def create_consolidated_invoice_in_quickbooks(
     ship_method_ref = get_or_create_ship_method_ref(
         ship_via_label, headers, realm_id, env_override
     )
-    # QBO is most reliable with value-only refs on create (name mismatch can drop Ship Via).
-    ship_method_ref_payload = None
-    if ship_method_ref and ship_method_ref.get("value"):
-        ship_method_ref_payload = {"value": str(ship_method_ref["value"])}
+    ship_method_ref_payload = _qbo_invoice_ship_method_ref_payload(ship_method_ref)
+    if ship_method_ref_payload:
         logging.info(
             "Consolidated invoice: will set Ship Via using ShipMethodRef value=%s name=%r (requested %r)",
             ship_method_ref_payload.get("value"),
-            (ship_method_ref.get("name") or ""),
+            (ship_method_ref_payload.get("name") or ship_method_ref.get("name") or ""),
             ship_via_label,
         )
 
@@ -6570,6 +6584,21 @@ def create_consolidated_invoice_in_quickbooks(
             "Sales → Delivery method → turn Shipping on, then add a method such as UPS Ground.",
             doc_number,
             ship_via_label,
+        )
+
+    # Second sparse pass: QBO occasionally drops ShipAmt / Ship Via after the first update.
+    if not has_opt_in_shipping_line and (
+        ship_amt_r > 0 or track_parts or ship_method_ref_payload
+    ):
+        _qbo_patch_invoice_shipping_and_tracking(
+            headers,
+            realm_id,
+            inv_id,
+            ship_amt_r,
+            track_parts,
+            ship_method_ref_payload,
+            txn_date_str,
+            env_override,
         )
 
     browser_url = _qbo_invoice_record_url(realm_id, inv_id, env_override)
@@ -13842,6 +13871,7 @@ def process_shipment():
         tracking_list = []
         label_relative_urls = []
         labels_copied_ok = False
+        ups_ship_billed_usd = None
         do_ups = (
             (not skip_ups)
             and bool(service_code and str(service_code).strip())
@@ -13889,9 +13919,12 @@ def process_shipment():
                 sc = sc[:2]
             elif len(sc) == 1:
                 sc = sc.zfill(2)
-            label_relative_urls, tracking_list, labels_local_ok = ups_create_shipment(
-                ship_to, packages_ups, sc
-            )
+            (
+                label_relative_urls,
+                tracking_list,
+                labels_local_ok,
+                ups_ship_billed_usd,
+            ) = ups_create_shipment(ship_to, packages_ups, sc)
             labels_drive_ok = False
             if label_relative_urls:
                 try:
@@ -13929,10 +13962,38 @@ def process_shipment():
             return 0
 
         box_count = _count_boxes_for_shipping_fee()
-        # Always honor selected rate + $5 per box for invoice shipping when an invoice is created.
-        shipping_line_amt = round(float(ups_purchased_rate or 0) + 5.0 * box_count, 2)
+        # ShipAmt = UPS base + $5/box. Prefer amount returned by Ship API (authoritative); else wizard quote.
+        try:
+            ups_from_ship = (
+                float(ups_ship_billed_usd)
+                if ups_ship_billed_usd is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            ups_from_ship = None
+        try:
+            ups_from_client = float(ups_purchased_rate or 0)
+        except (TypeError, ValueError):
+            ups_from_client = 0.0
+        if do_ups and ups_from_ship is not None and ups_from_ship > 0:
+            base_ship = ups_from_ship
+            ship_rate_source = "ups_ship_response"
+        else:
+            base_ship = ups_from_client
+            ship_rate_source = (
+                "ups_ship_response_zero" if do_ups and ups_from_ship is not None else "client_ups_purchased_rate"
+            )
+        shipping_line_amt = round(float(base_ship) + 5.0 * box_count, 2)
         if shipping_line_amt < 0:
             shipping_line_amt = 0.0
+        logging.info(
+            "QBO invoice shipping base: source=%s ups_ship_billed=%s ups_purchased_rate=%s box_count=%s -> shipping_line_amt=%s",
+            ship_rate_source,
+            ups_ship_billed_usd,
+            ups_purchased_rate,
+            box_count,
+            shipping_line_amt,
+        )
 
         # 5) Create invoice in QBO (optional — e.g. free samples)
         invoice_url = None

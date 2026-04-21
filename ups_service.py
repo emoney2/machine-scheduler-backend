@@ -389,6 +389,19 @@ def _save_ups_label_repo_pre_post_crop(
             pre_path,
             post_path,
         )
+        # Same filenames under system temp (always writable; e.g. cloud hosts with no repo mount).
+        try:
+            alt_dir = os.path.join(tempfile.gettempdir(), "ups_label_compare")
+            os.makedirs(alt_dir, exist_ok=True)
+            apre = os.path.join(alt_dir, pre_name)
+            apost = os.path.join(alt_dir, post_name)
+            with open(apre, "wb") as f:
+                f.write(pre_bytes)
+            with open(apost, "wb") as f:
+                f.write(post_bytes or b"")
+            logging.info("UPS label compare (temp): %s | %s", apre, apost)
+        except OSError as ex2:
+            logging.warning("UPS label temp compare copy failed: %s", ex2)
         log_label(
             "label_repo_debug_pre_post_saved",
             tracking=str(tracking or ""),
@@ -712,33 +725,92 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
             instrux_hits = 0
 
         writer = PdfWriter()
-        writer.add_page(src_page)
-        page = writer.pages[0]
-
-        # Letter: label may be top band OR bottom band depending on UPS layout.
         letter_crop = None
-        if mode in ("auto", "letter_crop"):
-            w, h = _dims_at(best_idx)
-            use_bottom = False
-            if _looks_like_us_letter(w, h):
-                if _prefer_bottom_letter_band(src_page, instrux_hits):
-                    use_bottom = True
-                elif _ups_letter_instructions_dominate_top(src_page):
-                    use_bottom = True
-                elif expected_tracking and _letter_label_likely_lower_half(
-                    src_page, expected_tracking
-                ):
-                    use_bottom = True
-                elif expected_tracking and _tracking_first_line_in_lower_portion(
-                    src_page, expected_tracking
-                ):
-                    use_bottom = True
-            if use_bottom:
-                letter_crop = "bottom_band"
-                _crop_us_letter_keep_bottom_band(page)
-            elif _looks_like_us_letter(w, h):
-                letter_crop = "top_band_or_none"
-                _crop_us_letter_label_only(page)
+        score_top = None
+        score_bot = None
+        w_let, h_let = _dims_at(best_idx)
+        # US Letter: build BOTH top- and bottom-band crops, score extracted text (tracking + digits
+        # vs instruction phrases), and keep the winner. Heuristics alone often kept the wrong band.
+        if mode in ("auto", "letter_crop") and _looks_like_us_letter(w_let, h_let):
+
+            def _clone_letter_page():
+                bio = io.BytesIO()
+                tw = PdfWriter()
+                tw.add_page(reader.pages[best_idx])
+                tw.write(bio)
+                bio.seek(0)
+                return PdfReader(bio).pages[0]
+
+            def _one_page_pdf_bytes(crop_apply, pg):
+                cw = PdfWriter()
+                cw.add_page(pg)
+                p0 = cw.pages[0]
+                crop_apply(p0)
+                ob = io.BytesIO()
+                cw.write(ob)
+                return ob.getvalue()
+
+            def _score_letter_bytes(pdf_b: bytes, trk):
+                try:
+                    rr = PdfReader(io.BytesIO(pdf_b))
+                    if not rr.pages:
+                        return -1e9
+                    t = rr.pages[0].extract_text() or ""
+                except Exception:
+                    return -1e9
+                wanted = re.sub(r"[^A-Za-z0-9]", "", str(trk or "")).upper()
+                norm = re.sub(r"[^A-Za-z0-9]", "", t).upper()
+                sc = 0.0
+                if wanted and wanted in norm:
+                    sc += 500.0
+                sc += min(260.0, sum(ch.isdigit() for ch in t) * 4.0)
+                sc -= 45.0 * len(_LABEL_INSTRUX_PATTERNS.findall(t))
+                return sc
+
+            try:
+                p_top = _clone_letter_page()
+                p_bot = _clone_letter_page()
+                b_top = _one_page_pdf_bytes(_crop_us_letter_label_only, p_top)
+                b_bot = _one_page_pdf_bytes(_crop_us_letter_keep_bottom_band, p_bot)
+                score_top = _score_letter_bytes(b_top, expected_tracking)
+                score_bot = _score_letter_bytes(b_bot, expected_tracking)
+                st, sb = score_top, score_bot
+                pick_bottom = False
+                if sb > st + 8.0:
+                    pick_bottom = True
+                elif st > sb + 8.0:
+                    pick_bottom = False
+                else:
+                    pick_bottom = bool(_ups_letter_instructions_dominate_top(src_page))
+                    if not pick_bottom and _prefer_bottom_letter_band(
+                        src_page, instrux_hits
+                    ):
+                        pick_bottom = True
+                    if not pick_bottom and expected_tracking:
+                        if _letter_label_likely_lower_half(
+                            src_page, expected_tracking
+                        ):
+                            pick_bottom = True
+                        elif _tracking_first_line_in_lower_portion(
+                            src_page, expected_tracking
+                        ):
+                            pick_bottom = True
+                letter_crop = "bottom_band_scored" if pick_bottom else "top_band_scored"
+                chosen = b_bot if pick_bottom else b_top
+                writer.add_page(PdfReader(io.BytesIO(chosen)).pages[0])
+            except Exception as ex_letter:
+                log_label(
+                    "pdf_letter_dual_crop_failed",
+                    expected_tracking=expected_tracking,
+                    error=str(ex_letter),
+                )
+                writer = PdfWriter()
+                writer.add_page(reader.pages[best_idx])
+                p0 = writer.pages[0]
+                _crop_us_letter_label_only(p0)
+                letter_crop = "top_band_fallback_error"
+        else:
+            writer.add_page(reader.pages[best_idx])
 
         out = io.BytesIO()
         writer.write(out)
@@ -750,6 +822,12 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
                 best_page_index=best_idx,
                 instruction_pattern_hits_on_chosen_page=instrux_hits,
                 letter_crop=letter_crop,
+                letter_score_top=round(score_top, 2)
+                if score_top is not None
+                else None,
+                letter_score_bottom=round(score_bot, 2)
+                if score_bot is not None
+                else None,
                 output_bytes=len(final_b),
             )
         except Exception:
@@ -1011,14 +1089,128 @@ def get_rate(
     results.sort(key=lambda x: (x["rate"] is None, x["rate"] if x["rate"] is not None else 1e9))
     return results
 
+
+def _money_blob_to_float(obj: Any) -> float | None:
+    """UPS money nodes: {\"MonetaryValue\": \"12.34\"} or bare string/number."""
+    if obj is None:
+        return None
+    if isinstance(obj, bool):
+        return None
+    if isinstance(obj, (int, float)):
+        try:
+            v = float(obj)
+            return v if v >= 0 else None
+        except (TypeError, ValueError):
+            return None
+    if isinstance(obj, str):
+        try:
+            v = float(obj.strip())
+            return v if v >= 0 else None
+        except (TypeError, ValueError):
+            return None
+    if isinstance(obj, dict):
+        for k in ("MonetaryValue", "monetaryValue", "value"):
+            if k in obj and obj.get(k) not in (None, ""):
+                return _money_blob_to_float(obj.get(k))
+    return None
+
+
+def _charges_block_total_usd(blk: Any) -> float | None:
+    if not isinstance(blk, dict):
+        return None
+    for key in (
+        "GrandTotalOfAllCharge",
+        "GrandTotalOfAllCharges",
+        "TotalCharges",
+        "totalCharges",
+        "TotalCharge",
+        "totalCharge",
+    ):
+        m = _money_blob_to_float(blk.get(key))
+        if m is not None and m > 0:
+            return m
+    return None
+
+
+def extract_ups_ship_billed_amount_usd(data: Dict[str, Any]) -> float | None:
+    """
+    Billed shipping from UPS Ship API JSON (v2409; tolerates camelCase).
+    Prefer negotiated/account charges. Used for QuickBooks ShipAmt when the client
+    omits or zeros ups_purchased_rate.
+    """
+    if not isinstance(data, dict):
+        return None
+    sr = data.get("ShipmentResponse") or data.get("shipmentResponse")
+    if not isinstance(sr, dict):
+        return None
+    res = sr.get("ShipmentResults") or sr.get("shipmentResults")
+    if not isinstance(res, dict):
+        return None
+
+    for blk_key in (
+        "NegotiatedRateCharges",
+        "negotiatedRateCharges",
+        "NegotiatedCharges",
+        "negotiatedCharges",
+    ):
+        v = _charges_block_total_usd(res.get(blk_key))
+        if v is not None and v > 0:
+            return v
+    for blk_key in ("ShipmentCharges", "shipmentCharges"):
+        v = _charges_block_total_usd(res.get(blk_key))
+        if v is not None and v > 0:
+            return v
+
+    pr = res.get("PackageResults") or res.get("packageResults")
+    if isinstance(pr, list):
+        pkgs = pr
+    elif isinstance(pr, dict):
+        pkgs = [pr]
+    else:
+        pkgs = []
+    pkg_total = 0.0
+    n_pkg = 0
+    for p in pkgs:
+        if not isinstance(p, dict):
+            continue
+        got: float | None = None
+        for inner_key in (
+            "NegotiatedCharges",
+            "negotiatedCharges",
+            "NegotiatedRateCharges",
+            "negotiatedRateCharges",
+            "ShipmentCharges",
+            "shipmentCharges",
+        ):
+            inner = p.get(inner_key)
+            if isinstance(inner, dict):
+                got = _charges_block_total_usd(inner)
+                if got is not None and got > 0:
+                    break
+        if got is None:
+            got = _charges_block_total_usd(p)
+        if got is None:
+            got = _money_blob_to_float(
+                p.get("TotalCharges") or p.get("totalCharges")
+            )
+        if got is not None and got > 0:
+            pkg_total += got
+            n_pkg += 1
+    if n_pkg > 0 and pkg_total > 0:
+        return pkg_total
+    return None
+
+
 # ------- Create Shipment (labels) -------
 def create_shipment(
     ship_to: Dict[str, str],
     packages: List[Dict[str, Any]],
     service_code: str
-) -> Tuple[List[str], List[str], bool]:
+) -> Tuple[List[str], List[str], bool, float | None]:
     """
-    Returns (label_urls, tracking_numbers, saved_to_label_printer_folder).
+    Returns (label_urls, tracking_numbers, saved_to_label_printer_folder, billed_shipping_usd_or_none).
+
+    billed_shipping_usd_or_none is parsed from the Ship API response (authoritative when present).
     Trimmed PDF/PNG/ZPL is written to temp for /labels/… and copied to UPS_LABEL_OUTPUT_DIR when that path exists.
     """
     token = get_access_token()
@@ -1069,6 +1261,15 @@ def create_shipment(
         ) from e
 
     data = resp.json()
+    billed_shipping_usd = extract_ups_ship_billed_amount_usd(data)
+    try:
+        log_label(
+            "ups_ship_response_billed_amount",
+            billed_shipping_usd=billed_shipping_usd,
+            service_code=service_code,
+        )
+    except Exception:
+        pass
     # Collect labels & tracking
     label_urls: List[str] = []
     tracking: List[str] = []
@@ -1135,7 +1336,7 @@ def create_shipment(
             f"Could not parse UPS label response: {e!s}; body_snippet={json.dumps(data)[:800]}"
         ) from e
 
-    return label_urls, tracking, saved_to_printer
+    return label_urls, tracking, saved_to_printer, billed_shipping_usd
 
 
 # ------- Quantum View (account shipment history) -------
