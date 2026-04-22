@@ -6104,29 +6104,64 @@ def _qbo_customer_memo_shipping_fallback(
         len(new_memo),
         new_memo[:300],
     )
-    sync = inv.get("SyncToken")
-    if sync is None:
+    if inv.get("SyncToken") is None:
         return
-    inv2, err2 = _qbo_sparse_invoice_update(
-        headers,
-        realm_id,
-        inv_id,
-        str(sync).strip(),
-        {"CustomerMemo": new_memo},
-        env_override,
-    )
+    # QBO sparse Invoice updates often expect CustomerMemo as MemoRef {"value":"..."},
+    # not a raw string (string can yield 2010 unsupported property).
+    memo_try = str(new_memo)[:1000]
+    inv2, err2 = None, None
+    for payload in (
+        {"CustomerMemo": {"value": memo_try}},
+        {"CustomerMemo": memo_try},
+    ):
+        inv_r, _e = _qbo_get_invoice(headers, realm_id, inv_id, env_override)
+        if not inv_r or inv_r.get("SyncToken") is None:
+            err2 = "memo_fallback_no_sync_token"
+            break
+        st = str(inv_r.get("SyncToken")).strip()
+        inv2, err2 = _qbo_sparse_invoice_update(
+            headers,
+            realm_id,
+            inv_id,
+            st,
+            payload,
+            env_override,
+        )
+        if inv2 is not None:
+            logging.warning(
+                "QBO CustomerMemo shipping fallback applied (native ShipAmt=%s shipViaOk=%s) payload=%s.",
+                cur_amt,
+                sm_ok,
+                "MemoRef.value" if isinstance(payload.get("CustomerMemo"), dict) else "string",
+            )
+            break
+
     if inv2 is None:
-        logging.warning(
-            "QBO CustomerMemo shipping fallback failed (invoice still missing shipping in memo): %s",
-            err2 or "?",
-        )
-    else:
-        logging.warning(
-            "QBO CustomerMemo shipping fallback applied (native ShipAmt=%s shipViaOk=%s) — "
-            "enable Sales → Shipping in QBO to use the Shipping field instead of memo.",
-            cur_amt,
-            sm_ok,
-        )
+        inv_r, _e = _qbo_get_invoice(headers, realm_id, inv_id, env_override)
+        pn = memo_try[:3900]
+        err3 = None
+        inv3 = None
+        if inv_r and inv_r.get("SyncToken") is not None:
+            inv3, err3 = _qbo_sparse_invoice_update(
+                headers,
+                realm_id,
+                inv_id,
+                str(inv_r.get("SyncToken")).strip(),
+                {"PrivateNote": pn},
+                env_override,
+            )
+        if inv3 is not None:
+            logging.warning(
+                "QBO shipping fallback wrote PrivateNote (CustomerMemo sparse rejected; "
+                "native ShipAmt=%s). In QBO this is usually an internal-only note, not printed on the customer PDF.",
+                cur_amt,
+            )
+        else:
+            logging.warning(
+                "QBO CustomerMemo shipping fallback failed (memo + PrivateNote): memo_err=%s private_err=%s",
+                err2 or "?",
+                err3 or "?",
+            )
 
 
 def _query_invoice_id_by_doc_number(
