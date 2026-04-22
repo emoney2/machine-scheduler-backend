@@ -463,6 +463,8 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
 
     Set UPS_LABEL_PDF_TRIM_MODE=off to disable trimming (not recommended for web printing).
     UPS_LABEL_LETTER_TOP_FRACTION (default 0.40) = fraction of page height kept from the top.
+    UPS_LABEL_LETTER_FORCE_HALF=bottom|top|auto — force which half of US Letter to keep after
+    a bad auto pick (default auto: prefers bottom when instructions dominate the top).
     """
     mode = (os.getenv("UPS_LABEL_PDF_TRIM_MODE") or "auto").strip().lower()
     if mode == "off" or not raw_pdf:
@@ -509,30 +511,36 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
     def _looks_like_us_letter(w: float, h: float) -> bool:
         return h >= 700 and 580 <= w <= 640 and h / max(w, 1) > 1.15
 
-    def _crop_us_letter_label_only(page):
-        """If page is tall US Letter with label in upper block, remove instructions below."""
+    def _crop_us_letter_keep_top_fraction(page, frac: float):
+        """Keep the top *frac* of page height (US Letter); removes fold/help below the label."""
         w, h, left, bottom, right, top = _page_wh(page)
         if not _looks_like_us_letter(w, h):
             return
-        # Default a bit tighter than before so folded / print-help text is excluded.
-        frac = float(os.getenv("UPS_LABEL_LETTER_TOP_FRACTION") or "0.40")
-        frac = min(max(frac, 0.22), 0.75)
+        frac = min(max(float(frac), 0.18), 0.78)
         new_bottom = bottom + h * (1.0 - frac)
         rect = RectangleObject([left, new_bottom, right, top])
         page.mediabox = rect
         page.cropbox = rect
 
-    def _crop_us_letter_keep_bottom_band(page):
-        """US Letter where the scannable label is in the lower portion; strip instruction header."""
+    def _crop_us_letter_label_only(page):
+        """Default top-band crop (env UPS_LABEL_LETTER_TOP_FRACTION, default 0.40)."""
+        frac = float(os.getenv("UPS_LABEL_LETTER_TOP_FRACTION") or "0.40")
+        _crop_us_letter_keep_top_fraction(page, frac)
+
+    def _crop_us_letter_keep_bottom_fraction(page, frac: float):
+        """Keep the bottom *frac* of page height (US Letter); strips instruction header above label."""
         w, h, left, bottom, right, top = _page_wh(page)
         if not _looks_like_us_letter(w, h):
             return
-        frac = float(os.getenv("UPS_LABEL_LETTER_BOTTOM_FRACTION") or "0.48")
-        frac = min(max(frac, 0.22), 0.78)
+        frac = min(max(float(frac), 0.22), 0.82)
         new_top = bottom + h * frac
         rect = RectangleObject([left, bottom, right, new_top])
         page.mediabox = rect
         page.cropbox = rect
+
+    def _crop_us_letter_keep_bottom_band(page):
+        frac = float(os.getenv("UPS_LABEL_LETTER_BOTTOM_FRACTION") or "0.48")
+        _crop_us_letter_keep_bottom_fraction(page, frac)
 
     def _letter_label_likely_lower_half(p, trk: str) -> bool:
         """
@@ -763,41 +771,176 @@ def _normalize_ups_label_pdf_bytes(raw_pdf: bytes, expected_tracking: str | None
                 sc = 0.0
                 if wanted and wanted in norm:
                     sc += 500.0
-                sc += min(260.0, sum(ch.isdigit() for ch in t) * 4.0)
-                sc -= 45.0 * len(_LABEL_INSTRUX_PATTERNS.findall(t))
+                # Instruction pages often have many digits (phones, ZIPs); cap so they
+                # do not outscore the real label when tracking text is missing from extract_text.
+                digit_count = sum(ch.isdigit() for ch in t)
+                sc += min(85.0, digit_count * 1.25)
+                hits = len(_LABEL_INSTRUX_PATTERNS.findall(t))
+                sc -= min(320.0, 75.0 + 60.0 * hits)
+                if hits >= 2 and (not wanted or wanted not in norm):
+                    sc -= 450.0
                 return sc
 
             try:
-                p_top = _clone_letter_page()
-                p_bot = _clone_letter_page()
-                b_top = _one_page_pdf_bytes(_crop_us_letter_label_only, p_top)
-                b_bot = _one_page_pdf_bytes(_crop_us_letter_keep_bottom_band, p_bot)
-                score_top = _score_letter_bytes(b_top, expected_tracking)
-                score_bot = _score_letter_bytes(b_bot, expected_tracking)
-                st, sb = score_top, score_bot
-                pick_bottom = False
-                if sb > st + 8.0:
-                    pick_bottom = True
-                elif st > sb + 8.0:
-                    pick_bottom = False
+                top_fracs = (0.30, 0.34, 0.38, 0.42, 0.46, 0.50, 0.55)
+                bot_fracs = (0.38, 0.42, 0.46, 0.50, 0.54, 0.58, 0.62, 0.68)
+                best_top_bytes = None
+                best_top_sc = -1e12
+                best_top_tag = "none"
+                best_bot_bytes = None
+                best_bot_sc = -1e12
+                best_bot_tag = "none"
+                score_top = None
+                score_bot = None
+                for frac in top_fracs:
+                    p = _clone_letter_page()
+
+                    def _apply_top(pg, fr=frac):
+                        _crop_us_letter_keep_top_fraction(pg, fr)
+
+                    b = _one_page_pdf_bytes(_apply_top, p)
+                    s = _score_letter_bytes(b, expected_tracking)
+                    if score_top is None or s > score_top:
+                        score_top = s
+                    if s > best_top_sc:
+                        best_top_sc = s
+                        best_top_bytes = b
+                        best_top_tag = f"top_frac={frac}"
+                for frac in bot_fracs:
+                    p = _clone_letter_page()
+
+                    def _apply_bot(pg, fr=frac):
+                        _crop_us_letter_keep_bottom_fraction(pg, fr)
+
+                    b = _one_page_pdf_bytes(_apply_bot, p)
+                    s = _score_letter_bytes(b, expected_tracking)
+                    if score_bot is None or s > score_bot:
+                        score_bot = s
+                    if s > best_bot_sc:
+                        best_bot_sc = s
+                        best_bot_bytes = b
+                        best_bot_tag = f"bottom_frac={frac}"
+
+                force_h = (os.getenv("UPS_LABEL_LETTER_FORCE_HALF") or "auto").strip().lower()
+                best_bytes = None
+                best_sc = -1e12
+                best_tag = "none"
+                if force_h == "bottom" and best_bot_bytes is not None:
+                    best_bytes, best_sc, best_tag = (
+                        best_bot_bytes,
+                        best_bot_sc,
+                        f"forced_bottom:{best_bot_tag}",
+                    )
+                elif force_h == "top" and best_top_bytes is not None:
+                    best_bytes, best_sc, best_tag = (
+                        best_top_bytes,
+                        best_top_sc,
+                        f"forced_top:{best_top_tag}",
+                    )
                 else:
-                    pick_bottom = bool(_ups_letter_instructions_dominate_top(src_page))
-                    if not pick_bottom and _prefer_bottom_letter_band(
-                        src_page, instrux_hits
-                    ):
-                        pick_bottom = True
-                    if not pick_bottom and expected_tracking:
-                        if _letter_label_likely_lower_half(
+                    # Auto: global winner, but UPS Letter often puts "how to print" on top and
+                    # the scannable label below — if a top-band crop wins while instructions are
+                    # present (or scores are close), keep the best bottom band instead.
+                    if best_top_bytes is None and best_bot_bytes is not None:
+                        best_bytes, best_sc, best_tag = (
+                            best_bot_bytes,
+                            best_bot_sc,
+                            best_bot_tag,
+                        )
+                    elif best_bot_bytes is None and best_top_bytes is not None:
+                        best_bytes, best_sc, best_tag = (
+                            best_top_bytes,
+                            best_top_sc,
+                            best_top_tag,
+                        )
+                    elif best_top_bytes is not None and best_bot_bytes is not None:
+                        if best_top_sc >= best_bot_sc:
+                            best_bytes, best_sc, best_tag = (
+                                best_top_bytes,
+                                best_top_sc,
+                                best_top_tag,
+                            )
+                            if best_tag.startswith("top_frac") and (
+                                instrux_hits >= 1
+                                or _ups_letter_instructions_dominate_top(src_page)
+                                or best_bot_sc >= best_top_sc - 40.0
+                            ):
+                                best_bytes, best_sc, best_tag = (
+                                    best_bot_bytes,
+                                    best_bot_sc,
+                                    f"prefer_bottom:{best_bot_tag}",
+                                )
+                        else:
+                            best_bytes, best_sc, best_tag = (
+                                best_bot_bytes,
+                                best_bot_sc,
+                                best_bot_tag,
+                            )
+                    elif best_top_bytes is not None:
+                        best_bytes, best_sc, best_tag = (
+                            best_top_bytes,
+                            best_top_sc,
+                            best_top_tag,
+                        )
+                    elif best_bot_bytes is not None:
+                        best_bytes, best_sc, best_tag = (
+                            best_bot_bytes,
+                            best_bot_sc,
+                            best_bot_tag,
+                        )
+
+                # If text extraction is empty (image-only PDF), all scores stay low — prefer
+                # bottom bands (label is usually below UPS “how to print” copy on Letter).
+                if best_bytes is None or best_sc < 40.0:
+                    if instrux_hits >= 1 or _ups_letter_instructions_dominate_top(src_page):
+                        for frac in (0.55, 0.60, 0.65, 0.70):
+                            p = _clone_letter_page()
+
+                            def _apply_bot2(pg, fr=frac):
+                                _crop_us_letter_keep_bottom_fraction(pg, fr)
+
+                            b = _one_page_pdf_bytes(_apply_bot2, p)
+                            s = _score_letter_bytes(b, expected_tracking)
+                            if s > best_sc:
+                                best_sc = s
+                                best_bytes = b
+                                best_tag = f"bottom_frac_weak={frac}"
+                    if (best_sc < 40.0 or best_bytes is None) and expected_tracking:
+                        if _prefer_bottom_letter_band(src_page, instrux_hits):
+                            p = _clone_letter_page()
+                            _crop_us_letter_keep_bottom_fraction(p, 0.58)
+                            ob = io.BytesIO()
+                            cw = PdfWriter()
+                            cw.add_page(p)
+                            cw.write(ob)
+                            best_bytes = ob.getvalue()
+                            best_tag = "bottom_frac=0.58_heuristic"
+                            best_sc = _score_letter_bytes(best_bytes, expected_tracking)
+                        elif _letter_label_likely_lower_half(
+                            src_page, expected_tracking
+                        ) or _tracking_first_line_in_lower_portion(
                             src_page, expected_tracking
                         ):
-                            pick_bottom = True
-                        elif _tracking_first_line_in_lower_portion(
-                            src_page, expected_tracking
-                        ):
-                            pick_bottom = True
-                letter_crop = "bottom_band_scored" if pick_bottom else "top_band_scored"
-                chosen = b_bot if pick_bottom else b_top
-                writer.add_page(PdfReader(io.BytesIO(chosen)).pages[0])
+                            p = _clone_letter_page()
+                            _crop_us_letter_keep_bottom_fraction(p, 0.58)
+                            ob = io.BytesIO()
+                            cw = PdfWriter()
+                            cw.add_page(p)
+                            cw.write(ob)
+                            best_bytes = ob.getvalue()
+                            best_tag = "bottom_frac=0.58_tracking_heuristic"
+                            best_sc = _score_letter_bytes(best_bytes, expected_tracking)
+                if best_bytes is None:
+                    p_top = _clone_letter_page()
+                    _crop_us_letter_label_only(p_top)
+                    ob = io.BytesIO()
+                    cw = PdfWriter()
+                    cw.add_page(p_top)
+                    cw.write(ob)
+                    best_bytes = ob.getvalue()
+                    best_tag = "top_band_fallback"
+                letter_crop = f"sweep:{best_tag}"
+                writer.add_page(PdfReader(io.BytesIO(best_bytes)).pages[0])
             except Exception as ex_letter:
                 log_label(
                     "pdf_letter_dual_crop_failed",
@@ -1160,6 +1303,23 @@ def extract_ups_ship_billed_amount_usd(data: Dict[str, Any]) -> float | None:
         v = _charges_block_total_usd(res.get(blk_key))
         if v is not None and v > 0:
             return v
+
+    # v2409: totals sometimes sit on ShipmentResults (not nested under ShipmentCharges).
+    for direct in ("TotalCharges", "totalCharges", "GrandTotalOfAllCharges", "grandTotalOfAllCharges"):
+        v = _money_blob_to_float(res.get(direct))
+        if v is not None and v > 0:
+            return v
+    for a, b in (
+        ("BaseServiceCharge", "TransportationCharges"),
+        ("baseServiceCharge", "transportationCharges"),
+    ):
+        pa = _money_blob_to_float(res.get(a))
+        pb = _money_blob_to_float(res.get(b))
+        parts = [x for x in (pa, pb) if x is not None and x > 0]
+        if parts:
+            s = round(sum(parts), 2)
+            if s > 0:
+                return s
 
     pr = res.get("PackageResults") or res.get("packageResults")
     if isinstance(pr, list):

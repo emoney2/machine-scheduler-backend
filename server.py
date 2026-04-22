@@ -5569,6 +5569,31 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
     return None
 
 
+def _qbo_native_shipping_unavailable(headers, realm_id, env_override=None):
+    """
+    True when QBO does not expose ShipMethod (Sales → Delivery / Shipping is off).
+    In that mode ShipAmt / ShipMethodRef sparse updates often return 2010 unsupported.
+    """
+    import requests
+
+    base = get_base_qbo_url(env_override)
+    query_url = f"{base}/v3/company/{realm_id}/query?minorversion={QBO_MINOR_VERSION}"
+    r = requests.get(
+        query_url,
+        headers=headers,
+        params={"query": "SELECT Id FROM ShipMethod MAXRESULTS 1"},
+    )
+    if r.status_code == 200:
+        return False
+    err = (r.text or "").lower()
+    if r.status_code == 400 and (
+        "metadata not found for entity: shipmethod" in err
+        or ("queryvalidationerror" in err and "shipmethod" in err)
+    ):
+        return True
+    return False
+
+
 def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start=1001):
     """
     Query the latest invoice DocNumber and return +1 (as string).
@@ -5732,6 +5757,105 @@ def _qbo_get_invoice(headers, realm_id, invoice_id, env_override=None):
     return (inv if inv else None), None
 
 
+def _qbo_invoice_shipping_snapshot(inv):
+    """Compact dict for logs when debugging ShipAmt / Ship Via / memo."""
+    if not isinstance(inv, dict):
+        return {}
+    sm = inv.get("ShipMethodRef") if isinstance(inv.get("ShipMethodRef"), dict) else {}
+    memo = inv.get("CustomerMemo")
+    if isinstance(memo, dict):
+        memo = memo.get("value") or memo
+    memo_s = (str(memo or "").replace("\n", " ").strip())[:220]
+    try:
+        amt = round(float(inv.get("ShipAmt") or 0), 2)
+    except (TypeError, ValueError):
+        amt = None
+    tr = str(inv.get("TrackingNum") or "").strip()
+    lines = inv.get("Line") or []
+    n_lines = len(lines) if isinstance(lines, list) else 0
+    ship_desc_lines = 0
+    if isinstance(lines, list):
+        for ln in lines:
+            if not isinstance(ln, dict):
+                continue
+            d = str(ln.get("Description") or "")
+            if d.startswith("Shipping ("):
+                ship_desc_lines += 1
+    try:
+        total = round(float(inv.get("TotalAmt") or 0), 2)
+    except (TypeError, ValueError):
+        total = None
+    return {
+        "ShipAmt": amt,
+        "TotalAmt": total,
+        "TrackingNum_len": len(tr),
+        "ShipMethodRef_value": (str(sm.get("value") or "").strip() or None),
+        "ShipMethodRef_name": (str(sm.get("name") or "").strip()[:40] or None),
+        "CustomerMemo_len": len(memo_s),
+        "CustomerMemo_preview": memo_s or None,
+        "Line_count": n_lines,
+        "shipping_sales_line_count": ship_desc_lines,
+    }
+
+
+def _qbo_log_invoice_shipping_diagnostics(
+    stage,
+    headers,
+    realm_id,
+    invoice_id,
+    env_override=None,
+    wanted_ship_amt=None,
+    wanted_tracking=None,
+    extra=None,
+):
+    """Single structured log line for Render when ShipAmt / Ship Via fail to persist."""
+    inv, err = _qbo_get_invoice(headers, realm_id, invoice_id, env_override)
+    if not inv:
+        logging.warning(
+            "QBO ship-field diagnostics stage=%s invoice_id=%s GET_failed=%s",
+            stage,
+            invoice_id,
+            (err or "?")[:500],
+        )
+        return inv
+    snap = _qbo_invoice_shipping_snapshot(inv)
+    payload = {
+        "stage": stage,
+        "invoice_id": str(invoice_id),
+        "wanted_ShipAmt": wanted_ship_amt,
+        "wanted_tracking_preview": (wanted_tracking[:24] + "…")
+        if wanted_tracking and len(wanted_tracking) > 24
+        else wanted_tracking,
+        "qbo_snapshot": snap,
+    }
+    if extra:
+        payload["extra"] = extra
+    try:
+        logging.info("QBO ship-field diagnostics %s", json.dumps(payload, default=str))
+    except Exception:
+        logging.info(
+            "QBO ship-field diagnostics stage=%s invoice_id=%s snap=%s",
+            stage,
+            invoice_id,
+            snap,
+        )
+    try:
+        wa = float(wanted_ship_amt or 0)
+        sa = float(snap.get("ShipAmt") or 0)
+    except (TypeError, ValueError):
+        wa, sa = 0.0, 0.0
+    if wa > 0.01 and sa <= 0.001:
+        logging.warning(
+            "QBO ship-field STILL_EMPTY: stage=%s invoice_id=%s wanted_ShipAmt=%s but QBO ShipAmt=%s "
+            "(API often rejects ShipAmt when ShipMethod entity is unavailable for this company).",
+            stage,
+            invoice_id,
+            wa,
+            snap.get("ShipAmt"),
+        )
+    return inv
+
+
 def _qbo_sparse_invoice_update(headers, realm_id, invoice_id, sync_token, fields, env_override=None):
     """Single sparse POST for an existing invoice. fields must not include Id/SyncToken."""
     iid = str(invoice_id or "").strip()
@@ -5818,7 +5942,25 @@ def _qbo_patch_invoice_shipping_and_tracking(
     if txn_date_str and str(inv.get("ShipDate") or "").strip() != str(txn_date_str).strip():
         patch["ShipDate"] = str(txn_date_str).strip()
 
+    logging.info(
+        "QBO ship-field patch plan invoice_id=%s wanted_ShipAmt=%s current_ShipAmt=%s "
+        "wanted_tracking_len=%s current_tracking_len=%s want_ShipMethod_value=%s current=%s "
+        "patch_keys=%s",
+        invoice_id,
+        wanted_amt,
+        cur_amt,
+        len(wanted_track),
+        len(cur_track),
+        want_sm_val or "(none)",
+        cur_sm_val or "(none)",
+        list(patch.keys()) if patch else "(none)",
+    )
+
     if not patch:
+        logging.info(
+            "QBO ship-field patch skip invoice_id=%s (QBO already matches wanted delivery fields)",
+            invoice_id,
+        )
         return True
 
     inv2, err2 = _qbo_sparse_invoice_update(
@@ -5829,6 +5971,16 @@ def _qbo_patch_invoice_shipping_and_tracking(
             "QBO shipping patch: applied to invoice %s keys=%s",
             invoice_id,
             list(patch.keys()),
+        )
+        _qbo_log_invoice_shipping_diagnostics(
+            "after_combined_sparse_patch",
+            headers,
+            realm_id,
+            invoice_id,
+            env_override,
+            wanted_ship_amt=wanted_amt,
+            wanted_tracking=wanted_track,
+            extra={"patch_keys_applied": list(patch.keys())},
         )
         return True
 
@@ -5855,7 +6007,126 @@ def _qbo_patch_invoice_shipping_and_tracking(
                 invoice_id,
                 err2 or "?",
             )
+        else:
+            logging.info(
+                "QBO ship-field patch single-field OK invoice_id=%s key=%s",
+                invoice_id,
+                key,
+            )
+    _qbo_log_invoice_shipping_diagnostics(
+        "after_per_field_patch_attempts",
+        headers,
+        realm_id,
+        invoice_id,
+        env_override,
+        wanted_ship_amt=wanted_amt,
+        wanted_tracking=wanted_track,
+        extra={"attempted_keys": list(patch.keys())},
+    )
     return True
+
+
+def _qbo_customer_memo_shipping_fallback(
+    headers,
+    realm_id,
+    inv_id,
+    ship_amt_r,
+    ship_via_label,
+    track_parts,
+    ship_method_ref_payload,
+    env_override=None,
+    shipping_on_line_item=False,
+):
+    """
+    If ShipAmt or Ship Via did not persist on the invoice (QBO company prefs / API quirks),
+    append shipping $, carrier, and tracking to CustomerMemo so the bill is not silent.
+    When shipping_on_line_item is True, freight is already on a Sales line — do not repeat $ in memo.
+    """
+    inv, _err = _qbo_get_invoice(headers, realm_id, inv_id, env_override)
+    if not inv:
+        return
+    want_amt = round(float(ship_amt_r or 0), 2)
+    try:
+        cur_amt = round(float(inv.get("ShipAmt") or 0), 2)
+    except (TypeError, ValueError):
+        cur_amt = 0.0
+    ship_amt_ok = (
+        want_amt <= 0.001 or cur_amt > 0.001 or bool(shipping_on_line_item)
+    )
+    sm_ok = _qbo_invoice_has_ship_method_ref(inv) or not (
+        isinstance(ship_method_ref_payload, dict)
+        and str(ship_method_ref_payload.get("value") or "").strip()
+    )
+    logging.info(
+        "QBO ship-field memo_fallback_check invoice_id=%s want_ShipAmt=%s cur_ShipAmt=%s "
+        "ship_amt_ok=%s sm_ok=%s shipping_on_line_item=%s ship_via=%r",
+        inv_id,
+        want_amt,
+        cur_amt,
+        ship_amt_ok,
+        sm_ok,
+        shipping_on_line_item,
+        (ship_via_label or "")[:80],
+    )
+    if ship_amt_ok and sm_ok:
+        logging.info(
+            "QBO ship-field memo_fallback_skip invoice_id=%s (ShipAmt and Ship Via already OK)",
+            inv_id,
+        )
+        return
+    memo = str(inv.get("CustomerMemo") or "").strip()
+    extras = []
+    if want_amt > 0.001 and cur_amt <= 0.001 and not shipping_on_line_item:
+        extras.append(f"UPS shipping ${want_amt:.2f}")
+    if not sm_ok and (ship_via_label or "").strip():
+        extras.append(f"Ship via: {str(ship_via_label).strip()}")
+    if track_parts:
+        tk = ", ".join(str(t).strip() for t in track_parts if str(t).strip())
+        if tk:
+            extras.append(f"Tracking: {tk}")
+    if not extras:
+        logging.info(
+            "QBO ship-field memo_fallback_no_extras invoice_id=%s (nothing to append)",
+            inv_id,
+        )
+        return
+    chunk = " | ".join(extras)
+    if chunk and memo and chunk in memo:
+        logging.info(
+            "QBO ship-field memo_fallback_skip invoice_id=%s (memo already contains chunk)",
+            inv_id,
+        )
+        return
+    new_memo = (f"{memo} | {chunk}")[:1000] if memo else chunk[:1000]
+    logging.info(
+        "QBO ship-field memo_fallback_apply invoice_id=%s new_memo_len=%s preview=%r",
+        inv_id,
+        len(new_memo),
+        new_memo[:300],
+    )
+    sync = inv.get("SyncToken")
+    if sync is None:
+        return
+    inv2, err2 = _qbo_sparse_invoice_update(
+        headers,
+        realm_id,
+        inv_id,
+        str(sync).strip(),
+        {"CustomerMemo": new_memo},
+        env_override,
+    )
+    if inv2 is None:
+        logging.warning(
+            "QBO CustomerMemo shipping fallback failed (invoice still missing shipping in memo): %s",
+            err2 or "?",
+        )
+    else:
+        logging.warning(
+            "QBO CustomerMemo shipping fallback applied (native ShipAmt=%s shipViaOk=%s) — "
+            "enable Sales → Shipping in QBO to use the Shipping field instead of memo.",
+            cur_amt,
+            sm_ok,
+        )
 
 
 def _query_invoice_id_by_doc_number(
@@ -5913,12 +6184,13 @@ def _qbo_invoice_record_url(realm_id, invoice_id, env_override=None):
         base = "https://app.qbo.intuit.com"
     else:
         base = "https://app.sandbox.qbo.intuit.com"
+    # txnType helps QBO open the existing sales invoice instead of a blank "new invoice" editor.
     if cid:
         return (
-            f"{base}/app/invoice?txnId={txn}"
+            f"{base}/app/invoice?txnId={txn}&txnType=Invoice"
             f"&companyId={cid}&deeplinkcompanyid={cid}"
         )
-    return f"{base}/app/invoice?txnId={txn}"
+    return f"{base}/app/invoice?txnId={txn}&txnType=Invoice"
 
 
 def fetch_customer_email_from_directory(sheet_service, company_name):
@@ -6302,7 +6574,7 @@ def create_consolidated_invoice_in_quickbooks(
         return {k: v for k, v in inv.items() if v is not None}
 
     def _fallback_invoice_payload():
-        """Opt-in only (QBO_SHIPPING_LINE_FALLBACK): shipping as a line item + memo."""
+        """Shipping as a Sales line item + CustomerMemo (used when native ShipAmt is unavailable)."""
         lines = list(line_items)
         if ship_amt_r > 0:
             try:
@@ -6408,24 +6680,87 @@ def create_consolidated_invoice_in_quickbooks(
     if track_parts:
         memo_fallback_parts.append(f"Tracking: {', '.join(track_parts)}")
     memo_fallback = " | ".join(memo_fallback_parts)
-    allow_ship_line = os.getenv("QBO_SHIPPING_LINE_FALLBACK", "").strip().lower() in (
+    env_ship_line = os.getenv("QBO_SHIPPING_LINE_FALLBACK", "").strip().lower() in (
         "1",
         "true",
         "yes",
     )
+    qbo_native_ship_off = _qbo_native_shipping_unavailable(
+        headers, realm_id, env_override
+    )
+    if qbo_native_ship_off and (ship_amt_r > 0 or track_parts):
+        logging.warning(
+            "QBO ShipMethod API unavailable for this company (native ShipAmt/Ship Via may fail). "
+            "Shipping stays in the Shipping field when QBO accepts it; optional line-item fallback "
+            "is only if you set QBO_SHIPPING_LINE_FALLBACK=1 on the server. "
+            "In QBO: Account and settings → Sales → add ship methods / delivery options so the API exposes ShipMethod."
+        )
+    # Line-item freight only when explicitly opted in (not automatic — you want ShipAmt in Shipping).
+    force_shipping_line = env_ship_line and (ship_amt_r > 0 or track_parts)
 
-    wants_native_shipping = bool(ship_amt_r > 0 or track_parts)
-    if wants_native_shipping:
-        invoice_payload = _native_invoice_payload()
+    used_force_line = False
+    force_attempted = False
+    res = None
+    invoice_payload = None
+
+    if force_shipping_line:
+        force_attempted = True
+        invoice_payload = _fallback_invoice_payload()
         logging.info(
-            "📦 Invoice payload (native ship/tracking fields):\n%s",
+            "📦 Invoice payload (shipping as Sales line — QBO_SHIPPING_LINE_FALLBACK=1):\n%s",
             json.dumps(invoice_payload, indent=2),
         )
         res = _post_inv(invoice_payload)
-    else:
-        invoice_payload = _native_invoice_payload()
-        logging.info("📦 Invoice payload (no ship charge/tracking):\n%s", json.dumps(invoice_payload, indent=2))
-        res = _post_inv(invoice_payload)
+
+        def _line_fb_bad():
+            return res.status_code not in (200, 201)
+
+        le = (res.text or "") if _line_fb_bad() else ""
+        if le and "2010" in le and "CustomerMemo" in invoice_payload:
+            invoice_payload = {
+                k: v for k, v in invoice_payload.items() if k != "CustomerMemo"
+            }
+            logging.warning(
+                "QBO invoice 2010 (shipping line): retrying without CustomerMemo"
+            )
+            res = _post_inv(invoice_payload)
+            le = (res.text or "") if _line_fb_bad() else ""
+        if le and "2010" in le and "SalesTermRef" in invoice_payload:
+            invoice_payload = {
+                k: v for k, v in invoice_payload.items() if k != "SalesTermRef"
+            }
+            logging.warning(
+                "QBO invoice 2010 (shipping line): retrying without SalesTermRef"
+            )
+            res = _post_inv(invoice_payload)
+            le = (res.text or "") if _line_fb_bad() else ""
+        if le and "2010" in le and "BillEmail" in invoice_payload:
+            invoice_payload = {
+                k: v for k, v in invoice_payload.items() if k != "BillEmail"
+            }
+            logging.warning(
+                "QBO invoice 2010 (shipping line): retrying without BillEmail"
+            )
+            res = _post_inv(invoice_payload)
+        if res.status_code in (200, 201):
+            used_force_line = True
+
+    if not used_force_line:
+        wants_native_shipping = bool(ship_amt_r > 0 or track_parts)
+        if wants_native_shipping:
+            invoice_payload = _native_invoice_payload()
+            logging.info(
+                "📦 Invoice payload (native ship/tracking fields):\n%s",
+                json.dumps(invoice_payload, indent=2),
+            )
+            res = _post_inv(invoice_payload)
+        else:
+            invoice_payload = _native_invoice_payload()
+            logging.info(
+                "📦 Invoice payload (no ship charge/tracking):\n%s",
+                json.dumps(invoice_payload, indent=2),
+            )
+            res = _post_inv(invoice_payload)
 
     def _qbo_still_bad():
         return res.status_code not in (200, 201)
@@ -6499,7 +6834,8 @@ def create_consolidated_invoice_in_quickbooks(
     if (
         _qbo_still_bad()
         and _qbo_is_2010()
-        and allow_ship_line
+        and env_ship_line
+        and not force_attempted
         and (ship_amt_r > 0 or track_parts)
     ):
         logging.warning(
@@ -6558,6 +6894,25 @@ def create_consolidated_invoice_in_quickbooks(
         for ln in (invoice_payload.get("Line") or [])
         if isinstance(ln, dict)
     )
+    try:
+        sm_un = _qbo_native_shipping_unavailable(headers, realm_id, env_override)
+        logging.info(
+            "QBO ship-field consolidated_start invoice_id=%s DocNumber=%s intended_ShipAmt=%s "
+            "tracking_count=%s has_ShipMethodRef_payload=%s qbo_ShipMethod_api_unavailable=%s "
+            "has_opt_in_shipping_line=%s",
+            inv_id,
+            doc_number,
+            ship_amt_r,
+            len(track_parts or []),
+            bool(
+                isinstance(ship_method_ref_payload, dict)
+                and str(ship_method_ref_payload.get("value") or "").strip()
+            ),
+            sm_un,
+            has_opt_in_shipping_line,
+        )
+    except Exception as ex:
+        logging.warning("QBO ship-field consolidated_start log failed: %s", ex)
     if not has_opt_in_shipping_line:
         _qbo_patch_invoice_shipping_and_tracking(
             headers,
@@ -6571,7 +6926,7 @@ def create_consolidated_invoice_in_quickbooks(
         )
     else:
         logging.info(
-            "QBO shipping patch skipped (invoice uses opt-in Shipping line item from QBO_SHIPPING_LINE_FALLBACK)"
+            "QBO shipping patch skipped (invoice uses Shipping sales line item; native ShipAmt not used)"
         )
     if ship_method_ref_payload:
         _ensure_qbo_invoice_ship_via(
@@ -6599,6 +6954,44 @@ def create_consolidated_invoice_in_quickbooks(
             ship_method_ref_payload,
             txn_date_str,
             env_override,
+        )
+
+    _qbo_customer_memo_shipping_fallback(
+        headers,
+        realm_id,
+        inv_id,
+        ship_amt_r,
+        ship_via_label,
+        track_parts,
+        ship_method_ref_payload,
+        env_override,
+        shipping_on_line_item=has_opt_in_shipping_line,
+    )
+
+    try:
+        wt = ", ".join(track_parts) if track_parts else ""
+        nu = _qbo_native_shipping_unavailable(headers, realm_id, env_override)
+        _qbo_log_invoice_shipping_diagnostics(
+            "consolidated_final_after_memo_fallback",
+            headers,
+            realm_id,
+            inv_id,
+            env_override,
+            wanted_ship_amt=ship_amt_r,
+            wanted_tracking=wt,
+            extra={
+                "DocNumber": str(doc_number),
+                "has_opt_in_shipping_line": has_opt_in_shipping_line,
+                "qbo_native_shipping_unavailable": nu,
+                "ship_method_ref_payload_set": bool(
+                    isinstance(ship_method_ref_payload, dict)
+                    and str(ship_method_ref_payload.get("value") or "").strip()
+                ),
+            },
+        )
+    except Exception as ex:
+        logging.warning(
+            "QBO ship-field consolidated_final diagnostics failed: %s", ex
         )
 
     browser_url = _qbo_invoice_record_url(realm_id, inv_id, env_override)
