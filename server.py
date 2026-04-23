@@ -6726,11 +6726,11 @@ def create_consolidated_invoice_in_quickbooks(
     if qbo_native_ship_off and (ship_amt_r > 0 or track_parts):
         logging.warning(
             "QBO ShipMethod API unavailable for this company (native ShipAmt/Ship Via may fail). "
-            "Shipping stays in the Shipping field when QBO accepts it; optional line-item fallback "
-            "is only if you set QBO_SHIPPING_LINE_FALLBACK=1 on the server. "
+            "The app will try a Sales line for freight before minimal create; set QBO_SHIPPING_LINE_FALLBACK=1 "
+            "to prefer a shipping line on the first POST. "
             "In QBO: Account and settings → Sales → add ship methods / delivery options so the API exposes ShipMethod."
         )
-    # Line-item freight only when explicitly opted in (not automatic — you want ShipAmt in Shipping).
+    # Line-item freight on first POST only when opted in; otherwise native ShipAmt first, then auto line before minimal.
     force_shipping_line = env_ship_line and (ship_amt_r > 0 or track_parts)
 
     used_force_line = False
@@ -6824,6 +6824,49 @@ def create_consolidated_invoice_in_quickbooks(
         )
         res = _post_inv(invoice_payload)
         err_txt = (res.text or "") if _qbo_still_bad() else ""
+
+    # Native ShipAmt / tracking on the POST body often return 2010. Downgrading to "minimal
+    # create" leaves freight off the invoice if sparse ShipAmt is ignored by QBO (common when
+    # shipping prefs / ShipMethod metadata are partial). Before minimal, try a single POST
+    # with freight on a Sales line — same as QBO_SHIPPING_LINE_FALLBACK but automatic.
+    if (
+        _qbo_still_bad()
+        and _qbo_is_2010()
+        and not used_force_line
+        and (ship_amt_r > 0 or track_parts)
+    ):
+        logging.warning(
+            "QBO invoice 2010: shipping as Sales line before minimal create "
+            "(avoids empty ShipAmt when delivery sparse-update does not stick)"
+        )
+        invoice_payload = _fallback_invoice_payload()
+        logging.info(
+            "📦 Invoice payload (auto shipping line before minimal create):\n%s",
+            json.dumps(invoice_payload, indent=2),
+        )
+        res = _post_inv(invoice_payload)
+        err_txt = (res.text or "") if _qbo_still_bad() else ""
+        if err_txt and "2010" in err_txt and "CustomerMemo" in (invoice_payload or {}):
+            invoice_payload = {k: v for k, v in invoice_payload.items() if k != "CustomerMemo"}
+            logging.warning(
+                "QBO invoice 2010 (auto shipping line): retrying without CustomerMemo"
+            )
+            res = _post_inv(invoice_payload)
+            err_txt = (res.text or "") if _qbo_still_bad() else ""
+        if err_txt and "2010" in err_txt and "SalesTermRef" in (invoice_payload or {}):
+            invoice_payload = {k: v for k, v in invoice_payload.items() if k != "SalesTermRef"}
+            logging.warning(
+                "QBO invoice 2010 (auto shipping line): retrying without SalesTermRef"
+            )
+            res = _post_inv(invoice_payload)
+            err_txt = (res.text or "") if _qbo_still_bad() else ""
+        if err_txt and "2010" in err_txt and "BillEmail" in (invoice_payload or {}):
+            invoice_payload = {k: v for k, v in invoice_payload.items() if k != "BillEmail"}
+            logging.warning("QBO invoice 2010 (auto shipping line): retrying without BillEmail")
+            res = _post_inv(invoice_payload)
+            err_txt = (res.text or "") if _qbo_still_bad() else ""
+        if res.status_code in (200, 201):
+            used_force_line = True
 
     # ShipAmt / TrackingNum (and historically ShipDate) on create often yield 2010; create
     # lines-only then sparse-patch. Without ShipDate on native POST, still downgrade to
