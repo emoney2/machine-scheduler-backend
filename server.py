@@ -4488,7 +4488,7 @@ def _fetch_directory_row_by_company(company_name: str):
         resp = (
             sheet.get(
                 spreadsheetId=SPREADSHEET_ID,
-                range="Directory!A1:K10000",
+                range="Directory!A1:ZZ10000",
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
         )
@@ -4506,6 +4506,51 @@ def _fetch_directory_row_by_company(company_name: str):
         if name == target:
             return row
     return None
+
+
+def _directory_company_names_from_sheet():
+    """
+    Unique non-empty values in the Directory sheet's Company Name column.
+    Includes rows appended by the website wholesale form (Apps Script → Sheet only).
+    """
+    if not SPREADSHEET_ID:
+        return []
+    rows = fetch_sheet(
+        SPREADSHEET_ID,
+        "Directory!A1:ZZ10000",
+        value_render="UNFORMATTED_VALUE",
+    )
+    if not rows or len(rows) < 2:
+        return []
+    headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+    idx = None
+    for i, h in enumerate(headers):
+        if h == "Company Name":
+            idx = i
+            break
+    if idx is None:
+        for i, h in enumerate(headers):
+            if h.lower() == "company name":
+                idx = i
+                break
+    if idx is None:
+        logger.warning("Directory sheet row 1 has no 'Company Name' header")
+        return []
+    seen_lower = set()
+    out = []
+    for r in rows[1:]:
+        if idx >= len(r):
+            continue
+        cell = r[idx]
+        name = str(cell).strip() if cell is not None else ""
+        if not name:
+            continue
+        k = name.lower()
+        if k in seen_lower:
+            continue
+        seen_lower.add(k)
+        out.append(name)
+    return out
 
 
 def _normalize_ups_ship_to_from_directory_row(row: dict) -> dict:
@@ -12553,19 +12598,25 @@ def shopify_webhook_orders_create():
 @login_required_session
 def get_directory():
     """
-    Return unique company names from Supabase Directory table,
-    sorted alphabetically. Falls back to last good payload.
+    Unique company names from the Directory Google Sheet (includes wholesale website
+    submissions) merged with the Supabase Directory table, sorted A–Z.
+    Falls back to the last successful payload if both sources are empty after errors.
     """
     from flask import make_response
 
     global _last_directory
-    _last_directory = {"data": []}   # force no fallback     # cached good payload
 
+    sheet_names = []
+    try:
+        sheet_names = _directory_company_names_from_sheet()
+    except Exception as e:
+        logger.exception("❌ /api/directory sheet read failed: %s", e)
+
+    supabase_names = []
     try:
         if not supabase:
             raise RuntimeError("Supabase unavailable")
 
-        # Supabase returns max 1000 rows by default; paginate to get all customers
         chunk_size = 1000
         rows = []
         offset = 0
@@ -12583,28 +12634,30 @@ def get_directory():
                 break
             offset += chunk_size
 
-        print("\n=== /api/directory DEBUG ===")
-        print("total rows fetched:", len(rows))
-        print("============================\n")
-
-
-        # extract company names
-        names = []
-        seen = set()
         for r in rows:
             name = (r.get("Company Name") or "").strip()
-            if name and name not in seen:
-                seen.add(name)
-                names.append(name)
-
-        names = sorted(names, key=str.lower)
-
-        # cache result
-        _last_directory = {"data": names, "ts": time.time()}
-        payload = names
-
+            if name:
+                supabase_names.append(name)
     except Exception as e:
         logger.exception(f"❌ /api/directory supabase fetch failed: {e}")
+
+    seen = set()
+    merged = []
+    for name in sheet_names + supabase_names:
+        n = (name or "").strip()
+        if not n:
+            continue
+        k = n.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(n)
+    merged.sort(key=str.lower)
+
+    if merged:
+        _last_directory = {"data": merged, "ts": time.time()}
+        payload = merged
+    else:
         payload = _last_directory.get("data", [])
 
     resp = make_response(jsonify(payload), 200)
@@ -13508,11 +13561,11 @@ def directory_row():
     if not company:
         return jsonify({"error": "Missing company"}), 400
 
-    # Read your 'Directory' tab (A:K or whatever your full header range is)
+    # Directory tab may extend past K when wholesale / billing columns are present
     sheet = sheets.values()
     resp = sheet.get(
         spreadsheetId=SPREADSHEET_ID,
-        range="Directory!A1:K10000",
+        range="Directory!A1:ZZ10000",
         valueRenderOption="UNFORMATTED_VALUE",
     ).execute()
     rows = resp.get("values", [])
