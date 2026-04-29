@@ -4078,17 +4078,51 @@ def kanban_mark_ordered_v2():
     """
     data = request.get_json(silent=True) or {}
     event_id = (data.get("eventId") or "").strip()
-    if not event_id:
-        return jsonify({"ok": False, "error": "missing eventId"}), 400
+    kanban_id = (data.get("kanbanId") or data.get("Kanban ID") or "").strip()
 
     ordered_qty = str(data.get("orderedQty") or "")
     po = (data.get("po") or "").strip()
     user_name = (request.headers.get("X-User-Name") or "Manager").strip()
     now_iso = _now_iso_utc()
 
-    rows, headers, found = _kanban_find_request_row_by_event(event_id)
+    rows = _kanban_read_all()
+    if not rows:
+        return jsonify({"ok": False, "error": "kanban sheet empty"}), 404
+    headers = rows[0]
+    hix_lookup = _kanban_headers_index(headers)
+
+    found = None
+    if event_id:
+        _rows, _headers, found = _kanban_find_request_row_by_event(event_id)
+        rows = _rows
+        headers = _headers
+        hix_lookup = _kanban_headers_index(headers)
+
+    if not found and kanban_id:
+        type_ix = hix_lookup.get("Type")
+        kid_ix = hix_lookup.get("Kanban ID")
+        status_ix = hix_lookup.get("Event Status")
+        event_ix = hix_lookup.get("Event ID")
+        if None not in (type_ix, kid_ix, status_ix):
+            for i in range(len(rows) - 1, 0, -1):
+                r = rows[i]
+                if not r:
+                    continue
+                if len(r) < len(headers):
+                    r = r + [""] * (len(headers) - len(r))
+                row_type = str(r[type_ix] or "").strip().upper()
+                row_kid = str(r[kid_ix] or "").strip()
+                row_status = str(r[status_ix] or "").strip().lower()
+                if row_type == KANBAN_REQUEST_TYPE and row_kid == kanban_id and row_status == "open":
+                    req = dict(zip(headers, r))
+                    req_row_index = i + 1
+                    found = (req_row_index, req)
+                    if event_ix is not None and not event_id:
+                        event_id = str(r[event_ix] or "").strip()
+                    break
+
     if not found:
-        return jsonify({"ok": False, "error": "request not found"}), 404
+        return jsonify({"ok": False, "error": "request not found (need eventId or kanbanId)"}), 404
 
     req_row_index, req = found
     hix = _kanban_headers_index(headers)
@@ -4109,7 +4143,7 @@ def kanban_mark_ordered_v2():
         elif h == "Units Basis (units/cases)":
             body_row[i] = req.get("Units Basis (units/cases)") or "cases"
         elif h == "Event ID":
-            body_row[i] = event_id
+            body_row[i] = event_id or (req.get("Event ID") or "")
         elif h == "Event Qty":
             body_row[i] = ordered_qty or (req.get("Event Qty") or "")
         elif h == "Ordered By":
@@ -4157,16 +4191,50 @@ def kanban_mark_received():
     """
     data = request.get_json(silent=True) or {}
     event_id = (data.get("eventId") or "").strip()
-    if not event_id:
-        return jsonify({"ok": False, "error": "missing eventId"}), 400
+    kanban_id = (data.get("kanbanId") or data.get("Kanban ID") or "").strip()
 
     received_qty = str(data.get("receivedQty") or "")
     user_name = (request.headers.get("X-User-Name") or "Manager").strip()
     now_iso = _now_iso_utc()
 
-    rows, headers, found = _kanban_find_request_row_by_event(event_id)
+    rows = _kanban_read_all()
+    if not rows:
+        return jsonify({"ok": False, "error": "kanban sheet empty"}), 404
+    headers = rows[0]
+    hix_lookup = _kanban_headers_index(headers)
+
+    found = None
+    if event_id:
+        _rows, _headers, found = _kanban_find_request_row_by_event(event_id)
+        rows = _rows
+        headers = _headers
+        hix_lookup = _kanban_headers_index(headers)
+
+    if not found and kanban_id:
+        type_ix = hix_lookup.get("Type")
+        kid_ix = hix_lookup.get("Kanban ID")
+        status_ix = hix_lookup.get("Event Status")
+        event_ix = hix_lookup.get("Event ID")
+        if None not in (type_ix, kid_ix, status_ix):
+            for i in range(len(rows) - 1, 0, -1):
+                r = rows[i]
+                if not r:
+                    continue
+                if len(r) < len(headers):
+                    r = r + [""] * (len(headers) - len(r))
+                row_type = str(r[type_ix] or "").strip().upper()
+                row_kid = str(r[kid_ix] or "").strip()
+                row_status = str(r[status_ix] or "").strip().lower()
+                if row_type == KANBAN_REQUEST_TYPE and row_kid == kanban_id and row_status == "ordered":
+                    req = dict(zip(headers, r))
+                    req_row_index = i + 1
+                    found = (req_row_index, req)
+                    if event_ix is not None and not event_id:
+                        event_id = str(r[event_ix] or "").strip()
+                    break
+
     if not found:
-        return jsonify({"ok": False, "error": "request not found"}), 404
+        return jsonify({"ok": False, "error": "request not found (need eventId or kanbanId)"}), 404
 
     req_row_index, req = found
     hix = _kanban_headers_index(headers)
@@ -4187,7 +4255,7 @@ def kanban_mark_received():
         elif h == "Units Basis (units/cases)":
             body_row[i] = req.get("Units Basis (units/cases)") or "cases"
         elif h == "Event ID":
-            body_row[i] = event_id
+            body_row[i] = event_id or (req.get("Event ID") or "")
         elif h == "Event Qty":
             body_row[i] = received_qty or (req.get("Event Qty") or "")
         elif h == "Received By":
