@@ -3973,29 +3973,14 @@ def kanban_request_public():
 def kanban_mark_ordered():
     try:
         data = request.get_json(silent=True) or {}
-        event_id = data.get("eventId", "").strip()
-        ordered_qty = str(data.get("orderedQty", "")).strip()
-        po = (data.get("po") or "").strip()
+        event_id = (data.get("eventId") or "").strip()
+        kanban_id = (data.get("kanbanId") or data.get("Kanban ID") or "").strip()
+        if not event_id and not kanban_id:
+            return jsonify({"ok": False, "error": "Missing eventId/kanbanId"}), 400
 
-        if not event_id:
-            return jsonify({"ok": False, "error": "Missing eventId"}), 400
-        if not ordered_qty:
-            return jsonify({"ok": False, "error": "Missing orderedQty"}), 400
-
-        # Log a new EVENT row
-        now_iso = datetime.utcnow().isoformat() + "Z"
-        row = {
-            "Type": "ORDERED",
-            "Kanban ID": event_id,
-            "Event Qty": ordered_qty,
-            "Event Status": "Ordered",
-            "PO": po,
-            "Timestamp": now_iso,
-        }
-
-        append_row("Kanban", row)  # <-- uses your existing helper
-
-        return jsonify({"ok": True})
+        # Delegate to the manager implementation so both routes share
+        # the same behavior (status update + fallback resolution).
+        return kanban_mark_ordered_v2()
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
