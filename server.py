@@ -5811,6 +5811,10 @@ def _qbo_native_shipping_unavailable(headers, realm_id, env_override=None):
     """
     True when QBO does not expose ShipMethod (Sales → Delivery / Shipping is off).
     In that mode ShipAmt / ShipMethodRef sparse updates often return 2010 unsupported.
+
+    Note: Any non-200 that is NOT the classic \"metadata not found\" case is logged and treated as
+    **unknown** (False) so we still attempt native ShipAmt / ShipMethod flows — intermittent auth or
+    minor-version glitches should not permanently flip this helper True.
     """
     import requests
 
@@ -5829,6 +5833,12 @@ def _qbo_native_shipping_unavailable(headers, realm_id, env_override=None):
         or ("queryvalidationerror" in err and "shipmethod" in err)
     ):
         return True
+    logging.warning(
+        "QBO ShipMethod probe inconclusive HTTP %s (treating as shipping APIs available). "
+        "Snippet: %s",
+        r.status_code,
+        (r.text or "")[:500],
+    )
     return False
 
 
@@ -6118,6 +6128,117 @@ def _qbo_sparse_invoice_update(headers, realm_id, invoice_id, sync_token, fields
     return inv2, None
 
 
+def _sanitize_invoice_body_for_full_update(inv):
+    """Strip read-only / response-only nodes so a POST update does not trip validation."""
+    if not isinstance(inv, dict):
+        return {}
+    body = deepcopy(inv)
+    for k in (
+        "MetaData",
+        "domain",
+        "InvoiceLink",
+        # computed / financial summaries — omit so QBO recomputes from Line + ShipAmt
+        "Balance",
+        "HomeBalance",
+        "TotalAmt",
+        "DepositToAccountRef",
+        "RemainingCredit",
+        "FinanceCharge",
+        "DeliveryInfo",
+    ):
+        body.pop(k, None)
+    return body
+
+
+def _qbo_try_full_invoice_update_shipamt(
+    headers, realm_id, invoice_id, ship_amt_r, env_override=None
+):
+    """
+    Sparse updates sometimes reject ShipAmt with 2010 even when Shipping is configured.
+    Full POST with sparse=false matches Intuit guidance for updating invoice-level shipping.
+
+    Ref: community patterns — repeat Lines from GET + set ShipAmt / ShipMethodRef together.
+    """
+    iid = str(invoice_id or "").strip()
+    if not iid:
+        return False
+    try:
+        wanted = round(float(ship_amt_r or 0), 2)
+    except (TypeError, ValueError):
+        return False
+    if wanted <= 0:
+        return False
+    base = get_base_qbo_url(env_override)
+    get_url = f"{base}/v3/company/{realm_id}/invoice/{iid}?minorversion={QBO_MINOR_VERSION}"
+    r = requests.get(get_url, headers=headers, timeout=40)
+    if r.status_code != 200:
+        logging.warning(
+            "QBO full ShipAmt: GET invoice %s failed HTTP %s: %s",
+            iid,
+            r.status_code,
+            (r.text or "")[:800],
+        )
+        return False
+    try:
+        jd = r.json() or {}
+    except Exception:
+        jd = {}
+    inv = jd.get("Invoice") if isinstance(jd.get("Invoice"), dict) else {}
+    if not inv:
+        logging.warning("QBO full ShipAmt: GET invoice %s had no Invoice object", iid)
+        return False
+
+    post_url = f"{base}/v3/company/{realm_id}/invoice?minorversion={QBO_MINOR_VERSION}"
+
+    def _attempt(body_dict):
+        r2 = requests.post(
+            post_url,
+            headers={**headers, "Content-Type": "application/json"},
+            json=body_dict,
+            timeout=45,
+        )
+        return r2
+
+    # Attempt 1: minimal strip + sparse=false + ShipAmt
+    body = _sanitize_invoice_body_for_full_update(inv)
+    body["sparse"] = False
+    body["ShipAmt"] = wanted
+    r2 = _attempt(body)
+    if r2.status_code in (200, 201):
+        logging.info(
+            "QBO full ShipAmt update succeeded invoice_id=%s ShipAmt=%s (minimal strip)",
+            iid,
+            wanted,
+        )
+        return True
+    logging.warning(
+        "QBO full ShipAmt minimal-strip failed HTTP %s: %s",
+        r2.status_code,
+        (r2.text or "")[:1000],
+    )
+
+    # Attempt 2: only remove MetaData / domain (keep addresses & balances) — some orgs need them
+    body2 = deepcopy(inv)
+    body2.pop("MetaData", None)
+    body2.pop("domain", None)
+    body2["sparse"] = False
+    body2["ShipAmt"] = wanted
+    r3 = _attempt(body2)
+    if r3.status_code in (200, 201):
+        logging.info(
+            "QBO full ShipAmt update succeeded invoice_id=%s ShipAmt=%s (light strip)",
+            iid,
+            wanted,
+        )
+        return True
+    logging.warning(
+        "QBO full ShipAmt light-strip failed HTTP %s: %s",
+        r3.status_code,
+        (r3.text or "")[:1000],
+    )
+    return False
+
+
 def _qbo_patch_invoice_shipping_and_tracking(
     headers,
     realm_id,
@@ -6238,6 +6359,24 @@ def _qbo_patch_invoice_shipping_and_tracking(
         inv2, err2 = _qbo_sparse_invoice_update(
             headers, realm_id, invoice_id, inv.get("SyncToken"), one, env_override
         )
+        if inv2 is None and key == "ShipAmt":
+            inv_a, _era = _qbo_get_invoice(headers, realm_id, invoice_id, env_override)
+            if inv_a and inv_a.get("SyncToken") is not None:
+                inv2s, err2s = _qbo_sparse_invoice_update(
+                    headers,
+                    realm_id,
+                    invoice_id,
+                    inv_a.get("SyncToken"),
+                    {"ShipAmt": f"{wanted_amt:.2f}"},
+                    env_override,
+                )
+                if inv2s is not None:
+                    inv2 = inv2s
+                    err2 = err2s
+                    logging.info(
+                        "QBO ship-field patch single-field OK invoice_id=%s key=ShipAmt (string decimal)",
+                        invoice_id,
+                    )
         if inv2 is None:
             logging.warning(
                 "QBO shipping patch: single-field %s failed for invoice %s: %s",
@@ -6251,6 +6390,19 @@ def _qbo_patch_invoice_shipping_and_tracking(
                 invoice_id,
                 key,
             )
+
+    # Sparse ShipAmt sometimes returns 2010 forever; full invoice POST with Lines from GET works per Intuit patterns.
+    if wanted_amt > 0:
+        inv_chk, _ec = _qbo_get_invoice(headers, realm_id, invoice_id, env_override)
+        if inv_chk and _curr_amt(inv_chk.get("ShipAmt")) <= 0.001:
+            if _qbo_try_full_invoice_update_shipamt(
+                headers, realm_id, invoice_id, wanted_amt, env_override
+            ):
+                logging.info(
+                    "QBO shipping patch: recovered ShipAmt via full invoice update invoice_id=%s",
+                    invoice_id,
+                )
+
     _qbo_log_invoice_shipping_diagnostics(
         "after_per_field_patch_attempts",
         headers,
