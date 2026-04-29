@@ -6276,9 +6276,14 @@ def _qbo_customer_memo_shipping_fallback(
     shipping_on_line_item=False,
 ):
     """
-    If ShipAmt or Ship Via did not persist on the invoice (QBO company prefs / API quirks),
-    append shipping $, carrier, and tracking to CustomerMemo so the bill is not silent.
-    When shipping_on_line_item is True, freight is already on a Sales line — do not repeat $ in memo.
+    Last resort after ShipAmt / Ship Via patches.
+
+    Default: do **not** write carrier/freight/tracking into CustomerMemo (customers see memo text).
+
+    Opt-in legacy CustomerMemo behavior: QBO_SHIPPING_CUSTOMER_MEMO_FALLBACK=1
+
+    Internal-only freight note (PrivateNote): QBO_SHIPPING_PRIVATE_NOTE_FALLBACK=1 (default on when
+    memo fallback is off) — staff-visible in QBO; not printed as customer-facing memo text.
     """
     inv, _err = _qbo_get_invoice(headers, realm_id, inv_id, env_override)
     if not inv:
@@ -6312,94 +6317,158 @@ def _qbo_customer_memo_shipping_fallback(
             inv_id,
         )
         return
-    memo = str(inv.get("CustomerMemo") or "").strip()
-    extras = []
-    if want_amt > 0.001 and cur_amt <= 0.001 and not shipping_on_line_item:
-        extras.append(f"UPS shipping ${want_amt:.2f}")
-    if not sm_ok and (ship_via_label or "").strip():
-        extras.append(f"Ship via: {str(ship_via_label).strip()}")
-    if track_parts:
-        tk = ", ".join(str(t).strip() for t in track_parts if str(t).strip())
-        if tk:
-            extras.append(f"Tracking: {tk}")
-    if not extras:
-        logging.info(
-            "QBO ship-field memo_fallback_no_extras invoice_id=%s (nothing to append)",
-            inv_id,
-        )
-        return
-    chunk = " | ".join(extras)
-    if chunk and memo and chunk in memo:
-        logging.info(
-            "QBO ship-field memo_fallback_skip invoice_id=%s (memo already contains chunk)",
-            inv_id,
-        )
-        return
-    new_memo = (f"{memo} | {chunk}")[:1000] if memo else chunk[:1000]
-    logging.info(
-        "QBO ship-field memo_fallback_apply invoice_id=%s new_memo_len=%s preview=%r",
-        inv_id,
-        len(new_memo),
-        new_memo[:300],
-    )
-    if inv.get("SyncToken") is None:
-        return
-    # QBO sparse Invoice updates often expect CustomerMemo as MemoRef {"value":"..."},
-    # not a raw string (string can yield 2010 unsupported property).
-    memo_try = str(new_memo)[:1000]
-    inv2, err2 = None, None
-    for payload in (
-        {"CustomerMemo": {"value": memo_try}},
-        {"CustomerMemo": memo_try},
-    ):
-        inv_r, _e = _qbo_get_invoice(headers, realm_id, inv_id, env_override)
-        if not inv_r or inv_r.get("SyncToken") is None:
-            err2 = "memo_fallback_no_sync_token"
-            break
-        st = str(inv_r.get("SyncToken")).strip()
-        inv2, err2 = _qbo_sparse_invoice_update(
-            headers,
-            realm_id,
-            inv_id,
-            st,
-            payload,
-            env_override,
-        )
-        if inv2 is not None:
-            logging.warning(
-                "QBO CustomerMemo shipping fallback applied (native ShipAmt=%s shipViaOk=%s) payload=%s.",
-                cur_amt,
-                sm_ok,
-                "MemoRef.value" if isinstance(payload.get("CustomerMemo"), dict) else "string",
-            )
-            break
 
-    if inv2 is None:
-        inv_r, _e = _qbo_get_invoice(headers, realm_id, inv_id, env_override)
-        pn = memo_try[:3900]
-        err3 = None
-        inv3 = None
-        if inv_r and inv_r.get("SyncToken") is not None:
-            inv3, err3 = _qbo_sparse_invoice_update(
+    memo_customer = os.getenv(
+        "QBO_SHIPPING_CUSTOMER_MEMO_FALLBACK", ""
+    ).strip().lower() in ("1", "true", "yes")
+    allow_private_note = os.getenv(
+        "QBO_SHIPPING_PRIVATE_NOTE_FALLBACK", "1"
+    ).strip().lower() not in ("0", "false", "no")
+
+    if memo_customer:
+        memo = str(inv.get("CustomerMemo") or "").strip()
+        extras = []
+        if want_amt > 0.001 and cur_amt <= 0.001 and not shipping_on_line_item:
+            extras.append(f"UPS shipping ${want_amt:.2f}")
+        if not sm_ok and (ship_via_label or "").strip():
+            extras.append(f"Ship via: {str(ship_via_label).strip()}")
+        if track_parts:
+            tk = ", ".join(str(t).strip() for t in track_parts if str(t).strip())
+            if tk:
+                extras.append(f"Tracking: {tk}")
+        if not extras:
+            logging.info(
+                "QBO ship-field memo_fallback_no_extras invoice_id=%s (nothing to append)",
+                inv_id,
+            )
+            return
+        chunk = " | ".join(extras)
+        if chunk and memo and chunk in memo:
+            logging.info(
+                "QBO ship-field memo_fallback_skip invoice_id=%s (memo already contains chunk)",
+                inv_id,
+            )
+            return
+        new_memo = (f"{memo} | {chunk}")[:1000] if memo else chunk[:1000]
+        logging.info(
+            "QBO ship-field memo_fallback_apply invoice_id=%s new_memo_len=%s preview=%r",
+            inv_id,
+            len(new_memo),
+            new_memo[:300],
+        )
+        if inv.get("SyncToken") is None:
+            return
+        memo_try = str(new_memo)[:1000]
+        inv2, err2 = None, None
+        for payload in (
+            {"CustomerMemo": {"value": memo_try}},
+            {"CustomerMemo": memo_try},
+        ):
+            inv_r, _e = _qbo_get_invoice(headers, realm_id, inv_id, env_override)
+            if not inv_r or inv_r.get("SyncToken") is None:
+                err2 = "memo_fallback_no_sync_token"
+                break
+            st = str(inv_r.get("SyncToken")).strip()
+            inv2, err2 = _qbo_sparse_invoice_update(
                 headers,
                 realm_id,
                 inv_id,
-                str(inv_r.get("SyncToken")).strip(),
-                {"PrivateNote": pn},
+                st,
+                payload,
                 env_override,
             )
-        if inv3 is not None:
-            logging.warning(
-                "QBO shipping fallback wrote PrivateNote (CustomerMemo sparse rejected; "
-                "native ShipAmt=%s). In QBO this is usually an internal-only note, not printed on the customer PDF.",
-                cur_amt,
-            )
-        else:
-            logging.warning(
-                "QBO CustomerMemo shipping fallback failed (memo + PrivateNote): memo_err=%s private_err=%s",
-                err2 or "?",
-                err3 or "?",
-            )
+            if inv2 is not None:
+                logging.warning(
+                    "QBO CustomerMemo shipping fallback applied (native ShipAmt=%s shipViaOk=%s) payload=%s.",
+                    cur_amt,
+                    sm_ok,
+                    "MemoRef.value"
+                    if isinstance(payload.get("CustomerMemo"), dict)
+                    else "string",
+                )
+                break
+
+        if inv2 is None:
+            inv_r, _e = _qbo_get_invoice(headers, realm_id, inv_id, env_override)
+            pn = memo_try[:3900]
+            err3 = None
+            inv3 = None
+            if inv_r and inv_r.get("SyncToken") is not None:
+                inv3, err3 = _qbo_sparse_invoice_update(
+                    headers,
+                    realm_id,
+                    inv_id,
+                    str(inv_r.get("SyncToken")).strip(),
+                    {"PrivateNote": pn},
+                    env_override,
+                )
+            if inv3 is not None:
+                logging.warning(
+                    "QBO shipping fallback wrote PrivateNote (CustomerMemo sparse rejected; "
+                    "native ShipAmt=%s).",
+                    cur_amt,
+                )
+            else:
+                logging.warning(
+                    "QBO CustomerMemo shipping fallback failed (memo + PrivateNote): memo_err=%s private_err=%s",
+                    err2 or "?",
+                    err3 or "?",
+                )
+        return
+
+    # Default path: no CustomerMemo spam — optional PrivateNote for operations only.
+    if not allow_private_note:
+        logging.info(
+            "QBO ship-field memo_fallback_skip invoice_id=%s (CustomerMemo fallback disabled; PrivateNote disabled)",
+            inv_id,
+        )
+        return
+    trk_on_invoice = str(inv.get("TrackingNum") or "").strip()
+    pn_parts = []
+    if want_amt > 0.001 and cur_amt <= 0.001 and not shipping_on_line_item:
+        pn_parts.append(
+            f"Freight ${want_amt:.2f} — QBO declined native ShipAmt on this company "
+            "(Sales → Delivery method / ShipMethod)."
+        )
+    if not sm_ok and (ship_via_label or "").strip():
+        pn_parts.append(f"Carrier (API): {str(ship_via_label).strip()}")
+    tk = ", ".join(str(t).strip() for t in (track_parts or []) if str(t).strip())
+    if tk and not trk_on_invoice:
+        pn_parts.append(f"Tracking: {tk}")
+    if not pn_parts:
+        logging.info(
+            "QBO ship-field private_note_fallback_skip invoice_id=%s (nothing internal to record)",
+            inv_id,
+        )
+        return
+    pn_body = " | ".join(pn_parts)[:3900]
+    inv_r, _e = _qbo_get_invoice(headers, realm_id, inv_id, env_override)
+    if not inv_r or inv_r.get("SyncToken") is None:
+        logging.warning(
+            "QBO PrivateNote freight fallback skipped invoice_id=%s (no SyncToken)",
+            inv_id,
+        )
+        return
+    inv_pn, err_pn = _qbo_sparse_invoice_update(
+        headers,
+        realm_id,
+        inv_id,
+        str(inv_r.get("SyncToken")).strip(),
+        {"PrivateNote": pn_body},
+        env_override,
+    )
+    if inv_pn is not None:
+        logging.info(
+            "QBO PrivateNote freight fallback applied invoice_id=%s preview=%r",
+            inv_id,
+            pn_body[:240],
+        )
+    else:
+        logging.warning(
+            "QBO PrivateNote freight fallback failed invoice_id=%s err=%s",
+            inv_id,
+            (err_pn or "?")[:600],
+        )
 
 
 def _query_invoice_id_by_doc_number(
@@ -6847,7 +6916,12 @@ def create_consolidated_invoice_in_quickbooks(
         return {k: v for k, v in inv.items() if v is not None}
 
     def _fallback_invoice_payload():
-        """Shipping as a Sales line item + CustomerMemo (used when native ShipAmt is unavailable)."""
+        """Shipping as a Sales line item (used when native ShipAmt / ShipMethod metadata is unavailable).
+
+        Avoid Customer-facing memo lines for carrier / tracking — tracking belongs on Invoice.TrackingNum,
+        freight belongs on ShipAmt or this Sales line; ship-via text appears in the line Description (UPS …).
+        Opt-in memo: QBO_SHIPPING_CUSTOMER_MEMO_ON_CREATE=1
+        """
         lines = list(line_items)
         if ship_amt_r > 0:
             try:
@@ -6871,10 +6945,15 @@ def create_consolidated_invoice_in_quickbooks(
                     "Consolidated invoice: could not add Shipping line item: %s", ex
                 )
         memo_bits_fb = []
-        if not ship_method_ref_payload:
-            memo_bits_fb.append(f"Ship via: {ship_via_label}")
-        if track_parts:
-            memo_bits_fb.append(f"Tracking: {', '.join(track_parts)}")
+        if os.getenv("QBO_SHIPPING_CUSTOMER_MEMO_ON_CREATE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            if not ship_method_ref_payload:
+                memo_bits_fb.append(f"Ship via: {ship_via_label}")
+            if track_parts:
+                memo_bits_fb.append(f"Tracking: {', '.join(track_parts)}")
         cm = " | ".join(memo_bits_fb)[:1000] if memo_bits_fb else None
         inv = {
             "CustomerRef": customer_ref,
@@ -6907,7 +6986,11 @@ def create_consolidated_invoice_in_quickbooks(
         if include_ship_method_ref and ship_method_ref_payload:
             inv["ShipMethodRef"] = ship_method_ref_payload
         memo_bits = []
-        if not (include_ship_method_ref and ship_method_ref_payload):
+        if os.getenv("QBO_SHIPPING_CUSTOMER_MEMO_ON_CREATE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ) and not (include_ship_method_ref and ship_method_ref_payload):
             memo_bits.append(f"Ship via: {ship_via_label}")
         cm = " | ".join(memo_bits)[:1000] if memo_bits else None
         if cm:
@@ -6917,7 +7000,11 @@ def create_consolidated_invoice_in_quickbooks(
     def _native_invoice_payload():
         """Preferred for UPS+QBO: ShipAmt, TrackingNum, Ship Via ref on the invoice (no duplicate ship line)."""
         memo_bits_n = []
-        if not ship_method_ref_payload:
+        if os.getenv("QBO_SHIPPING_CUSTOMER_MEMO_ON_CREATE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ) and not ship_method_ref_payload:
             memo_bits_n.append(f"Ship via: {ship_via_label}")
         cm = " | ".join(memo_bits_n)[:1000] if memo_bits_n else None
         inv = {
@@ -7017,6 +7104,49 @@ def create_consolidated_invoice_in_quickbooks(
             }
             logging.warning(
                 "QBO invoice 2010 (shipping line): retrying without BillEmail"
+            )
+            res = _post_inv(invoice_payload)
+        if res.status_code in (200, 201):
+            used_force_line = True
+
+    # ShipMethod metadata missing ⇒ ShipAmt / Ship Via sparse patches get 2010; prefer freight on a Sales line
+    # up front instead of minimal invoice + CustomerMemo fallback.
+    if not used_force_line and qbo_native_ship_off and ship_amt_r > 0:
+        invoice_payload = _fallback_invoice_payload()
+        logging.info(
+            "📦 Invoice payload (freight Sales line — ShipMethod entity unavailable):\n%s",
+            json.dumps(invoice_payload, indent=2),
+        )
+        res = _post_inv(invoice_payload)
+
+        def _line_native_off_bad():
+            return res.status_code not in (200, 201)
+
+        le = (res.text or "") if _line_native_off_bad() else ""
+        if le and "2010" in le and "CustomerMemo" in invoice_payload:
+            invoice_payload = {
+                k: v for k, v in invoice_payload.items() if k != "CustomerMemo"
+            }
+            logging.warning(
+                "QBO invoice 2010 (freight line ShipMethod-off): retrying without CustomerMemo"
+            )
+            res = _post_inv(invoice_payload)
+            le = (res.text or "") if _line_native_off_bad() else ""
+        if le and "2010" in le and "SalesTermRef" in invoice_payload:
+            invoice_payload = {
+                k: v for k, v in invoice_payload.items() if k != "SalesTermRef"
+            }
+            logging.warning(
+                "QBO invoice 2010 (freight line ShipMethod-off): retrying without SalesTermRef"
+            )
+            res = _post_inv(invoice_payload)
+            le = (res.text or "") if _line_native_off_bad() else ""
+        if le and "2010" in le and "BillEmail" in invoice_payload:
+            invoice_payload = {
+                k: v for k, v in invoice_payload.items() if k != "BillEmail"
+            }
+            logging.warning(
+                "QBO invoice 2010 (freight line ShipMethod-off): retrying without BillEmail"
             )
             res = _post_inv(invoice_payload)
         if res.status_code in (200, 201):
