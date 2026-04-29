@@ -1343,6 +1343,43 @@ def _kanban_find_item_row(rows, kanban_id):
     return None, None
 
 
+def _kanban_find_request_row_by_event(event_id):
+    """
+    Locate a REQUEST row whose Event ID matches (used by mark-ordered / mark-received flows).
+    Scans from the bottom of the sheet so the latest matching row wins if duplicates exist.
+
+    Returns:
+      (rows, headers, (sheet_row_1based, req_dict))  when found
+      (rows, headers, None)  when not found or event_id empty
+    """
+    rows = _kanban_read_all()
+    if not rows or len(rows) < 2:
+        return rows or [], rows[0] if rows else [], None
+    headers = rows[0]
+    hix = _kanban_headers_index(headers)
+    type_ix = hix.get("Type")
+    event_ix = hix.get("Event ID")
+    if event_ix is None:
+        event_ix = hix.get("Event Id")
+    if type_ix is None or event_ix is None:
+        return rows, headers, None
+    needle = str(event_id or "").strip()
+    if not needle:
+        return rows, headers, None
+    for ri in range(len(rows) - 1, 0, -1):
+        r = rows[ri]
+        if not r:
+            continue
+        if len(r) < len(headers):
+            r = r + [""] * (len(headers) - len(r))
+        row_type = str(r[type_ix] or "").strip().upper()
+        ev = str(r[event_ix] or "").strip()
+        if row_type == KANBAN_REQUEST_TYPE and ev == needle:
+            req = dict(zip(headers, r))
+            return rows, headers, (ri + 1, req)
+    return rows, headers, None
+
+
 def _kanban_upsert_item(item_obj):
     """
     item_obj keys must match Kanban ITEM columns (we fill defaults for missing).
