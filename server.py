@@ -3912,6 +3912,7 @@ def kanban_queue_manager():
                         "Order URL": row.get("Order URL"),
                         "Requested By": row.get("Requested By"),
                         "Event Qty": row.get("Event Qty"),
+                        "Reorder Qty (basis)": row.get("Reorder Qty (basis)"),
                         "Timestamp": row.get("Timestamp"),
                         "Photo URL": row.get("Photo URL"),
                         "Event Status": row.get("Event Status"),
