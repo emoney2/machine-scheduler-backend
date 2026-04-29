@@ -6968,8 +6968,12 @@ def create_consolidated_invoice_in_quickbooks(
             "to prefer a shipping line on the first POST. "
             "In QBO: Account and settings → Sales → add ship methods / delivery options so the API exposes ShipMethod."
         )
-    # Line-item freight on first POST only when opted in; otherwise native ShipAmt first, then auto line before minimal.
+    # Line-item freight on first POST only when opted in. Keep native ShipAmt first;
+    # optional auto line fallback is guarded by env to avoid silently moving freight to a sales line.
     force_shipping_line = env_ship_line and (ship_amt_r > 0 or track_parts)
+    auto_ship_line_on_2010 = os.getenv(
+        "QBO_AUTO_SHIPPING_LINE_ON_2010", ""
+    ).strip().lower() in ("1", "true", "yes")
 
     used_force_line = False
     force_attempted = False
@@ -7071,6 +7075,7 @@ def create_consolidated_invoice_in_quickbooks(
         _qbo_still_bad()
         and _qbo_is_2010()
         and not used_force_line
+        and auto_ship_line_on_2010
         and (ship_amt_r > 0 or track_parts)
     ):
         logging.warning(
@@ -7105,6 +7110,11 @@ def create_consolidated_invoice_in_quickbooks(
             err_txt = (res.text or "") if _qbo_still_bad() else ""
         if res.status_code in (200, 201):
             used_force_line = True
+    elif _qbo_still_bad() and _qbo_is_2010() and not used_force_line and (ship_amt_r > 0 or track_parts):
+        logging.info(
+            "QBO invoice 2010: auto shipping-line fallback disabled (QBO_AUTO_SHIPPING_LINE_ON_2010 not enabled); "
+            "continuing to minimal create + sparse ship/tracking patch"
+        )
 
     # ShipAmt / TrackingNum (and historically ShipDate) on create often yield 2010; create
     # lines-only then sparse-patch. Without ShipDate on native POST, still downgrade to
@@ -14712,6 +14722,19 @@ def process_shipment():
             shipping_line_amt,
         )
 
+        shipping_method_for_invoice = "UPS" if do_ups else (shipping_method or "Manual")
+        logging.info(
+            "Shipment invoice inputs: do_ups=%s skip_invoice=%s requested_shipping_method=%r invoice_shipping_method=%r "
+            "service_code=%r tracking_count=%s shipping_line_amt=%s",
+            do_ups,
+            skip_invoice,
+            shipping_method,
+            shipping_method_for_invoice,
+            service_code,
+            len(tracking_list or []),
+            shipping_line_amt,
+        )
+
         # 5) Create invoice in QBO (optional — e.g. free samples)
         invoice_url = None
         qbo_invoice_id = None
@@ -14720,13 +14743,19 @@ def process_shipment():
         else:
             invoice_url, qbo_invoice_id = create_consolidated_invoice_in_quickbooks(
                 all_order_data,
-                shipping_method or ("UPS" if do_ups else "Manual"),
+                shipping_method_for_invoice,
                 tracking_list=tracking_list,
                 base_shipping_cost=shipping_line_amt,
                 sheet=service,
                 env_override=env_override,
             )
             print("✅ Invoice created:", invoice_url, "id:", qbo_invoice_id)
+            logging.info(
+                "Shipment invoice outputs: qbo_invoice_id=%s qbo_realm_id=%s invoice_url=%r",
+                qbo_invoice_id,
+                str(realm_id or "").strip(),
+                invoice_url,
+            )
 
         # 6) Build packing slip PDF (always create, even if empty)
         try:
