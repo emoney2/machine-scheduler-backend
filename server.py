@@ -2576,6 +2576,139 @@ def kanban_scan():
         return f"<h3>❌ Server error: {e}</h3>", 500
 
 
+@app.route("/kanban/receive", methods=["GET"])
+def kanban_receive_scan():
+    """Public endpoint triggered by receive QR scan — marks latest ordered request as received."""
+    try:
+        kanban_id = (request.args.get("id") or request.args.get("kanbanId") or "").strip()
+        qty = str(request.args.get("qty", "1")).strip() or "1"
+        if not kanban_id:
+            return "<h3>❌ Missing Kanban ID</h3>", 400
+
+        rows = _kanban_read_all()
+        if not rows:
+            return "<h3>❌ Kanban sheet is empty</h3>", 404
+
+        headers = rows[0]
+        hix = _kanban_headers_index(headers)
+        type_ix = hix.get("Type")
+        kid_ix = hix.get("Kanban ID")
+        status_ix = hix.get("Event Status")
+        event_ix = (
+            hix.get("Event ID")
+            if hix.get("Event ID") is not None
+            else hix.get("Event Id")
+        )
+
+        if None in (type_ix, kid_ix, status_ix):
+            return "<h3>❌ Missing required Kanban columns</h3>", 500
+
+        candidate_row = None
+        candidate_event_id = ""
+        candidate_sheet_row = None
+        # find latest REQUEST row for this Kanban ID that is currently Ordered
+        for i in range(len(rows) - 1, 0, -1):
+            r = rows[i]
+            if not r:
+                continue
+            if len(r) < len(headers):
+                r = r + [""] * (len(headers) - len(r))
+            row_type = str(r[type_ix] or "").strip().upper()
+            row_kid = str(r[kid_ix] or "").strip()
+            row_status = str(r[status_ix] or "").strip().lower()
+            if row_type == KANBAN_REQUEST_TYPE and row_kid == kanban_id and row_status == "ordered":
+                candidate_row = r
+                candidate_sheet_row = i + 1  # rows[0] is header => sheet row number
+                if event_ix is not None:
+                    candidate_event_id = str(r[event_ix] or "").strip()
+                break
+
+        if not candidate_row:
+            return """
+            <html>
+              <body style="background:#fff7ed;display:flex;align-items:center;justify-content:center;height:100vh;">
+                <div style="text-align:center;font-family:sans-serif;">
+                  <h1>⚠️ Nothing to receive</h1>
+                  <p>No ordered request is currently open for this Kanban card.</p>
+                </div>
+              </body>
+            </html>
+            """
+
+        if not candidate_event_id:
+            # Fallback if Event ID is blank on older rows
+            candidate_event_id = kanban_id
+
+        # Apply same sheet mutation as manager "mark received"
+        rows2, headers2, found = _kanban_find_request_row_by_event(candidate_event_id)
+        hix2 = _kanban_headers_index(headers2)
+        if found:
+            req_row_index, req = found
+        else:
+            # Fallback for older rows missing Event ID: use the ordered request row we already located
+            req_row_index = candidate_sheet_row
+            req = dict(zip(headers, candidate_row))
+            if not req_row_index:
+                return "<h3>❌ Matching request row not found for this Event ID</h3>", 404
+        now_iso = _now_iso_utc()
+        body_row = [""] * len(headers2)
+        for i, h in enumerate(headers2):
+            if h == "Type":
+                body_row[i] = KANBAN_RECEIVED_TYPE
+            elif h == "Kanban ID":
+                body_row[i] = req.get("Kanban ID") or ""
+            elif h == "Item Name":
+                body_row[i] = req.get("Item Name") or ""
+            elif h == "SKU":
+                body_row[i] = req.get("SKU") or ""
+            elif h == "Supplier":
+                body_row[i] = req.get("Supplier") or ""
+            elif h == "Units Basis (units/cases)":
+                body_row[i] = req.get("Units Basis (units/cases)") or "cases"
+            elif h == "Event ID":
+                body_row[i] = candidate_event_id
+            elif h == "Event Qty":
+                body_row[i] = qty or (req.get("Event Qty") or "")
+            elif h == "Received By":
+                body_row[i] = "Public Scanner"
+            elif h == "Timestamp":
+                body_row[i] = now_iso
+
+        _kanban_values_api().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{KANBAN_SHEET_TAB}!A2",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [body_row]},
+        ).execute()
+
+        status_ix2 = hix2.get("Event Status")
+        if status_ix2 is not None:
+            cur = rows2[req_row_index - 1]
+            if len(cur) < len(headers2):
+                cur = cur + [""] * (len(headers2) - len(cur))
+            cur[status_ix2] = "Received"
+            _kanban_values_api().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{KANBAN_SHEET_TAB}!A{req_row_index}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [cur[: len(headers2)]]},
+            ).execute()
+
+        return """
+        <html>
+          <body style="background:#ecfdf5;display:flex;align-items:center;justify-content:center;height:100vh;">
+            <div style="text-align:center;font-family:sans-serif;">
+              <h1>✅ Received Logged</h1>
+              <p>This item has been marked received and moved into inventory flow.</p>
+            </div>
+          </body>
+        </html>
+        """
+    except Exception as e:
+        return f"<h3>❌ Server error: {e}</h3>", 500
+
+
 # === Kanban order status update ===
 @app.route("/api/kanban/mark-ordered", methods=["POST"])
 @login_required_session
@@ -3896,14 +4029,20 @@ def kanban_queue_manager():
                 r = r + [""] * (len(headers) - len(r))
 
             row = dict(zip(headers, r))
+            def _first(*names):
+                for n in names:
+                    v = row.get(n)
+                    if v is not None and str(v).strip() != "":
+                        return v
+                return ""
             status = (row.get("Event Status") or "").strip().lower()
             row_type = (row.get("Type") or "").strip().upper()
 
             if row_type == KANBAN_REQUEST_TYPE and status in ("open", "ordered"):
                 out.append(
                     {
-                        "Event ID": row.get("Event ID"),
-                        "Kanban ID": row.get("Kanban ID"),
+                        "Event ID": _first("Event ID", "Event Id", "EventID", "eventId", "ID", "Id"),
+                        "Kanban ID": _first("Kanban ID", "Kanban Id", "KanbanID", "kanbanId"),
                         "Item Name": row.get("Item Name"),
                         "SKU": row.get("SKU"),
                         "Supplier": row.get("Supplier"),
