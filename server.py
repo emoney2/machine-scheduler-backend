@@ -6756,6 +6756,77 @@ def fetch_customer_email_from_directory(sheet_service, company_name):
     return ""
 
 
+def _directory_header_col_index(headers, *names):
+    """Return 0-based column index for the first header matching any of names (case-insensitive)."""
+    if not headers:
+        return None
+    norm_map = {str(h).strip().lower(): i for i, h in enumerate(headers)}
+    for n in names:
+        key = str(n or "").strip().lower()
+        if key in norm_map:
+            return norm_map[key]
+    return None
+
+
+def fetch_payment_preference_from_directory(sheet_service, company_name):
+    """
+    Read Directory sheet 'Payment preference' (or common variants) for the company row.
+    Returns raw string or "".
+    """
+    SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+    if not SPREADSHEET_ID:
+        logging.warning("⚠️ Missing SPREADSHEET_ID; cannot read Directory payment preference.")
+        return ""
+    try:
+        resp = (
+            sheet_service.spreadsheets()
+            .values()
+            .get(spreadsheetId=SPREADSHEET_ID, range="Directory!A1:ZZ")
+            .execute()
+        )
+    except Exception as ex:
+        logging.warning("Directory read for payment preference failed: %s", ex)
+        return ""
+    rows = resp.get("values", []) or []
+    if len(rows) < 2:
+        return ""
+    headers = rows[0]
+    idx_company = _directory_header_col_index(headers, "Company Name")
+    idx_pref = _directory_header_col_index(
+        headers, "Payment preference", "Payment Preference", "payment preference"
+    )
+    if idx_company is None or idx_pref is None:
+        return ""
+    target = (company_name or "").strip()
+    for row in rows[1:]:
+        if len(row) <= idx_company:
+            continue
+        if str(row[idx_company] or "").strip() != target:
+            continue
+        return str(row[idx_pref]).strip() if len(row) > idx_pref else ""
+    return ""
+
+
+def _directory_pref_is_credit_card(payment_pref: str) -> bool:
+    """True when Directory indicates this customer pays by credit card (incl. wholesale label text)."""
+    s = (payment_pref or "").strip().lower()
+    if not s:
+        return False
+    return "credit card" in s
+
+
+def _qbo_cc_processing_fee_item_name():
+    return (os.getenv("QBO_CC_PROCESSING_FEE_ITEM_NAME") or "CC Processing fee").strip()
+
+
+def _qbo_invoice_credit_card_payment_fields():
+    """QBO invoice flags to show Pay online / credit card on the invoice (requires QB Payments)."""
+    return {
+        "AllowOnlinePayment": True,
+        "AllowOnlineCreditCardPayment": True,
+    }
+
+
 def create_invoice_in_quickbooks(
     order_data,
     shipping_method="UPS Ground",
@@ -6848,6 +6919,15 @@ def create_invoice_in_quickbooks(
         )
         or ""
     )
+    pay_pref = fetch_payment_preference_from_directory(
+        sheet_service, order_data.get("Company Name", "")
+    )
+    wants_cc_invoice = _directory_pref_is_credit_card(pay_pref)
+    ship_amt_for_fee = (
+        float(round(float(shipping_total), 2)) if shipping_total and float(shipping_total) > 0 else 0.0
+    )
+    fee_base = float(round(amount, 2)) + ship_amt_for_fee
+    cc_fee_amt = round(fee_base * 0.03, 2) if wants_cc_invoice else 0.0
     # Ship Via (dropdown) — requires ShipMethod in QBO + API metadata; see get_or_create_ship_method_ref.
     ship_via_single = str(shipping_method or "UPS Ground").strip() or "UPS Ground"
     ship_method_ref = get_or_create_ship_method_ref(
@@ -6857,26 +6937,46 @@ def create_invoice_in_quickbooks(
     # Next DocNumber (+1)
     doc_number = get_next_invoice_number(headers, realm_id, env_override)
 
-    invoice_payload = {
-        "CustomerRef": customer_ref,
-        "Line": [
+    inv_lines = [
+        {
+            "DetailType": "SalesItemLineDetail",
+            "Amount": float(round(amount, 2)),
+            "Description": order_data.get("Design", ""),
+            "SalesItemLineDetail": {
+                "ItemRef": _qbo_ref_value_only(item_ref),
+                "Qty": float(qty),
+                "UnitPrice": float(round(unit_price, 2)),
+            },
+        }
+    ]
+    if cc_fee_amt > 0:
+        cc_item_ref = get_or_create_item_ref(
+            _qbo_cc_processing_fee_item_name(), headers, realm_id, env_override
+        )
+        inv_lines.append(
             {
                 "DetailType": "SalesItemLineDetail",
-                "Amount": float(round(amount, 2)),
-                "Description": order_data.get("Design", ""),
+                "Amount": float(cc_fee_amt),
+                "Description": "Credit card processing fee (3% of invoice subtotal before this fee)",
                 "SalesItemLineDetail": {
-                    "ItemRef": _qbo_ref_value_only(item_ref),
-                    "Qty": float(qty),
-                    "UnitPrice": float(round(unit_price, 2)),
+                    "ItemRef": _qbo_ref_value_only(cc_item_ref),
+                    "Qty": 1.0,
+                    "UnitPrice": float(cc_fee_amt),
                 },
             }
-        ],
+        )
+
+    invoice_payload = {
+        "CustomerRef": customer_ref,
+        "Line": inv_lines,
         "TxnDate": txn_date_str,
         "DocNumber": doc_number,
         "SalesTermRef": {"value": "3"},
         "BillEmail": {"Address": bill_email} if bill_email else None,
         "ShipMethodRef": ship_method_ref_payload,
     }
+    if wants_cc_invoice:
+        invoice_payload.update(_qbo_invoice_credit_card_payment_fields())
     if shipping_total and float(shipping_total) > 0:
         invoice_payload["ShipAmt"] = float(round(float(shipping_total), 2))
     if not ship_method_ref_payload:
@@ -7101,6 +7201,32 @@ def create_consolidated_invoice_in_quickbooks(
     # Next DocNumber (+1 from last)
     doc_number = get_next_invoice_number(headers, realm_id, env_override)
 
+    pay_pref = fetch_payment_preference_from_directory(
+        sheet_service, first_order.get("Company Name", "")
+    )
+    wants_cc_invoice = _directory_pref_is_credit_card(pay_pref)
+    merch_total = sum(float((ln or {}).get("Amount", 0) or 0) for ln in line_items)
+    fee_base = float(round(merch_total, 2)) + float(ship_amt_r)
+    cc_fee_amt = round(fee_base * 0.03, 2) if wants_cc_invoice else 0.0
+    cc_fee_line = None
+    if cc_fee_amt > 0:
+        cc_item_ref = get_or_create_item_ref(
+            _qbo_cc_processing_fee_item_name(), headers, realm_id, env_override
+        )
+        cc_fee_line = {
+            "DetailType": "SalesItemLineDetail",
+            "Amount": float(cc_fee_amt),
+            "Description": "Credit card processing fee (3% of invoice subtotal before this fee)",
+            "SalesItemLineDetail": {
+                "ItemRef": {"value": str(cc_item_ref["value"])},
+                "Qty": 1.0,
+                "UnitPrice": float(cc_fee_amt),
+            },
+        }
+    qbo_cc_payment_fields = (
+        _qbo_invoice_credit_card_payment_fields() if wants_cc_invoice else {}
+    )
+
     def _invoice_drop_none(inv):
         return {k: v for k, v in inv.items() if v is not None}
 
@@ -7133,6 +7259,8 @@ def create_consolidated_invoice_in_quickbooks(
                 logging.warning(
                     "Consolidated invoice: could not add Shipping line item: %s", ex
                 )
+        if cc_fee_line:
+            lines.append(cc_fee_line)
         memo_bits_fb = []
         if os.getenv("QBO_SHIPPING_CUSTOMER_MEMO_ON_CREATE", "").strip().lower() in (
             "1",
@@ -7155,6 +7283,7 @@ def create_consolidated_invoice_in_quickbooks(
         }
         if cm:
             inv["CustomerMemo"] = cm
+        inv.update(qbo_cc_payment_fields)
         return _invoice_drop_none(inv)
 
     def _minimal_create_payload(include_ship_method_ref: bool):
@@ -7166,7 +7295,7 @@ def create_consolidated_invoice_in_quickbooks(
         """
         inv = {
             "CustomerRef": customer_ref,
-            "Line": list(line_items),
+            "Line": list(line_items) + ([cc_fee_line] if cc_fee_line else []),
             "TxnDate": txn_date_str,
             "DocNumber": doc_number,
             "SalesTermRef": {"value": "3"},
@@ -7184,6 +7313,7 @@ def create_consolidated_invoice_in_quickbooks(
         cm = " | ".join(memo_bits)[:1000] if memo_bits else None
         if cm:
             inv["CustomerMemo"] = cm
+        inv.update(qbo_cc_payment_fields)
         return _invoice_drop_none(inv)
 
     def _native_invoice_payload():
@@ -7198,7 +7328,7 @@ def create_consolidated_invoice_in_quickbooks(
         cm = " | ".join(memo_bits_n)[:1000] if memo_bits_n else None
         inv = {
             "CustomerRef": customer_ref,
-            "Line": list(line_items),
+            "Line": list(line_items) + ([cc_fee_line] if cc_fee_line else []),
             "TxnDate": txn_date_str,
             "DocNumber": doc_number,
             "SalesTermRef": {"value": "3"},
@@ -7211,6 +7341,7 @@ def create_consolidated_invoice_in_quickbooks(
             inv["TrackingNum"] = ", ".join(track_parts)
         if cm:
             inv["CustomerMemo"] = cm
+        inv.update(qbo_cc_payment_fields)
         return _invoice_drop_none(inv)
 
     # ── 5) Send to QuickBooks ───────────────────────────────────────
