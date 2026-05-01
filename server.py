@@ -4041,7 +4041,27 @@ def kanban_queue_manager():
         print(
             "🧾 Kanban headers:", headers[:10]
         )  # show first 10 headers for verification
-        hix = _kanban_headers_index(headers)
+        items_by_kanban_id: dict[str, dict] = {}
+
+        def _first_from_row(rec: dict, *names):
+            for n in names:
+                v = rec.get(n)
+                if v is not None and str(v).strip() != "":
+                    return v
+            return ""
+
+        for r in rows[1:]:
+            if not r:
+                continue
+            if len(r) < len(headers):
+                r = r + [""] * (len(headers) - len(r))
+            rec = dict(zip(headers, r))
+            if str(rec.get("Type") or "").strip().upper() != KANBAN_ITEM_TYPE:
+                continue
+            kid = str(rec.get("Kanban ID") or "").strip()
+            if kid:
+                items_by_kanban_id[kid] = rec
+
         out = []
 
         for r in rows[1:]:
@@ -4051,34 +4071,59 @@ def kanban_queue_manager():
                 r = r + [""] * (len(headers) - len(r))
 
             row = dict(zip(headers, r))
+
             def _first(*names):
-                for n in names:
-                    v = row.get(n)
-                    if v is not None and str(v).strip() != "":
-                        return v
-                return ""
+                return _first_from_row(row, *names)
+
             status = (row.get("Event Status") or "").strip().lower()
             row_type = (row.get("Type") or "").strip().upper()
 
             if row_type == KANBAN_REQUEST_TYPE and status in ("open", "ordered"):
-                out.append(
-                    {
-                        "Event ID": _first("Event ID", "Event Id", "EventID", "eventId", "ID", "Id"),
-                        "Kanban ID": _first("Kanban ID", "Kanban Id", "KanbanID", "kanbanId"),
-                        "Item Name": row.get("Item Name"),
-                        "SKU": row.get("SKU"),
-                        "Supplier": row.get("Supplier"),
-                        "Order Method": row.get("Order Method (Email/Online)"),
-                        "Order Email": row.get("Order Email"),
-                        "Order URL": row.get("Order URL"),
-                        "Requested By": row.get("Requested By"),
-                        "Event Qty": row.get("Event Qty"),
-                        "Reorder Qty (basis)": row.get("Reorder Qty (basis)"),
-                        "Timestamp": row.get("Timestamp"),
-                        "Photo URL": row.get("Photo URL"),
-                        "Event Status": row.get("Event Status"),
-                    }
-                )
+                entry = {
+                    "Event ID": _first("Event ID", "Event Id", "EventID", "eventId", "ID", "Id"),
+                    "Kanban ID": _first("Kanban ID", "Kanban Id", "KanbanID", "kanbanId"),
+                    "Item Name": row.get("Item Name"),
+                    "SKU": row.get("SKU"),
+                    "Supplier": row.get("Supplier"),
+                    "Order Method": row.get("Order Method (Email/Online)"),
+                    "Order Email": row.get("Order Email"),
+                    "Order URL": row.get("Order URL"),
+                    "Requested By": row.get("Requested By"),
+                    "Event Qty": row.get("Event Qty"),
+                    "Reorder Qty (basis)": row.get("Reorder Qty (basis)"),
+                    "Timestamp": row.get("Timestamp"),
+                    "Photo URL": row.get("Photo URL"),
+                    "Event Status": row.get("Event Status"),
+                }
+                kid = str(entry.get("Kanban ID") or "").strip()
+                item = items_by_kanban_id.get(kid) if kid else None
+                if item:
+                    if not str(entry.get("Photo URL") or "").strip():
+                        entry["Photo URL"] = item.get("Photo URL")
+                    if not str(entry.get("Item Name") or "").strip():
+                        entry["Item Name"] = item.get("Item Name")
+                    if not str(entry.get("SKU") or "").strip():
+                        entry["SKU"] = item.get("SKU")
+                    if not str(entry.get("Supplier") or "").strip():
+                        entry["Supplier"] = item.get("Supplier")
+                    if not str(entry.get("Order URL") or "").strip():
+                        entry["Order URL"] = item.get("Order URL")
+                    if not str(entry.get("Order Email") or "").strip():
+                        entry["Order Email"] = item.get("Order Email")
+                    if not str(entry.get("Order Method") or "").strip():
+                        entry["Order Method"] = item.get("Order Method (Email/Online)")
+                    if not str(entry.get("Event Qty") or "").strip():
+                        fallback_q = item.get("Reorder Qty (basis)")
+                        if fallback_q is None or str(fallback_q).strip() == "":
+                            fallback_q = item.get("Bin Qty (units)")
+                        if fallback_q is not None and str(fallback_q).strip() != "":
+                            entry["Event Qty"] = fallback_q
+                    if not str(entry.get("Reorder Qty (basis)") or "").strip():
+                        rqb = item.get("Reorder Qty (basis)")
+                        if rqb is not None and str(rqb).strip() != "":
+                            entry["Reorder Qty (basis)"] = rqb
+
+                out.append(entry)
 
         # ✅ FIXED: safely convert timestamps to strings before sorting
         out.sort(key=lambda x: str(x.get("Timestamp") or ""), reverse=True)
