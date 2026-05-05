@@ -7024,6 +7024,12 @@ def create_invoice_in_quickbooks(
         invoice_payload.update(_qbo_invoice_credit_card_payment_fields())
     if shipping_total and float(shipping_total) > 0:
         invoice_payload["ShipAmt"] = float(round(float(shipping_total), 2))
+    if tracking_list:
+        track_parts_single = [str(t).strip() for t in tracking_list if str(t).strip()]
+        if track_parts_single:
+            invoice_payload["TrackingNum"] = ", ".join(track_parts_single)
+    # Mirror shipment date into invoice ShipDate so the Ship tab date populates QBO.
+    invoice_payload["ShipDate"] = txn_date_str
     if not ship_method_ref_payload:
         invoice_payload["CustomerMemo"] = f"Ship via: {ship_via_single}"
     # Remove any None values QBO might reject (e.g., missing BillEmail)
@@ -7734,21 +7740,16 @@ def create_consolidated_invoice_in_quickbooks(
         )
     except Exception as ex:
         logging.warning("QBO ship-field consolidated_start log failed: %s", ex)
-    if not has_opt_in_shipping_line:
-        _qbo_patch_invoice_shipping_and_tracking(
-            headers,
-            realm_id,
-            inv_id,
-            ship_amt_r,
-            track_parts,
-            ship_method_ref_payload,
-            txn_date_str,
-            env_override,
-        )
-    else:
-        logging.info(
-            "QBO shipping patch skipped (invoice uses Shipping sales line item; native ShipAmt not used)"
-        )
+    _qbo_patch_invoice_shipping_and_tracking(
+        headers,
+        realm_id,
+        inv_id,
+        ship_amt_r,
+        track_parts,
+        ship_method_ref_payload,
+        txn_date_str,
+        env_override,
+    )
     if ship_method_ref_payload:
         _ensure_qbo_invoice_ship_via(
             headers, realm_id, inv_id, ship_method_ref_payload, env_override
@@ -7763,9 +7764,7 @@ def create_consolidated_invoice_in_quickbooks(
         )
 
     # Second sparse pass: QBO occasionally drops ShipAmt / Ship Via after the first update.
-    if not has_opt_in_shipping_line and (
-        ship_amt_r > 0 or track_parts or ship_method_ref_payload
-    ):
+    if ship_amt_r > 0 or track_parts or ship_method_ref_payload:
         _qbo_patch_invoice_shipping_and_tracking(
             headers,
             realm_id,
