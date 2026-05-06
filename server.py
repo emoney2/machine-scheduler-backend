@@ -5924,6 +5924,73 @@ def _qbo_native_shipping_unavailable(headers, realm_id, env_override=None):
     return False
 
 
+def _qbo_try_enable_shipping_preferences(headers, realm_id, env_override=None):
+    """
+    Best-effort: enable SalesFormsPrefs.AllowShipping so Invoice ShipAmt/ShipMethodRef
+    can persist on native fields instead of forcing a shipping sales line.
+    Returns (enabled_or_already_on: bool, detail: str).
+    """
+    base = get_base_qbo_url(env_override)
+    pref_url = f"{base}/v3/company/{realm_id}/preferences?minorversion={QBO_MINOR_VERSION}"
+    try:
+        r = requests.get(pref_url, headers=headers, timeout=40)
+    except Exception as ex:
+        logging.warning("QBO preferences GET failed while enabling shipping: %s", ex)
+        return False, "preferences_get_exception"
+    if r.status_code != 200:
+        logging.warning(
+            "QBO preferences GET failed HTTP %s while enabling shipping: %s",
+            r.status_code,
+            (r.text or "")[:800],
+        )
+        return False, "preferences_get_http"
+    try:
+        pref_json = r.json() or {}
+    except Exception:
+        pref_json = {}
+    pref = pref_json.get("Preferences") if isinstance(pref_json.get("Preferences"), dict) else {}
+    if not pref:
+        return False, "preferences_missing"
+    try:
+        sf = pref.get("SalesFormsPrefs") if isinstance(pref.get("SalesFormsPrefs"), dict) else {}
+        if sf.get("AllowShipping") is True:
+            return True, "already_enabled"
+    except Exception:
+        pass
+    pid = str(pref.get("Id") or "").strip()
+    sync = str(pref.get("SyncToken") or "").strip()
+    if not pid or not sync:
+        logging.warning(
+            "QBO preferences missing Id/SyncToken; cannot enable AllowShipping. keys=%s",
+            list(pref.keys()) if isinstance(pref, dict) else [],
+        )
+        return False, "missing_id_or_sync"
+    patch = {
+        "Id": pid,
+        "SyncToken": sync,
+        "sparse": True,
+        "SalesFormsPrefs": {"AllowShipping": True},
+    }
+    r2 = requests.post(
+        pref_url,
+        headers={**headers, "Content-Type": "application/json"},
+        json=patch,
+        timeout=45,
+    )
+    if r2.status_code not in (200, 201):
+        logging.warning(
+            "QBO preferences AllowShipping update failed HTTP %s: %s",
+            r2.status_code,
+            (r2.text or "")[:1000],
+        )
+        return False, "preferences_update_http"
+    logging.info(
+        "QBO preferences updated: SalesFormsPrefs.AllowShipping=True (realm=%s)",
+        str(realm_id or "").strip(),
+    )
+    return True, "enabled"
+
+
 def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start=1001):
     """
     Query the latest invoice DocNumber and return +1 (as string).
@@ -7416,9 +7483,25 @@ def create_consolidated_invoice_in_quickbooks(
         "true",
         "yes",
     )
-    qbo_native_ship_off = _qbo_native_shipping_unavailable(
-        headers, realm_id, env_override
-    )
+    qbo_native_ship_off = _qbo_native_shipping_unavailable(headers, realm_id, env_override)
+    if qbo_native_ship_off and (ship_amt_r > 0 or track_parts):
+        enabled_ok, enabled_detail = _qbo_try_enable_shipping_preferences(
+            headers, realm_id, env_override
+        )
+        if enabled_ok:
+            qbo_native_ship_off = _qbo_native_shipping_unavailable(
+                headers, realm_id, env_override
+            )
+            logging.info(
+                "QBO shipping-preference probe after enable attempt: native_shipping_unavailable=%s detail=%s",
+                qbo_native_ship_off,
+                enabled_detail,
+            )
+        else:
+            logging.warning(
+                "QBO shipping-preference enable attempt failed/skipped detail=%s; native shipping may remain unavailable",
+                enabled_detail,
+            )
     if qbo_native_ship_off and (ship_amt_r > 0 or track_parts):
         logging.warning(
             "QBO ShipMethod API unavailable for this company (native ShipAmt/Ship Via may fail). "
@@ -15576,8 +15659,14 @@ def process_shipment():
             "labels_api_raw": full_label_raw_urls,
         }
         if not skip_invoice and qbo_invoice_id:
+            canonical_invoice_url = _qbo_invoice_record_url(
+                realm_id, qbo_invoice_id, env_override
+            )
+            if canonical_invoice_url:
+                invoice_url = canonical_invoice_url
             resp_payload["qbo_invoice_id"] = qbo_invoice_id
             resp_payload["qbo_realm_id"] = str(realm_id or "").strip()
+            resp_payload["invoice"] = invoice_url
         resp = jsonify(resp_payload)
         resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
         resp.headers["Access-Control-Allow-Credentials"] = "true"
