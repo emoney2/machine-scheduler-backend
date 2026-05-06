@@ -10874,6 +10874,106 @@ def jobs_for_company():
         return resp
 
 
+@app.route("/api/shopify/admin/order", methods=["GET"])
+@login_required_session
+def api_shopify_admin_order():
+    """Live Shopify order (shipping_lines, etc.) for Ship tab — Admin API."""
+    try:
+        import shopify_admin as sa
+    except ImportError:
+        return jsonify({"error": "Shopify admin module unavailable"}), 500
+
+    oid = (request.args.get("shopify_order_id") or request.args.get("id") or "").strip()
+    if not oid:
+        return jsonify({"error": "Missing shopify_order_id"}), 400
+    if not sa.shopify_configured():
+        return jsonify(
+            {
+                "error": "Shopify Admin API not configured",
+                "hint": "Set SHOPIFY_STORE_DOMAIN and SHOPIFY_ADMIN_ACCESS_TOKEN",
+            }
+        ), 503
+    try:
+        st, data = sa.fetch_order(oid)
+    except Exception as e:
+        logger.exception("api_shopify_admin_order")
+        return jsonify({"error": str(e)}), 500
+
+    if st >= 400:
+        err_body = data if isinstance(data, dict) else {"error": data}
+        return jsonify(err_body), st
+
+    order = (data or {}).get("order") or {}
+    shop_oid = str(order.get("id") or oid).strip()
+    out = {
+        "order": order,
+        "shipping_lines": order.get("shipping_lines") or [],
+        "admin_order_url": sa.admin_order_editor_url(shop_oid),
+        "shop_domain": sa.normalize_shop_domain(sa.SHOPIFY_STORE_DOMAIN),
+    }
+    return jsonify(out)
+
+
+@app.route("/api/shopify/admin/fulfill", methods=["POST", "OPTIONS"])
+@login_required_session
+def api_shopify_admin_fulfill():
+    """Create Shopify fulfillment with UPS tracking; returns admin order URL for packing slip."""
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
+
+    try:
+        import shopify_admin as sa
+    except ImportError:
+        return jsonify({"error": "Shopify admin module unavailable"}), 500
+
+    payload = request.get_json() or {}
+    oid = str(payload.get("shopify_order_id") or "").strip()
+    tracking = payload.get("tracking_numbers")
+    if isinstance(tracking, str):
+        tracking = [tracking]
+    if not isinstance(tracking, list):
+        tracking = []
+    notify = payload.get("notify_customer")
+    if notify is None:
+        notify = True
+    carrier = str(payload.get("carrier") or "UPS").strip() or "UPS"
+
+    if not oid:
+        return jsonify({"error": "Missing shopify_order_id"}), 400
+    if not sa.shopify_configured():
+        return jsonify(
+            {
+                "error": "Shopify Admin API not configured",
+                "hint": "Set SHOPIFY_STORE_DOMAIN and SHOPIFY_ADMIN_ACCESS_TOKEN",
+            }
+        ), 503
+
+    try:
+        st, data = sa.create_fulfillment_with_tracking(
+            oid,
+            tracking,
+            carrier_name=carrier,
+            notify_customer=bool(notify),
+        )
+    except Exception as e:
+        logger.exception("api_shopify_admin_fulfill")
+        return jsonify({"error": str(e)}), 500
+
+    admin_order_url = sa.admin_order_editor_url(oid)
+    if st >= 400:
+        body = data if isinstance(data, dict) else {"detail": data}
+        body["admin_order_url"] = admin_order_url
+        return jsonify(body), st
+
+    out = data if isinstance(data, dict) else {}
+    if isinstance(out, dict):
+        out["admin_order_url"] = admin_order_url
+    return jsonify(out), 200
+
+
 def _ship_queue_parse_due(val):
     """Parse Due Date from sheet (serial, datetime, or string) for sorting."""
     if val is None or val == "":
