@@ -5932,31 +5932,45 @@ def _qbo_try_enable_shipping_preferences(headers, realm_id, env_override=None):
     """
     base = get_base_qbo_url(env_override)
     pref_url = f"{base}/v3/company/{realm_id}/preferences?minorversion={QBO_MINOR_VERSION}"
-    try:
-        r = requests.get(pref_url, headers=headers, timeout=40)
-    except Exception as ex:
-        logging.warning("QBO preferences GET failed while enabling shipping: %s", ex)
-        return False, "preferences_get_exception"
-    if r.status_code != 200:
-        logging.warning(
-            "QBO preferences GET failed HTTP %s while enabling shipping: %s",
-            r.status_code,
-            (r.text or "")[:800],
+    def _get_pref():
+        try:
+            rr = requests.get(pref_url, headers=headers, timeout=40)
+        except Exception as ex:
+            logging.warning("QBO preferences GET failed while enabling shipping: %s", ex)
+            return None, None, None, "preferences_get_exception"
+        if rr.status_code != 200:
+            logging.warning(
+                "QBO preferences GET failed HTTP %s while enabling shipping: %s",
+                rr.status_code,
+                (rr.text or "")[:800],
+            )
+            return None, None, None, "preferences_get_http"
+        try:
+            jd = rr.json() or {}
+        except Exception:
+            jd = {}
+        pref_obj = (
+            jd.get("Preferences") if isinstance(jd.get("Preferences"), dict) else {}
         )
-        return False, "preferences_get_http"
-    try:
-        pref_json = r.json() or {}
-    except Exception:
-        pref_json = {}
-    pref = pref_json.get("Preferences") if isinstance(pref_json.get("Preferences"), dict) else {}
-    if not pref:
-        return False, "preferences_missing"
-    try:
-        sf = pref.get("SalesFormsPrefs") if isinstance(pref.get("SalesFormsPrefs"), dict) else {}
-        if sf.get("AllowShipping") is True:
-            return True, "already_enabled"
-    except Exception:
-        pass
+        if not pref_obj:
+            return None, None, None, "preferences_missing"
+        sf_obj = (
+            pref_obj.get("SalesFormsPrefs")
+            if isinstance(pref_obj.get("SalesFormsPrefs"), dict)
+            else {}
+        )
+        allow = bool(sf_obj.get("AllowShipping") is True)
+        return pref_obj, sf_obj, allow, None
+
+    pref, sf, allow_before, err = _get_pref()
+    if err:
+        return False, err
+    if allow_before:
+        logging.info(
+            "QBO preferences check: AllowShipping already true (realm=%s)",
+            str(realm_id or "").strip(),
+        )
+        return True, "already_enabled"
     pid = str(pref.get("Id") or "").strip()
     sync = str(pref.get("SyncToken") or "").strip()
     if not pid or not sync:
@@ -5965,7 +5979,13 @@ def _qbo_try_enable_shipping_preferences(headers, realm_id, env_override=None):
             list(pref.keys()) if isinstance(pref, dict) else [],
         )
         return False, "missing_id_or_sync"
-    patch = {
+    logging.warning(
+        "QBO preferences check: AllowShipping is false; attempting enable (realm=%s)",
+        str(realm_id or "").strip(),
+    )
+
+    # Pass 1: sparse update (lightweight).
+    patch_sparse = {
         "Id": pid,
         "SyncToken": sync,
         "sparse": True,
@@ -5974,21 +5994,60 @@ def _qbo_try_enable_shipping_preferences(headers, realm_id, env_override=None):
     r2 = requests.post(
         pref_url,
         headers={**headers, "Content-Type": "application/json"},
-        json=patch,
+        json=patch_sparse,
         timeout=45,
     )
     if r2.status_code not in (200, 201):
         logging.warning(
-            "QBO preferences AllowShipping update failed HTTP %s: %s",
+            "QBO preferences sparse AllowShipping update failed HTTP %s: %s",
             r2.status_code,
             (r2.text or "")[:1000],
         )
-        return False, "preferences_update_http"
-    logging.info(
-        "QBO preferences updated: SalesFormsPrefs.AllowShipping=True (realm=%s)",
-        str(realm_id or "").strip(),
+    pref2, sf2, allow_after_sparse, err2 = _get_pref()
+    if not err2 and allow_after_sparse:
+        logging.info(
+            "QBO preferences updated (sparse): AllowShipping=True (realm=%s)",
+            str(realm_id or "").strip(),
+        )
+        return True, "enabled_sparse"
+
+    # Pass 2: full SalesFormsPrefs update (some companies ignore sparse for this node).
+    sync2 = str((pref2 or {}).get("SyncToken") or sync).strip()
+    sf_full = dict(sf2 or sf or {})
+    sf_full["AllowShipping"] = True
+    patch_full = {
+        "Id": pid,
+        "SyncToken": sync2,
+        "sparse": False,
+        "SalesFormsPrefs": sf_full,
+    }
+    r3 = requests.post(
+        pref_url,
+        headers={**headers, "Content-Type": "application/json"},
+        json=patch_full,
+        timeout=45,
     )
-    return True, "enabled"
+    if r3.status_code not in (200, 201):
+        logging.warning(
+            "QBO preferences full AllowShipping update failed HTTP %s: %s",
+            r3.status_code,
+            (r3.text or "")[:1200],
+        )
+    _pref3, _sf3, allow_after_full, err3 = _get_pref()
+    if not err3 and allow_after_full:
+        logging.info(
+            "QBO preferences updated (full): AllowShipping=True (realm=%s)",
+            str(realm_id or "").strip(),
+        )
+        return True, "enabled_full"
+    logging.warning(
+        "QBO preferences update did not persist AllowShipping=true (realm=%s) "
+        "sparse_http=%s full_http=%s",
+        str(realm_id or "").strip(),
+        r2.status_code,
+        r3.status_code,
+    )
+    return False, "preferences_not_persisted"
 
 
 def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start=1001):
@@ -7804,6 +7863,7 @@ def create_consolidated_invoice_in_quickbooks(
         for ln in (invoice_payload.get("Line") or [])
         if isinstance(ln, dict)
     )
+    sm_un = False
     try:
         sm_un = _qbo_native_shipping_unavailable(headers, realm_id, env_override)
         logging.info(
@@ -7823,11 +7883,19 @@ def create_consolidated_invoice_in_quickbooks(
         )
     except Exception as ex:
         logging.warning("QBO ship-field consolidated_start log failed: %s", ex)
+    patch_ship_amt = ship_amt_r
+    if sm_un and has_opt_in_shipping_line and ship_amt_r > 0:
+        patch_ship_amt = 0.0
+        logging.info(
+            "QBO ship-field: skipping ShipAmt patch attempts invoice_id=%s because "
+            "ShipMethod API is unavailable and freight is already on a Sales line",
+            inv_id,
+        )
     _qbo_patch_invoice_shipping_and_tracking(
         headers,
         realm_id,
         inv_id,
-        ship_amt_r,
+        patch_ship_amt,
         track_parts,
         ship_method_ref_payload,
         txn_date_str,
@@ -7847,12 +7915,12 @@ def create_consolidated_invoice_in_quickbooks(
         )
 
     # Second sparse pass: QBO occasionally drops ShipAmt / Ship Via after the first update.
-    if ship_amt_r > 0 or track_parts or ship_method_ref_payload:
+    if patch_ship_amt > 0 or track_parts or ship_method_ref_payload:
         _qbo_patch_invoice_shipping_and_tracking(
             headers,
             realm_id,
             inv_id,
-            ship_amt_r,
+            patch_ship_amt,
             track_parts,
             ship_method_ref_payload,
             txn_date_str,
@@ -9312,6 +9380,118 @@ def overview_combined():
     resp.headers["Cache-Control"] = f"public, max-age={TTL}"
     return resp
 
+
+@app.route("/overview/rebuild-materials", methods=["POST"], endpoint="overview_rebuild_materials_plain")
+@app.route("/api/overview/rebuild-materials", methods=["POST"], endpoint="overview_rebuild_materials_api")
+@login_required_session
+def overview_rebuild_materials():
+    """
+    Run the bound Google Apps Script JRCO_rebuildMaterialsToOrder (writes Overview !M:!N),
+    then clear the overview in-memory cache so the next GET sees fresh lists.
+    Configure GOOGLE_APPS_SCRIPT_WEBAPP_URL. Optional shared secret:
+    GOOGLE_APPS_SCRIPT_REBUILD_TOKEN (backend) + JRCO_REBUILD_TOKEN (Apps Script script property).
+    """
+    global _overview_cache, _overview_ts
+
+    apps_script_url = (os.environ.get("GOOGLE_APPS_SCRIPT_WEBAPP_URL") or "").strip()
+    if not apps_script_url:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "GOOGLE_APPS_SCRIPT_WEBAPP_URL is not configured on the server.",
+                }
+            ),
+            503,
+        )
+
+    token = (os.environ.get("GOOGLE_APPS_SCRIPT_REBUILD_TOKEN") or "").strip()
+    body = {"action": "rebuildMaterialsToOrder"}
+    if token:
+        body["secret"] = token
+
+    try:
+        r = requests.post(
+            apps_script_url,
+            json=body,
+            timeout=240,
+            headers={"Content-Type": "application/json"},
+            allow_redirects=True,
+        )
+    except requests.exceptions.Timeout:
+        app.logger.exception("overview_rebuild_materials: Apps Script timeout")
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "Timed out waiting for Google Apps Script (rebuild may still be running).",
+                }
+            ),
+            504,
+        )
+    except requests.exceptions.RequestException as ex:
+        app.logger.exception("overview_rebuild_materials: request failed: %s", ex)
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "Could not reach Google Apps Script.",
+                }
+            ),
+            502,
+        )
+
+    snippet = (r.text or "")[:2000]
+    ct = (r.headers.get("Content-Type") or "").lower()
+    if r.status_code >= 400 or "text/html" in ct or snippet.strip().startswith("<"):
+        app.logger.error(
+            "overview_rebuild_materials: bad response status=%s ct=%s body=%s",
+            r.status_code,
+            ct,
+            snippet[:500],
+        )
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "Google Apps Script returned an error or HTML (check deployment / auth).",
+                }
+            ),
+            502,
+        )
+
+    try:
+        data = r.json()
+    except ValueError:
+        app.logger.error("overview_rebuild_materials: invalid JSON: %s", snippet[:500])
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "Invalid JSON from Google Apps Script.",
+                }
+            ),
+            502,
+        )
+
+    if not data.get("success"):
+        err = data.get("error") or "Apps Script rebuild failed"
+        app.logger.warning("overview_rebuild_materials: script error: %s", err)
+        return jsonify({"success": False, "error": err}), 400
+
+    _overview_cache = None
+    _overview_ts = 0.0
+    invalidate_materials_needed_cache()
+
+    try:
+        socketio.emit(
+            "materialsUpdated",
+            {"status": "ok", "source": "rebuild-materials"},
+        )
+    except Exception as emit_err:
+        app.logger.warning("overview_rebuild_materials: socket emit failed: %s", emit_err)
+
+    return jsonify({"success": True, "message": data.get("message")}), 200
 
 
 @app.route("/api/upcoming_jobs")
