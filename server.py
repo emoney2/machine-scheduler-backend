@@ -8567,6 +8567,109 @@ def invalidate_upcoming_cache():
     _overview_upcoming_ts = 0.0
 
 
+def invalidate_overview_combined_cache():
+    """Clear `/api/overview` JSON cache so Materials To Order reflects Inventory changes."""
+    global _overview_cache, _overview_ts
+
+    _overview_cache = None
+    _overview_ts = 0.0
+
+
+def _bump_material_inventory_on_order_plain(
+    sheet_svc, spreadsheet_id: str, material_name: str, add_qty: float
+) -> bool:
+    """
+    Add add_qty to Material Inventory column C (On Order) when cell C is numeric / blank.
+    Skip when C contains a formula (sheet SUMIFS/etc. maintains On Order — avoid double-counting).
+    """
+    if (
+        sheet_svc is None
+        or spreadsheet_id is None
+        or not (material_name or "").strip()
+        or add_qty <= 0
+        or add_qty != add_qty  # nan
+    ):
+        return False
+    nm = material_name.strip()
+    key = nm.lower()
+    try:
+        inv = (
+            sheet_svc.get(spreadsheetId=spreadsheet_id, range="Material Inventory!A:C")
+            .execute()
+            .get("values", [])
+            or []
+        )
+    except Exception as e:
+        logger.warning("[materialInventory bump] fetch A:C failed %s", e)
+        return False
+
+    row_1_based = None
+    for i, row in enumerate(inv[1:], start=2):
+        if row and len(row) > 0 and str(row[0]).strip().lower() == key:
+            row_1_based = i
+            break
+    if not row_1_based:
+        logger.warning("[materialInventory bump] no row for material %s", nm)
+        return False
+
+    cell_a1 = f"Material Inventory!C{row_1_based}"
+
+    try:
+        f_cells = (
+            sheet_svc.get(
+                spreadsheetId=spreadsheet_id,
+                range=cell_a1,
+                valueRenderOption="FORMULA",
+            )
+            .execute()
+            .get("values", [[]])
+        )
+        formula_text = ""
+        if f_cells and f_cells[0]:
+            formula_text = str(f_cells[0][0] or "").lstrip()
+
+        has_formula = isinstance(formula_text, str) and formula_text.strip().startswith(
+            "="
+        )
+
+        raw_cells = (
+            sheet_svc.get(
+                spreadsheetId=spreadsheet_id,
+                range=cell_a1,
+                valueRenderOption="UNFORMATTED_VALUE",
+            )
+            .execute()
+            .get("values", [[]])
+        )
+        raw_v = ""
+        if raw_cells and raw_cells[0]:
+            raw_v = raw_cells[0][0]
+        cur = 0.0
+        if raw_v is not None and raw_v != "":
+            cur = float(raw_v)
+
+        if has_formula:
+            logger.info(
+                "[materialInventory bump] %s column C has formula — relying on sheet (RESTOCK row + log)",
+                nm,
+            )
+            return False
+
+        new_tot = cur + float(add_qty)
+        sheet_svc.update(
+            spreadsheetId=spreadsheet_id,
+            range=cell_a1,
+            valueInputOption="USER_ENTERED",
+            body={"values": [[new_tot]]},
+        ).execute()
+        logger.info("[materialInventory bump] %s On Order %+s → %s", nm, add_qty, new_tot)
+        return True
+
+    except Exception as e:
+        logger.warning("[materialInventory bump] failed for %s: %s", nm, e)
+        return False
+
+
 # ---------------------------------------------------------------------------
 
 # ✅ You must define or update this function to match your actual Google Sheet logic
@@ -9381,6 +9484,63 @@ def overview_combined():
     return resp
 
 
+def _parse_json_from_apps_script_response(resp):
+    """
+    Parse Google Apps Script Web App bodies into a dict.
+
+    Scripts often emit UTF-8 with BOM or minor leading noise; requests' .json() can fail.
+    Returns (data_dict_or_none, error_message_or_none).
+    """
+    raw = resp.content if resp.content is not None else b""
+    if not raw.strip():
+        return None, "empty response body (redeploy the web app or check Executions in Apps Script)"
+
+    text = None
+    for enc in ("utf-8-sig", "utf-8"):
+        try:
+            text = raw.decode(enc).strip()
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        text = raw.decode("utf-8", errors="replace").strip()
+
+    if not text:
+        return None, "empty body after decode"
+
+    lead = text.lstrip()
+    if lead.startswith("<") or lead.lower().startswith("<!doctype"):
+        return None, "HTML response (open the web app URL once to authorize, or fix deployment)"
+
+    try:
+        return json.loads(text), None
+    except ValueError:
+        pass
+
+    # Leading log line / noise before first "{"
+    brace = lead.find("{")
+    if brace != -1:
+        sub = lead[brace:]
+        depth = 0
+        end = None
+        for i, ch in enumerate(sub):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end:
+            try:
+                return json.loads(sub[:end]), None
+            except ValueError:
+                pass
+
+    preview = lead[:240].replace("\n", "\\n")
+    return None, f"not valid JSON (preview): {preview!r}"
+
+
 @app.route("/overview/rebuild-materials", methods=["POST"], endpoint="overview_rebuild_materials_plain")
 @app.route("/api/overview/rebuild-materials", methods=["POST"], endpoint="overview_rebuild_materials_api")
 @login_required_session
@@ -9460,15 +9620,21 @@ def overview_rebuild_materials():
             502,
         )
 
-    try:
-        data = r.json()
-    except ValueError:
-        app.logger.error("overview_rebuild_materials: invalid JSON: %s", snippet[:500])
+    data, parse_err = _parse_json_from_apps_script_response(r)
+    if data is None:
+        app.logger.error(
+            "overview_rebuild_materials: could not parse JSON status=%s ct=%s err=%s body=%s",
+            r.status_code,
+            ct,
+            parse_err,
+            snippet[:800],
+        )
         return (
             jsonify(
                 {
                     "success": False,
-                    "error": "Invalid JSON from Google Apps Script.",
+                    "error": "Could not read JSON from Google Apps Script.",
+                    "detail": parse_err,
                 }
             ),
             502,
@@ -14505,6 +14671,9 @@ def submit_material_inventory():
                 row[td_idx["O/R"]] = action  # Ordered/Received
             return row
 
+        ordered_material_totals = {}
+        ordered_material_canonical = {}
+
         # 5) Process each item
         for it in items:
             name = (it.get("materialName") or it.get("value") or "").strip()
@@ -14556,10 +14725,29 @@ def submit_material_inventory():
                     mat_rows.append([name])
 
                 # ALWAYS log the material movement (even if not new)
+                #
+                # Use a sentinel Order # for vendor-facing purchases so sheet formulas that
+                # SUMIFS(..., Material Log Order #, "<>", "") still count replenishment orders.
+                # (Outbound job usage stays matched to Production Order #'s.)
+                order_col_vendor = ""
+                action_l = action.strip().lower()
+                if action_l == "ordered":
+                    order_col_vendor = "RESTOCK"
+                    try:
+                        q_add = float(str(qty_raw).strip().replace(",", ""))
+                        if q_add > 0:
+                            lk = name.strip().lower()
+                            ordered_material_totals[lk] = (
+                                ordered_material_totals.get(lk, 0.0) + q_add
+                            )
+                            ordered_material_canonical[lk] = name.strip()
+                    except (TypeError, ValueError):
+                        pass
+
                 material_log_rows.append(
                     [
                         timestamp,
-                        "",
+                        order_col_vendor,
                         "",
                         "",
                         "",
@@ -14601,6 +14789,15 @@ def submit_material_inventory():
                 insertDataOption="INSERT_ROWS",
                 body={"values": thread_log_rows},
             ).execute()
+
+        for lk, qty_sum in ordered_material_totals.items():
+            disp = ordered_material_canonical.get(lk) or lk
+            _bump_material_inventory_on_order_plain(
+                sheet, SPREADSHEET_ID, disp, float(qty_sum)
+            )
+
+        invalidate_overview_combined_cache()
+        invalidate_materials_needed_cache()
 
         return jsonify({"status": "submitted"}), 200
 
