@@ -12818,13 +12818,42 @@ def submit_order():
             except Exception as e:
                 logger.error("[MaterialLog] Failed to log to Google Sheets for back order %s: %s", back_order, e)
 
+        # First uploaded production file id — UI can show /api/drive/thumbnail on Order Submission strip
+        primary_file_id = None
+        if prod_links:
+            try:
+                m = re.search(r"/file/d/([A-Za-z0-9_-]{10,})", str(prod_links[0] or ""))
+                if m:
+                    primary_file_id = m.group(1)
+            except Exception:
+                primary_file_id = None
+
         invalidate_upcoming_cache()
-        
+
         # Return both order numbers if quilted front, otherwise just the one
         if is_quilted_front and back_order:
-            return jsonify({"status": "ok", "order": new_order, "back_order": back_order}), 200
+            return (
+                jsonify(
+                    {
+                        "status": "ok",
+                        "order": new_order,
+                        "back_order": back_order,
+                        "primaryFileId": primary_file_id,
+                    }
+                ),
+                200,
+            )
         else:
-            return jsonify({"status": "ok", "order": new_order}), 200
+            return (
+                jsonify(
+                    {
+                        "status": "ok",
+                        "order": new_order,
+                        "primaryFileId": primary_file_id,
+                    }
+                ),
+                200,
+            )
 
     except Exception as e:
         tb = traceback.format_exc()
