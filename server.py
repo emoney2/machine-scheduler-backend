@@ -8498,6 +8498,110 @@ _materials_needed_ts = 0.0
 _OVERVIEW_METRICS_CACHE = {"data": None, "ts": 0}
 OVERVIEW_METRICS_TTL = int(os.environ.get("OVERVIEW_METRICS_TTL", "60"))  # seconds
 
+
+def _safe_pb_orders_table_sql_ident(table_name: str) -> str:
+    """Validate and escape production-orders table name for use inside SQL double-quotes."""
+    t = (table_name or "").strip()
+    if not re.match(r"^[A-Za-z0-9_ ]+$", t):
+        raise ValueError("invalid production orders table name")
+    return t.replace('"', '""')
+
+
+def _calendar_days_elapsed_in_year(year: int, today=None) -> int:
+    """Inclusive day count from Jan 1 through today when still in `year`; full year if past `year`."""
+    if today is None:
+        today = datetime.now(ZoneInfo("UTC")).date()
+    jan1 = date(year, 1, 1)
+    dec31 = date(year, 12, 31)
+    if today < jan1:
+        return 1
+    if today.year > year:
+        return (dec31 - jan1).days + 1
+    return (today - jan1).days + 1
+
+
+def _overview_rpc_sql_rows(query: str):
+    """Run read-only SQL via Supabase RPC; supports execute_sql or exec_sql responses."""
+    rows = None
+    resp = supabase.rpc("execute_sql", {"query": query}).execute()
+    data = resp.data
+    if isinstance(data, list):
+        rows = data
+    elif data is not None:
+        rows = [data]
+    if rows is not None:
+        return rows
+    resp2 = supabase.rpc("exec_sql", {"sql": query}).execute()
+    raw = resp2.data
+    if isinstance(raw, list) and len(raw) > 0:
+        first = raw[0]
+        if isinstance(first, str):
+            import json
+
+            return json.loads(first)
+        if isinstance(first, dict):
+            return [first]
+    return None
+
+
+def compute_products_sold_per_day_ytd(
+    sales_year=None,
+    log=None,
+):
+    """
+    Units per calendar day YTD: sum(Quantity) for orders dated in sales_year in
+    SUPABASE_PB_ORDERS_TABLE, excluding rows whose Product contains 'back'
+    (case-insensitive). Dates stored as M/D/YYYY ... strings are matched safely.
+    If sales_year is omitted, uses the current calendar year in UTC.
+    Returns None if Supabase or RPC fails.
+    """
+    if supabase is None:
+        return None
+    if sales_year is None:
+        sales_year = datetime.now(ZoneInfo("UTC")).year
+    logger = log or app.logger
+    try:
+        tbl = _safe_pb_orders_table_sql_ident(SUPABASE_PB_ORDERS_TABLE)
+    except ValueError:
+        return None
+
+    query = f"""
+    select coalesce(sum(coalesce("Quantity"::numeric, 0)), 0) as total_qty
+    from "{tbl}"
+    where (
+      trim(cast("Date" as text)) like '%/{sales_year} %'
+      or trim(cast("Date" as text)) like '%/{sales_year}'
+      or left(trim(cast("Date" as text)), 5) = '{sales_year}-'
+    )
+    and (
+      "Product" is null
+      or lower(trim(cast("Product" as text))) not like '%back%'
+    )
+    """
+
+    try:
+        rows = _overview_rpc_sql_rows(query)
+    except Exception as e:
+        logger.warning("products_sold_per_day: RPC failed: %s", e)
+        return None
+
+    if not rows:
+        return None
+    row = rows[0]
+    if not isinstance(row, dict):
+        return None
+    raw_total = row.get("total_qty")
+    try:
+        total_qty = float(raw_total or 0)
+    except (TypeError, ValueError):
+        return None
+
+    days = _calendar_days_elapsed_in_year(sales_year)
+    if days < 1:
+        days = 1
+    return total_qty / float(days)
+
+
 # ─── Google client singletons ───────────────────────────────────────────────
 _sheets_service = None
 _drive_service = None
@@ -10041,11 +10145,17 @@ def overview_metrics():
             emb_weeks = round(float(turnaround.get("weeks") or 0), 2)
 
         # ─── 3️⃣ MERGED METRICS (KEEP EXISTING KEYS) ───────
+        sold_per_day_live = compute_products_sold_per_day_ytd(log=app.logger)
+        if sold_per_day_live is not None:
+            headcovers_sold = round(float(sold_per_day_live), 2)
+        else:
+            headcovers_sold = round(
+                float(metrics_row.get("headcovers_sold_per_day") or 0), 2
+            )
+
         metrics = {
             # 🔒 EXISTING (DO NOT CHANGE)
-            "headcovers_sold_per_day": round(
-                float(metrics_row.get("headcovers_sold_per_day") or 0), 2
-            ),
+            "headcovers_sold_per_day": headcovers_sold,
             "goal": float(metrics_row.get("goal") or 0),
             "average_price_per_cover": round(
                 float(metrics_row.get("average_price_per_cover") or 0), 2
