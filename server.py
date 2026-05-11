@@ -5795,6 +5795,45 @@ def _qbo_invoice_ship_method_ref_payload(ship_method_ref):
     return out
 
 
+def _qbo_invoice_memo_when_ship_method_unavailable(
+    ship_method_ref_payload,
+    ship_via_label,
+    track_parts,
+    ship_amt_r,
+    *,
+    freight_on_sales_line: bool,
+):
+    """
+    Build CustomerMemo (message on invoice) when ShipMethodRef cannot be used — Intuit often
+    returns 'Metadata not found for Entity: ShipMethod' so the Ship Via control stays blank
+    in the UI even with Sales → Shipping on. This text is customer-visible on templates that print it.
+    """
+    if isinstance(ship_method_ref_payload, dict) and str(
+        ship_method_ref_payload.get("value") or ""
+    ).strip():
+        return None
+    bits = []
+    sv = str(ship_via_label or "").strip()
+    if sv:
+        bits.append(f"Ship via: {sv}")
+    if track_parts:
+        tk = ", ".join(str(x).strip() for x in track_parts if str(x).strip())
+        if tk:
+            bits.append(f"Tracking: {tk}")
+    try:
+        amt = round(float(ship_amt_r or 0), 2)
+    except (TypeError, ValueError):
+        amt = 0.0
+    if amt > 0.001:
+        if freight_on_sales_line:
+            bits.append(f"Shipping ${amt:.2f} (see Shipping line item)")
+        else:
+            bits.append(f"Shipping ${amt:.2f}")
+    if not bits:
+        return None
+    return " | ".join(bits)[:1000]
+
+
 def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
     """
     Return {"value": Id, "name": Name} for a QBO ShipMethod, or None if unresolved.
@@ -5921,9 +5960,9 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
 
     logging.warning(
         "⚠️ No QuickBooks ShipMethod for %r; invoice will omit Ship Via (ShipMethodRef). "
-        "If queries return 'Metadata not found for Entity: ShipMethod', enable Shipping in "
-        "QuickBooks: Settings → Account and settings → Sales → Delivery method (Shipping). "
-        "CustomerMemo will still carry the carrier name when ShipMethodRef is omitted.",
+        "If queries return 'Metadata not found for Entity: ShipMethod', Intuit may not expose "
+        "ShipMethod to the API for this company (Sales → Shipping can still be on). "
+        "The app sets Customer Message (CustomerMemo) with ship via / tracking / freight hint when the API cannot bind ShipMethod.",
         name,
     )
     return None
@@ -7510,11 +7549,16 @@ def create_consolidated_invoice_in_quickbooks(
     def _fallback_invoice_payload():
         """Shipping as a Sales line item (used when native ShipAmt / ShipMethod metadata is unavailable).
 
-        Avoid Customer-facing memo lines for carrier / tracking — tracking belongs on Invoice.TrackingNum,
-        freight belongs on ShipAmt or this Sales line; ship-via text appears in the line Description (UPS …).
-        Opt-in memo: QBO_SHIPPING_CUSTOMER_MEMO_ON_CREATE=1
+        Sends **both** header ShipAmt and a Shipping sales line (duplicate freight) so the Shipping
+        field is filled; remove the line or clear ShipAmt in QBO before sending if you only want one.
+
+        Opt-in memo: QBO_SHIPPING_CUSTOMER_MEMO_ON_CREATE=1 (legacy bits; auto memo when ShipMethod missing).
+
+        When ShipMethodRef is unavailable, CustomerMemo is always set (ship via / tracking / freight hint)
+        so the customer-facing message area is not blank — the Ship Via dropdown itself may stay empty (API).
         """
         lines = list(line_items)
+        ship_line_appended = False
         if ship_amt_r > 0:
             try:
                 ship_item = get_or_create_item_ref(
@@ -7532,6 +7576,7 @@ def create_consolidated_invoice_in_quickbooks(
                         },
                     }
                 )
+                ship_line_appended = True
             except Exception as ex:
                 logging.warning(
                     "Consolidated invoice: could not add Shipping line item: %s", ex
@@ -7548,7 +7593,16 @@ def create_consolidated_invoice_in_quickbooks(
                 memo_bits_fb.append(f"Ship via: {ship_via_label}")
             if track_parts:
                 memo_bits_fb.append(f"Tracking: {', '.join(track_parts)}")
-        cm = " | ".join(memo_bits_fb)[:1000] if memo_bits_fb else None
+        cm_legacy = " | ".join(memo_bits_fb)[:1000] if memo_bits_fb else ""
+        cm_auto = _qbo_invoice_memo_when_ship_method_unavailable(
+            ship_method_ref_payload,
+            ship_via_label,
+            track_parts,
+            ship_amt_r,
+            freight_on_sales_line=ship_line_appended,
+        )
+        # Prefer auto memo when ShipMethod is missing (covers ship via + tracking + freight hint).
+        cm_final = cm_auto if cm_auto else cm_legacy
         inv = {
             "CustomerRef": customer_ref,
             "Line": lines,
@@ -7558,8 +7612,11 @@ def create_consolidated_invoice_in_quickbooks(
             "BillEmail": {"Address": bill_email} if bill_email else None,
             "ShipMethodRef": ship_method_ref_payload,
         }
-        if cm:
-            inv["CustomerMemo"] = cm
+        # Duplicate freight: header ShipAmt + Shipping line (user removes line before sending).
+        if ship_amt_r > 0:
+            inv["ShipAmt"] = float(ship_amt_r)
+        if cm_final:
+            inv["CustomerMemo"] = cm_final
         inv.update(qbo_cc_payment_fields)
         return _invoice_drop_none(inv)
 
@@ -7591,14 +7648,23 @@ def create_consolidated_invoice_in_quickbooks(
             "yes",
         ) and not (include_ship_method_ref and ship_method_ref_payload):
             memo_bits.append(f"Ship via: {ship_via_label}")
-        cm = " | ".join(memo_bits)[:1000] if memo_bits else None
-        if cm:
-            inv["CustomerMemo"] = cm
+        cm_legacy = " | ".join(memo_bits)[:1000] if memo_bits else ""
+        cm_auto = _qbo_invoice_memo_when_ship_method_unavailable(
+            ship_method_ref_payload,
+            ship_via_label,
+            track_parts,
+            ship_amt_r,
+            freight_on_sales_line=bool(ups_ship_line_inserted),
+        )
+        cm_final = cm_auto if cm_auto else cm_legacy
+        if cm_final:
+            inv["CustomerMemo"] = cm_final
         inv.update(qbo_cc_payment_fields)
         return _invoice_drop_none(inv)
 
     def _native_invoice_payload():
-        """Ship Via + tracking on the invoice; optional Shipping sales line (rate audit; default on)."""
+        """Ship Via + tracking; optional Shipping sales line. Header ShipAmt is always set when ship_amt_r > 0
+        even with a Shipping line (duplicate freight until you delete one in QBO)."""
         nonlocal ups_ship_line_inserted
         ups_ship_line_inserted = False
         memo_bits_n = []
@@ -7608,7 +7674,6 @@ def create_consolidated_invoice_in_quickbooks(
             "yes",
         ) and not ship_method_ref_payload:
             memo_bits_n.append(f"Ship via: {ship_via_label}")
-        cm = " | ".join(memo_bits_n)[:1000] if memo_bits_n else None
         base_lines = list(line_items) + ([cc_fee_line] if cc_fee_line else [])
         lines_native = _lines_with_optional_ups_ship_line(base_lines)
         inv = {
@@ -7620,13 +7685,23 @@ def create_consolidated_invoice_in_quickbooks(
             "BillEmail": {"Address": bill_email} if bill_email else None,
             "ShipMethodRef": ship_method_ref_payload,
         }
-        # Avoid charging freight twice: native ShipAmt only when freight is not on a Sales line.
-        if ship_amt_r > 0 and not ups_ship_line_inserted:
+        # Native ShipAmt on the invoice header even when a Shipping sales line exists (user deletes
+        # the line before sending; both amounts intentionally duplicate until then).
+        if ship_amt_r > 0:
             inv["ShipAmt"] = float(ship_amt_r)
         if track_parts:
             inv["TrackingNum"] = ", ".join(track_parts)
-        if cm:
-            inv["CustomerMemo"] = cm
+        cm_legacy = " | ".join(memo_bits_n)[:1000] if memo_bits_n else ""
+        cm_auto = _qbo_invoice_memo_when_ship_method_unavailable(
+            ship_method_ref_payload,
+            ship_via_label,
+            track_parts,
+            ship_amt_r,
+            freight_on_sales_line=bool(ups_ship_line_inserted),
+        )
+        cm_final = cm_auto if cm_auto else cm_legacy
+        if cm_final:
+            inv["CustomerMemo"] = cm_final
         inv.update(qbo_cc_payment_fields)
         return _invoice_drop_none(inv)
 
@@ -7994,10 +8069,9 @@ def create_consolidated_invoice_in_quickbooks(
         logging.warning("QBO ship-field consolidated_start log failed: %s", ex)
     patch_ship_amt = ship_amt_r
     if has_opt_in_shipping_line and ship_amt_r > 0:
-        patch_ship_amt = 0.0
         logging.info(
-            "QBO ship-field: skipping ShipAmt patch invoice_id=%s (freight on Shipping sales line; "
-            "native ShipAmt would duplicate the charge)",
+            "QBO ship-field: invoice_id=%s has Shipping sales line and native ShipAmt both set "
+            "(duplicate freight until you remove one in QBO).",
             inv_id,
         )
     _qbo_patch_invoice_shipping_and_tracking(
