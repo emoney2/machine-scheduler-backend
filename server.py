@@ -5741,6 +5741,46 @@ def _qbo_ship_methods_from_response(resp_json):
     return [sm]
 
 
+# UPS domestic / common service codes (2-digit as used after process-shipment trim).
+# Used when building QBO Ship Via + Shipping line description so the chosen rate tile matches the invoice.
+_UPS_SERVICE_CODE_SHIP_VIA_LABEL = {
+    "01": "UPS Next Day Air",
+    "02": "UPS 2nd Day Air",
+    "03": "UPS Ground",
+    "07": "UPS Worldwide Express",
+    "08": "UPS Worldwide Expedited",
+    "11": "UPS Standard",
+    "12": "UPS 3 Day Select",
+    "13": "UPS Next Day Air Saver",
+    "14": "UPS Next Day Air Early",
+    "54": "UPS Worldwide Express Plus",
+    "59": "UPS 2nd Day Air A.M.",
+    "82": "UPS Today Standard",
+    "83": "UPS Today Dedicated Courier",
+    "84": "UPS Today Intercity",
+    "85": "UPS Today Express",
+    "96": "UPS Worldwide Express Freight",
+}
+
+
+def _ups_service_code_to_ship_via_label(service_code) -> str:
+    """Return a human UPS service name from API service code, or ''."""
+    sc = str(service_code or "").strip()
+    if not sc:
+        return ""
+    if len(sc) > 2:
+        sc = sc[:2]
+    elif len(sc) == 1:
+        sc = sc.zfill(2)
+    return _UPS_SERVICE_CODE_SHIP_VIA_LABEL.get(sc, "")
+
+
+def _qbo_env_shipping_line_with_native() -> bool:
+    """When true (default), native invoice POSTs also include a Shipping sales line (rate audit trail)."""
+    v = (os.getenv("QBO_SHIPPING_LINE_WITH_NATIVE") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 def _qbo_invoice_ship_method_ref_payload(ship_method_ref):
     """
     ShipMethodRef for Invoice create/sparse: always include value; include name when known.
@@ -6638,12 +6678,14 @@ def _qbo_customer_memo_shipping_fallback(
     """
     Last resort after ShipAmt / Ship Via patches.
 
-    Default: do **not** write carrier/freight/tracking into CustomerMemo (customers see memo text).
+    CustomerMemo: QBO_SHIPPING_CUSTOMER_MEMO_FALLBACK defaults to **auto** — when the invoice has
+    no native Ship Via (ShipMethodRef) but we have a carrier label and/or tracking, append a short
+    memo so printed/emailed invoices show ship details (QBO often hides ShipMethod from the API).
 
-    Opt-in legacy CustomerMemo behavior: QBO_SHIPPING_CUSTOMER_MEMO_FALLBACK=1
+    Set to 0/false/no to disable, 1/true/yes to always use memo rules below when other checks pass.
 
-    Internal-only freight note (PrivateNote): QBO_SHIPPING_PRIVATE_NOTE_FALLBACK=1 (default on when
-    memo fallback is off) — staff-visible in QBO; not printed as customer-facing memo text.
+    PrivateNote (internal): QBO_SHIPPING_PRIVATE_NOTE_FALLBACK=1 (default) when CustomerMemo path
+    does not run or is disabled — staff-visible in QBO; not printed as customer-facing memo text.
     """
     inv, _err = _qbo_get_invoice(headers, realm_id, inv_id, env_override)
     if not inv:
@@ -6656,9 +6698,17 @@ def _qbo_customer_memo_shipping_fallback(
     ship_amt_ok = (
         want_amt <= 0.001 or cur_amt > 0.001 or bool(shipping_on_line_item)
     )
-    sm_ok = _qbo_invoice_has_ship_method_ref(inv) or not (
-        isinstance(ship_method_ref_payload, dict)
-        and str(ship_method_ref_payload.get("value") or "").strip()
+    has_native_ship_method = _qbo_invoice_has_ship_method_ref(inv)
+    payload_sm_val = (
+        str(ship_method_ref_payload.get("value") or "").strip()
+        if isinstance(ship_method_ref_payload, dict)
+        else ""
+    )
+    wants_ship_via_text = bool((ship_via_label or "").strip())
+    # Old logic treated "no ShipMethodRef id to POST" as sm_ok=True, which skipped fallbacks while
+    # the invoice still had a blank Ship Via (common when QBO hides ShipMethod from the API).
+    sm_ok = has_native_ship_method or (
+        not payload_sm_val and not wants_ship_via_text
     )
     logging.info(
         "QBO ship-field memo_fallback_check invoice_id=%s want_ShipAmt=%s cur_ShipAmt=%s "
@@ -6678,9 +6728,16 @@ def _qbo_customer_memo_shipping_fallback(
         )
         return
 
-    memo_customer = os.getenv(
-        "QBO_SHIPPING_CUSTOMER_MEMO_FALLBACK", ""
-    ).strip().lower() in ("1", "true", "yes")
+    _memo_mode = (os.getenv("QBO_SHIPPING_CUSTOMER_MEMO_FALLBACK") or "auto").strip().lower()
+    if _memo_mode in ("0", "false", "no"):
+        memo_customer = False
+    elif _memo_mode in ("1", "true", "yes"):
+        memo_customer = True
+    else:
+        # auto (default): customer-visible memo when native Ship Via is missing but we have carrier/tracking
+        memo_customer = (not has_native_ship_method) and (
+            wants_ship_via_text or bool(track_parts)
+        )
     allow_private_note = os.getenv(
         "QBO_SHIPPING_PRIVATE_NOTE_FALLBACK", "1"
     ).strip().lower() not in ("0", "false", "no")
@@ -7231,12 +7288,14 @@ def create_consolidated_invoice_in_quickbooks(
     base_shipping_cost,
     sheet,
     env_override=None,
+    service_code=None,
 ):
     """
     Builds a single consolidated invoice in QuickBooks (sandbox or production).
 
     base_shipping_cost: final USD amount for the Shipping line (already includes any per-box fee).
     tracking_list: UPS tracking strings, joined with commas on Invoice.TrackingNum.
+    service_code: UPS 2-digit service code from the rate tile (e.g. 03 Ground); refines Ship Via label.
     """
 
     # ── 0) Pick sandbox vs. production base URL ─────────────────────
@@ -7361,8 +7420,17 @@ def create_consolidated_invoice_in_quickbooks(
         or ""
     )
 
-    # Use selected service in Ship Via (e.g., UPS - Ground, UPS - 2 Day).
-    ship_via_label = _normalize_ship_via_label(shipping_method)
+    # Prefer UPS service code (matches the rate tile), then the label from the Ship UI.
+    code_ship = _ups_service_code_to_ship_via_label(service_code)
+    ship_via_label = _normalize_ship_via_label(
+        (code_ship or str(shipping_method or "")).strip() or shipping_method
+    )
+    logging.info(
+        "Consolidated invoice ship-via: service_code=%r shipping_method=%r -> ship_via_label=%r",
+        service_code,
+        shipping_method,
+        ship_via_label,
+    )
     ship_method_ref = get_or_create_ship_method_ref(
         ship_via_label, headers, realm_id, env_override
     )
@@ -7403,6 +7471,38 @@ def create_consolidated_invoice_in_quickbooks(
     qbo_cc_payment_fields = (
         _qbo_invoice_credit_card_payment_fields() if wants_cc_invoice else {}
     )
+
+    use_shipping_line_with_native = _qbo_env_shipping_line_with_native()
+    ups_ship_line_inserted = False
+
+    def _lines_with_optional_ups_ship_line(base_lines):
+        """Append a Shipping sales line when QBO_SHIPPING_LINE_WITH_NATIVE is on (default: on)."""
+        nonlocal ups_ship_line_inserted
+        out = list(base_lines)
+        if not (use_shipping_line_with_native and ship_amt_r > 0):
+            return out
+        try:
+            ship_item = get_or_create_item_ref(
+                "Shipping", headers, realm_id, env_override
+            )
+            out.append(
+                {
+                    "DetailType": "SalesItemLineDetail",
+                    "Amount": float(ship_amt_r),
+                    "Description": f"Shipping ({ship_via_label})",
+                    "SalesItemLineDetail": {
+                        "ItemRef": {"value": str(ship_item["value"])},
+                        "Qty": 1.0,
+                        "UnitPrice": float(ship_amt_r),
+                    },
+                }
+            )
+            ups_ship_line_inserted = True
+        except Exception as ex:
+            logging.warning(
+                "Consolidated invoice: optional Shipping sales line not added: %s", ex
+            )
+        return out
 
     def _invoice_drop_none(inv):
         return {k: v for k, v in inv.items() if v is not None}
@@ -7470,9 +7570,13 @@ def create_consolidated_invoice_in_quickbooks(
         applies ShipDate after create in _qbo_patch_invoice_shipping_and_tracking.
         Caller should sparse-patch delivery fields afterward.
         """
+        nonlocal ups_ship_line_inserted
+        ups_ship_line_inserted = False
+        base_lines = list(line_items) + ([cc_fee_line] if cc_fee_line else [])
+        lines_min = _lines_with_optional_ups_ship_line(base_lines)
         inv = {
             "CustomerRef": customer_ref,
-            "Line": list(line_items) + ([cc_fee_line] if cc_fee_line else []),
+            "Line": lines_min,
             "TxnDate": txn_date_str,
             "DocNumber": doc_number,
             "SalesTermRef": {"value": "3"},
@@ -7494,7 +7598,9 @@ def create_consolidated_invoice_in_quickbooks(
         return _invoice_drop_none(inv)
 
     def _native_invoice_payload():
-        """Preferred for UPS+QBO: ShipAmt, TrackingNum, Ship Via ref on the invoice (no duplicate ship line)."""
+        """Ship Via + tracking on the invoice; optional Shipping sales line (rate audit; default on)."""
+        nonlocal ups_ship_line_inserted
+        ups_ship_line_inserted = False
         memo_bits_n = []
         if os.getenv("QBO_SHIPPING_CUSTOMER_MEMO_ON_CREATE", "").strip().lower() in (
             "1",
@@ -7503,16 +7609,19 @@ def create_consolidated_invoice_in_quickbooks(
         ) and not ship_method_ref_payload:
             memo_bits_n.append(f"Ship via: {ship_via_label}")
         cm = " | ".join(memo_bits_n)[:1000] if memo_bits_n else None
+        base_lines = list(line_items) + ([cc_fee_line] if cc_fee_line else [])
+        lines_native = _lines_with_optional_ups_ship_line(base_lines)
         inv = {
             "CustomerRef": customer_ref,
-            "Line": list(line_items) + ([cc_fee_line] if cc_fee_line else []),
+            "Line": lines_native,
             "TxnDate": txn_date_str,
             "DocNumber": doc_number,
             "SalesTermRef": {"value": "3"},
             "BillEmail": {"Address": bill_email} if bill_email else None,
             "ShipMethodRef": ship_method_ref_payload,
         }
-        if ship_amt_r > 0:
+        # Avoid charging freight twice: native ShipAmt only when freight is not on a Sales line.
+        if ship_amt_r > 0 and not ups_ship_line_inserted:
             inv["ShipAmt"] = float(ship_amt_r)
         if track_parts:
             inv["TrackingNum"] = ", ".join(track_parts)
@@ -7884,11 +7993,11 @@ def create_consolidated_invoice_in_quickbooks(
     except Exception as ex:
         logging.warning("QBO ship-field consolidated_start log failed: %s", ex)
     patch_ship_amt = ship_amt_r
-    if sm_un and has_opt_in_shipping_line and ship_amt_r > 0:
+    if has_opt_in_shipping_line and ship_amt_r > 0:
         patch_ship_amt = 0.0
         logging.info(
-            "QBO ship-field: skipping ShipAmt patch attempts invoice_id=%s because "
-            "ShipMethod API is unavailable and freight is already on a Sales line",
+            "QBO ship-field: skipping ShipAmt patch invoice_id=%s (freight on Shipping sales line; "
+            "native ShipAmt would duplicate the charge)",
             inv_id,
         )
     _qbo_patch_invoice_shipping_and_tracking(
@@ -15915,7 +16024,11 @@ def process_shipment():
             shipping_line_amt,
         )
 
-        shipping_method_for_invoice = "UPS" if do_ups else (shipping_method or "Manual")
+        # Preserve the rate tile label (Ground, 2 Day, etc.) for QBO Ship Via — do not collapse to "UPS".
+        if do_ups:
+            shipping_method_for_invoice = str(shipping_method or "").strip() or "UPS Ground"
+        else:
+            shipping_method_for_invoice = str(shipping_method or "").strip() or "Manual Shipping"
         logging.info(
             "Shipment invoice inputs: do_ups=%s skip_invoice=%s requested_shipping_method=%r invoice_shipping_method=%r "
             "service_code=%r tracking_count=%s shipping_line_amt=%s",
@@ -15941,6 +16054,7 @@ def process_shipment():
                 base_shipping_cost=shipping_line_amt,
                 sheet=service,
                 env_override=env_override,
+                service_code=service_code,
             )
             print("✅ Invoice created:", invoice_url, "id:", qbo_invoice_id)
             logging.info(
