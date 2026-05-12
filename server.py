@@ -14510,6 +14510,242 @@ def get_sales_reps():
     return resp
 
 
+def _sales_portal_session():
+    return session.get("sales_portal_user") or None
+
+
+def _sales_cors(resp):
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    try:
+        allowed = set(_cors_allowed_origins())
+    except Exception:
+        allowed = set()
+    allowed.update(
+        {
+            (
+                os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+                .strip()
+                .rstrip("/")
+            ),
+            "https://machineschedule.netlify.app",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        }
+    )
+    fallback = (
+        os.environ.get("FRONTEND_URL", "https://machineschedule.netlify.app")
+        .strip()
+        .rstrip("/")
+    )
+    resp.headers["Access-Control-Allow-Origin"] = origin if origin in allowed else fallback
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers["Vary"] = "Origin"
+    return resp
+
+
+@app.route("/api/sales/login", methods=["OPTIONS", "POST"])
+def sales_portal_login():
+    if request.method == "OPTIONS":
+        r = make_response("", 204)
+        r.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        r.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
+        return _sales_cors(r)
+    import sales_commission as scomm
+
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username") or "").strip()
+    password = str(body.get("password") or "")
+    rec = scomm.find_sales_user(username, password)
+    if not rec:
+        resp = jsonify({"ok": False, "error": "Invalid username or password"})
+        return _sales_cors(resp), 401
+    session["sales_portal_user"] = {
+        "username": rec["username"],
+        "role": rec["role"],
+        "repName": rec.get("repName") or "",
+    }
+    resp = jsonify(
+        {
+            "ok": True,
+            "role": rec["role"],
+            "repName": rec.get("repName") or "",
+        }
+    )
+    return _sales_cors(resp), 200
+
+
+@app.route("/api/sales/logout", methods=["OPTIONS", "POST"])
+def sales_portal_logout():
+    if request.method == "OPTIONS":
+        r = make_response("", 204)
+        r.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        r.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
+        return _sales_cors(r)
+    session.pop("sales_portal_user", None)
+    return _sales_cors(jsonify({"ok": True})), 200
+
+
+@app.route("/api/sales/session", methods=["OPTIONS", "GET"])
+def sales_portal_session_get():
+    if request.method == "OPTIONS":
+        r = make_response("", 204)
+        r.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        r.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
+        return _sales_cors(r)
+    sp = _sales_portal_session()
+    if not sp:
+        return _sales_cors(jsonify({"loggedIn": False})), 200
+    return (
+        _sales_cors(
+            jsonify(
+                {
+                    "loggedIn": True,
+                    "username": sp.get("username"),
+                    "role": sp.get("role"),
+                    "repName": sp.get("repName") or "",
+                }
+            )
+        ),
+        200,
+    )
+
+
+def _sales_portal_require_json():
+    sp = _sales_portal_session()
+    if not sp:
+        return None, (_sales_cors(jsonify({"error": "sales portal login required"})), 401)
+    return sp, None
+
+
+@app.route("/api/sales/me", methods=["OPTIONS", "GET"])
+def sales_portal_me():
+    if request.method == "OPTIONS":
+        r = make_response("", 204)
+        r.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        r.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
+        return _sales_cors(r)
+    import sales_commission as scomm
+
+    sp, err = _sales_portal_require_json()
+    if err:
+        return err
+    if sp.get("role") != "rep":
+        return _sales_cors(jsonify({"error": "rep login required"})), 403
+    rep_name = str(sp.get("repName") or "").strip()
+    if not rep_name:
+        return _sales_cors(jsonify({"error": "repName not set for this user in SALES_PORTAL_USERS"})), 400
+    try:
+        svc = get_sheets_service()
+        _, rows = scomm.read_ledger_all(svc, SPREADSHEET_ID)
+        rows_out = scomm.ledger_rows_for_rep(rows, rep_name)
+        return _sales_cors(jsonify({"rep": rep_name, "rows": rows_out})), 200
+    except Exception as e:
+        logger.exception("sales/me failed: %s", e)
+        return _sales_cors(jsonify({"error": str(e)})), 500
+
+
+@app.route("/api/sales/admin/ledger", methods=["OPTIONS", "GET"])
+def sales_portal_admin_ledger():
+    if request.method == "OPTIONS":
+        r = make_response("", 204)
+        r.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        r.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
+        return _sales_cors(r)
+    import sales_commission as scomm
+
+    sp, err = _sales_portal_require_json()
+    if err:
+        return err
+    if sp.get("role") != "admin":
+        return _sales_cors(jsonify({"error": "admin only"})), 403
+    try:
+        svc = get_sheets_service()
+        _, rows = scomm.read_ledger_all(svc, SPREADSHEET_ID)
+        rows_out = scomm.ledger_rows_admin(rows)
+        by_rep = {}
+        for row in rows_out:
+            rnm = str(row.get("Rep") or "").strip() or "(no rep)"
+            by_rep.setdefault(rnm, {"commission": 0.0, "rows": []})
+            try:
+                amt = float(row.get("Commission $") or 0)
+            except (TypeError, ValueError):
+                amt = 0.0
+            cust = str(row.get("Customer paid") or "").strip().upper()
+            rp = str(row.get("Rep paid") or "").strip().upper()
+            if cust == "Y" and rp != "Y":
+                by_rep[rnm]["commission"] += amt
+            by_rep[rnm]["rows"].append(row)
+        return _sales_cors(jsonify({"rows": rows_out, "summaryByRep": by_rep})), 200
+    except Exception as e:
+        logger.exception("sales/admin/ledger failed: %s", e)
+        return _sales_cors(jsonify({"error": str(e)})), 500
+
+
+@app.route("/api/sales/admin/mark-paid", methods=["OPTIONS", "POST"])
+def sales_portal_admin_mark_paid():
+    if request.method == "OPTIONS":
+        r = make_response("", 204)
+        r.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        r.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept"
+        return _sales_cors(r)
+    import sales_commission as scomm
+
+    sp, err = _sales_portal_require_json()
+    if err:
+        return err
+    if sp.get("role") != "admin":
+        return _sales_cors(jsonify({"error": "admin only"})), 403
+    body = request.get_json(silent=True) or {}
+    ids = body.get("invoiceQboIds") or body.get("invoice_ids") or []
+    if not isinstance(ids, list):
+        return _sales_cors(jsonify({"error": "invoiceQboIds array required"})), 400
+    try:
+        svc = get_sheets_service()
+        n = scomm.mark_rep_paid_rows(svc, SPREADSHEET_ID, [str(x) for x in ids])
+        return _sales_cors(jsonify({"ok": True, "updated": n})), 200
+    except Exception as e:
+        logger.exception("sales/admin/mark-paid failed: %s", e)
+        return _sales_cors(jsonify({"error": str(e)})), 500
+
+
+@app.route("/api/sales/cron/sync-qbo", methods=["OPTIONS", "GET", "POST"])
+def sales_portal_cron_sync_qbo():
+    if request.method == "OPTIONS":
+        r = make_response("", 204)
+        r.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        r.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Requested-With, Accept, X-Sales-Cron-Secret"
+        )
+        return _sales_cors(r)
+    import sales_commission as scomm
+
+    expect = (os.environ.get("SALES_CRON_SECRET") or "").strip()
+    got = (request.headers.get("X-Sales-Cron-Secret") or "").strip()
+    if not expect or not secrets.compare_digest(got, expect):
+        return _sales_cors(jsonify({"error": "unauthorized"})), 401
+    try:
+        headers, realm_id = get_quickbooks_credentials()
+    except RedirectException as redir:
+        return _sales_cors(jsonify({"error": "qbo_auth_required", "redirect": redir.redirect_url})), 401
+    except Exception as e:
+        return _sales_cors(jsonify({"error": f"qbo_credentials: {e}"})), 500
+    env_override = (os.environ.get("QBO_ENV") or "production").strip().lower()
+    try:
+        svc = get_sheets_service()
+        result = scomm.sync_ledger_with_qbo(
+            svc,
+            SPREADSHEET_ID,
+            _qbo_get_invoice,
+            headers,
+            realm_id,
+            env_override,
+        )
+        return _sales_cors(jsonify({"ok": True, **result})), 200
+    except Exception as e:
+        logger.exception("sales/cron/sync-qbo failed: %s", e)
+        return _sales_cors(jsonify({"error": str(e)})), 500
+
+
 @app.route("/api/materials", methods=["OPTIONS"])
 def materials_preflight():
     return make_response("", 204)
@@ -15967,7 +16203,7 @@ def process_shipment():
             .values()
             .get(
                 spreadsheetId=sheet_id,
-                range=f"{sheet_name}!A1:Z",
+                range=f"{sheet_name}!A1:AZ",
             )
             .execute()
         )
@@ -15980,11 +16216,13 @@ def process_shipment():
 
         updates = []
         all_order_data = []
+        order_id_to_rownum = {}
 
         # 3) Build update requests & collect data for invoice
         for i, row in enumerate(rows[1:], start=2):
             order_id = str(row[id_col]).strip()
             if order_id in order_ids:
+                order_id_to_rownum[order_id] = i
                 raw = shipped_quantities.get(order_id, 0)
                 try:
                     parsed_qty = int(float(raw))
@@ -16336,6 +16574,51 @@ def process_shipment():
                 )
             except Exception as ex:
                 logging.warning("UPS label copies to order Drive folders failed: %s", ex)
+
+        # 8b) Commission ledger + optional Invoice QBO Id / Invoice # on Production Orders
+        if not skip_invoice and qbo_invoice_id and headers and realm_id:
+            try:
+                import sales_commission as scomm
+
+                inv_row, inv_err = _qbo_get_invoice(
+                    headers, realm_id, qbo_invoice_id, env_override
+                )
+                if inv_row:
+                    doc_num = str(inv_row.get("DocNumber") or "").strip()
+                    try:
+                        _, ledger_vals = scomm.read_ledger_all(service, sheet_id)
+                        if not scomm.invoice_id_exists_in_ledger(
+                            ledger_vals, qbo_invoice_id
+                        ):
+                            rate = float(os.environ.get("COMMISSION_RATE", "0.12"))
+                            row_vals = scomm.ledger_row_for_pending_invoice(
+                                inv_row,
+                                order_ids,
+                                all_order_data,
+                                rate,
+                            )
+                            scomm.append_ledger_row(service, sheet_id, row_vals)
+                            logger.info(
+                                "Commission ledger: appended pending row for invoice %s",
+                                qbo_invoice_id,
+                            )
+                    except Exception as le:
+                        logger.exception(
+                            "Commission ledger append skipped/failed: %s", le
+                        )
+                    try:
+                        scomm.maybe_add_invoice_column_updates(
+                            updates,
+                            headers_row,
+                            sheet_name,
+                            order_id_to_rownum,
+                            qbo_invoice_id,
+                            doc_num,
+                        )
+                    except Exception as ue:
+                        logger.warning("Invoice column updates on Production Orders: %s", ue)
+            except Exception as ce:
+                logger.exception("Commission ledger / invoice columns hook: %s", ce)
 
         # 9) Only after invoice + slips succeed, write Shipped to the sheet
         if updates:
