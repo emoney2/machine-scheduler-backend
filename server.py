@@ -8417,6 +8417,8 @@ PRODUCTION_ORDERS_PB_SHEET_TAB = os.environ.get("PRODUCTION_ORDERS_PB_SHEET_TAB"
 # Supabase table for Shopify product-builder orders
 SUPABASE_PB_ORDERS_TABLE = os.environ.get("SUPABASE_PB_ORDERS_TABLE", "Production Orders TEST")
 FUR_RANGE = os.environ.get("FUR_RANGE", "Fur List!A1:Z")
+# Sales Rep commission list (Order Submission REP dropdown)
+SALES_REP_LIST_RANGE = os.environ.get("SALES_REP_LIST_RANGE", "Sales Rep!A2:A10")
 CUT_RANGE = os.environ.get("CUT_RANGE", "Cut List!A1:Z")
 # Sewing Summary tab: Order # + Top (when Top >= order qty, overview shows sewing-complete check in Stage)
 SEWING_SUMMARY_RANGE = os.environ.get("SEWING_SUMMARY_RANGE", "Sewing Summary!A1:Z")
@@ -12977,6 +12979,15 @@ def submit_order():
             valueInputOption="USER_ENTERED",
             body={"values": [row]},
         ).execute()
+
+        # ─── SALES REP (column AQ) ───────────────────────────────────────────
+        sales_rep = (data.get("salesRep") or "").strip()
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!AQ{next_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[sales_rep]]},
+        ).execute()
         
         # ─── WRITE THREADS FORMULA SEPARATELY (column AF) ─────────────────────
         if threads_formula:
@@ -13067,6 +13078,13 @@ def submit_order():
                 range=f"Production Orders!A{back_next_row}:AK{back_next_row}",
                 valueInputOption="USER_ENTERED",
                 body={"values": [back_row]},
+            ).execute()
+
+            sheets.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!AQ{back_next_row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[sales_rep]]},
             ).execute()
             
             # ─── WRITE THREADS FORMULA SEPARATELY FOR BACK ORDER (column AF) ───
@@ -14463,6 +14481,33 @@ def get_table():
 from flask import make_response  # if not already imported
 
 # ─── MATERIALS ENDPOINTS ────────────────────────────────────────────────
+
+
+@app.route("/api/sales-reps", methods=["GET"])
+@login_required_session
+def get_sales_reps():
+    """Names from the Sales Rep sheet (dropdown on Order Submission)."""
+
+    def build():
+        try:
+            rows = fetch_sheet(SPREADSHEET_ID, SALES_REP_LIST_RANGE) or []
+            out = []
+            for r in rows:
+                if not r:
+                    continue
+                cell = str(r[0]).strip() if len(r) > 0 and r[0] is not None else ""
+                if cell:
+                    out.append(cell)
+            return out
+        except Exception:
+            logging.exception("Error fetching sales reps")
+            return []
+
+    payload = build()
+    resp = make_response(jsonify(payload), 200)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 @app.route("/api/materials", methods=["OPTIONS"])
