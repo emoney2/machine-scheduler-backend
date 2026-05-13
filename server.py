@@ -5775,12 +5775,6 @@ def _ups_service_code_to_ship_via_label(service_code) -> str:
     return _UPS_SERVICE_CODE_SHIP_VIA_LABEL.get(sc, "")
 
 
-def _qbo_env_shipping_line_with_native() -> bool:
-    """When true (default), native invoice POSTs also include a Shipping sales line (rate audit trail)."""
-    v = (os.getenv("QBO_SHIPPING_LINE_WITH_NATIVE") or "1").strip().lower()
-    return v not in ("0", "false", "no", "off")
-
-
 def _qbo_invoice_ship_method_ref_payload(ship_method_ref):
     """
     ShipMethodRef for Invoice create/sparse: always include value; include name when known.
@@ -6257,6 +6251,17 @@ def _ensure_qbo_invoice_ship_via(
             iid,
             (r2.text or "")[:1200],
         )
+        if _qbo_try_full_invoice_update_delivery_overlays(
+            headers,
+            realm_id,
+            iid,
+            {"ShipMethodRef": dict(ship_method_ref_payload)},
+            env_override,
+        ):
+            logging.info(
+                "QBO Ship Via fix: full invoice POST recovered ShipMethodRef for invoice %s",
+                iid,
+            )
         return
     try:
         jd2 = r2.json()
@@ -6265,12 +6270,22 @@ def _ensure_qbo_invoice_ship_via(
     inv2 = _qbo_invoice_dict_from_payload(jd2)
     if _qbo_invoice_has_ship_method_ref(inv2):
         logging.info("QBO Ship Via fix: sparse update succeeded for invoice %s", iid)
-    else:
-        logging.warning(
-            "QBO Ship Via fix: sparse POST OK but ShipMethodRef still missing in response — "
-            "enable Shipping under Sales settings and ensure ShipMethod API/metadata is available. "
-            "invoice_keys=%s",
-            list(inv2.keys()) if inv2 else [],
+        return
+    logging.warning(
+        "QBO Ship Via fix: sparse POST OK but ShipMethodRef still missing in response — "
+        "enable Shipping under Sales settings and ensure ShipMethod API/metadata is available. "
+        "invoice_keys=%s",
+        list(inv2.keys()) if inv2 else [],
+    )
+    if _qbo_try_full_invoice_update_delivery_overlays(
+        headers,
+        realm_id,
+        iid,
+        {"ShipMethodRef": dict(ship_method_ref_payload)},
+        env_override,
+    ):
+        logging.info(
+            "QBO Ship Via fix: full invoice POST recovered ShipMethodRef for invoice %s", iid
         )
 
 
@@ -6526,6 +6541,91 @@ def _qbo_try_full_invoice_update_shipamt(
     return False
 
 
+def _qbo_try_full_invoice_update_delivery_overlays(
+    headers, realm_id, invoice_id, field_overlays, env_override=None
+):
+    """
+    Full (non-sparse) invoice POST: merge field_overlays onto the latest GET body.
+
+    Intuit often accepts sparse updates but leaves ShipAmt / ShipMethodRef / TrackingNum / ShipDate
+    empty in the UI; posting the full invoice with Lines from GET plus delivery fields matches
+    community guidance and recovers when per-field sparse passes do not stick.
+    """
+    iid = str(invoice_id or "").strip()
+    if not iid or not isinstance(field_overlays, dict) or not field_overlays:
+        return False
+    base = get_base_qbo_url(env_override)
+    get_url = f"{base}/v3/company/{realm_id}/invoice/{iid}?minorversion={QBO_MINOR_VERSION}"
+    r = requests.get(get_url, headers=headers, timeout=40)
+    if r.status_code != 200:
+        logging.warning(
+            "QBO full delivery overlays: GET invoice %s failed HTTP %s: %s",
+            iid,
+            r.status_code,
+            (r.text or "")[:800],
+        )
+        return False
+    try:
+        jd = r.json() or {}
+    except Exception:
+        jd = {}
+    inv = jd.get("Invoice") if isinstance(jd.get("Invoice"), dict) else {}
+    if not inv:
+        logging.warning(
+            "QBO full delivery overlays: GET invoice %s had no Invoice object", iid
+        )
+        return False
+
+    post_url = f"{base}/v3/company/{realm_id}/invoice?minorversion={QBO_MINOR_VERSION}"
+
+    def _attempt(body_dict):
+        return requests.post(
+            post_url,
+            headers={**headers, "Content-Type": "application/json"},
+            json=body_dict,
+            timeout=45,
+        )
+
+    merged_overlays = dict(field_overlays)
+
+    body = _sanitize_invoice_body_for_full_update(inv)
+    body["sparse"] = False
+    body.update(merged_overlays)
+    r2 = _attempt(body)
+    if r2.status_code in (200, 201):
+        logging.info(
+            "QBO full delivery overlays OK invoice_id=%s keys=%s (minimal strip)",
+            iid,
+            list(merged_overlays.keys()),
+        )
+        return True
+    logging.warning(
+        "QBO full delivery overlays minimal-strip failed HTTP %s: %s",
+        r2.status_code,
+        (r2.text or "")[:1000],
+    )
+
+    body2 = deepcopy(inv)
+    body2.pop("MetaData", None)
+    body2.pop("domain", None)
+    body2["sparse"] = False
+    body2.update(merged_overlays)
+    r3 = _attempt(body2)
+    if r3.status_code in (200, 201):
+        logging.info(
+            "QBO full delivery overlays OK invoice_id=%s keys=%s (light strip)",
+            iid,
+            list(merged_overlays.keys()),
+        )
+        return True
+    logging.warning(
+        "QBO full delivery overlays light-strip failed HTTP %s: %s",
+        r3.status_code,
+        (r3.text or "")[:1000],
+    )
+    return False
+
+
 def _qbo_patch_invoice_shipping_and_tracking(
     headers,
     realm_id,
@@ -6628,13 +6728,40 @@ def _qbo_patch_invoice_shipping_and_tracking(
             wanted_tracking=wanted_track,
             extra={"patch_keys_applied": list(patch.keys())},
         )
-        return True
-
-    logging.warning(
-        "QBO shipping patch: sparse failed for invoice %s: %s — retrying fields individually",
-        invoice_id,
-        err2 or "?",
-    )
+        # QBO sometimes returns 200 with ShipAmt / ShipMethodRef still empty on a follow-up GET.
+        inv_v, _ev = _qbo_get_invoice(headers, realm_id, invoice_id, env_override)
+        if inv_v:
+            verify_ok = True
+            if "ShipAmt" in patch and wanted_amt > 0.001:
+                if abs(_curr_amt(inv_v.get("ShipAmt")) - wanted_amt) > 0.02:
+                    verify_ok = False
+            if "TrackingNum" in patch and wanted_track:
+                if str(inv_v.get("TrackingNum") or "").strip() != wanted_track:
+                    verify_ok = False
+            if "ShipMethodRef" in patch and want_sm_val:
+                smv = inv_v.get("ShipMethodRef")
+                smd = smv if isinstance(smv, dict) else {}
+                if str(smd.get("value") or "").strip() != want_sm_val:
+                    verify_ok = False
+            if "ShipDate" in patch and txn_date_str:
+                if (
+                    str(inv_v.get("ShipDate") or "").strip()
+                    != str(txn_date_str).strip()
+                ):
+                    verify_ok = False
+            if verify_ok:
+                return True
+        logging.warning(
+            "QBO shipping patch: sparse OK but GET verification failed for invoice %s — "
+            "retrying per-field and full POST recovery",
+            invoice_id,
+        )
+    else:
+        logging.warning(
+            "QBO shipping patch: sparse failed for invoice %s: %s — retrying fields individually",
+            invoice_id,
+            err2 or "?",
+        )
     # Retry one field at a time (fresh SyncToken each time).
     for key in ("ShipAmt", "TrackingNum", "ShipMethodRef", "ShipDate"):
         if key not in patch:
@@ -6678,17 +6805,57 @@ def _qbo_patch_invoice_shipping_and_tracking(
                 key,
             )
 
-    # Sparse ShipAmt sometimes returns 2010 forever; full invoice POST with Lines from GET works per Intuit patterns.
-    if wanted_amt > 0:
-        inv_chk, _ec = _qbo_get_invoice(headers, realm_id, invoice_id, env_override)
-        if inv_chk and _curr_amt(inv_chk.get("ShipAmt")) <= 0.001:
-            if _qbo_try_full_invoice_update_shipamt(
-                headers, realm_id, invoice_id, wanted_amt, env_override
+    # Full invoice POST: merge delivery fields onto GET body (recovers when sparse is ignored).
+    inv_chk, _ec = _qbo_get_invoice(headers, realm_id, invoice_id, env_override)
+    if inv_chk:
+        c_amt = _curr_amt(inv_chk.get("ShipAmt"))
+        c_sm = (
+            inv_chk.get("ShipMethodRef")
+            if isinstance(inv_chk.get("ShipMethodRef"), dict)
+            else {}
+        )
+        c_sm_v = str(c_sm.get("value") or "").strip()
+        c_tr = str(inv_chk.get("TrackingNum") or "").strip()
+        c_sd = str(inv_chk.get("ShipDate") or "").strip()
+        want_sd = str(txn_date_str or "").strip()
+
+        need_amt = wanted_amt > 0.001 and c_amt <= 0.001
+        need_sm = bool(want_sm_val) and c_sm_v != want_sm_val
+        need_tr = bool(wanted_track) and c_tr != wanted_track
+        need_sd = bool(want_sd) and c_sd != want_sd
+
+        if need_amt or need_sm or need_tr or need_sd:
+            overlays = {}
+            if need_amt:
+                overlays["ShipAmt"] = float(wanted_amt)
+            if need_sm:
+                overlays["ShipMethodRef"] = (
+                    dict(ship_method_ref_payload)
+                    if isinstance(ship_method_ref_payload, dict)
+                    else {"value": want_sm_val}
+                )
+            if need_tr:
+                overlays["TrackingNum"] = wanted_track
+            if need_sd:
+                overlays["ShipDate"] = want_sd
+            if _qbo_try_full_invoice_update_delivery_overlays(
+                headers, realm_id, invoice_id, overlays, env_override
             ):
                 logging.info(
-                    "QBO shipping patch: recovered ShipAmt via full invoice update invoice_id=%s",
+                    "QBO shipping patch: recovered delivery fields via full invoice POST "
+                    "invoice_id=%s keys=%s",
                     invoice_id,
+                    list(overlays.keys()),
                 )
+            elif need_amt:
+                if _qbo_try_full_invoice_update_shipamt(
+                    headers, realm_id, invoice_id, wanted_amt, env_override
+                ):
+                    logging.info(
+                        "QBO shipping patch: recovered ShipAmt via full invoice update "
+                        "(Amt-only fallback) invoice_id=%s",
+                        invoice_id,
+                    )
 
     _qbo_log_invoice_shipping_diagnostics(
         "after_per_field_patch_attempts",
@@ -6925,6 +7092,14 @@ def _qbo_customer_memo_shipping_fallback(
             inv_id,
             (err_pn or "?")[:600],
         )
+
+
+def _qbo_invoice_env_label(env_override=None):
+    """Return 'production' or 'sandbox' for browser deeplinks (must match OAuth/QBO company)."""
+    e = str(env_override or QBO_ENV or os.getenv("QBO_ENV") or "sandbox").strip().lower()
+    if e in ("production", "prod", "live"):
+        return "production"
+    return "sandbox"
 
 
 def _query_invoice_id_by_doc_number(
@@ -7459,15 +7634,20 @@ def create_consolidated_invoice_in_quickbooks(
         or ""
     )
 
-    # Prefer UPS service code (matches the rate tile), then the label from the Ship UI.
+    # Ship Via: prefer the exact label from the Ship app (user's chosen rate tile), not service-code mapping.
+    ui_ship = str(shipping_method or "").strip()
     code_ship = _ups_service_code_to_ship_via_label(service_code)
-    ship_via_label = _normalize_ship_via_label(
-        (code_ship or str(shipping_method or "")).strip() or shipping_method
-    )
+    if ui_ship:
+        ship_via_label = _normalize_ship_via_label(ui_ship)
+    else:
+        ship_via_label = _normalize_ship_via_label(
+            (code_ship or "UPS Ground").strip()
+        )
     logging.info(
-        "Consolidated invoice ship-via: service_code=%r shipping_method=%r -> ship_via_label=%r",
+        "Consolidated invoice ship-via: service_code=%r shipping_method=%r code_fallback=%r -> ship_via_label=%r",
         service_code,
         shipping_method,
+        code_ship,
         ship_via_label,
     )
     ship_method_ref = get_or_create_ship_method_ref(
@@ -7511,14 +7691,16 @@ def create_consolidated_invoice_in_quickbooks(
         _qbo_invoice_credit_card_payment_fields() if wants_cc_invoice else {}
     )
 
-    use_shipping_line_with_native = _qbo_env_shipping_line_with_native()
+    # Always include a Shipping sales line alongside header ShipAmt when freight > 0 (user may remove
+    # the line in QBO to avoid double-charging). Intentionally not gated on env vars.
+    use_shipping_line_with_native = True
     ups_ship_line_inserted = False
 
     def _lines_with_optional_ups_ship_line(base_lines):
-        """Append a Shipping sales line when QBO_SHIPPING_LINE_WITH_NATIVE is on (default: on)."""
+        """Append a Shipping sales line when freight > 0 (paired with native ShipAmt on the invoice)."""
         nonlocal ups_ship_line_inserted
         out = list(base_lines)
-        if not (use_shipping_line_with_native and ship_amt_r > 0):
+        if not (ship_amt_r > 0):
             return out
         try:
             ship_item = get_or_create_item_ref(
@@ -7546,11 +7728,13 @@ def create_consolidated_invoice_in_quickbooks(
     def _invoice_drop_none(inv):
         return {k: v for k, v in inv.items() if v is not None}
 
-    def _fallback_invoice_payload():
+    def _fallback_invoice_payload(*, include_header_ship_amt=True):
         """Shipping as a Sales line item (used when native ShipAmt / ShipMethod metadata is unavailable).
 
-        Sends **both** header ShipAmt and a Shipping sales line (duplicate freight) so the Shipping
-        field is filled; remove the line or clear ShipAmt in QBO before sending if you only want one.
+        When include_header_ship_amt is True, sends header ShipAmt **and** a Shipping sales line
+        (duplicate freight until you remove one in QBO). Intuit often returns 2010 on that combo
+        when the ShipMethod entity is missing from the API — use include_header_ship_amt=False
+        (freight on the Sales line only) for those companies.
 
         Opt-in memo: QBO_SHIPPING_CUSTOMER_MEMO_ON_CREATE=1 (legacy bits; auto memo when ShipMethod missing).
 
@@ -7612,8 +7796,8 @@ def create_consolidated_invoice_in_quickbooks(
             "BillEmail": {"Address": bill_email} if bill_email else None,
             "ShipMethodRef": ship_method_ref_payload,
         }
-        # Duplicate freight: header ShipAmt + Shipping line (user removes line before sending).
-        if ship_amt_r > 0:
+        # Optional header ShipAmt; when ShipMethod API is dead, duplicate line+header often 2010s.
+        if ship_amt_r > 0 and include_header_ship_amt:
             inv["ShipAmt"] = float(ship_amt_r)
         if cm_final:
             inv["CustomerMemo"] = cm_final
@@ -7748,9 +7932,9 @@ def create_consolidated_invoice_in_quickbooks(
     if qbo_native_ship_off and (ship_amt_r > 0 or track_parts):
         logging.warning(
             "QBO ShipMethod API unavailable for this company (native ShipAmt/Ship Via may fail). "
-            "The app will try a Sales line for freight before minimal create; set QBO_SHIPPING_LINE_FALLBACK=1 "
-            "to prefer a shipping line on the first POST. "
-            "In QBO: Account and settings → Sales → add ship methods / delivery options so the API exposes ShipMethod."
+            "Freight will post on a Sales line without header ShipAmt first; auto shipping-line retry "
+            "before minimal create is enabled. In QBO: Account and settings → Sales — Intuit may still "
+            "hide ShipMethod from the API (code 4001) even when Shipping is on."
         )
     # Line-item freight on first POST only when opted in. Keep native ShipAmt first;
     # optional auto line fallback is guarded by env to avoid silently moving freight to a sales line.
@@ -7758,11 +7942,16 @@ def create_consolidated_invoice_in_quickbooks(
     auto_ship_line_on_2010 = os.getenv(
         "QBO_AUTO_SHIPPING_LINE_ON_2010", ""
     ).strip().lower() in ("1", "true", "yes")
+    # ShipMethod query/create returns 4001/500 for this file — native ShipAmt on POST almost always
+    # 2010s; always run the shipping-line-before-minimal path without requiring an env flag.
+    if qbo_native_ship_off:
+        auto_ship_line_on_2010 = True
 
     used_force_line = False
     force_attempted = False
     res = None
     invoice_payload = None
+    freight_line_only_for_native_off = False
 
     if force_shipping_line:
         force_attempted = True
@@ -7809,9 +7998,12 @@ def create_consolidated_invoice_in_quickbooks(
     # ShipMethod metadata missing ⇒ ShipAmt / Ship Via sparse patches get 2010; prefer freight on a Sales line
     # up front instead of minimal invoice + CustomerMemo fallback.
     if not used_force_line and qbo_native_ship_off and ship_amt_r > 0:
-        invoice_payload = _fallback_invoice_payload()
+        freight_line_only_for_native_off = True
+        # Omit header ShipAmt: duplicate line + ShipAmt commonly 2010 when ShipMethod metadata is missing.
+        invoice_payload = _fallback_invoice_payload(include_header_ship_amt=False)
         logging.info(
-            "📦 Invoice payload (freight Sales line — ShipMethod entity unavailable):\n%s",
+            "📦 Invoice payload (freight Sales line — ShipMethod entity unavailable; "
+            "header ShipAmt omitted to avoid 2010):\n%s",
             json.dumps(invoice_payload, indent=2),
         )
         res = _post_inv(invoice_payload)
@@ -7848,6 +8040,42 @@ def create_consolidated_invoice_in_quickbooks(
             res = _post_inv(invoice_payload)
         if res.status_code in (200, 201):
             used_force_line = True
+        elif "2010" in (res.text or ""):
+            # Second attempt: some orgs accept duplicate header+line; try if line-only failed.
+            invoice_payload = _fallback_invoice_payload(include_header_ship_amt=True)
+            logging.warning(
+                "QBO freight line (no header ShipAmt) still 2010; retrying with header ShipAmt + line"
+            )
+            res = _post_inv(invoice_payload)
+            le = (res.text or "") if res.status_code not in (200, 201) else ""
+            if le and "2010" in le and "CustomerMemo" in invoice_payload:
+                invoice_payload = {
+                    k: v for k, v in invoice_payload.items() if k != "CustomerMemo"
+                }
+                logging.warning(
+                    "QBO invoice 2010 (freight line + header ShipAmt): retrying without CustomerMemo"
+                )
+                res = _post_inv(invoice_payload)
+                le = (res.text or "") if res.status_code not in (200, 201) else ""
+            if le and "2010" in le and "SalesTermRef" in invoice_payload:
+                invoice_payload = {
+                    k: v for k, v in invoice_payload.items() if k != "SalesTermRef"
+                }
+                logging.warning(
+                    "QBO invoice 2010 (freight line + header ShipAmt): retrying without SalesTermRef"
+                )
+                res = _post_inv(invoice_payload)
+                le = (res.text or "") if res.status_code not in (200, 201) else ""
+            if le and "2010" in le and "BillEmail" in invoice_payload:
+                invoice_payload = {
+                    k: v for k, v in invoice_payload.items() if k != "BillEmail"
+                }
+                logging.warning(
+                    "QBO invoice 2010 (freight line + header ShipAmt): retrying without BillEmail"
+                )
+                res = _post_inv(invoice_payload)
+            if res.status_code in (200, 201):
+                used_force_line = True
 
     if not used_force_line:
         wants_native_shipping = bool(ship_amt_r > 0 or track_parts)
@@ -7904,12 +8132,15 @@ def create_consolidated_invoice_in_quickbooks(
         and not used_force_line
         and auto_ship_line_on_2010
         and (ship_amt_r > 0 or track_parts)
+        and not (freight_line_only_for_native_off and qbo_native_ship_off)
     ):
         logging.warning(
             "QBO invoice 2010: shipping as Sales line before minimal create "
             "(avoids empty ShipAmt when delivery sparse-update does not stick)"
         )
-        invoice_payload = _fallback_invoice_payload()
+        invoice_payload = _fallback_invoice_payload(
+            include_header_ship_amt=not qbo_native_ship_off
+        )
         logging.info(
             "📦 Invoice payload (auto shipping line before minimal create):\n%s",
             json.dumps(invoice_payload, indent=2),
@@ -7939,8 +8170,8 @@ def create_consolidated_invoice_in_quickbooks(
             used_force_line = True
     elif _qbo_still_bad() and _qbo_is_2010() and not used_force_line and (ship_amt_r > 0 or track_parts):
         logging.info(
-            "QBO invoice 2010: auto shipping-line fallback disabled (QBO_AUTO_SHIPPING_LINE_ON_2010 not enabled); "
-            "continuing to minimal create + sparse ship/tracking patch"
+            "QBO invoice 2010: continuing to minimal create + sparse ship/tracking patch "
+            "(shipping-line-before-minimal did not apply or did not resolve)"
         )
 
     # ShipAmt / TrackingNum (and historically ShipDate) on create often yield 2010; create
@@ -16383,7 +16614,7 @@ def process_shipment():
 
         # Preserve the rate tile label (Ground, 2 Day, etc.) for QBO Ship Via — do not collapse to "UPS".
         if do_ups:
-            shipping_method_for_invoice = str(shipping_method or "").strip() or "UPS Ground"
+            shipping_method_for_invoice = str(shipping_method or "").strip() or "UPS - Ground"
         else:
             shipping_method_for_invoice = str(shipping_method or "").strip() or "Manual Shipping"
         logging.info(
@@ -16698,6 +16929,7 @@ def process_shipment():
                 invoice_url = canonical_invoice_url
             resp_payload["qbo_invoice_id"] = qbo_invoice_id
             resp_payload["qbo_realm_id"] = str(realm_id or "").strip()
+            resp_payload["qbo_invoice_env"] = _qbo_invoice_env_label(env_override)
             resp_payload["invoice"] = invoice_url
         resp = jsonify(resp_payload)
         resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
