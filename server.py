@@ -9018,6 +9018,85 @@ def compute_products_sold_per_day_ytd(
     return total_qty / float(days)
 
 
+def _sql_pb_order_date_on_calendar_days(start: date, end: date) -> str:
+    """
+    SQL predicate: true when the production-orders "Date" text falls on a calendar
+    day in [start, end] inclusive. Handles M/D/YYYY... (sheet/webhook style) and
+    YYYY-MM-DD... prefixes.
+    """
+    parts = []
+    d = start
+    while d <= end:
+        y, m, day = d.year, d.month, d.day
+        iso = f"{y:04d}-{m:02d}-{day:02d}"
+        parts.append(
+            f'(left(trim(cast("Date" as text)), 10) = \'{iso}\''
+            f' or trim(cast("Date" as text)) like \'{iso} %\')'
+        )
+        for ms in (str(m), f"{m:02d}"):
+            for ds in (str(day), f"{day:02d}"):
+                parts.append(f'(trim(cast("Date" as text)) like \'{ms}/{ds}/{y}%\')')
+        d += timedelta(days=1)
+    return "(" + " OR ".join(parts) + ")"
+
+
+def compute_headcovers_sold_this_week_mon_fri(log=None):
+    """
+    Sum of Quantity for the current ISO week, counting only Mon–Fri (America/New_York).
+    On Mon–Fri, includes from this week's Monday through today (capped at Friday).
+    On Sat–Sun, shows the completed Mon–Fri total for that ISO week (then resets at
+    the following Monday 00:00 ET as the window moves to a new week).
+
+    Excludes line items whose Product contains 'back' (case-insensitive), matching
+    compute_products_sold_per_day_ytd.
+    """
+    if supabase is None:
+        return None
+    logger = log or app.logger
+    try:
+        tbl = _safe_pb_orders_table_sql_ident(SUPABASE_PB_ORDERS_TABLE)
+    except ValueError:
+        return None
+
+    tz = ZoneInfo("America/New_York")
+    today = datetime.now(tz).date()
+    week_monday = today - timedelta(days=today.isoweekday() - 1)
+    if today.isoweekday() in (6, 7):
+        range_start = week_monday
+        range_end = week_monday + timedelta(days=4)
+    else:
+        range_start = week_monday
+        range_end = min(today, week_monday + timedelta(days=4))
+
+    date_pred = _sql_pb_order_date_on_calendar_days(range_start, range_end)
+    query = f"""
+    select coalesce(sum(coalesce("Quantity"::numeric, 0)), 0) as total_qty
+    from "{tbl}"
+    where {date_pred}
+    and (
+      "Product" is null
+      or lower(trim(cast("Product" as text))) not like '%back%'
+    )
+    """
+
+    try:
+        rows = _overview_rpc_sql_rows(query)
+    except Exception as e:
+        logger.warning("headcovers_sold_this_week: RPC failed: %s", e)
+        return None
+
+    if not rows:
+        return None
+    row = rows[0]
+    if not isinstance(row, dict):
+        return None
+    raw_total = row.get("total_qty")
+    try:
+        return float(raw_total or 0)
+    except (TypeError, ValueError):
+        return None
+
+
 # ─── Google client singletons ───────────────────────────────────────────────
 _sheets_service = None
 _drive_service = None
@@ -10569,6 +10648,11 @@ def overview_metrics():
                 float(metrics_row.get("headcovers_sold_per_day") or 0), 2
             )
 
+        sold_this_week = compute_headcovers_sold_this_week_mon_fri(log=app.logger)
+        headcovers_sold_this_week = (
+            round(float(sold_this_week), 2) if sold_this_week is not None else None
+        )
+
         metrics = {
             # 🔒 EXISTING (DO NOT CHANGE)
             "headcovers_sold_per_day": headcovers_sold,
@@ -10576,6 +10660,9 @@ def overview_metrics():
             "average_price_per_cover": round(
                 float(metrics_row.get("average_price_per_cover") or 0), 2
             ),
+
+            # Mon–Fri week-to-date (ET); resets each Monday; excludes Product containing "back"
+            "headcovers_sold_this_week": headcovers_sold_this_week,
 
             # 🧵 Embroidery backlog: from Overview sheet cells (open jobs) or Supabase fallback
             "embroidery_backlog_hours": emb_hours,
