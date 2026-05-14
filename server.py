@@ -9006,8 +9006,9 @@ def _calendar_days_elapsed_in_year(year: int, today=None) -> int:
     return (today - jan1).days + 1
 
 
-def _overview_rpc_sql_rows(query: str):
+def _overview_rpc_sql_rows(query: str, log=None):
     """Run read-only SQL via Supabase RPC; supports execute_sql or exec_sql responses."""
+    logger = log or app.logger
     rows = None
     try:
         resp = supabase.rpc("execute_sql", {"query": query}).execute()
@@ -9018,8 +9019,8 @@ def _overview_rpc_sql_rows(query: str):
             rows = [data]
         elif data is not None and not isinstance(data, list):
             rows = [data]
-    except Exception:
-        rows = None
+    except Exception as e:
+        logger.warning("overview RPC execute_sql failed: %s", e)
 
     # execute_sql sometimes returns [] on success; fall through to exec_sql in that case
     if rows:
@@ -9038,7 +9039,8 @@ def _overview_rpc_sql_rows(query: str):
                 return [first]
             if isinstance(first, list):
                 return raw
-    except Exception:
+    except Exception as e:
+        logger.warning("overview RPC exec_sql failed: %s", e)
         return None
     return None
 
@@ -9105,7 +9107,7 @@ def compute_products_sold_per_day_ytd(
     """
 
     try:
-        rows = _overview_rpc_sql_rows(query)
+        rows = _overview_rpc_sql_rows(query, log=logger)
     except Exception as e:
         logger.warning("products_sold_per_day: RPC failed: %s", e)
         return None
@@ -9120,35 +9122,26 @@ def compute_products_sold_per_day_ytd(
     return total_qty / float(days)
 
 
-def _sql_pb_order_calendar_date_between_inclusive(start: date, end: date) -> str:
+def _sql_pb_order_like_calendar_days(start: date, end: date) -> str:
     """
-    SQL predicate: order row's calendar day is in [start, end] inclusive.
-    Parses "Date" as either YYYY-MM-DD... (including ISO timestamps) or M/D/YYYY...
-    (Shopify webhook / sheet style). Avoids huge OR-lists that some RPC paths mishandle.
+    Match production-order \"Date\" text to calendar days in [start, end] using the
+    same style as YTD metrics (ISO prefix + M/D/YYYY LIKE variants). At most seven
+    days — keeps the SQL small so Supabase execute_sql/exec_sql stay reliable.
     """
-    a = start.isoformat()
-    b = end.isoformat()
-    return (
-        "("
-        " COALESCE("
-        "   CASE"
-        "     WHEN trim(cast(\"Date\" as text)) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'"
-        "       THEN cast(substring(trim(cast(\"Date\" as text)) from '^[0-9]{4}-[0-9]{2}-[0-9]{2}') AS date)"
-        "     ELSE NULL"
-        "   END,"
-        "   CASE"
-        "     WHEN trim(cast(\"Date\" as text)) ~ '^[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}'"
-        "       AND regexp_match(trim(cast(\"Date\" as text)), '^([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})') IS NOT NULL"
-        "       THEN make_date("
-        "         (regexp_match(trim(cast(\"Date\" as text)), '^([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})'))[3]::integer,"
-        "         (regexp_match(trim(cast(\"Date\" as text)), '^([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})'))[1]::integer,"
-        "         (regexp_match(trim(cast(\"Date\" as text)), '^([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})'))[2]::integer"
-        "       )"
-        "     ELSE NULL"
-        "   END"
-        " ) BETWEEN '" + a + "'::date AND '" + b + "'::date"
-        ")"
-    )
+    parts = []
+    d = start
+    while d <= end:
+        y, m, day = d.year, d.month, d.day
+        iso = f"{y:04d}-{m:02d}-{day:02d}"
+        parts.append(
+            f'(left(trim(cast("Date" as text)), 10) = \'{iso}\''
+            f' or trim(cast("Date" as text)) like \'{iso} %\')'
+        )
+        for ms in (str(m), f"{m:02d}"):
+            for ds in (str(day), f"{day:02d}"):
+                parts.append(f'(trim(cast("Date" as text)) like \'{ms}/{ds}/{y}%\')')
+        d += timedelta(days=1)
+    return "(" + " OR ".join(parts) + ")"
 
 
 def compute_headcovers_sold_this_week(log=None):
@@ -9175,7 +9168,8 @@ def compute_headcovers_sold_this_week(log=None):
     range_start = week_monday
     range_end = min(today, week_sunday)
 
-    date_pred = _sql_pb_order_calendar_date_between_inclusive(range_start, range_end)
+    # Text-based day match (same family as YTD); regex/BETWEEN parse failed in some RPC/DB setups.
+    date_pred = _sql_pb_order_like_calendar_days(range_start, range_end)
     query = f"""
     select coalesce(sum(coalesce("Quantity"::numeric, 0)), 0) as total_qty
     from "{tbl}"
@@ -9187,13 +9181,27 @@ def compute_headcovers_sold_this_week(log=None):
     """
 
     try:
-        rows = _overview_rpc_sql_rows(query)
+        rows = _overview_rpc_sql_rows(query, log=logger)
     except Exception as e:
         logger.warning("headcovers_sold_this_week: RPC failed: %s", e)
         return None
 
+    if rows is None or not rows:
+        logger.warning(
+            "headcovers_sold_this_week: no result from execute_sql/exec_sql (table=%s range=%s..%s)",
+            tbl,
+            range_start,
+            range_end,
+        )
+        return None
+
     total_qty = _overview_sql_coalesce_total_qty(rows)
     if total_qty is None:
+        logger.warning(
+            "headcovers_sold_this_week: could not read total_qty from row=%r (table=%s)",
+            rows[0] if rows else None,
+            tbl,
+        )
         return None
     return total_qty
 
