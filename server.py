@@ -938,6 +938,83 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "qbo_token.json")
 
 
+def _normalize_qbo_token_dict(d):
+    """Intuit often returns expires_in but not expires_at; normalize for refresh logic."""
+    if not d or not isinstance(d, dict):
+        return {}
+    out = dict(d)
+    try:
+        ea = out.get("expires_at")
+        if ea is None or float(ea) <= 0:
+            ein = out.get("expires_in")
+            if ein is not None:
+                out["expires_at"] = time.time() + int(ein)
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
+def _bootstrap_qbo_token_from_env():
+    """
+    If QBO_TOKEN_JSON or QBO_TOKEN_JSON_B64 is set, write qbo_token.json when the file is missing
+    (same idea as GOOGLE_TOKEN_JSON). Skips when the file already exists so a refreshed token on disk
+    is not overwritten by an outdated dashboard secret on restart.
+    """
+    if os.path.exists(TOKEN_PATH):
+        return False
+    raw = None
+    src = None
+    b64 = os.environ.get("QBO_TOKEN_JSON_B64", "").strip()
+    if b64:
+        try:
+            raw = base64.b64decode(b64).decode("utf-8")
+            src = "QBO_TOKEN_JSON_B64"
+        except Exception as e:
+            print("⚠️ Failed to decode QBO_TOKEN_JSON_B64:", e)
+    if not raw:
+        val = os.environ.get("QBO_TOKEN_JSON", "").strip()
+        if val:
+            raw = val
+            src = "QBO_TOKEN_JSON"
+    if not raw:
+        return False
+    try:
+        info = json.loads(raw)
+        if not isinstance(info, dict):
+            return False
+        info = _normalize_qbo_token_dict(info)
+        with open(TOKEN_PATH, "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2)
+        print(
+            f"✅ qbo_token.json written from {src} (realmId={bool(info.get('realmId'))}, refresh_token={bool(info.get('refresh_token'))})"
+        )
+        return True
+    except Exception as e:
+        print("⚠️ Failed to write qbo_token.json from env:", e)
+        return False
+
+
+def _persist_qbo_token_to_disk(disk_data: dict) -> None:
+    """Write normalized QuickBooks token JSON (includes realmId)."""
+    data = _normalize_qbo_token_dict(disk_data)
+    with open(TOKEN_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _qbo_env_for_oauth():
+    """Sandbox vs production OAuth client; safe without a Flask request (e.g. cron)."""
+    from flask import has_request_context
+
+    if has_request_context():
+        return (
+            session.get("qboEnv", os.environ.get("QBO_ENV", "production")) or "production"
+        ).strip().lower()
+    return (os.environ.get("QBO_ENV", "production")).strip().lower()
+
+
+_bootstrap_qbo_token_from_env()
+
+
 # ─── Google Drive Token/Scopes Config ──────────────────────────────
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
@@ -5346,22 +5423,19 @@ def get_quickbooks_credentials():
     # Always read from disk to avoid storing large tokens in sessions
     # Sessions only store a flag (qbo_authenticated) to indicate auth status
     if os.path.exists(TOKEN_PATH):
-        with open(TOKEN_PATH) as f:
-            file_token = json.load(f)
+        with open(TOKEN_PATH, encoding="utf-8") as f:
+            file_token = _normalize_qbo_token_dict(json.load(f))
         realm_id = file_token.get("realmId")
         token = {
             "access_token": file_token.get("access_token"),
             "refresh_token": file_token.get("refresh_token"),
-            "expires_at": file_token.get("expires_at", 0),
+            "expires_at": file_token.get("expires_at") or 0,
         }
 
         if token["access_token"] and realm_id:
             # → refresh if expired
-            if token["expires_at"] < time.time():
-                # Use env-aware credentials (production vs sandbox)
-                env_for_oauth = session.get(
-                    "qboEnv", os.environ.get("QBO_ENV", "production")
-                ).lower()
+            if float(token["expires_at"] or 0) < time.time():
+                env_for_oauth = _qbo_env_for_oauth()
                 try:
                     client_id, client_secret = get_qbo_oauth_credentials(env_for_oauth)
                 except NameError:
@@ -5397,11 +5471,11 @@ def get_quickbooks_credentials():
                     new_token.get("expires_in", 3600)
                 )
 
-                # persist refreshed token to disk only (not session to save memory)
-                with open(TOKEN_PATH, "w") as f:
-                    json.dump({**new_token, "realmId": realm_id}, f, indent=2)
-                # Only store a flag in session, not the full token
-                session["qbo_authenticated"] = True
+                _persist_qbo_token_to_disk({**new_token, "realmId": realm_id})
+                from flask import has_request_context
+
+                if has_request_context():
+                    session["qbo_authenticated"] = True
                 token = new_token
 
             headers = {
@@ -5456,15 +5530,14 @@ def refresh_quickbooks_token():
     """
     Refresh the QuickBooks OAuth token using sandbox or production credentials.
     """
-    # ── 0) Determine environment from session ─────────────────────
-    env_override = session.get("qboEnv", QBO_ENV)
+    env_override = _qbo_env_for_oauth()
 
     # ── 1) Pick the correct client ID/secret ─────────────────────
     client_id, client_secret = get_qbo_oauth_credentials(env_override)
 
     # ── 2) Load existing token from disk ──────────────────────────
-    with open(TOKEN_PATH, "r") as f:
-        disk_data = json.load(f)
+    with open(TOKEN_PATH, "r", encoding="utf-8") as f:
+        disk_data = _normalize_qbo_token_dict(json.load(f))
 
     # ── 3) Rebuild the OAuth2Session with that token ─────────────
     oauth = OAuth2Session(client_id=client_id, token=disk_data)
@@ -5478,11 +5551,12 @@ def refresh_quickbooks_token():
 
     # ── 5) Persist refreshed token to disk ───────────────────────
     disk_data.update(new_token)
-    with open(TOKEN_PATH, "w") as f:
-        json.dump(disk_data, f, indent=2)
+    _persist_qbo_token_to_disk(disk_data)
 
-    # ── 6) Only store a flag in session (not the full token to save memory) ───────
-    session["qbo_authenticated"] = True
+    from flask import has_request_context
+
+    if has_request_context():
+        session["qbo_authenticated"] = True
 
     print(f"🔁 Refreshed QBO token for env '{env_override}'")
 
@@ -7281,42 +7355,38 @@ def create_invoice_in_quickbooks(
     # Read token from disk instead of session to avoid memory issues
     token = None
     if os.path.exists(TOKEN_PATH):
-        with open(TOKEN_PATH) as f:
-            disk_token = json.load(f)
+        with open(TOKEN_PATH, encoding="utf-8") as f:
+            disk_token = _normalize_qbo_token_dict(json.load(f))
             token = {
                 "access_token": disk_token.get("access_token"),
                 "refresh_token": disk_token.get("refresh_token"),
-                "expires_at": disk_token.get("expires_at", 0),
+                "expires_at": disk_token.get("expires_at") or 0,
                 "realmId": disk_token.get("realmId"),
             }
     print("🔑 QBO Token from disk:", "present" if token else "missing")
     print("🏢 Realm ID:", token.get("realmId") if token else None)
-    if not token or "access_token" not in token or "expires_at" not in token:
-        env_qbo = session.get("qboEnv", QBO_ENV)
+    if (
+        not token
+        or "access_token" not in token
+        or not token.get("refresh_token")
+        or not token.get("realmId")
+    ):
+        env_qbo = _qbo_env_for_oauth()
         next_url = f"/qbo/login?env={env_qbo}"
         raise RedirectException(next_url)
 
     # Refresh if token is expired
-    if time.time() >= token["expires_at"]:
+    if time.time() >= float(token["expires_at"] or 0):
         print("🔁 Access token expired. Refreshing...")
         refresh_quickbooks_token()
         # Re-read token from disk after refresh
         if os.path.exists(TOKEN_PATH):
-            with open(TOKEN_PATH) as f:
-                disk_token = json.load(f)
+            with open(TOKEN_PATH, encoding="utf-8") as f:
+                disk_token = _normalize_qbo_token_dict(json.load(f))
                 token = {
                     "access_token": disk_token.get("access_token"),
                     "refresh_token": disk_token.get("refresh_token"),
-                    "expires_at": disk_token.get("expires_at", 0),
-                    "realmId": disk_token.get("realmId"),
-                }
-        if os.path.exists(TOKEN_PATH):
-            with open(TOKEN_PATH) as f:
-                disk_token = json.load(f)
-                token = {
-                    "access_token": disk_token.get("access_token"),
-                    "refresh_token": disk_token.get("refresh_token"),
-                    "expires_at": disk_token.get("expires_at", 0),
+                    "expires_at": disk_token.get("expires_at") or 0,
                     "realmId": disk_token.get("realmId"),
                 }
 
@@ -9050,34 +9120,42 @@ def compute_products_sold_per_day_ytd(
     return total_qty / float(days)
 
 
-def _sql_pb_order_date_on_calendar_days(start: date, end: date) -> str:
+def _sql_pb_order_calendar_date_between_inclusive(start: date, end: date) -> str:
     """
-    SQL predicate: true when the production-orders "Date" text falls on a calendar
-    day in [start, end] inclusive. Handles M/D/YYYY... (sheet/webhook style) and
-    YYYY-MM-DD... prefixes.
+    SQL predicate: order row's calendar day is in [start, end] inclusive.
+    Parses "Date" as either YYYY-MM-DD... (including ISO timestamps) or M/D/YYYY...
+    (Shopify webhook / sheet style). Avoids huge OR-lists that some RPC paths mishandle.
     """
-    parts = []
-    d = start
-    while d <= end:
-        y, m, day = d.year, d.month, d.day
-        iso = f"{y:04d}-{m:02d}-{day:02d}"
-        parts.append(
-            f'(left(trim(cast("Date" as text)), 10) = \'{iso}\''
-            f' or trim(cast("Date" as text)) like \'{iso} %\')'
-        )
-        for ms in (str(m), f"{m:02d}"):
-            for ds in (str(day), f"{day:02d}"):
-                parts.append(f'(trim(cast("Date" as text)) like \'{ms}/{ds}/{y}%\')')
-        d += timedelta(days=1)
-    return "(" + " OR ".join(parts) + ")"
+    a = start.isoformat()
+    b = end.isoformat()
+    return (
+        "("
+        " COALESCE("
+        "   CASE"
+        "     WHEN trim(cast(\"Date\" as text)) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'"
+        "       THEN cast(substring(trim(cast(\"Date\" as text)) from '^[0-9]{4}-[0-9]{2}-[0-9]{2}') AS date)"
+        "     ELSE NULL"
+        "   END,"
+        "   CASE"
+        "     WHEN trim(cast(\"Date\" as text)) ~ '^[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}'"
+        "       AND regexp_match(trim(cast(\"Date\" as text)), '^([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})') IS NOT NULL"
+        "       THEN make_date("
+        "         (regexp_match(trim(cast(\"Date\" as text)), '^([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})'))[3]::integer,"
+        "         (regexp_match(trim(cast(\"Date\" as text)), '^([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})'))[1]::integer,"
+        "         (regexp_match(trim(cast(\"Date\" as text)), '^([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})'))[2]::integer"
+        "       )"
+        "     ELSE NULL"
+        "   END"
+        " ) BETWEEN '" + a + "'::date AND '" + b + "'::date"
+        ")"
+    )
 
 
-def compute_headcovers_sold_this_week_mon_fri(log=None):
+def compute_headcovers_sold_this_week(log=None):
     """
-    Sum of Quantity for the current ISO week, counting only Mon–Fri (America/New_York).
-    On Mon–Fri, includes from this week's Monday through today (capped at Friday).
-    On Sat–Sun, shows the completed Mon–Fri total for that ISO week (then resets at
-    the following Monday 00:00 ET as the window moves to a new week).
+    Sum of Quantity for the current calendar week (America/New_York): Monday 00:00
+    through end of Sunday, but only rows dated through today (so on Thursday you
+    get Mon–Thu of that week; the week window is still Mon–Sun, e.g. the 11th–17th).
 
     Excludes line items whose Product contains 'back' (case-insensitive), matching
     compute_products_sold_per_day_ytd.
@@ -9093,14 +9171,11 @@ def compute_headcovers_sold_this_week_mon_fri(log=None):
     tz = ZoneInfo("America/New_York")
     today = datetime.now(tz).date()
     week_monday = today - timedelta(days=today.isoweekday() - 1)
-    if today.isoweekday() in (6, 7):
-        range_start = week_monday
-        range_end = week_monday + timedelta(days=4)
-    else:
-        range_start = week_monday
-        range_end = min(today, week_monday + timedelta(days=4))
+    week_sunday = week_monday + timedelta(days=6)
+    range_start = week_monday
+    range_end = min(today, week_sunday)
 
-    date_pred = _sql_pb_order_date_on_calendar_days(range_start, range_end)
+    date_pred = _sql_pb_order_calendar_date_between_inclusive(range_start, range_end)
     query = f"""
     select coalesce(sum(coalesce("Quantity"::numeric, 0)), 0) as total_qty
     from "{tbl}"
@@ -10674,7 +10749,7 @@ def overview_metrics():
                 float(metrics_row.get("headcovers_sold_per_day") or 0), 2
             )
 
-        sold_this_week = compute_headcovers_sold_this_week_mon_fri(log=app.logger)
+        sold_this_week = compute_headcovers_sold_this_week(log=app.logger)
         headcovers_sold_this_week = (
             round(float(sold_this_week), 2) if sold_this_week is not None else None
         )
@@ -10687,7 +10762,7 @@ def overview_metrics():
                 float(metrics_row.get("average_price_per_cover") or 0), 2
             ),
 
-            # Mon–Fri week-to-date (ET); resets each Monday; excludes Product containing "back"
+            # Calendar week Mon–Sun (ET), summed through today; excludes Product containing "back"
             "headcovers_sold_this_week": headcovers_sold_this_week,
 
             # 🧵 Embroidery backlog: from Overview sheet cells (open jobs) or Supabase fallback
@@ -17867,9 +17942,8 @@ def qbo_callback():
     token = qbo.fetch_token(QBO_TOKEN_URL, client_secret=client_secret, code=code)
 
     # ── 4) Persist token & realmId to disk for reuse ─────────────
-    disk_data = {**token, "realmId": realm}
-    with open(TOKEN_PATH, "w") as f:
-        json.dump(disk_data, f, indent=2)
+    disk_data = _normalize_qbo_token_dict({**token, "realmId": realm})
+    _persist_qbo_token_to_disk(disk_data)
     logger.info("✅ Wrote QBO token to disk at %s", TOKEN_PATH)
 
     # ── 5) Only store a flag in session (not the full token to save memory) ────────────────────
