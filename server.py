@@ -8939,25 +8939,64 @@ def _calendar_days_elapsed_in_year(year: int, today=None) -> int:
 def _overview_rpc_sql_rows(query: str):
     """Run read-only SQL via Supabase RPC; supports execute_sql or exec_sql responses."""
     rows = None
-    resp = supabase.rpc("execute_sql", {"query": query}).execute()
-    data = resp.data
-    if isinstance(data, list):
-        rows = data
-    elif data is not None:
-        rows = [data]
-    if rows is not None:
-        return rows
-    resp2 = supabase.rpc("exec_sql", {"sql": query}).execute()
-    raw = resp2.data
-    if isinstance(raw, list) and len(raw) > 0:
-        first = raw[0]
-        if isinstance(first, str):
-            import json
+    try:
+        resp = supabase.rpc("execute_sql", {"query": query}).execute()
+        data = resp.data
+        if isinstance(data, list) and len(data) > 0:
+            rows = data
+        elif isinstance(data, dict):
+            rows = [data]
+        elif data is not None and not isinstance(data, list):
+            rows = [data]
+    except Exception:
+        rows = None
 
-            return json.loads(first)
-        if isinstance(first, dict):
-            return [first]
+    # execute_sql sometimes returns [] on success; fall through to exec_sql in that case
+    if rows:
+        return rows
+
+    try:
+        resp2 = supabase.rpc("exec_sql", {"sql": query}).execute()
+        raw = resp2.data
+        if isinstance(raw, list) and len(raw) > 0:
+            first = raw[0]
+            if isinstance(first, str):
+                import json
+
+                return json.loads(first)
+            if isinstance(first, dict):
+                return [first]
+            if isinstance(first, list):
+                return raw
+    except Exception:
+        return None
     return None
+
+
+def _overview_sql_coalesce_total_qty(rows):
+    """Read coalesce(sum(...)) as total_qty from aggregate RPC rows (dict, or list/tuple row)."""
+    if not rows:
+        return None
+    row = rows[0]
+    if isinstance(row, (list, tuple)) and len(row) > 0:
+        try:
+            return float(row[0] or 0)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(row, dict):
+        return None
+    raw_total = row.get("total_qty")
+    if raw_total is None:
+        for k, v in row.items():
+            if str(k).lower() == "total_qty":
+                raw_total = v
+                break
+    if raw_total is None and len(row) == 1:
+        raw_total = next(iter(row.values()))
+    try:
+        return float(raw_total or 0)
+    except (TypeError, ValueError):
+        return None
 
 
 def compute_products_sold_per_day_ytd(
@@ -9001,15 +9040,8 @@ def compute_products_sold_per_day_ytd(
         logger.warning("products_sold_per_day: RPC failed: %s", e)
         return None
 
-    if not rows:
-        return None
-    row = rows[0]
-    if not isinstance(row, dict):
-        return None
-    raw_total = row.get("total_qty")
-    try:
-        total_qty = float(raw_total or 0)
-    except (TypeError, ValueError):
+    total_qty = _overview_sql_coalesce_total_qty(rows)
+    if total_qty is None:
         return None
 
     days = _calendar_days_elapsed_in_year(sales_year)
@@ -9085,16 +9117,10 @@ def compute_headcovers_sold_this_week_mon_fri(log=None):
         logger.warning("headcovers_sold_this_week: RPC failed: %s", e)
         return None
 
-    if not rows:
+    total_qty = _overview_sql_coalesce_total_qty(rows)
+    if total_qty is None:
         return None
-    row = rows[0]
-    if not isinstance(row, dict):
-        return None
-    raw_total = row.get("total_qty")
-    try:
-        return float(raw_total or 0)
-    except (TypeError, ValueError):
-        return None
+    return total_qty
 
 
 # ─── Google client singletons ───────────────────────────────────────────────
