@@ -9206,6 +9206,89 @@ def compute_headcovers_sold_this_week(log=None):
     return total_qty
 
 
+def compute_headcovers_sold_this_week_from_sheets(log=None):
+    """
+    Sum Quantity on the Production Orders Google Sheet for rows whose Date falls in
+    the current week (America/New_York, Monday through today inclusive within that
+    week). Excludes lines whose Product contains 'back' (case-insensitive), same
+    rule as compute_headcovers_sold_this_week (Supabase).
+
+    Uses OVERVIEW_PRODUCTION_ORDERS_RANGE (same tab/range as the Overview upcoming
+    jobs payload). Returns 0.0 when the tab is readable but has no matching rows.
+    Returns None only on read/parse failures so callers can fall back to Supabase.
+    """
+    logger = log or app.logger
+    try:
+        tz = ZoneInfo("America/New_York")
+        today = datetime.now(tz).date()
+        week_monday = today - timedelta(days=today.isoweekday() - 1)
+        week_sunday = week_monday + timedelta(days=6)
+        range_end = min(today, week_sunday)
+
+        with acquire_sheet_lock():
+            svc = get_sheets_service().spreadsheets().values()
+            resp = svc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=OVERVIEW_PRODUCTION_ORDERS_RANGE,
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        values = resp.get("values") or []
+        if len(values) < 2:
+            return 0.0
+
+        headers = [str(h).strip() for h in values[0]]
+        lower_h = {h.lower(): h for h in headers}
+
+        def _col(*names):
+            for n in names:
+                if n in headers:
+                    return n
+                ln = n.lower()
+                if ln in lower_h:
+                    return lower_h[ln]
+            return None
+
+        date_col = _col("Date", "Order Date")
+        prod_col = _col("Product")
+        qty_col = _col("Quantity", "Qty")
+        order_col = _col("Order #", "Order#")
+        if not date_col or not prod_col or not qty_col:
+            logger.warning(
+                "headcovers_sold_this_week sheets: missing column (Date=%s Product=%s Quantity=%s) headers_sample=%s",
+                date_col,
+                prod_col,
+                qty_col,
+                headers[:25],
+            )
+            return None
+
+        total = 0.0
+        for raw in values[1:]:
+            row = raw or []
+            if len(row) < len(headers):
+                row = row + [""] * (len(headers) - len(row))
+            rec = dict(zip(headers, row))
+            if order_col and not str(rec.get(order_col) or "").strip():
+                continue
+            d = _ship_queue_parse_due(rec.get(date_col))
+            if d is None or d < week_monday or d > range_end:
+                continue
+            prod = rec.get(prod_col)
+            if prod is not None and "back" in str(prod).lower():
+                continue
+            qraw = rec.get(qty_col)
+            try:
+                q = float(qraw) if qraw not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                q = 0.0
+            if q == q:
+                total += q
+        return total
+    except Exception as e:
+        logger.warning("headcovers_sold_this_week sheets: %s", e)
+        return None
+
+
 # ─── Google client singletons ───────────────────────────────────────────────
 _sheets_service = None
 _drive_service = None
@@ -10757,7 +10840,9 @@ def overview_metrics():
                 float(metrics_row.get("headcovers_sold_per_day") or 0), 2
             )
 
-        sold_this_week = compute_headcovers_sold_this_week(log=app.logger)
+        sold_this_week = compute_headcovers_sold_this_week_from_sheets(log=app.logger)
+        if sold_this_week is None:
+            sold_this_week = compute_headcovers_sold_this_week(log=app.logger)
         headcovers_sold_this_week = (
             round(float(sold_this_week), 2) if sold_this_week is not None else None
         )
