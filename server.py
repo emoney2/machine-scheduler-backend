@@ -13886,7 +13886,7 @@ def _product_type_display(prop, needs_front_back=False, is_back=False):
         "hybrid": "Hybrid",
         "blade": "Blade",
         "mid-mallet": "Mid Mallet",
-        "mallet": "Center Shafted Mallet" if mallet == "center-shafted" else "Mallet",
+        "mallet": "Center Shafted Mallet" if mallet == "center-shafted" else "Standard Mallet",
     }.get(pt, pt.capitalize())
     if not needs_front_back:
         return name + " Full" if pt in ("driver", "fairway", "hybrid") else name
