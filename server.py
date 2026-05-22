@@ -8977,7 +8977,9 @@ def drive_make_public():
 sheet_lock = Semaphore(3)
 SHEET_LOCK_TIMEOUT = 30  # seconds - timeout for acquiring the lock
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-ORDERS_RANGE = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AP")
+# Through column AZ so AT (Process Sheet Printed) and other late columns are included.
+# Process Sheet Printed lives in column AT on Production Orders.
+ORDERS_RANGE = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AZ")
 # Overview “Upcoming Jobs” must read the Production Orders tab only. ORDERS_RANGE may be
 # overridden in env to another tab; this range is used only by build_overview_payload().
 OVERVIEW_PRODUCTION_ORDERS_RANGE = os.environ.get(
@@ -12336,7 +12338,7 @@ def jobs_for_company():
         return jsonify(cached["data"])
 
     try:
-        # Uses ORDERS_RANGE (default Production Orders!A1:AP)
+        # Uses ORDERS_RANGE (default Production Orders!A1:AZ, includes AT Process Sheet Printed)
         prod_data = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
         if not prod_data or not prod_data[0]:
             return jsonify({"jobs": []}), 200
@@ -19735,11 +19737,27 @@ def _mark_orders_sheet_column(sheet_title: str, order_ids, column_name: str, val
             return 0
 
         headers = [str(h).strip() for h in rows[0]]
-        if "Order #" not in headers or col_name not in headers:
+        if "Order #" not in headers:
             return 0
 
         order_ix = headers.index("Order #")
-        col_ix = headers.index(col_name)
+        if col_name in headers:
+            col_ix = headers.index(col_name)
+        else:
+            # Production Orders: Process Sheet Printed is column AT
+            orders_sheet = ORDERS_RANGE.split("!", 1)[0]
+            fallback_col = (
+                os.environ.get("PRODUCTION_ORDERS_PROCESS_SHEET_PRINTED_COL") or "AT"
+            ).strip().upper()
+            if sheet_title != orders_sheet or not fallback_col:
+                return 0
+            col_ix = 0
+            for ch in fallback_col:
+                if "A" <= ch <= "Z":
+                    col_ix = col_ix * 26 + (ord(ch) - ord("A") + 1)
+            col_ix -= 1
+            if col_ix < 0:
+                return 0
         order_to_row = {}
         for i in range(1, len(rows)):
             r = rows[i] or []
