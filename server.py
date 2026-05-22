@@ -9637,6 +9637,13 @@ def invalidate_overview_combined_cache():
     _overview_ts = 0.0
 
 
+def _invalidate_combined_orders_cache():
+    """Clear `/api/combined` caches so Fur List sees sheet updates on all clients."""
+    global _json_cache
+    for key in ("combined-v2", "combined"):
+        _json_cache.pop(key, None)
+
+
 def _bump_material_inventory_on_order_plain(
     sheet_svc, spreadsheet_id: str, material_name: str, add_qty: float
 ) -> bool:
@@ -12811,6 +12818,16 @@ def get_combined():
             if fr and "Status" in fr:
                 o["Status"] = fr.get("Status", "")
                 o["Fur Status"] = fr.get("Status", "")
+
+            if fr:
+                printed_col = (
+                    os.environ.get("FUR_PROCESS_SHEET_PRINTED_COLUMN")
+                    or "Process Sheet Printed"
+                ).strip()
+                if printed_col and printed_col in fr:
+                    fur_printed = fr.get(printed_col, "")
+                    if fur_printed not in (None, "") and not o.get(printed_col):
+                        o[printed_col] = fur_printed
 
             cr = cut_map.get(oid)
             if cr and "Status" in cr:
@@ -19681,6 +19698,100 @@ def util_shorten():
         return jsonify({"error": "shorten_exception", "detail": str(e)}), 500
 
 
+def _sheet_col_letter(idx0: int) -> str:
+    n = idx0 + 1
+    s = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+
+def _mark_orders_sheet_column(sheet_title: str, order_ids, column_name: str, value) -> int:
+    """
+    Set column_name for each order on sheet_title (e.g. Production Orders, Fur List).
+    Returns number of rows updated. No-op if the column is missing.
+    """
+    order_ids = [str(o).strip() for o in (order_ids or []) if str(o).strip()]
+    col_name = (column_name or "").strip()
+    if not order_ids or not col_name or not sheet_title:
+        return 0
+
+    try:
+        vsvc = get_sheets_service().spreadsheets().values()
+    except Exception as e:
+        print(f"⚠️ Sheets unavailable marking {col_name}: {e}")
+        return 0
+
+    try:
+        with sheet_lock:
+            resp = vsvc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{sheet_title}!A1:ZZ",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        rows = resp.get("values", []) or []
+        if not rows:
+            return 0
+
+        headers = [str(h).strip() for h in rows[0]]
+        if "Order #" not in headers or col_name not in headers:
+            return 0
+
+        order_ix = headers.index("Order #")
+        col_ix = headers.index(col_name)
+        order_to_row = {}
+        for i in range(1, len(rows)):
+            r = rows[i] or []
+            val = str(r[order_ix] if order_ix < len(r) else "").strip()
+            if val:
+                order_to_row[val] = i + 1
+
+        updates = []
+        for oid in order_ids:
+            row_num = order_to_row.get(oid)
+            if row_num:
+                updates.append(
+                    {
+                        "range": f"{sheet_title}!{_sheet_col_letter(col_ix)}{row_num}",
+                        "values": [[value]],
+                    }
+                )
+
+        if not updates:
+            return 0
+
+        with sheet_lock:
+            vsvc.batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"valueInputOption": "USER_ENTERED", "data": updates},
+            ).execute()
+        return len(updates)
+    except Exception as e:
+        print(f"⚠️ Failed to mark {col_name} on {sheet_title}: {e}")
+        return 0
+
+
+def _mark_process_sheet_printed(order_ids) -> None:
+    """Persist printed state on Production Orders and Fur List for all clients."""
+    col = (
+        os.environ.get("FUR_PROCESS_SHEET_PRINTED_COLUMN") or "Process Sheet Printed"
+    ).strip()
+    if not col:
+        return
+    mark_val = (os.environ.get("FUR_PROCESS_SHEET_PRINTED_VALUE") or "Yes").strip()
+    orders_sheet = ORDERS_RANGE.split("!", 1)[0]
+    fur_sheet = FUR_RANGE.split("!", 1)[0]
+    n_orders = _mark_orders_sheet_column(orders_sheet, order_ids, col, mark_val)
+    n_fur = _mark_orders_sheet_column(fur_sheet, order_ids, col, mark_val)
+    if n_orders or n_fur:
+        _invalidate_combined_orders_cache()
+        print(
+            f"✅ Marked {col} for {len(order_ids)} order(s) "
+            f"(Production Orders={n_orders}, Fur List={n_fur})"
+        )
+
+
 def _newest_stamped_pdf_for_order(pdf_files, order):
     """
     Pick the newest PDF named like {order}_Stamped.pdf or {order}_Stamped (1).pdf
@@ -19888,6 +19999,12 @@ def print_handler():
                 printed_orders.append(str(order))
             else:
                 errors.append(f"Order {order}: {error_msg}")
+
+        if printed_orders:
+            try:
+                _mark_process_sheet_printed(printed_orders)
+            except Exception as mark_err:
+                print(f"⚠️ Printed PDFs queued but sheet mark failed: {mark_err}")
 
         if is_batch:
             return jsonify({
