@@ -19681,89 +19681,114 @@ def util_shorten():
         return jsonify({"error": "shorten_exception", "detail": str(e)}), 500
 
 
-def _process_single_order_print(drive, order, mode, print_folder_id, binsheet_folder_id, ORDERS_PARENT_FOLDER_ID):
-    """Helper function to process printing for a single order. Returns (success, error_message)"""
+def _newest_stamped_pdf_for_order(pdf_files, order):
+    """
+    Pick the newest PDF named like {order}_Stamped.pdf or {order}_Stamped (1).pdf
+    in the order's Drive folder (compare modifiedTime).
+    """
+    prefix = f"{order}_Stamped".lower()
+    candidates = [
+        f
+        for f in (pdf_files or [])
+        if (f.get("name") or "").lower().startswith(prefix)
+        and (f.get("name") or "").lower().endswith(".pdf")
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda f: f.get("modifiedTime") or "", reverse=True)
+    return candidates[0]
+
+
+def _download_drive_pdf_to_temp(drive, file_id, filename):
+    """Download a Drive PDF to a temp path; returns path or None."""
+    safe_name = os.path.basename(filename or "stamped.pdf")
+    tmp_path = os.path.join(tempfile.gettempdir(), safe_name)
+    request_drive = drive.files().get_media(fileId=file_id)
+    buf = BytesIO()
+    downloader = MediaIoBaseDownload(buf, request_drive)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    with open(tmp_path, "wb") as f:
+        f.write(buf.getvalue())
+    return tmp_path
+
+
+def _copy_stamped_pdf_to_packing_slip_printer(drive, stamped_file):
+    """
+    Copy newest {order}_Stamped*.pdf into PackingSlipPrinter (Drive + local G:\\My Drive sync).
+    """
+    packing_folder_id = _get_packing_slip_print_drive_folder_id(drive)
+    pdf_name = stamped_file["name"]
+    drive.files().copy(
+        fileId=stamped_file["id"],
+        body={"name": pdf_name, "parents": [packing_folder_id]},
+        fields="id, name",
+    ).execute()
+    tmp_path = _download_drive_pdf_to_temp(drive, stamped_file["id"], pdf_name)
+    if tmp_path:
+        _try_copy_packing_slip_to_local_sync_folder(tmp_path, pdf_name)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _process_single_order_print(drive, order, orders_parent_folder_id):
+    """
+    Find the newest {order}_Stamped*.pdf in the order folder and queue it for packing-slip print.
+    Returns (success, error_message).
+    """
     try:
-        # Handle process sheet (mode is "process" or "both")
-        if mode == "process" or mode == "both":
-            # 1. Find the order folder
-            order_folder_query = (
-                f"name = '{order}' and "
-                f"mimeType = 'application/vnd.google-apps.folder' and "
-                f"trashed = false and "
-                f"'{ORDERS_PARENT_FOLDER_ID}' in parents"
-            )
-            order_folders = drive.files().list(
-                q=order_folder_query, fields="files(id, name)"
-            ).execute().get("files", [])
-            
-            if not order_folders:
-                return (False, f"Order folder not found for {order}")
-            
-            order_folder_id = order_folders[0]["id"]
+        safe_order = _drive_query_escape_name(str(order))
+        order_folder_query = (
+            f"name = '{safe_order}' and "
+            f"mimeType = 'application/vnd.google-apps.folder' and "
+            f"trashed = false and "
+            f"'{orders_parent_folder_id}' in parents"
+        )
+        order_folders = (
+            drive.files()
+            .list(q=order_folder_query, fields="files(id, name)")
+            .execute()
+            .get("files", [])
+        )
+        if not order_folders:
+            return (False, f"Order folder not found for {order}")
 
-            # 2. List all PDF files in the order folder
-            pdf_query = (
-                f"'{order_folder_id}' in parents and "
-                f"mimeType = 'application/pdf' and "
-                f"trashed = false"
-            )
-            pdf_files = drive.files().list(
-                q=pdf_query, 
+        order_folder_id = order_folders[0]["id"]
+        pdf_query = (
+            f"'{order_folder_id}' in parents and "
+            f"mimeType = 'application/pdf' and "
+            f"trashed = false"
+        )
+        pdf_files = (
+            drive.files()
+            .list(
+                q=pdf_query,
                 fields="files(id, name, modifiedTime)",
-                orderBy="modifiedTime desc"
-            ).execute().get("files", [])
-            
-            if not pdf_files:
-                return (False, f"No PDF files found for order {order}")
-
-            # 3. Get the latest PDF (first one since we sorted by modifiedTime desc)
-            latest_pdf = pdf_files[0]
-
-            # 4. Copy the PDF to the Print Fur PDF folder with order number prefix
-            new_pdf_name = f"{order}_{latest_pdf['name']}"
-            
-            drive.files().copy(
-                fileId=latest_pdf["id"],
-                body={"name": new_pdf_name, "parents": [print_folder_id]},
-                fields="id, name"
-            ).execute()
-            
-            print(f"✅ Copied process sheet PDF for order {order}")
-
-        # Handle bin sheet (mode is "binsheet" or "both")
-        if mode == "binsheet" or mode == "both":
-            # 1. Find the bin sheet file: {order}_BINSHEET.pdf
-            bin_sheet_filename = f"{order}_BINSHEET.pdf"
-            bin_sheet_query = (
-                f"name = '{bin_sheet_filename}' and "
-                f"'{binsheet_folder_id}' in parents and "
-                f"mimeType = 'application/pdf' and "
-                f"trashed = false"
+                orderBy="modifiedTime desc",
+                pageSize=200,
             )
-            bin_sheet_files = drive.files().list(
-                q=bin_sheet_query, fields="files(id, name)"
-            ).execute().get("files", [])
-            
-            if not bin_sheet_files:
-                return (False, f"Bin sheet file not found: {bin_sheet_filename}")
+            .execute()
+            .get("files", [])
+        )
 
-            bin_sheet_file = bin_sheet_files[0]
+        stamped_pdf = _newest_stamped_pdf_for_order(pdf_files, order)
+        if not stamped_pdf:
+            return (
+                False,
+                f"No stamped PDF found for order {order} (expected {order}_Stamped*.pdf)",
+            )
 
-            # 2. Copy the bin sheet to the Print Fur PDF folder
-            new_bin_sheet_name = f"{order}_{bin_sheet_file['name']}"
-            
-            drive.files().copy(
-                fileId=bin_sheet_file["id"],
-                body={"name": new_bin_sheet_name, "parents": [print_folder_id]},
-                fields="id, name"
-            ).execute()
-            
-            print(f"✅ Copied bin sheet PDF for order {order}")
-
+        _copy_stamped_pdf_to_packing_slip_printer(drive, stamped_pdf)
+        print(
+            f"✅ Queued stamped PDF for order {order}: {stamped_pdf['name']} → PackingSlipPrinter"
+        )
         return (True, None)
     except Exception as e:
         import traceback
+
         error_msg = str(e)
         print(f"❌ Error processing order {order}: {error_msg}")
         traceback.print_exc()
@@ -19851,60 +19876,16 @@ def print_handler():
             "ORDERS_PARENT_FOLDER_ID", "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
         )
 
-        # Find or create "Print Fur PDF" folder in root
-        print_folder_query = (
-            f"name = 'Print Fur PDF' and "
-            f"mimeType = 'application/vnd.google-apps.folder' and "
-            f"trashed = false and "
-            f"'root' in parents"
-        )
-        print_folders = drive.files().list(
-            q=print_folder_query, fields="files(id)"
-        ).execute().get("files", [])
-        
-        if print_folders:
-            print_folder_id = print_folders[0]["id"]
-            print(f"✅ Found 'Print Fur PDF' folder: {print_folder_id}")
-        else:
-            # Create the folder
-            folder_metadata = {
-                "name": "Print Fur PDF",
-                "mimeType": "application/vnd.google-apps.folder"
-            }
-            print_folder = drive.files().create(
-                body=folder_metadata, fields="id"
-            ).execute()
-            print_folder_id = print_folder["id"]
-            print(f"✅ Created 'Print Fur PDF' folder: {print_folder_id}")
-
-        # Find BinSheet folder (needed for binsheet mode)
-        binsheet_folder_id = None
-        if mode == "binsheet" or mode == "both":
-            binsheet_folder_query = (
-                f"name = 'BinSheet' and "
-                f"mimeType = 'application/vnd.google-apps.folder' and "
-                f"trashed = false and "
-                f"'root' in parents"
-            )
-            binsheet_folders = drive.files().list(
-                q=binsheet_folder_query, fields="files(id)"
-            ).execute().get("files", [])
-            
-            if not binsheet_folders:
-                return jsonify({"status": "error", "error": "BinSheet folder not found"}), 404
-            
-            binsheet_folder_id = binsheet_folders[0]["id"]
-            print(f"✅ Found BinSheet folder: {binsheet_folder_id}")
-
-        # Process all orders
         success_count = 0
+        printed_orders = []
         errors = []
         for order in orders:
             success, error_msg = _process_single_order_print(
-                drive, order, mode, print_folder_id, binsheet_folder_id, ORDERS_PARENT_FOLDER_ID
+                drive, order, ORDERS_PARENT_FOLDER_ID
             )
             if success:
                 success_count += 1
+                printed_orders.append(str(order))
             else:
                 errors.append(f"Order {order}: {error_msg}")
 
@@ -19913,14 +19894,14 @@ def print_handler():
                 "status": "ok",
                 "successCount": success_count,
                 "totalCount": len(orders),
+                "printedOrders": printed_orders,
                 "errors": errors if errors else None
             })
         else:
-            # Single order mode - return error if failed
             if success_count == 0:
                 error_msg = errors[0] if errors else "Unknown error"
                 return jsonify({"status": "error", "error": error_msg}), 500
-            return jsonify({"status": "ok"})
+            return jsonify({"status": "ok", "printedOrders": printed_orders})
 
     except Exception as e:
         import traceback
