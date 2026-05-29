@@ -16928,6 +16928,88 @@ def _invoice_url_parts_for_log(url):
         return {"invoice_in_response": True, "open_invoice_url_prefix": str(url)[:200]}
 
 
+@app.route("/api/mark-shipped", methods=["OPTIONS", "POST"])
+@login_required_session
+def mark_shipped():
+    """Update Shipped column on Production Orders only (no UPS, QBO, or packing slip)."""
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Requested-With, Accept"
+        )
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
+
+    data = request.get_json() or {}
+    order_ids = [str(oid).strip() for oid in data.get("order_ids", [])]
+    shipped_quantities = {
+        str(k).strip(): v for k, v in data.get("shipped_quantities", {}).items()
+    }
+    if not order_ids:
+        return jsonify({"error": "Missing order_ids"}), 400
+
+    sheet_id = os.environ["SPREADSHEET_ID"]
+    sheet_name = "Production Orders"
+
+    try:
+        service = get_sheets_service()
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=sheet_id,
+                range=f"{sheet_name}!A1:AZ",
+            )
+            .execute()
+        )
+        rows = result.get("values", [])
+        if not rows:
+            return jsonify({"error": "Production Orders sheet is empty"}), 400
+
+        headers_row = rows[0]
+        id_col = headers_row.index("Order #")
+        shipped_col = headers_row.index("Shipped")
+
+        updates = []
+        matched = []
+        for i, row in enumerate(rows[1:], start=2):
+            order_id = str(row[id_col]).strip()
+            if order_id not in order_ids:
+                continue
+            raw = shipped_quantities.get(order_id, 0)
+            try:
+                parsed_qty = int(float(raw))
+            except Exception:
+                parsed_qty = 0
+            updates.append(
+                {
+                    "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
+                    "values": [[str(parsed_qty)]],
+                }
+            )
+            matched.append(order_id)
+
+        if not matched:
+            return jsonify({"error": "No matching orders in sheet for given order_ids"}), 400
+
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"valueInputOption": "USER_ENTERED", "data": updates},
+        ).execute()
+
+        resp = jsonify({"ok": True, "order_ids": matched, "updated": len(updates)})
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp, 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logging.exception("mark_shipped failed")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/process-shipment", methods=["OPTIONS", "POST"])
 @login_required_session
 def process_shipment():
