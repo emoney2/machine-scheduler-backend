@@ -15466,7 +15466,9 @@ def sales_portal_admin_ledger():
         rows_out = scomm.ledger_rows_admin(rows)
         by_rep = {}
         for row in rows_out:
-            rnm = str(row.get("Rep") or "").strip() or "(no rep)"
+            rnm = str(row.get("Rep") or "").strip()
+            if not rnm:
+                continue
             by_rep.setdefault(rnm, {"commission": 0.0, "rows": []})
             try:
                 amt = float(row.get("Commission $") or 0)
