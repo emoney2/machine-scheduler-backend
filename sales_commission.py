@@ -89,9 +89,23 @@ def find_sales_user(username: str, password: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _rep_value_from_order_dict(od: dict) -> str:
+def _find_rep_column_index(headers: List[str]) -> Optional[int]:
+    for i, h in enumerate(headers):
+        if str(h or "").strip().lower() in _REP_HEADER_NAMES:
+            return i
+    # Legacy submit writes rep to AQ (0-based index 42)
+    if len(headers) > 42:
+        return 42
+    return None
+
+
+def _rep_value_from_order_dict(
+    od: dict,
+    headers: Optional[List[str]] = None,
+    padded_row: Optional[List[Any]] = None,
+) -> str:
     if not od:
-        return ""
+        od = {}
     for k in _REP_KEYS:
         v = str(od.get(k) or "").strip()
         if v:
@@ -99,6 +113,12 @@ def _rep_value_from_order_dict(od: dict) -> str:
     for hk, hv in od.items():
         if str(hk or "").strip().lower() in _REP_HEADER_NAMES:
             v = str(hv or "").strip()
+            if v:
+                return v
+    if headers is not None and padded_row is not None:
+        idx = _find_rep_column_index(headers)
+        if idx is not None and idx < len(padded_row):
+            v = str(padded_row[idx] or "").strip()
             if v:
                 return v
     return ""
@@ -120,7 +140,15 @@ def _rep_from_order_ids_cell(cell: Any, lookup: Dict[str, str]) -> str:
 
 
 def _production_orders_range() -> str:
-    return os.environ.get("ORDERS_RANGE", "Production Orders!A1:AZ")
+    """
+    Range for sales portal reads. Must include column AQ+ (Sales Rep).
+    ORDERS_RANGE on Render is often Production Orders!A1:AP, which stops before AQ.
+    """
+    explicit = (os.environ.get("SALES_PORTAL_ORDERS_RANGE") or "").strip()
+    if explicit:
+        return explicit
+    tab = (os.environ.get("PRODUCTION_ORDERS_PB_SHEET_TAB") or "Production Orders").strip()
+    return f"{tab}!A1:AZ"
 
 
 def _commission_rate() -> float:
@@ -152,18 +180,23 @@ def read_production_order_rows(
     if len(vals) < 2:
         return [], []
     headers = [str(h or "").strip() for h in vals[0]]
-    # Column AQ (index 42) is REP on submit; header cell is sometimes blank.
-    aq_rep_idx = 42
-    while len(headers) <= aq_rep_idx:
-        headers.append("")
-    if not str(headers[aq_rep_idx] or "").strip():
-        headers[aq_rep_idx] = "REP"
-    elif str(headers[aq_rep_idx]).strip().lower() not in _REP_HEADER_NAMES:
-        pass
+    rep_idx = _find_rep_column_index(headers)
+    if rep_idx is None:
+        while len(headers) <= 42:
+            headers.append("")
+        if not str(headers[42] or "").strip():
+            headers[42] = "Sales Rep"
+        rep_idx = 42
+    elif not str(headers[rep_idx] or "").strip():
+        headers[rep_idx] = "Sales Rep"
     out: List[Dict[str, Any]] = []
     for r in vals[1:]:
         pad = (r or []) + [""] * max(0, len(headers) - len(r))
-        out.append({headers[i]: pad[i] for i in range(len(headers))})
+        rowd = {headers[i]: pad[i] for i in range(len(headers))}
+        rep_val = _rep_value_from_order_dict(rowd, headers, pad)
+        if rep_val and rep_idx is not None:
+            rowd["Sales Rep"] = rep_val
+        out.append(rowd)
     return headers, out
 
 
@@ -173,7 +206,7 @@ def build_order_rep_lookup(service, spreadsheet_id: str) -> Dict[str, str]:
     lookup: Dict[str, str] = {}
     for rowd in rows:
         oid = str(rowd.get("Order #") or "").strip()
-        rep = _rep_value_from_order_dict(rowd)
+        rep = _rep_value_from_order_dict(rowd) or str(rowd.get("Sales Rep") or "").strip()
         if oid and rep:
             lookup[oid] = rep
     return lookup
@@ -330,8 +363,8 @@ def build_sales_dashboard(
     """
     rate = _commission_rate()
     pct = round(rate * 100.0, 2)
+    headers, prod_rows = read_production_order_rows(service, spreadsheet_id)
     rep_lookup = build_order_rep_lookup(service, spreadsheet_id)
-    _, prod_rows = read_production_order_rows(service, spreadsheet_id)
     _, ledger_vals = read_ledger_all(service, spreadsheet_id)
     ledger_rows = ledger_rows_admin(ledger_vals, rep_lookup)
     ledger_by_oid = _build_ledger_by_order_id(ledger_rows)
@@ -339,8 +372,11 @@ def build_sales_dashboard(
     summary_by_rep: Dict[str, Dict[str, Any]] = {}
     all_orders: List[Dict[str, Any]] = []
 
+    rows_with_rep = 0
     for rowd in _dedupe_production_rows(prod_rows):
-        rep = _rep_value_from_order_dict(rowd)
+        rep = _rep_value_from_order_dict(rowd) or str(rowd.get("Sales Rep") or "").strip()
+        if rep:
+            rows_with_rep += 1
         if not rep or not _rep_name_matches(rep, rep_filter):
             continue
         order = _sales_order_from_sheet(rowd, rep, rate, pct, ledger_by_oid)
@@ -362,6 +398,7 @@ def build_sales_dashboard(
         bucket["unpaidCommission"] = round(bucket["unpaidCommission"], 2)
         bucket["commission"] = bucket["owed"]
         bucket["pipelineCommission"] = bucket["unpaidCommission"]
+        rep_col_idx = _find_rep_column_index(headers) if headers else None
         return {
             "rep": rep_display,
             "owed": bucket["owed"],
@@ -370,6 +407,17 @@ def build_sales_dashboard(
             "pipelineOrders": bucket["orders"],
             "commissionRows": bucket["orders"],
             "rows": bucket["orders"],
+            "meta": {
+                "sheetRange": _production_orders_range(),
+                "productionRowCount": len(prod_rows),
+                "rowsWithRep": rows_with_rep,
+                "repColumn": (
+                    headers[rep_col_idx]
+                    if rep_col_idx is not None and headers and rep_col_idx < len(headers)
+                    else ""
+                ),
+                "repColumnIndex": rep_col_idx,
+            },
         }
 
     for bucket in summary_by_rep.values():
@@ -378,12 +426,24 @@ def build_sales_dashboard(
         bucket["commission"] = bucket["owed"]
         bucket["pipelineCommission"] = bucket["unpaidCommission"]
 
+    rep_col_idx = _find_rep_column_index(headers) if prod_rows else None
+    rep_col_name = (
+        headers[rep_col_idx] if rep_col_idx is not None and headers and rep_col_idx < len(headers) else ""
+    )
+
     return {
         "summaryByRep": summary_by_rep,
         "orders": all_orders,
         "pipelineOrders": all_orders,
         "commissionRows": all_orders,
         "rows": all_orders,
+        "meta": {
+            "sheetRange": _production_orders_range(),
+            "productionRowCount": len(prod_rows),
+            "rowsWithRep": rows_with_rep,
+            "repColumn": rep_col_name,
+            "repColumnIndex": rep_col_idx,
+        },
     }
 
 
