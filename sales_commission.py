@@ -32,7 +32,8 @@ LEDGER_HEADERS: List[str] = [
     "Notes",
 ]
 
-_REP_KEYS = ("REP", "Referral", "Sales Rep", "rep")
+_REP_KEYS = ("REP", "Rep", "Referral", "Sales Rep", "rep")
+_REP_HEADER_NAMES = frozenset({"rep", "referral", "sales rep"})
 
 
 def _col_letter(idx0: int) -> str:
@@ -88,16 +89,91 @@ def find_sales_user(username: str, password: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _rep_value_from_order_dict(od: dict) -> str:
+    if not od:
+        return ""
+    for k in _REP_KEYS:
+        v = str(od.get(k) or "").strip()
+        if v:
+            return v
+    for hk, hv in od.items():
+        if str(hk or "").strip().lower() in _REP_HEADER_NAMES:
+            v = str(hv or "").strip()
+            if v:
+                return v
+    return ""
+
+
+def _parse_order_ids_from_cell(cell: Any) -> List[str]:
+    return [p.strip() for p in str(cell or "").split(",") if p.strip()]
+
+
+def _rep_from_order_ids_cell(cell: Any, lookup: Dict[str, str]) -> str:
+    if not lookup:
+        return ""
+    names: List[str] = []
+    for oid in _parse_order_ids_from_cell(cell):
+        r = str(lookup.get(oid) or "").strip()
+        if r:
+            names.append(r)
+    return names[0] if names else ""
+
+
+def build_order_rep_lookup(service, spreadsheet_id: str) -> Dict[str, str]:
+    """Map Production Orders Order # -> REP (or Referral / Sales Rep)."""
+    sheet_range = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AZ")
+    try:
+        res = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=sheet_range, majorDimension="ROWS")
+            .execute()
+        )
+    except Exception as e:
+        logger.warning("build_order_rep_lookup failed: %s", e)
+        return {}
+    vals = res.get("values") or []
+    if len(vals) < 2:
+        return {}
+    headers = vals[0]
+    hdr_lower = [str(h or "").strip().lower() for h in headers]
+    try:
+        id_col = hdr_lower.index("order #")
+    except ValueError:
+        return {}
+    rep_col = None
+    for i, h in enumerate(hdr_lower):
+        if h in _REP_HEADER_NAMES:
+            rep_col = i
+            break
+    if rep_col is None:
+        return {}
+    lookup: Dict[str, str] = {}
+    for r in vals[1:]:
+        pad = (r or []) + [""] * max(0, len(headers) - len(r))
+        oid = str(pad[id_col] or "").strip()
+        rep = str(pad[rep_col] or "").strip()
+        if oid and rep:
+            lookup[oid] = rep
+    return lookup
+
+
+def _enrich_row_rep(rowd: Dict[str, Any], lookup: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    rep = str(rowd.get("Rep") or "").strip()
+    if rep or not lookup:
+        return rowd
+    resolved = _rep_from_order_ids_cell(rowd.get("Order #s"), lookup)
+    if not resolved:
+        return rowd
+    out = dict(rowd)
+    out["Rep"] = resolved
+    return out
+
+
 def _rep_from_orders(all_order_data: List[dict]) -> Tuple[str, str]:
     names: List[str] = []
     for od in all_order_data or []:
-        found = ""
-        for k in _REP_KEYS:
-            v = str(od.get(k) or "").strip()
-            if v:
-                found = v
-                break
-        names.append(found)
+        names.append(_rep_value_from_order_dict(od))
     primary = names[0] if names else ""
     uniq = {n for n in names if n}
     note = ""
@@ -410,7 +486,11 @@ def mark_rep_paid_rows(
     return changed
 
 
-def ledger_rows_for_rep(rows: List[List[Any]], rep_name: str) -> List[Dict[str, Any]]:
+def ledger_rows_for_rep(
+    rows: List[List[Any]],
+    rep_name: str,
+    order_rep_lookup: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     out = []
     if len(rows) < 2:
         return out
@@ -419,14 +499,18 @@ def ledger_rows_for_rep(rows: List[List[Any]], rep_name: str) -> List[Dict[str, 
     for r in rows[1:]:
         pad = (r or []) + [""] * len(headers)
         rowd = {headers[i]: pad[i] for i in range(len(headers))}
+        rowd = _enrich_row_rep(rowd, order_rep_lookup)
         rep = str(rowd.get("Rep") or "").strip()
         if rep.lower() == target:
             out.append(rowd)
     return out
 
 
-def ledger_rows_admin(rows: List[List[Any]]) -> List[Dict[str, Any]]:
-    """All commission rows with a sales rep (house / empty Rep excluded)."""
+def ledger_rows_admin(
+    rows: List[List[Any]],
+    order_rep_lookup: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Commission rows with a sales rep; house accounts (no rep on any order) excluded."""
     if len(rows) < 2:
         return []
     headers = LEDGER_HEADERS
@@ -434,6 +518,7 @@ def ledger_rows_admin(rows: List[List[Any]]) -> List[Dict[str, Any]]:
     for r in rows[1:]:
         pad = (r or []) + [""] * len(headers)
         rowd = {headers[i]: pad[i] for i in range(len(headers))}
+        rowd = _enrich_row_rep(rowd, order_rep_lookup)
         if not str(rowd.get("Rep") or "").strip():
             continue
         out.append(rowd)

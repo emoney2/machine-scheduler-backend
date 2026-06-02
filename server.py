@@ -12148,7 +12148,8 @@ def prepare_shipment():
         all_order_data = []
 
         for r in prod_data[1:]:
-            row = dict(zip(prod_headers, r))
+            padded = list(r) + [""] * max(0, len(prod_headers) - len(r))
+            row = dict(zip(prod_headers, padded))
             order_id = str(row.get("Order #", "")).strip()
 
             if order_id in order_ids:
@@ -12158,10 +12159,9 @@ def prepare_shipment():
                 except Exception:
                     parsed_qty = 0
 
-                headers = list(row.keys())
                 order_data = {
                     h: (str(parsed_qty) if h == "Shipped" else row.get(h, ""))
-                    for h in headers
+                    for h in prod_headers
                 }
                 order_data["ShippedQty"] = parsed_qty
                 all_order_data.append(order_data)
@@ -15439,7 +15439,8 @@ def sales_portal_me():
     try:
         svc = get_sheets_service()
         _, rows = scomm.read_ledger_all(svc, SPREADSHEET_ID)
-        rows_out = scomm.ledger_rows_for_rep(rows, rep_name)
+        rep_lookup = scomm.build_order_rep_lookup(svc, SPREADSHEET_ID)
+        rows_out = scomm.ledger_rows_for_rep(rows, rep_name, rep_lookup)
         return _sales_cors(jsonify({"rep": rep_name, "rows": rows_out})), 200
     except Exception as e:
         logger.exception("sales/me failed: %s", e)
@@ -15463,7 +15464,8 @@ def sales_portal_admin_ledger():
     try:
         svc = get_sheets_service()
         _, rows = scomm.read_ledger_all(svc, SPREADSHEET_ID)
-        rows_out = scomm.ledger_rows_admin(rows)
+        rep_lookup = scomm.build_order_rep_lookup(svc, SPREADSHEET_ID)
+        rows_out = scomm.ledger_rows_admin(rows, rep_lookup)
         by_rep = {}
         for row in rows_out:
             rnm = str(row.get("Rep") or "").strip()
@@ -17123,8 +17125,9 @@ def process_shipment():
                     }
                 )
 
-                # build order_data dict for invoice
-                row_dict = dict(zip(headers_row, row))
+                # build order_data dict for invoice (pad row so AQ/REP column aligns with headers)
+                padded_row = list(row) + [""] * max(0, len(headers_row) - len(row))
+                row_dict = dict(zip(headers_row, padded_row))
                 order_dict = {
                     h: (
                         str(parsed_qty)
