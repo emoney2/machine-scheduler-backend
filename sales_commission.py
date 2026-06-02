@@ -152,6 +152,14 @@ def read_production_order_rows(
     if len(vals) < 2:
         return [], []
     headers = [str(h or "").strip() for h in vals[0]]
+    # Column AQ (index 42) is REP on submit; header cell is sometimes blank.
+    aq_rep_idx = 42
+    while len(headers) <= aq_rep_idx:
+        headers.append("")
+    if not str(headers[aq_rep_idx] or "").strip():
+        headers[aq_rep_idx] = "REP"
+    elif str(headers[aq_rep_idx]).strip().lower() not in _REP_HEADER_NAMES:
+        pass
     out: List[Dict[str, Any]] = []
     for r in vals[1:]:
         pad = (r or []) + [""] * max(0, len(headers) - len(r))
@@ -171,44 +179,15 @@ def build_order_rep_lookup(service, spreadsheet_id: str) -> Dict[str, str]:
     return lookup
 
 
-def _is_production_order_open(rowd: Dict[str, Any]) -> bool:
-    """True when the job is still in progress (not shipped/complete on the sheet)."""
-    stage = str(rowd.get("Stage") or "").strip().upper()
-    if stage in ("COMPLETE", "COMPLETED", "SHIPPED"):
-        return False
-    shipped = rowd.get("Shipped")
-    if shipped is True:
-        return False
-    s = str(shipped).strip().upper() if shipped is not None and shipped != "" else ""
-    if s in ("YES", "Y", "TRUE", "1", "DONE", "SHIPPED"):
-        return False
-    try:
-        sq = float(shipped)
-        qty = float(rowd.get("Quantity") or 0)
-        if qty > 0 and sq >= qty - 1e-9:
-            return False
-    except (TypeError, ValueError):
-        pass
-    return True
-
-
-def _order_ids_on_ledger(ledger_rows: List[Dict[str, Any]]) -> set:
-    ids: set = set()
-    for row in ledger_rows:
-        for oid in _parse_order_ids_from_cell(row.get("Order #s")):
-            ids.add(oid)
-    return ids
-
-
 def _rep_name_matches(rep: str, rep_filter: Optional[str]) -> bool:
     if not rep_filter:
         return True
     return str(rep or "").strip().lower() == str(rep_filter).strip().lower()
 
 
-def _pipeline_order_from_sheet(
-    rowd: Dict[str, Any], rep: str, rate: float, pct: float
-) -> Dict[str, Any]:
+def _sheet_sales_and_commission(
+    rowd: Dict[str, Any], rate: float
+) -> Tuple[float, float, float, float]:
     try:
         unit_price = float(rowd.get("Price") or 0)
     except (TypeError, ValueError):
@@ -221,44 +200,123 @@ def _pipeline_order_from_sheet(
         qty = 1.0
     subtotal = round(unit_price * qty, 2)
     comm = round(subtotal * rate, 2)
+    return unit_price, qty, subtotal, comm
+
+
+def _dedupe_production_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One row per Order # (front/back rows share an order number)."""
+    by_oid: Dict[str, Dict[str, Any]] = {}
+
+    def extended(r: Dict[str, Any]) -> float:
+        _, _, sub, _ = _sheet_sales_and_commission(r, 0.0)
+        return sub
+
+    for rowd in rows:
+        oid = str(rowd.get("Order #") or "").strip()
+        if not oid:
+            continue
+        prev = by_oid.get(oid)
+        if prev is None or extended(rowd) >= extended(prev):
+            by_oid[oid] = rowd
+    return list(by_oid.values())
+
+
+def _build_ledger_by_order_id(
+    ledger_rows: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    by_oid: Dict[str, Dict[str, Any]] = {}
+    for row in ledger_rows:
+        for oid in _parse_order_ids_from_cell(row.get("Order #s")):
+            by_oid[oid] = row
+    return by_oid
+
+
+def _yn_flag(val: Any) -> str:
+    return str(val or "").strip().upper()
+
+
+def _is_rep_paid_flag(val: Any) -> bool:
+    return _yn_flag(val) == "Y"
+
+
+def _sales_order_from_sheet(
+    rowd: Dict[str, Any],
+    rep: str,
+    rate: float,
+    pct: float,
+    ledger_by_oid: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    oid = str(rowd.get("Order #") or "").strip()
+    unit_price, qty, sheet_sub, sheet_comm = _sheet_sales_and_commission(rowd, rate)
+    ledger = ledger_by_oid.get(oid)
+
+    if ledger:
+        try:
+            sales = float(ledger.get("Product subtotal") or sheet_sub)
+        except (TypeError, ValueError):
+            sales = sheet_sub
+        try:
+            commission = float(ledger.get("Commission $") or sheet_comm)
+        except (TypeError, ValueError):
+            commission = sheet_comm
+        customer_paid = _yn_flag(ledger.get("Customer paid")) or "N"
+        rep_paid = _yn_flag(ledger.get("Rep paid")) or "N"
+        invoice_qbo_id = str(ledger.get("Invoice QBO Id") or "").strip()
+        invoice_num = str(ledger.get("Invoice #") or "").strip()
+        invoice_paid_date = str(ledger.get("Invoice paid date") or "").strip()
+        rep_pay_due = str(ledger.get("Rep pay due") or "").strip()
+    else:
+        sales = sheet_sub
+        commission = sheet_comm
+        customer_paid = "N"
+        rep_paid = "N"
+        invoice_qbo_id = ""
+        invoice_num = ""
+        invoice_paid_date = ""
+        rep_pay_due = ""
+
     return {
-        "orderId": str(rowd.get("Order #") or "").strip(),
+        "orderId": oid,
         "rep": rep,
         "company": str(rowd.get("Company Name") or "").strip(),
         "design": str(rowd.get("Design") or "").strip(),
         "product": str(rowd.get("Product") or "").strip(),
         "quantity": qty,
         "unitPrice": unit_price,
-        "estimatedSubtotal": subtotal,
-        "estimatedCommission": comm,
+        "salesAmount": sales,
+        "commission": commission,
         "commissionPct": pct,
         "stage": str(rowd.get("Stage") or "").strip(),
         "dueDate": str(rowd.get("Due Date") or "").strip(),
-        "customerPaid": "—",
-        "repPaid": "—",
-        "status": "in_progress",
+        "customerPaid": customer_paid,
+        "repPaid": rep_paid,
+        "invoiceQboId": invoice_qbo_id,
+        "invoiceNum": invoice_num,
+        "invoicePaidDate": invoice_paid_date,
+        "repPayDue": rep_pay_due,
     }
 
 
 def _empty_rep_bucket() -> Dict[str, Any]:
     return {
         "owed": 0.0,
-        "pipelineCommission": 0.0,
+        "unpaidCommission": 0.0,
+        "orders": [],
         "pipelineOrders": [],
         "commissionRows": [],
     }
 
 
-def _add_ledger_to_bucket(bucket: Dict[str, Any], rowd: Dict[str, Any]) -> None:
-    bucket["commissionRows"].append(rowd)
+def _add_order_to_bucket(bucket: Dict[str, Any], order: Dict[str, Any]) -> None:
+    bucket["orders"].append(order)
+    bucket["pipelineOrders"].append(order)
     try:
-        amt = float(rowd.get("Commission $") or 0)
+        comm = float(order.get("commission") or 0)
     except (TypeError, ValueError):
-        amt = 0.0
-    cust = str(rowd.get("Customer paid") or "").strip().upper()
-    rp = str(rowd.get("Rep paid") or "").strip().upper()
-    if cust == "Y" and rp != "Y":
-        bucket["owed"] += amt
+        comm = 0.0
+    bucket["unpaidCommission"] += comm
+    if _yn_flag(order.get("customerPaid")) == "Y" and not _is_rep_paid_flag(order.get("repPaid")):
+        bucket["owed"] += comm
 
 
 def build_sales_dashboard(
@@ -267,8 +325,8 @@ def build_sales_dashboard(
     rep_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Sales portal payload: open Production Orders with a rep + Commission Ledger rows.
-    Admin: summaryByRep. Rep: single-rep totals and lists.
+    All Production Orders with a REP where the rep has not been marked paid.
+    QuickBooks (via Commission Ledger) only supplies customer-paid status after invoice.
     """
     rate = _commission_rate()
     pct = round(rate * 100.0, 2)
@@ -276,32 +334,20 @@ def build_sales_dashboard(
     _, prod_rows = read_production_order_rows(service, spreadsheet_id)
     _, ledger_vals = read_ledger_all(service, spreadsheet_id)
     ledger_rows = ledger_rows_admin(ledger_vals, rep_lookup)
-    invoiced_ids = _order_ids_on_ledger(ledger_rows)
+    ledger_by_oid = _build_ledger_by_order_id(ledger_rows)
 
     summary_by_rep: Dict[str, Dict[str, Any]] = {}
-    pipeline_all: List[Dict[str, Any]] = []
+    all_orders: List[Dict[str, Any]] = []
 
-    for rowd in prod_rows:
+    for rowd in _dedupe_production_rows(prod_rows):
         rep = _rep_value_from_order_dict(rowd)
         if not rep or not _rep_name_matches(rep, rep_filter):
             continue
-        if not _is_production_order_open(rowd):
+        order = _sales_order_from_sheet(rowd, rep, rate, pct, ledger_by_oid)
+        if _is_rep_paid_flag(order.get("repPaid")):
             continue
-        oid = str(rowd.get("Order #") or "").strip()
-        if not oid or oid in invoiced_ids:
-            continue
-        po = _pipeline_order_from_sheet(rowd, rep, rate, pct)
-        pipeline_all.append(po)
-        bucket = summary_by_rep.setdefault(rep, _empty_rep_bucket())
-        bucket["pipelineOrders"].append(po)
-        bucket["pipelineCommission"] += po["estimatedCommission"]
-
-    for rowd in ledger_rows:
-        rep = str(rowd.get("Rep") or "").strip()
-        if not rep or not _rep_name_matches(rep, rep_filter):
-            continue
-        bucket = summary_by_rep.setdefault(rep, _empty_rep_bucket())
-        _add_ledger_to_bucket(bucket, rowd)
+        all_orders.append(order)
+        _add_order_to_bucket(summary_by_rep.setdefault(rep, _empty_rep_bucket()), order)
 
     if rep_filter:
         target = rep_filter.strip().lower()
@@ -312,24 +358,32 @@ def build_sales_dashboard(
                 bucket = b
                 rep_display = name
                 break
+        bucket["owed"] = round(bucket["owed"], 2)
+        bucket["unpaidCommission"] = round(bucket["unpaidCommission"], 2)
+        bucket["commission"] = bucket["owed"]
+        bucket["pipelineCommission"] = bucket["unpaidCommission"]
         return {
             "rep": rep_display,
-            "owed": round(bucket["owed"], 2),
-            "pipelineCommission": round(bucket["pipelineCommission"], 2),
-            "pipelineOrders": bucket["pipelineOrders"],
-            "commissionRows": bucket["commissionRows"],
-            "rows": bucket["commissionRows"],
+            "owed": bucket["owed"],
+            "unpaidCommission": bucket["unpaidCommission"],
+            "orders": bucket["orders"],
+            "pipelineOrders": bucket["orders"],
+            "commissionRows": bucket["orders"],
+            "rows": bucket["orders"],
         }
 
-    for rep_name, bucket in summary_by_rep.items():
-        bucket["commission"] = round(bucket["owed"], 2)
-        bucket["pipelineCommission"] = round(bucket["pipelineCommission"], 2)
+    for bucket in summary_by_rep.values():
+        bucket["owed"] = round(bucket["owed"], 2)
+        bucket["unpaidCommission"] = round(bucket["unpaidCommission"], 2)
+        bucket["commission"] = bucket["owed"]
+        bucket["pipelineCommission"] = bucket["unpaidCommission"]
 
     return {
         "summaryByRep": summary_by_rep,
-        "pipelineOrders": pipeline_all,
-        "commissionRows": ledger_rows,
-        "rows": ledger_rows,
+        "orders": all_orders,
+        "pipelineOrders": all_orders,
+        "commissionRows": all_orders,
+        "rows": all_orders,
     }
 
 
