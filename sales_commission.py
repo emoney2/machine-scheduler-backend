@@ -426,11 +426,15 @@ def ledger_rows_for_rep(rows: List[List[Any]], rep_name: str) -> List[Dict[str, 
 
 
 def ledger_rows_admin(rows: List[List[Any]]) -> List[Dict[str, Any]]:
+    """All commission rows with a sales rep (house / empty Rep excluded)."""
     if len(rows) < 2:
         return []
     headers = LEDGER_HEADERS
     out = []
     for r in rows[1:]:
         pad = (r or []) + [""] * len(headers)
-        out.append({headers[i]: pad[i] for i in range(len(headers))})
+        rowd = {headers[i]: pad[i] for i in range(len(headers))}
+        if not str(rowd.get("Rep") or "").strip():
+            continue
+        out.append(rowd)
     return out
