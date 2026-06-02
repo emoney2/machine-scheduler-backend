@@ -15438,10 +15438,8 @@ def sales_portal_me():
         return _sales_cors(jsonify({"error": "repName not set for this user in SALES_PORTAL_USERS"})), 400
     try:
         svc = get_sheets_service()
-        _, rows = scomm.read_ledger_all(svc, SPREADSHEET_ID)
-        rep_lookup = scomm.build_order_rep_lookup(svc, SPREADSHEET_ID)
-        rows_out = scomm.ledger_rows_for_rep(rows, rep_name, rep_lookup)
-        return _sales_cors(jsonify({"rep": rep_name, "rows": rows_out})), 200
+        payload = scomm.build_sales_dashboard(svc, SPREADSHEET_ID, rep_filter=rep_name)
+        return _sales_cors(jsonify(payload)), 200
     except Exception as e:
         logger.exception("sales/me failed: %s", e)
         return _sales_cors(jsonify({"error": str(e)})), 500
@@ -15463,25 +15461,8 @@ def sales_portal_admin_ledger():
         return _sales_cors(jsonify({"error": "admin only"})), 403
     try:
         svc = get_sheets_service()
-        _, rows = scomm.read_ledger_all(svc, SPREADSHEET_ID)
-        rep_lookup = scomm.build_order_rep_lookup(svc, SPREADSHEET_ID)
-        rows_out = scomm.ledger_rows_admin(rows, rep_lookup)
-        by_rep = {}
-        for row in rows_out:
-            rnm = str(row.get("Rep") or "").strip()
-            if not rnm:
-                continue
-            by_rep.setdefault(rnm, {"commission": 0.0, "rows": []})
-            try:
-                amt = float(row.get("Commission $") or 0)
-            except (TypeError, ValueError):
-                amt = 0.0
-            cust = str(row.get("Customer paid") or "").strip().upper()
-            rp = str(row.get("Rep paid") or "").strip().upper()
-            if cust == "Y" and rp != "Y":
-                by_rep[rnm]["commission"] += amt
-            by_rep[rnm]["rows"].append(row)
-        return _sales_cors(jsonify({"rows": rows_out, "summaryByRep": by_rep})), 200
+        payload = scomm.build_sales_dashboard(svc, SPREADSHEET_ID)
+        return _sales_cors(jsonify(payload)), 200
     except Exception as e:
         logger.exception("sales/admin/ledger failed: %s", e)
         return _sales_cors(jsonify({"error": str(e)})), 500

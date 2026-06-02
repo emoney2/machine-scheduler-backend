@@ -119,43 +119,218 @@ def _rep_from_order_ids_cell(cell: Any, lookup: Dict[str, str]) -> str:
     return names[0] if names else ""
 
 
-def build_order_rep_lookup(service, spreadsheet_id: str) -> Dict[str, str]:
-    """Map Production Orders Order # -> REP (or Referral / Sales Rep)."""
-    sheet_range = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AZ")
+def _production_orders_range() -> str:
+    return os.environ.get("ORDERS_RANGE", "Production Orders!A1:AZ")
+
+
+def _commission_rate() -> float:
+    try:
+        return float(os.environ.get("COMMISSION_RATE", str(COMMISSION_RATE_DEFAULT)))
+    except (TypeError, ValueError):
+        return COMMISSION_RATE_DEFAULT
+
+
+def read_production_order_rows(
+    service, spreadsheet_id: str
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """All Production Orders rows as header-keyed dicts (rows padded to header width)."""
     try:
         res = (
             service.spreadsheets()
             .values()
-            .get(spreadsheetId=spreadsheet_id, range=sheet_range, majorDimension="ROWS")
+            .get(
+                spreadsheetId=spreadsheet_id,
+                range=_production_orders_range(),
+                majorDimension="ROWS",
+            )
             .execute()
         )
     except Exception as e:
-        logger.warning("build_order_rep_lookup failed: %s", e)
-        return {}
+        logger.warning("read_production_order_rows failed: %s", e)
+        return [], []
     vals = res.get("values") or []
     if len(vals) < 2:
-        return {}
-    headers = vals[0]
-    hdr_lower = [str(h or "").strip().lower() for h in headers]
-    try:
-        id_col = hdr_lower.index("order #")
-    except ValueError:
-        return {}
-    rep_col = None
-    for i, h in enumerate(hdr_lower):
-        if h in _REP_HEADER_NAMES:
-            rep_col = i
-            break
-    if rep_col is None:
-        return {}
-    lookup: Dict[str, str] = {}
+        return [], []
+    headers = [str(h or "").strip() for h in vals[0]]
+    out: List[Dict[str, Any]] = []
     for r in vals[1:]:
         pad = (r or []) + [""] * max(0, len(headers) - len(r))
-        oid = str(pad[id_col] or "").strip()
-        rep = str(pad[rep_col] or "").strip()
+        out.append({headers[i]: pad[i] for i in range(len(headers))})
+    return headers, out
+
+
+def build_order_rep_lookup(service, spreadsheet_id: str) -> Dict[str, str]:
+    """Map Production Orders Order # -> REP (or Referral / Sales Rep)."""
+    _, rows = read_production_order_rows(service, spreadsheet_id)
+    lookup: Dict[str, str] = {}
+    for rowd in rows:
+        oid = str(rowd.get("Order #") or "").strip()
+        rep = _rep_value_from_order_dict(rowd)
         if oid and rep:
             lookup[oid] = rep
     return lookup
+
+
+def _is_production_order_open(rowd: Dict[str, Any]) -> bool:
+    """True when the job is still in progress (not shipped/complete on the sheet)."""
+    stage = str(rowd.get("Stage") or "").strip().upper()
+    if stage in ("COMPLETE", "COMPLETED", "SHIPPED"):
+        return False
+    shipped = rowd.get("Shipped")
+    if shipped is True:
+        return False
+    s = str(shipped).strip().upper() if shipped is not None and shipped != "" else ""
+    if s in ("YES", "Y", "TRUE", "1", "DONE", "SHIPPED"):
+        return False
+    try:
+        sq = float(shipped)
+        qty = float(rowd.get("Quantity") or 0)
+        if qty > 0 and sq >= qty - 1e-9:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return True
+
+
+def _order_ids_on_ledger(ledger_rows: List[Dict[str, Any]]) -> set:
+    ids: set = set()
+    for row in ledger_rows:
+        for oid in _parse_order_ids_from_cell(row.get("Order #s")):
+            ids.add(oid)
+    return ids
+
+
+def _rep_name_matches(rep: str, rep_filter: Optional[str]) -> bool:
+    if not rep_filter:
+        return True
+    return str(rep or "").strip().lower() == str(rep_filter).strip().lower()
+
+
+def _pipeline_order_from_sheet(
+    rowd: Dict[str, Any], rep: str, rate: float, pct: float
+) -> Dict[str, Any]:
+    try:
+        unit_price = float(rowd.get("Price") or 0)
+    except (TypeError, ValueError):
+        unit_price = 0.0
+    try:
+        qty = float(rowd.get("Quantity") or 1)
+    except (TypeError, ValueError):
+        qty = 1.0
+    if qty <= 0:
+        qty = 1.0
+    subtotal = round(unit_price * qty, 2)
+    comm = round(subtotal * rate, 2)
+    return {
+        "orderId": str(rowd.get("Order #") or "").strip(),
+        "rep": rep,
+        "company": str(rowd.get("Company Name") or "").strip(),
+        "design": str(rowd.get("Design") or "").strip(),
+        "product": str(rowd.get("Product") or "").strip(),
+        "quantity": qty,
+        "unitPrice": unit_price,
+        "estimatedSubtotal": subtotal,
+        "estimatedCommission": comm,
+        "commissionPct": pct,
+        "stage": str(rowd.get("Stage") or "").strip(),
+        "dueDate": str(rowd.get("Due Date") or "").strip(),
+        "customerPaid": "—",
+        "repPaid": "—",
+        "status": "in_progress",
+    }
+
+
+def _empty_rep_bucket() -> Dict[str, Any]:
+    return {
+        "owed": 0.0,
+        "pipelineCommission": 0.0,
+        "pipelineOrders": [],
+        "commissionRows": [],
+    }
+
+
+def _add_ledger_to_bucket(bucket: Dict[str, Any], rowd: Dict[str, Any]) -> None:
+    bucket["commissionRows"].append(rowd)
+    try:
+        amt = float(rowd.get("Commission $") or 0)
+    except (TypeError, ValueError):
+        amt = 0.0
+    cust = str(rowd.get("Customer paid") or "").strip().upper()
+    rp = str(rowd.get("Rep paid") or "").strip().upper()
+    if cust == "Y" and rp != "Y":
+        bucket["owed"] += amt
+
+
+def build_sales_dashboard(
+    service,
+    spreadsheet_id: str,
+    rep_filter: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Sales portal payload: open Production Orders with a rep + Commission Ledger rows.
+    Admin: summaryByRep. Rep: single-rep totals and lists.
+    """
+    rate = _commission_rate()
+    pct = round(rate * 100.0, 2)
+    rep_lookup = build_order_rep_lookup(service, spreadsheet_id)
+    _, prod_rows = read_production_order_rows(service, spreadsheet_id)
+    _, ledger_vals = read_ledger_all(service, spreadsheet_id)
+    ledger_rows = ledger_rows_admin(ledger_vals, rep_lookup)
+    invoiced_ids = _order_ids_on_ledger(ledger_rows)
+
+    summary_by_rep: Dict[str, Dict[str, Any]] = {}
+    pipeline_all: List[Dict[str, Any]] = []
+
+    for rowd in prod_rows:
+        rep = _rep_value_from_order_dict(rowd)
+        if not rep or not _rep_name_matches(rep, rep_filter):
+            continue
+        if not _is_production_order_open(rowd):
+            continue
+        oid = str(rowd.get("Order #") or "").strip()
+        if not oid or oid in invoiced_ids:
+            continue
+        po = _pipeline_order_from_sheet(rowd, rep, rate, pct)
+        pipeline_all.append(po)
+        bucket = summary_by_rep.setdefault(rep, _empty_rep_bucket())
+        bucket["pipelineOrders"].append(po)
+        bucket["pipelineCommission"] += po["estimatedCommission"]
+
+    for rowd in ledger_rows:
+        rep = str(rowd.get("Rep") or "").strip()
+        if not rep or not _rep_name_matches(rep, rep_filter):
+            continue
+        bucket = summary_by_rep.setdefault(rep, _empty_rep_bucket())
+        _add_ledger_to_bucket(bucket, rowd)
+
+    if rep_filter:
+        target = rep_filter.strip().lower()
+        bucket = _empty_rep_bucket()
+        rep_display = rep_filter.strip()
+        for name, b in summary_by_rep.items():
+            if name.lower() == target:
+                bucket = b
+                rep_display = name
+                break
+        return {
+            "rep": rep_display,
+            "owed": round(bucket["owed"], 2),
+            "pipelineCommission": round(bucket["pipelineCommission"], 2),
+            "pipelineOrders": bucket["pipelineOrders"],
+            "commissionRows": bucket["commissionRows"],
+            "rows": bucket["commissionRows"],
+        }
+
+    for rep_name, bucket in summary_by_rep.items():
+        bucket["commission"] = round(bucket["owed"], 2)
+        bucket["pipelineCommission"] = round(bucket["pipelineCommission"], 2)
+
+    return {
+        "summaryByRep": summary_by_rep,
+        "pipelineOrders": pipeline_all,
+        "commissionRows": ledger_rows,
+        "rows": ledger_rows,
+    }
 
 
 def _enrich_row_rep(rowd: Dict[str, Any], lookup: Optional[Dict[str, str]]) -> Dict[str, Any]:
