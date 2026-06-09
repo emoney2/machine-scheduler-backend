@@ -14044,6 +14044,33 @@ def _fur_color_to_sheet_display(fur_raw):
     return mapping.get(key, s)
 
 
+def _shopify_text_from_props(prop_fn):
+    """Plain text for Production Orders Shopify Text column."""
+    st = (prop_fn("_shopifyText") or prop_fn("Text") or "").strip()
+    if st:
+        return st[:500]
+    for key in ("Custom Text", "Circle text", "Customization"):
+        val = (prop_fn(key) or "").strip()
+        if val:
+            return val[:500]
+    raw_texts = prop_fn("_texts")
+    if raw_texts:
+        try:
+            parsed = json.loads(raw_texts)
+            if isinstance(parsed, list):
+                parts = []
+                for item in parsed:
+                    if isinstance(item, dict):
+                        t = (item.get("text") or "").strip()
+                        if t:
+                            parts.append(t)
+                if parts:
+                    return "; ".join(parts)[:500]
+        except Exception:
+            pass
+    return ""
+
+
 def _rewrite_formula_row_refs(formula, from_row, to_row):
     """
     Rewrite A1-style cell references in a Sheets formula from one row index to another
@@ -14441,10 +14468,13 @@ def _stock_due_date(order_dt):
 
 
 def _is_product_builder_line_item(line_item):
-    """True if this line item has product builder properties (Material, Fur, or _builder_config)."""
+    """True if this line item has product builder / semi-custom headcover properties."""
     props = line_item.get("properties") or []
-    prop_names = { (p.get("name") or "").strip() for p in props }
-    return bool(prop_names & {"Material", "Fur", "_builder_config", "_productType"})
+    prop_names = {(p.get("name") or "").strip() for p in props}
+    return bool(
+        prop_names
+        & {"Material", "Fur", "_builder_config", "_productType", "_semihc"}
+    )
 
 
 def _product_type_display(prop, needs_front_back=False, is_back=False):
@@ -15247,6 +15277,10 @@ def shopify_webhook_orders_create():
             _set("Threads", _pb_threads_formula_for_row(write_row_num))
             if not stock_template_row or notes_val:
                 _set("Notes", notes_val)
+            if is_pb_line:
+                shopify_text_val = _shopify_text_from_props(_prop)
+                if shopify_text_val:
+                    _set("Shopify Text", shopify_text_val)
             _set("Order Folder Link", order_folder_link or "")
             _set("Folder Link", order_folder_link or "")
             _set("Shopify Order ID", shopify_order_id or "")
