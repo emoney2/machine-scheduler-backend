@@ -14208,10 +14208,32 @@ def _find_stock_product_row(stock_rows, stock_ph, design, product_name):
     return None
 
 
+_STOCK_COPY_EXCLUDE_COLS = frozenset({
+    "Order #",
+    "Date",
+    "Preview",
+    "Company Name",
+    "Quantity",
+    "Price",
+    "Due Date",
+    "Stage",
+    "Ship Date",
+    "Stitch Count",
+    "Threads",
+    "Shopify ID",
+    "Shopify Order ID",
+    "Order Folder Link",
+    "Folder Link",
+    "Image",
+})
+
+
 def _copy_stock_row_to_production(stock_row, stock_ph, pb_ph, num_cols):
     """Copy shared column values from a Stock Products template into a Production Orders row."""
     row = [""] * num_cols
     for col_name, pb_idx in pb_ph.items():
+        if col_name in _STOCK_COPY_EXCLUDE_COLS:
+            continue
         stock_idx = stock_ph.get(col_name)
         if stock_idx is None or stock_idx >= len(stock_row):
             continue
@@ -14219,6 +14241,186 @@ def _copy_stock_row_to_production(stock_row, stock_ph, pb_ph, num_cols):
         if pb_idx < len(row) and val is not None and str(val).strip() != "":
             row[pb_idx] = val
     return row
+
+
+def _shopify_line_item_image_url(line_item):
+    """Best-effort product/variant image URL from a Shopify line item."""
+    img = line_item.get("image") or {}
+    if isinstance(img, dict):
+        return (img.get("src") or img.get("url") or "").strip()
+    if isinstance(img, str):
+        return img.strip()
+    return ""
+
+
+def _production_row_is_complete(row, ph):
+    """True when Date and Product are populated (row fully written)."""
+    date_i = ph.get("Date")
+    prod_i = ph.get("Product")
+    if date_i is None or prod_i is None:
+        return False
+    if len(row) <= max(date_i, prod_i):
+        return False
+    return bool(str(row[date_i] or "").strip()) and bool(str(row[prod_i] or "").strip())
+
+
+def _expected_webhook_row_count(line_items, import_all_orders):
+    n = 0
+    for li in line_items:
+        if _is_product_builder_line_item(li):
+            props = li.get("properties") or []
+            pt = (_get_prop(props, "_productType") or "driver").strip().lower()
+            never_two = pt in ("blade", "mid-mallet", "mallet")
+            back = (_get_prop(props, "_back_has_content") or "").strip().lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+            n += 2 if (not never_two and back) else 1
+        elif import_all_orders:
+            n += 1
+    return n
+
+
+def _parse_existing_shopify_order_rows(existing_rows, row_numbers, shopify_order_id, ph):
+    """
+    Rows on the sheet that already reference this Shopify order ID.
+    Returns (complete_by_product, incomplete_slots).
+    """
+    shopify_col = ph.get("Shopify Order ID")
+    if shopify_col is None:
+        shopify_col = ph.get("Shopify ID")
+    order_col = ph.get("Order #", 0)
+    prod_col = ph.get("Product")
+    complete_by_product = {}
+    incomplete_slots = []
+    sid = str(shopify_order_id or "").strip()
+    if not sid:
+        return complete_by_product, incomplete_slots
+    for row, sheet_row in zip(existing_rows or [], row_numbers or []):
+        matched = False
+        if shopify_col is not None and len(row) > shopify_col:
+            matched = str(row[shopify_col] or "").strip() == sid
+        else:
+            matched = any(str(cell or "").strip() == sid for cell in row)
+        if not matched:
+            continue
+        order_num = row[order_col] if order_col < len(row) else ""
+        product = ""
+        if prod_col is not None and prod_col < len(row):
+            product = str(row[prod_col] or "").strip()
+        entry = {"row_num": sheet_row, "order_num": order_num, "product": product}
+        if _production_row_is_complete(row, ph):
+            complete_by_product[product.casefold()] = entry
+        else:
+            incomplete_slots.append(entry)
+    return complete_by_product, incomplete_slots
+
+
+def _stock_preview_urls(line_item, stock_template_row, stock_ph):
+    """Preview sources for stock lines: Shopify variant image, then template Image."""
+    urls = []
+    shopify_img = _shopify_line_item_image_url(line_item)
+    if shopify_img:
+        urls.append(shopify_img)
+    if stock_template_row:
+        template_image = str(_stock_sheet_cell(stock_template_row, stock_ph, "Image")).strip()
+        if template_image and template_image not in urls:
+            urls.append(template_image)
+    return urls
+
+
+def _upload_preview_to_order_folder(drive_svc, folder_id, new_order, preview_urls, make_public_fn):
+    """
+    Upload or copy a preview into the order Drive folder.
+    Returns (drive_view_link, file_id) or ("", None).
+    """
+    if not drive_svc or not folder_id:
+        return "", None
+    for preview_url in preview_urls or []:
+        preview_url = (preview_url or "").strip()
+        if not preview_url:
+            continue
+        fid = None
+        if "drive.google.com" in preview_url:
+            m = re.search(r"[?&]id=([^&\s/#]+)", preview_url)
+            if m:
+                fid = m.group(1)
+            m = re.search(r"file/d/([^/]+)", preview_url)
+            if m:
+                fid = m.group(1)
+        if fid:
+            try:
+                copied = drive_svc.files().copy(
+                    fileId=fid,
+                    body={"name": f"preview_{new_order}.jpg", "parents": [folder_id]},
+                    fields="id,webViewLink",
+                ).execute()
+                up_id = copied.get("id")
+                if up_id:
+                    make_public_fn(drive_svc, up_id)
+                    return (
+                        "https://drive.google.com/file/d/" + up_id + "/view",
+                        up_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[ShopifyWebhook] Drive copy preview for order %s failed: %s",
+                    new_order,
+                    e,
+                )
+        if preview_url.startswith(("http://", "https://")):
+            try:
+                import urllib.request
+
+                req = urllib.request.Request(
+                    preview_url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; JRCo/1.0)"},
+                )
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    preview_bytes = resp.read()
+                if not preview_bytes:
+                    continue
+                try:
+                    from PIL import Image as PILImage
+
+                    img = PILImage.open(io.BytesIO(preview_bytes))
+                    if img.mode in ("RGBA", "P"):
+                        img = img.convert("RGB")
+                    buf = io.BytesIO()
+                    img.save(buf, "JPEG", quality=98)
+                    preview_bytes = buf.getvalue()
+                except Exception:
+                    pass
+                from googleapiclient.http import MediaIoBaseUpload
+
+                m = MediaIoBaseUpload(
+                    io.BytesIO(preview_bytes), mimetype="image/jpeg", resumable=False
+                )
+                up = drive_svc.files().create(
+                    body={"name": f"preview_{new_order}.jpg", "parents": [folder_id]},
+                    media_body=m,
+                    fields="id",
+                ).execute()
+                up_id = up.get("id")
+                if up_id:
+                    make_public_fn(drive_svc, up_id)
+                    logger.info(
+                        "[ShopifyWebhook] Row %s: uploaded stock preview (%s bytes)",
+                        new_order,
+                        len(preview_bytes),
+                    )
+                    return (
+                        "https://drive.google.com/file/d/" + up_id + "/view",
+                        up_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[ShopifyWebhook] Download/upload preview for order %s: %s",
+                    new_order,
+                    e,
+                )
+    return "", None
 
 
 def _add_business_days(start_date, num_days):
@@ -14510,7 +14712,11 @@ def shopify_webhook_orders_create():
         pb_headers = []
         pb_ph = {}
 
-    # Dedupe: if we already processed this Shopify order (or reserved rows), skip
+    existing_complete_by_product = {}
+    incomplete_slots = []
+    claimed_incomplete_rows = set()
+
+    # Dedupe: skip only when every expected line item already has a complete row
     if shopify_order_id:
         try:
             headers = pb_headers
@@ -14544,14 +14750,33 @@ def shopify_webhook_orders_create():
                             duplicate_rows.append(r)
                             duplicate_row_indices.append(sheet_row)
                             break
-            if duplicate_rows:
+            existing_complete_by_product, incomplete_slots = _parse_existing_shopify_order_rows(
+                duplicate_rows, duplicate_row_indices, shopify_order_id, pb_ph
+            )
+            complete_duplicate_rows = [
+                r for r in duplicate_rows if _production_row_is_complete(r, pb_ph)
+            ]
+            expected_row_count = _expected_webhook_row_count(line_items, import_all_orders)
+            order_fully_imported = (
+                expected_row_count > 0
+                and len(complete_duplicate_rows) >= expected_row_count
+            )
+            if duplicate_rows and not order_fully_imported:
+                logger.info(
+                    "[ShopifyWebhook] Resuming partial Shopify order %s (%s/%s rows complete, %s incomplete slot(s))",
+                    shopify_order_id,
+                    len(complete_duplicate_rows),
+                    expected_row_count,
+                    len(incomplete_slots),
+                )
+            if duplicate_rows and order_fully_imported:
                 design_sent_col_idx = next((i for i, x in enumerate(hdr) if str(x).strip().lower() in ("design confirmation sent", "design email sent")), None)
                 first_row = duplicate_rows[0]
                 if design_sent_col_idx is not None and len(first_row) > design_sent_col_idx and str(first_row[design_sent_col_idx] or "").strip().upper() == "YES":
                     logger.info("[ShopifyWebhook] Skipping duplicate order %s (design confirmation already sent)", shopify_order_id)
                     return jsonify({"status": "ok", "created": []}), 200
                 if not design_confirmation_enabled:
-                    logger.info("[ShopifyWebhook] Skipping duplicate order %s (design confirmation email is paused)", shopify_order_id)
+                    logger.info("[ShopifyWebhook] Skipping duplicate order %s (already fully imported)", shopify_order_id)
                     return jsonify({"status": "ok", "created": []}), 200
                 logger.info("[ShopifyWebhook] Skipping duplicate order %s (already in sheet), sending design confirmation email", shopify_order_id)
                 def _col_letter_dedup(idx0):
@@ -14703,17 +14928,12 @@ def shopify_webhook_orders_create():
         total_rows += 2 if (not _never and _back) else 1
     total_rows += len(standard_lines)
     num_cols_reserve = max(len(pb_headers), 42)  # at least through column AP
-    shopify_col_idx = pb_ph.get("Shopify Order ID")
-    if shopify_col_idx is None:
-        shopify_col_idx = pb_ph.get("Shopify ID")
-    if total_rows > 0 and (shopify_col_idx is not None or True):
+    if total_rows > 0 and not incomplete_slots:
         try:
             placeholder_rows = []
             for i in range(total_rows):
                 r = [""] * num_cols_reserve
                 r[0] = prev_order + 1 + i
-                if shopify_col_idx is not None:
-                    r[shopify_col_idx] = shopify_order_id or ""
                 placeholder_rows.append(r)
             _last_letter = _col_letter(num_cols_reserve - 1)
             sheets.update(
@@ -14788,9 +15008,6 @@ def shopify_webhook_orders_create():
                 )
                 template_notes = str(_stock_sheet_cell(stock_template_row, stock_ph, "Notes")).strip()
                 notes_val = (template_notes or order_notes or "").strip()[:500]
-                template_image = str(_stock_sheet_cell(stock_template_row, stock_ph, "Image")).strip()
-                if template_image:
-                    preview_url_prop = template_image
                 logger.info(
                     "[ShopifyWebhook] Stock Products match: Design=%r Product=%r",
                     design_lookup,
@@ -14807,6 +15024,11 @@ def shopify_webhook_orders_create():
                     preview_url_prop = (img.get("src") or img.get("url") or "").strip()
                 elif isinstance(img, str):
                     preview_url_prop = img.strip()
+        stock_preview_urls = (
+            _stock_preview_urls(line_item, stock_template_row, stock_ph)
+            if stock_template_row
+            else []
+        )
         line_preview_file_id = None
         line_item_preview_link = None
         if preview_url_prop:
@@ -14817,9 +15039,48 @@ def shopify_webhook_orders_create():
         row_image_links = []  # (sheet_row, image_link) to backfill empty Image cells
 
         for idx in row_order if num_rows == len(row_order) else range(num_rows):
-            new_order = prev_order + 1
-            prev_order = new_order
             product_title = product_names_line[idx] if idx < len(product_names_line) else product_names_line[0]
+            prod_key = product_title.casefold()
+            if prod_key in existing_complete_by_product:
+                logger.info(
+                    "[ShopifyWebhook] Skipping already-complete line %s for Shopify order %s",
+                    product_title,
+                    shopify_order_id,
+                )
+                continue
+
+            write_row_num = next_row
+            new_order = prev_order + 1
+            claimed_slot = None
+            for slot in incomplete_slots:
+                slot_row = int(slot["row_num"])
+                if slot_row in claimed_incomplete_rows:
+                    continue
+                slot_prod = (slot.get("product") or "").strip().casefold()
+                if not slot_prod or slot_prod == prod_key:
+                    claimed_slot = slot
+                    break
+            if claimed_slot is None:
+                for slot in incomplete_slots:
+                    slot_row = int(slot["row_num"])
+                    if slot_row in claimed_incomplete_rows:
+                        continue
+                    if not (slot.get("product") or "").strip():
+                        claimed_slot = slot
+                        break
+            if claimed_slot is not None:
+                write_row_num = int(claimed_slot["row_num"])
+                try:
+                    new_order = int(claimed_slot["order_num"])
+                except Exception:
+                    new_order = prev_order + 1
+                claimed_incomplete_rows.add(write_row_num)
+                prev_order = max(prev_order, new_order)
+            else:
+                prev_order += 1
+                new_order = prev_order
+                write_row_num = next_row
+
             preview_link = ""
             order_folder_link = ""
             folder_id = None
@@ -14846,10 +15107,20 @@ def shopify_webhook_orders_create():
 
             if drive and folder_id:
                 try:
+                    if stock_template_row and stock_preview_urls:
+                        preview_link, uploaded_id = _upload_preview_to_order_folder(
+                            drive,
+                            folder_id,
+                            new_order,
+                            stock_preview_urls,
+                            _make_public_safe,
+                        )
+                        if uploaded_id:
+                            line_preview_file_id = uploaded_id
                     # Upload full design proof into the order folder. Prefer _preview_image_url (builder uploads
                     # full-res JPEG/PNG) over inline _preview_image (Shopify line properties are size-capped → tiny).
                     preview_bytes = None
-                    if preview_url_prop and preview_url_prop.startswith(("http://", "https://")):
+                    if not preview_link and preview_url_prop and preview_url_prop.startswith(("http://", "https://")):
                         try:
                             import urllib.request
 
@@ -14937,7 +15208,7 @@ def shopify_webhook_orders_create():
             image_col_idx = pb_ph.get("Image")
             image_col_letter = _col_letter(image_col_idx) if image_col_idx is not None else "Y"
             # Extract Drive file ID from either file/d/ID or id=ID so Preview works for both URL formats
-            preview_formula = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & IFERROR(REGEXEXTRACT(' + image_col_letter + str(next_row) + ',"file/d/([^/]+)"),REGEXEXTRACT(' + image_col_letter + str(next_row) + ',"[?&]id=([^&\\s]+)"))),"No preview available")'
+            preview_formula = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & IFERROR(REGEXEXTRACT(' + image_col_letter + str(write_row_num) + ',"file/d/([^/]+)"),REGEXEXTRACT(' + image_col_letter + str(write_row_num) + ',"[?&]id=([^&\\s]+)"))),"No preview available")'
 
             _set("Order #", new_order)
             _set("Date", ts_str)
@@ -14947,11 +15218,10 @@ def shopify_webhook_orders_create():
             elif not stock_template_row:
                 _set("Image", "")
             _set("Company Name", company)
-            if not stock_template_row:
-                _set("Design", design_for_row)
-                _set("Product", product_title)
+            _set("Design", design_for_row)
+            _set("Product", product_title)
             _set("Quantity", line_qty)
-            _set("Stage", _pb_stage_formula_for_row(next_row))
+            _set("Stage", _pb_stage_formula_for_row(write_row_num))
             _set("Price", line_price if idx == 0 else 0)
             if stock_template_row:
                 stock_due = _stock_due_date(ts)
@@ -14972,14 +15242,9 @@ def shopify_webhook_orders_create():
                 _set("Fur Color", fur_display)
                 _set("EMB Backing", "Cut Away")
                 _set("Hard Date/Soft Date", "Hard Date")
-            _set("Ship Date", _pb_ship_date_formula_for_row(next_row, _due_date_col_letter))
-            _set("Stitch Count", _pb_stitch_count_formula_for_row(next_row))
-            if stock_template_row:
-                template_threads = str(_stock_sheet_cell(stock_template_row, stock_ph, "Threads")).strip()
-                if not template_threads:
-                    _set("Threads", _pb_threads_formula_for_row(next_row))
-            else:
-                _set("Threads", _pb_threads_formula_for_row(next_row))
+            _set("Ship Date", _pb_ship_date_formula_for_row(write_row_num, _due_date_col_letter))
+            _set("Stitch Count", _pb_stitch_count_formula_for_row(write_row_num))
+            _set("Threads", _pb_threads_formula_for_row(write_row_num))
             if not stock_template_row or notes_val:
                 _set("Notes", notes_val)
             _set("Order Folder Link", order_folder_link or "")
@@ -14987,10 +15252,10 @@ def shopify_webhook_orders_create():
             _set("Shopify Order ID", shopify_order_id or "")
             _set("Shopify ID", shopify_order_id or "")
             if pb_ph.get("Order #") is None:
-                fixed_preview = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & IFERROR(REGEXEXTRACT(D' + str(next_row) + ',"file/d/([^/]+)"),REGEXEXTRACT(D' + str(next_row) + ',"[?&]id=([^&\\s]+)"))),"No preview available")'
+                fixed_preview = '=IFNA(IMAGE("https://drive.google.com/uc?export=view&id=" & IFERROR(REGEXEXTRACT(D' + str(write_row_num) + ',"file/d/([^/]+)"),REGEXEXTRACT(D' + str(write_row_num) + ',"[?&]id=([^&\\s]+)"))),"No preview available")'
                 fixed = [
                     new_order, ts_str, fixed_preview, image_link_for_row or "", company, design,
-                    line_qty, "", product_title, _pb_stage_formula_for_row(next_row),
+                    line_qty, "", product_title, _pb_stage_formula_for_row(write_row_num),
                     line_price if idx == 0 else 0, due_for_row_sheet, print_cell, material1,
                     "", "", "", "", "", fur_display, "", shopify_order_id or "",
                     "", "", notes_val, order_folder_link or "",
@@ -15001,7 +15266,7 @@ def shopify_webhook_orders_create():
             last_col_letter = _col_letter(len(row) - 1)
             sheets.update(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{next_row}:{last_col_letter}{next_row}",
+                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{write_row_num}:{last_col_letter}{write_row_num}",
                 valueInputOption="USER_ENTERED",
                 body={"values": [row]},
             ).execute()
@@ -15013,12 +15278,12 @@ def shopify_webhook_orders_create():
                     pnum = float(line_price if idx == 0 else 0)
                     sheets.update(
                         spreadsheetId=SPREADSHEET_ID,
-                        range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{_col_letter(price_idx)}{next_row}",
+                        range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{_col_letter(price_idx)}{write_row_num}",
                         valueInputOption="RAW",
                         body={"values": [[pnum]]},
                     ).execute()
                 except Exception as e:
-                    logger.warning("[ShopifyWebhook] RAW Price write failed for row %s: %s", next_row, e)
+                    logger.warning("[ShopifyWebhook] RAW Price write failed for row %s: %s", write_row_num, e)
 
             # Material1% as numeric 100 for product-builder rows with a material
             if material1:
@@ -15028,13 +15293,13 @@ def shopify_webhook_orders_create():
                         try:
                             sheets.update(
                                 spreadsheetId=SPREADSHEET_ID,
-                                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{_col_letter(_m1p)}{next_row}",
+                                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{_col_letter(_m1p)}{write_row_num}",
                                 valueInputOption="RAW",
                                 body={"values": [[100]]},
                             ).execute()
                             break
                         except Exception as e:
-                            logger.warning("[ShopifyWebhook] RAW Material1%% write failed for row %s: %s", next_row, e)
+                            logger.warning("[ShopifyWebhook] RAW Material1%% write failed for row %s: %s", write_row_num, e)
 
             if supabase:
                 supabase_insert = {
@@ -15054,8 +15319,13 @@ def shopify_webhook_orders_create():
                     supabase_insert["Material 1"] = material1
                 supabase.table(SUPABASE_PB_ORDERS_TABLE).insert(supabase_insert).execute()
 
-            row_image_links.append((next_row, image_link_for_row))
+            row_image_links.append((write_row_num, image_link_for_row))
             created.append(new_order)
+            existing_complete_by_product[prod_key] = {
+                "row_num": write_row_num,
+                "order_num": new_order,
+                "product": product_title,
+            }
             if stock_template_row:
                 logger.info(
                     "[ShopifyWebhook] Created stock order %s '%s' (Design=%s, Material=%s, Fur=%s)",
@@ -15073,7 +15343,7 @@ def shopify_webhook_orders_create():
                     material1,
                     fur_display,
                 )
-            next_row += 1
+            next_row = max(next_row, write_row_num + 1)
 
         first_link = next((link for _, link in row_image_links if link and "file/d/" in link and "/drive/folders/" not in link), None)
         if first_link and pb_ph.get("Image") is not None:
