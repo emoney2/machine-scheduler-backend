@@ -8988,6 +8988,8 @@ OVERVIEW_PRODUCTION_ORDERS_RANGE = os.environ.get(
 )
 # Sheet tab for Shopify product-builder webhook rows (same tab as main Production Orders by default)
 PRODUCTION_ORDERS_PB_SHEET_TAB = os.environ.get("PRODUCTION_ORDERS_PB_SHEET_TAB", "Production Orders")
+# Template rows for stock headcovers (matched by Design + variant name → Product)
+STOCK_PRODUCTS_RANGE = os.environ.get("STOCK_PRODUCTS_RANGE", "Stock Products!A1:AZ")
 # Supabase table for Shopify product-builder orders
 SUPABASE_PB_ORDERS_TABLE = os.environ.get("SUPABASE_PB_ORDERS_TABLE", "Production Orders TEST")
 FUR_RANGE = os.environ.get("FUR_RANGE", "Fur List!A1:Z")
@@ -14159,6 +14161,83 @@ def _pb_ship_date_formula_for_row(row: int, due_date_col_letter: str) -> str:
     return f'=IF({c}{r}="","",WORKDAY({c}{r},-5))'
 
 
+_STOCK_VARIANT_TO_PRODUCT = {
+    "driver": "Driver Full",
+    "fairway": "Fairway Full",
+    "hybrid": "Hybrid Full",
+    "mini driver": "Mini Driver Full",
+    "blade": "Blade",
+    "mid mallet": "Mid Mallet",
+    "standard mallet": "Standard Mallet",
+    "center shafted mallet": "Center Shafted Mallet",
+}
+
+
+def _stock_variant_to_product_name(variant_title):
+    """Map Shopify variant title to Production Orders Product (e.g. Fairway → Fairway Full)."""
+    v = (variant_title or "").strip()
+    if not v or v.lower() in ("default title", "default"):
+        return ""
+    key = v.lower()
+    if key in _STOCK_VARIANT_TO_PRODUCT:
+        return _STOCK_VARIANT_TO_PRODUCT[key]
+    if key.endswith(" full"):
+        return v
+    return ""
+
+
+def _stock_sheet_cell(row, header_map, col_name):
+    idx = header_map.get(col_name)
+    if idx is None or idx >= len(row):
+        return ""
+    val = row[idx]
+    return val if val is not None else ""
+
+
+def _find_stock_product_row(stock_rows, stock_ph, design, product_name):
+    """Find a Stock Products template row by Design (product title) + Product (club type)."""
+    design_key = (design or "").strip().casefold()
+    product_key = (product_name or "").strip().casefold()
+    if not design_key or not product_key:
+        return None
+    for row in stock_rows:
+        d = str(_stock_sheet_cell(row, stock_ph, "Design")).strip().casefold()
+        p = str(_stock_sheet_cell(row, stock_ph, "Product")).strip().casefold()
+        if d == design_key and p == product_key:
+            return row
+    return None
+
+
+def _copy_stock_row_to_production(stock_row, stock_ph, pb_ph, num_cols):
+    """Copy shared column values from a Stock Products template into a Production Orders row."""
+    row = [""] * num_cols
+    for col_name, pb_idx in pb_ph.items():
+        stock_idx = stock_ph.get(col_name)
+        if stock_idx is None or stock_idx >= len(stock_row):
+            continue
+        val = stock_row[stock_idx]
+        if pb_idx < len(row) and val is not None and str(val).strip() != "":
+            row[pb_idx] = val
+    return row
+
+
+def _add_business_days(start_date, num_days):
+    """Advance start_date by num_days Mon–Fri."""
+    d = start_date
+    added = 0
+    while added < num_days:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            added += 1
+    return d
+
+
+def _stock_due_date(order_dt):
+    """Stock headcovers: due = order date + 1 week (7 days) + 1 business day."""
+    d = order_dt.date() if hasattr(order_dt, "date") else order_dt
+    return _add_business_days(d + timedelta(days=7), 1)
+
+
 def _is_product_builder_line_item(line_item):
     """True if this line item has product builder properties (Material, Fur, or _builder_config)."""
     props = line_item.get("properties") or []
@@ -14343,10 +14422,15 @@ def _html_escape(s):
 @app.route("/api/shopify/webhook/orders/create", methods=["POST"], strict_slashes=False)
 def shopify_webhook_orders_create():
     """
-    Shopify orders/create webhook. For each line item that has product builder
-    properties (Material, Fur, etc.), creates one row in PRODUCTION_ORDERS_PB_SHEET_TAB
-    and one row in Supabase (SUPABASE_PB_ORDERS_TABLE).
-    Fur → Fur Color column, Material → Material 1. Does not touch manual /submit.
+    Shopify orders/create webhook. Creates one production row per line item in
+    PRODUCTION_ORDERS_PB_SHEET_TAB and Supabase (SUPABASE_PB_ORDERS_TABLE).
+
+    - Product-builder lines (Material, Fur, _builder_config, _productType): full mapping.
+    - Stock catalog lines: match Stock Products tab by Design (product title) + variant name
+      (e.g. Fairway → Fairway Full), copy template row, then set Order #, Date, qty, price, Shopify ID.
+    - Other catalog lines: imported when SHOPIFY_WEBHOOK_ALL_ORDERS is true/1/yes (default on).
+
+    Does not touch manual /submit.
     """
     raw = request.get_data()
     if not raw:
@@ -14377,9 +14461,29 @@ def shopify_webhook_orders_create():
 
     line_items = order.get("line_items") or []
     pb_lines = [li for li in line_items if _is_product_builder_line_item(li)]
-    if not pb_lines:
-        logger.info("[ShopifyWebhook] No product-builder line items in order %s", order.get("id") or order.get("order_number"))
+    import_all_orders = (os.environ.get("SHOPIFY_WEBHOOK_ALL_ORDERS") or "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    standard_lines = (
+        [li for li in line_items if not _is_product_builder_line_item(li)] if import_all_orders else []
+    )
+    webhook_lines = pb_lines + standard_lines
+    if not webhook_lines:
+        logger.info(
+            "[ShopifyWebhook] No line items to import in order %s (import_all=%s)",
+            order.get("id") or order.get("order_number"),
+            import_all_orders,
+        )
         return jsonify({"status": "ok", "created": 0}), 200
+    if standard_lines:
+        logger.info(
+            "[ShopifyWebhook] Order %s: %s product-builder + %s standard catalog line(s)",
+            order.get("id") or order.get("order_number"),
+            len(pb_lines),
+            len(standard_lines),
+        )
 
     _design_enabled = (os.environ.get("DESIGN_CONFIRMATION_EMAIL_ENABLED") or "").strip().lower() in ("1", "true", "yes")
     _design_paused = (os.environ.get("PAUSE_DESIGN_CONFIRMATION_EMAIL") or "").strip().lower() in ("1", "true", "yes")
@@ -14504,7 +14608,7 @@ def shopify_webhook_orders_create():
                 last_name = (billing.get("last_name") or order.get("customer", {}).get("last_name") or "").strip()
                 company = (billing.get("company") or "").strip() or "Customer"
                 customer_name = (f"{first_name} {last_name}".strip() or company).strip()
-                total_qty = sum(int(li.get("quantity") or 1) for li in pb_lines)
+                total_qty = sum(int(li.get("quantity") or 1) for li in webhook_lines)
                 _send_design_confirmation_email(
                     to_email=to_email,
                     first_name=first_name or "Customer",
@@ -14527,7 +14631,17 @@ def shopify_webhook_orders_create():
     order_name = (order.get("name") or str(order.get("order_number") or "")).strip()
     order_notes = (order.get("note") or "").strip()
     design = order_name
-    total_qty = sum(int(li.get("quantity") or 1) for li in pb_lines)
+    total_qty = sum(int(li.get("quantity") or 1) for li in webhook_lines)
+
+    stock_products_rows = []
+    stock_ph = {}
+    try:
+        stock_raw = fetch_sheet(SPREADSHEET_ID, STOCK_PRODUCTS_RANGE) or []
+        if len(stock_raw) >= 2:
+            stock_products_rows = stock_raw[1:]
+            stock_ph = {str(h).strip(): i for i, h in enumerate(stock_raw[0])}
+    except Exception as e:
+        logger.warning("[ShopifyWebhook] Could not load Stock Products: %s", e)
 
     ts = datetime.now(ZoneInfo("America/New_York"))
     ts_str = ts.strftime("%-m/%-d/%Y %H:%M:%S")
@@ -14587,6 +14701,7 @@ def shopify_webhook_orders_create():
         _never = _pt in ("blade", "mid-mallet", "mallet")
         _back = (_get_prop(_props, "_back_has_content") or "").strip().lower() in ("true", "1", "yes")
         total_rows += 2 if (not _never and _back) else 1
+    total_rows += len(standard_lines)
     num_cols_reserve = max(len(pb_headers), 42)  # at least through column AP
     shopify_col_idx = pb_ph.get("Shopify Order ID")
     if shopify_col_idx is None:
@@ -14611,34 +14726,87 @@ def shopify_webhook_orders_create():
         except Exception as e:
             logger.warning("[ShopifyWebhook] Reserve rows failed: %s", e)
 
-    for line_item in pb_lines:
+    for line_item in webhook_lines:
+        is_pb_line = _is_product_builder_line_item(line_item)
+        stock_template_row = None
+        design_for_row = design
         props = line_item.get("properties") or []
         def _prop(n):
             return _get_prop(props, n)
-        material_color_code = _prop("_materialColor") or _prop("materialColor") or ""
-        material1 = _material_color_to_display(material_color_code) if material_color_code else (_prop("Material") or "")
-        fur_raw = _prop("Fur")
-        fur_display = _fur_color_to_sheet_display(fur_raw)
-        print_val = _prop("Print")
-        print_cell = "YES" if print_val and str(print_val).upper() in ("YES", "TRUE", "1") else "NO"
         line_qty = int(line_item.get("quantity") or 1)
         line_price = float(line_item.get("price") or 0)
-        notes_val = (_prop("_notes") or _prop("Notes") or order_notes or "").strip()[:500]
-        pt_lower = (_prop("_productType") or "driver").strip().lower()
-        never_two = pt_lower in ("blade", "mid-mallet", "mallet")
-        back_has_content_val = (_prop("_back_has_content") or "").strip().lower()
-        needs_front_back = not never_two and back_has_content_val in ("true", "1", "yes")
-        num_rows = 2 if needs_front_back else 1
-        base_name = _product_type_display(_prop, needs_front_back=False, is_back=False)
-        if needs_front_back:
-            # Front first, then Back (index 0 = Front, index 1 = Back)
-            product_names_line = [base_name.replace(" Full", " Front"), base_name.replace(" Full", " Back")]
-            row_order = (0, 1)  # guarantee Front row written first, then Back
+        if is_pb_line:
+            material_color_code = _prop("_materialColor") or _prop("materialColor") or ""
+            material1 = _material_color_to_display(material_color_code) if material_color_code else (_prop("Material") or "")
+            fur_raw = _prop("Fur")
+            fur_display = _fur_color_to_sheet_display(fur_raw)
+            print_val = _prop("Print")
+            print_cell = "YES" if print_val and str(print_val).upper() in ("YES", "TRUE", "1") else "NO"
+            notes_val = (_prop("_notes") or _prop("Notes") or order_notes or "").strip()[:500]
+            pt_lower = (_prop("_productType") or "driver").strip().lower()
+            never_two = pt_lower in ("blade", "mid-mallet", "mallet")
+            back_has_content_val = (_prop("_back_has_content") or "").strip().lower()
+            needs_front_back = not never_two and back_has_content_val in ("true", "1", "yes")
+            num_rows = 2 if needs_front_back else 1
+            base_name = _product_type_display(_prop, needs_front_back=False, is_back=False)
+            if needs_front_back:
+                # Front first, then Back (index 0 = Front, index 1 = Back)
+                product_names_line = [base_name.replace(" Full", " Front"), base_name.replace(" Full", " Back")]
+                row_order = (0, 1)  # guarantee Front row written first, then Back
+            else:
+                product_names_line = [base_name]
+                row_order = (0,)
+            preview_data_url = _prop("_preview_image")
+            preview_url_prop = (_prop("_preview_image_url") or _prop("preview_image_url") or "").strip()
         else:
-            product_names_line = [base_name]
+            material1 = ""
+            fur_display = ""
+            print_cell = "NO"
+            notes_val = (order_notes or "").strip()[:500]
+            num_rows = 1
             row_order = (0,)
-        preview_data_url = _prop("_preview_image")
-        preview_url_prop = (_prop("_preview_image_url") or _prop("preview_image_url") or "").strip()
+            preview_data_url = None
+            preview_url_prop = ""
+            design_lookup = (line_item.get("title") or line_item.get("name") or "Product").strip()
+            variant = (line_item.get("variant_title") or "").strip()
+            stock_product_name = _stock_variant_to_product_name(variant)
+            if stock_product_name and design_lookup and stock_products_rows:
+                stock_template_row = _find_stock_product_row(
+                    stock_products_rows, stock_ph, design_lookup, stock_product_name
+                )
+            if stock_template_row:
+                product_names_line = [stock_product_name]
+                base_name = stock_product_name
+                design_for_row = str(_stock_sheet_cell(stock_template_row, stock_ph, "Design")).strip() or design_lookup
+                material1 = str(_stock_sheet_cell(stock_template_row, stock_ph, "Material1")).strip()
+                if not material1:
+                    material1 = str(_stock_sheet_cell(stock_template_row, stock_ph, "Material 1")).strip()
+                fur_display = str(_stock_sheet_cell(stock_template_row, stock_ph, "Fur Color")).strip()
+                print_raw = str(_stock_sheet_cell(stock_template_row, stock_ph, "Print")).strip()
+                print_cell = (
+                    "YES" if print_raw.upper() in ("YES", "TRUE", "1") else (print_raw or "NO")
+                )
+                template_notes = str(_stock_sheet_cell(stock_template_row, stock_ph, "Notes")).strip()
+                notes_val = (template_notes or order_notes or "").strip()[:500]
+                template_image = str(_stock_sheet_cell(stock_template_row, stock_ph, "Image")).strip()
+                if template_image:
+                    preview_url_prop = template_image
+                logger.info(
+                    "[ShopifyWebhook] Stock Products match: Design=%r Product=%r",
+                    design_lookup,
+                    stock_product_name,
+                )
+            else:
+                title = design_lookup
+                if variant and variant.lower() not in ("default title", "default"):
+                    title = f"{title} — {variant}"
+                product_names_line = [title]
+                base_name = title
+                img = line_item.get("image") or {}
+                if isinstance(img, dict):
+                    preview_url_prop = (img.get("src") or img.get("url") or "").strip()
+                elif isinstance(img, str):
+                    preview_url_prop = img.strip()
         line_preview_file_id = None
         line_item_preview_link = None
         if preview_url_prop:
@@ -14757,7 +14925,10 @@ def shopify_webhook_orders_create():
             image_link_for_row = (preview_link or "").strip()
 
             num_cols = max(len(pb_headers), 42)  # at least through column AP
-            row = [""] * num_cols
+            if stock_template_row:
+                row = _copy_stock_row_to_production(stock_template_row, stock_ph, pb_ph, num_cols)
+            else:
+                row = [""] * num_cols
 
             def _set(col_name, value):
                 if col_name in pb_ph and pb_ph[col_name] < len(row):
@@ -14771,27 +14942,46 @@ def shopify_webhook_orders_create():
             _set("Order #", new_order)
             _set("Date", ts_str)
             _set("Preview", preview_formula)
-            _set("Image", image_link_for_row or "")
+            if image_link_for_row:
+                _set("Image", image_link_for_row)
+            elif not stock_template_row:
+                _set("Image", "")
             _set("Company Name", company)
-            _set("Design", design)
+            if not stock_template_row:
+                _set("Design", design_for_row)
+                _set("Product", product_title)
             _set("Quantity", line_qty)
-            _set("Product", product_title)
             _set("Stage", _pb_stage_formula_for_row(next_row))
             _set("Price", line_price if idx == 0 else 0)
-            _set("Due Date", due_str_sheet)
-            _set("Print", print_cell)
-            _set("Material 1", material1)
-            _set("Material1", material1)
-            _set("Material1%", 100)
-            _set("Material 1%", 100)
-            _set("Back Material", material1)
-            _set("Fur Color", fur_display)
-            _set("EMB Backing", "Cut Away")
-            _set("Hard Date/Soft Date", "Hard Date")
+            if stock_template_row:
+                stock_due = _stock_due_date(ts)
+                due_for_row_sheet = stock_due.strftime("%-m/%-d/%Y")
+                due_for_row_supabase = stock_due.strftime("%Y-%m-%d")
+            else:
+                due_for_row_sheet = due_str_sheet
+                due_for_row_supabase = due_str_supabase
+            _set("Due Date", due_for_row_sheet)
+            if not stock_template_row:
+                _set("Print", print_cell)
+                _set("Material 1", material1)
+                _set("Material1", material1)
+                if material1:
+                    _set("Material1%", 100)
+                    _set("Material 1%", 100)
+                _set("Back Material", material1)
+                _set("Fur Color", fur_display)
+                _set("EMB Backing", "Cut Away")
+                _set("Hard Date/Soft Date", "Hard Date")
             _set("Ship Date", _pb_ship_date_formula_for_row(next_row, _due_date_col_letter))
             _set("Stitch Count", _pb_stitch_count_formula_for_row(next_row))
-            _set("Threads", _pb_threads_formula_for_row(next_row))
-            _set("Notes", notes_val)
+            if stock_template_row:
+                template_threads = str(_stock_sheet_cell(stock_template_row, stock_ph, "Threads")).strip()
+                if not template_threads:
+                    _set("Threads", _pb_threads_formula_for_row(next_row))
+            else:
+                _set("Threads", _pb_threads_formula_for_row(next_row))
+            if not stock_template_row or notes_val:
+                _set("Notes", notes_val)
             _set("Order Folder Link", order_folder_link or "")
             _set("Folder Link", order_folder_link or "")
             _set("Shopify Order ID", shopify_order_id or "")
@@ -14801,7 +14991,7 @@ def shopify_webhook_orders_create():
                 fixed = [
                     new_order, ts_str, fixed_preview, image_link_for_row or "", company, design,
                     line_qty, "", product_title, _pb_stage_formula_for_row(next_row),
-                    line_price if idx == 0 else 0, due_str_sheet, print_cell, material1,
+                    line_price if idx == 0 else 0, due_for_row_sheet, print_cell, material1,
                     "", "", "", "", "", fur_display, "", shopify_order_id or "",
                     "", "", notes_val, order_folder_link or "",
                     "", "", "", "", "", "", "", "",
@@ -14830,37 +15020,59 @@ def shopify_webhook_orders_create():
                 except Exception as e:
                     logger.warning("[ShopifyWebhook] RAW Price write failed for row %s: %s", next_row, e)
 
-            # Material1% as numeric 100 (ensures cell is not left blank if row width skipped it)
-            for _mhdr in ("Material1%", "Material 1%"):
-                _m1p = pb_ph.get(_mhdr)
-                if _m1p is not None:
-                    try:
-                        sheets.update(
-                            spreadsheetId=SPREADSHEET_ID,
-                            range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{_col_letter(_m1p)}{next_row}",
-                            valueInputOption="RAW",
-                            body={"values": [[100]]},
-                        ).execute()
-                        break
-                    except Exception as e:
-                        logger.warning("[ShopifyWebhook] RAW Material1%% write failed for row %s: %s", next_row, e)
+            # Material1% as numeric 100 for product-builder rows with a material
+            if material1:
+                for _mhdr in ("Material1%", "Material 1%"):
+                    _m1p = pb_ph.get(_mhdr)
+                    if _m1p is not None:
+                        try:
+                            sheets.update(
+                                spreadsheetId=SPREADSHEET_ID,
+                                range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!{_col_letter(_m1p)}{next_row}",
+                                valueInputOption="RAW",
+                                body={"values": [[100]]},
+                            ).execute()
+                            break
+                        except Exception as e:
+                            logger.warning("[ShopifyWebhook] RAW Material1%% write failed for row %s: %s", next_row, e)
 
             if supabase:
-                supabase.table(SUPABASE_PB_ORDERS_TABLE).insert({
+                supabase_insert = {
                     "Order #": new_order,
                     "Date": ts_str,
                     "Company Name": company,
-                    "Design": design,
+                    "Design": design_for_row,
                     "Quantity": line_qty,
                     "Product": product_title,
                     "Price": line_price if idx == 0 else 0,
-                    "Due Date": due_str_supabase,
+                    "Due Date": due_for_row_supabase,
                     "Stage": "ORDERED",
-                }).execute()
+                }
+                if fur_display:
+                    supabase_insert["Fur Color"] = fur_display
+                if material1:
+                    supabase_insert["Material 1"] = material1
+                supabase.table(SUPABASE_PB_ORDERS_TABLE).insert(supabase_insert).execute()
 
             row_image_links.append((next_row, image_link_for_row))
             created.append(new_order)
-            logger.info("[ShopifyWebhook] Created order %s '%s' (Material=%s, Fur=%s)", new_order, product_title, material1, fur_display)
+            if stock_template_row:
+                logger.info(
+                    "[ShopifyWebhook] Created stock order %s '%s' (Design=%s, Material=%s, Fur=%s)",
+                    new_order,
+                    product_title,
+                    design_for_row,
+                    material1,
+                    fur_display,
+                )
+            else:
+                logger.info(
+                    "[ShopifyWebhook] Created order %s '%s' (Material=%s, Fur=%s)",
+                    new_order,
+                    product_title,
+                    material1,
+                    fur_display,
+                )
             next_row += 1
 
         first_link = next((link for _, link in row_image_links if link and "file/d/" in link and "/drive/folders/" not in link), None)
