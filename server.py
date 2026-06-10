@@ -4948,20 +4948,30 @@ def _order_ship_address_from_production_row(row: dict) -> dict:
     }
 
 
-def _write_order_ship_address_for_row(sheets, row_num: int, data) -> None:
-    """Write Order Ship * columns when headers exist on Production Orders row 1."""
+def _production_orders_header_row(sheets):
     try:
-        header_row = (
+        return (
             sheets.values()
             .get(spreadsheetId=SPREADSHEET_ID, range="Production Orders!1:1")
             .execute()
             .get("values", [[]])[0]
         )
     except Exception as e:
-        logger.warning("Order ship address header read failed: %s", e)
-        return
+        logger.warning("Production Orders header read failed: %s", e)
+        return []
 
-    field_map = {
+
+def _col_letter_local(idx0: int) -> str:
+    n = idx0 + 1
+    s = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+
+def _order_ship_field_map_from_submit_data(data) -> dict:
+    return {
         "Order Ship Company": (data.get("orderShipCompany") or "").strip(),
         "Order Ship Contact": (data.get("orderShipContact") or "").strip(),
         "Order Ship Phone": (data.get("orderShipPhone") or "").strip(),
@@ -4971,7 +4981,23 @@ def _write_order_ship_address_for_row(sheets, row_num: int, data) -> None:
         "Order Ship State": _state_abbr_ups(data.get("orderShipState") or ""),
         "Order Ship ZIP": _zip5_ups(data.get("orderShipZip") or ""),
     }
-    if not field_map["Order Ship Street 1"]:
+
+
+def _order_ship_field_map_from_row_dict(row: dict) -> dict:
+    if not isinstance(row, dict):
+        return {}
+    return {
+        hdr: str(row.get(hdr, "") or "").strip()
+        for hdr in ORDER_SHIP_ADDRESS_HEADERS
+    }
+
+
+def _write_order_ship_address_fields(sheets, row_num: int, field_map: dict) -> None:
+    """Write Order Ship * columns when headers exist on Production Orders row 1."""
+    if not str(field_map.get("Order Ship Street 1", "") or "").strip():
+        return
+    header_row = _production_orders_header_row(sheets)
+    if not header_row:
         return
 
     updates = []
@@ -4979,15 +5005,6 @@ def _write_order_ship_address_for_row(sheets, row_num: int, data) -> None:
         if hdr not in header_row:
             continue
         col_idx = header_row.index(hdr)
-
-        def _col_letter_local(idx0: int) -> str:
-            n = idx0 + 1
-            s = ""
-            while n:
-                n, rem = divmod(n - 1, 26)
-                s = chr(65 + rem) + s
-            return s
-
         updates.append(
             {
                 "range": f"Production Orders!{_col_letter_local(col_idx)}{row_num}",
@@ -5000,6 +5017,121 @@ def _write_order_ship_address_for_row(sheets, row_num: int, data) -> None:
             spreadsheetId=SPREADSHEET_ID,
             body={"valueInputOption": "USER_ENTERED", "data": updates},
         ).execute()
+
+
+def _write_order_ship_address_for_row(sheets, row_num: int, data) -> None:
+    _write_order_ship_address_fields(
+        sheets, row_num, _order_ship_field_map_from_submit_data(data)
+    )
+
+
+def _copy_order_ship_address_between_sheet_rows(
+    sheets, from_row_num: int, to_row_num: int
+) -> None:
+    """Copy Order Ship * values from one sheet row to another."""
+    header_row = _production_orders_header_row(sheets)
+    if not header_row:
+        return
+    try:
+        row_vals = (
+            sheets.values()
+            .get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!{from_row_num}:{from_row_num}",
+            )
+            .execute()
+            .get("values", [[]])[0]
+        )
+    except Exception as e:
+        logger.warning(
+            "Order ship address source row read failed (row %s): %s",
+            from_row_num,
+            e,
+        )
+        return
+
+    padded = list(row_vals) + [""] * max(0, len(header_row) - len(row_vals))
+    source_row = dict(zip(header_row, padded))
+    _write_order_ship_address_fields(
+        sheets, to_row_num, _order_ship_field_map_from_row_dict(source_row)
+    )
+
+
+def _production_order_row_dict_by_number(sheets, order_number) -> dict:
+    """Return a header→value dict for the given Order #, or {}."""
+    try:
+        order_num = str(order_number).strip()
+        if not order_num:
+            return {}
+        result = (
+            sheets.values()
+            .get(spreadsheetId=SPREADSHEET_ID, range=ORDERS_RANGE)
+            .execute()
+        )
+        rows = result.get("values", [])
+        if not rows:
+            return {}
+        headers = rows[0]
+        if "Order #" not in headers:
+            return {}
+        id_col = headers.index("Order #")
+        for row in rows[1:]:
+            padded = list(row) + [""] * max(0, len(headers) - len(row))
+            if str(padded[id_col]).strip() == order_num:
+                return dict(zip(headers, padded))
+    except Exception as e:
+        logger.warning(
+            "Failed to load Production Orders row for order %s: %s",
+            order_number,
+            e,
+        )
+    return {}
+
+
+def _copy_order_ship_address_from_paired_front_order(
+    sheets, front_order_number, dest_row_num: int
+) -> None:
+    """Copy Order Ship * from the front order row onto dest_row_num (e.g. new back order)."""
+    front_row = _production_order_row_dict_by_number(sheets, front_order_number)
+    field_map = _order_ship_field_map_from_row_dict(front_row)
+    if field_map.get("Order Ship Street 1"):
+        _write_order_ship_address_fields(sheets, dest_row_num, field_map)
+
+
+def _is_back_product_name(product: str) -> bool:
+    return "back" in str(product or "").strip().lower()
+
+
+def _paired_front_order_number(order_number) -> int | None:
+    try:
+        return int(str(order_number).strip()) - 1
+    except (TypeError, ValueError):
+        return None
+
+
+def _order_ship_address_from_production_row_with_pair_fallback(
+    row: dict,
+    orders_by_id: dict | None = None,
+    sheets=None,
+) -> dict:
+    """Order ship address from row, or from paired front order when this is a back product."""
+    addr = _order_ship_address_from_production_row(row)
+    if addr.get("addr1"):
+        return addr
+    product = str(row.get("Product", "") or "")
+    if not _is_back_product_name(product):
+        return {}
+    front_num = _paired_front_order_number(row.get("Order #"))
+    if front_num is None:
+        return {}
+    front_row = None
+    if isinstance(orders_by_id, dict):
+        front_row = orders_by_id.get(str(front_num))
+    if not front_row and sheets is not None:
+        front_row = _production_order_row_dict_by_number(sheets, front_num)
+    if not front_row:
+        return {}
+    return _order_ship_address_from_production_row(front_row)
 
 
 def _normalize_ups_ship_to_from_directory_row(row: dict) -> dict:
@@ -5437,7 +5569,11 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
 
     # Right cell: customer info from the first order
     cust = order_data_list[0]
-    order_ship = _order_ship_address_from_production_row(cust)
+    order_ship = _order_ship_address_from_production_row_with_pair_fallback(
+        cust,
+        {str(o.get("Order #", "")).strip(): o for o in order_data_list if o.get("Order #")},
+        get_sheets_service(),
+    )
     if order_ship.get("addr1"):
         ship_lines = [
             order_ship.get("name") or "",
@@ -13905,7 +14041,13 @@ def submit_order():
         # ─── ORDER-SPECIFIC SHIP ADDRESS (Order Ship * columns) ──────────────
         if (data.get("useOrderShipAddress") or "").strip().lower() in ("1", "true", "yes"):
             _write_order_ship_address_for_row(sheets, next_row, data)
-        
+        elif _is_back_product_name(product):
+            front_num = _paired_front_order_number(new_order)
+            if front_num is not None:
+                _copy_order_ship_address_from_paired_front_order(
+                    sheets, front_num, next_row
+                )
+
         # ─── WRITE THREADS FORMULA SEPARATELY (column AF) ─────────────────────
         if threads_formula:
             sheets.values().update(
@@ -14004,9 +14146,11 @@ def submit_order():
                 body={"values": [[sales_rep]]},
             ).execute()
 
-            if (data.get("useOrderShipAddress") or "").strip().lower() in ("1", "true", "yes"):
-                _write_order_ship_address_for_row(sheets, back_next_row, data)
-            
+            # Copy front row ship address down to the back row on the sheet.
+            _copy_order_ship_address_between_sheet_rows(
+                sheets, next_row, back_next_row
+            )
+
             # ─── WRITE THREADS FORMULA SEPARATELY FOR BACK ORDER (column AF) ───
             if back_threads_formula:
                 sheets.values().update(
@@ -17755,6 +17899,14 @@ def process_shipment():
         if not all_order_data:
             return jsonify({"error": "No matching orders in sheet for given order_ids"}), 400
 
+        orders_by_id = {}
+        for sheet_row in rows[1:]:
+            padded = list(sheet_row) + [""] * max(0, len(headers_row) - len(sheet_row))
+            row_dict = dict(zip(headers_row, padded))
+            oid = str(row_dict.get("Order #", "")).strip()
+            if oid:
+                orders_by_id[oid] = row_dict
+
         # 4) UPS labels (before invoice so we have tracking numbers)
         tracking_list = []
         label_relative_urls = []
@@ -17786,7 +17938,11 @@ def process_shipment():
                 }
             else:
                 company = str(all_order_data[0].get("Company Name", "") or "").strip()
-                order_ship = _order_ship_address_from_production_row(all_order_data[0])
+                order_ship = _order_ship_address_from_production_row_with_pair_fallback(
+                    all_order_data[0],
+                    orders_by_id,
+                    service,
+                )
                 if order_ship.get("addr1"):
                     ship_to = order_ship
                 else:
