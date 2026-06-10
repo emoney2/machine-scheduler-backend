@@ -4905,6 +4905,103 @@ def _directory_company_names_from_sheet():
     return out
 
 
+ORDER_SHIP_ADDRESS_HEADERS = (
+    "Order Ship Company",
+    "Order Ship Contact",
+    "Order Ship Phone",
+    "Order Ship Street 1",
+    "Order Ship Street 2",
+    "Order Ship City",
+    "Order Ship State",
+    "Order Ship ZIP",
+)
+
+
+def _order_ship_address_from_production_row(row: dict) -> dict:
+    """Order-specific ship address saved on Production Orders at submit time."""
+    if not isinstance(row, dict):
+        return {}
+    street1 = str(row.get("Order Ship Street 1", "") or "").strip()
+    if not street1:
+        return {}
+    city = str(row.get("Order Ship City", "") or "").strip()
+    state = _state_abbr_ups(row.get("Order Ship State", ""))
+    zipc = _zip5_ups(row.get("Order Ship ZIP", ""))
+    if not city or len(state) != 2 or len(zipc) != 5:
+        return {}
+    company = str(row.get("Order Ship Company", "") or "").strip()
+    contact = str(row.get("Order Ship Contact", "") or "").strip()
+    phone = re.sub(r"\D", "", str(row.get("Order Ship Phone", "") or ""))[:15]
+    if not phone:
+        phone = "0000000000"
+    a2 = str(row.get("Order Ship Street 2", "") or "").strip()
+    return {
+        "name": (company or contact or "Recipient")[:200],
+        "attention_name": (contact[:35] if contact else None),
+        "phone": phone,
+        "addr1": street1,
+        "addr2": a2 or None,
+        "city": city,
+        "state": state,
+        "zip": zipc,
+        "country": "US",
+    }
+
+
+def _write_order_ship_address_for_row(sheets, row_num: int, data) -> None:
+    """Write Order Ship * columns when headers exist on Production Orders row 1."""
+    try:
+        header_row = (
+            sheets.values()
+            .get(spreadsheetId=SPREADSHEET_ID, range="Production Orders!1:1")
+            .execute()
+            .get("values", [[]])[0]
+        )
+    except Exception as e:
+        logger.warning("Order ship address header read failed: %s", e)
+        return
+
+    field_map = {
+        "Order Ship Company": (data.get("orderShipCompany") or "").strip(),
+        "Order Ship Contact": (data.get("orderShipContact") or "").strip(),
+        "Order Ship Phone": (data.get("orderShipPhone") or "").strip(),
+        "Order Ship Street 1": (data.get("orderShipStreet1") or "").strip(),
+        "Order Ship Street 2": (data.get("orderShipStreet2") or "").strip(),
+        "Order Ship City": (data.get("orderShipCity") or "").strip(),
+        "Order Ship State": _state_abbr_ups(data.get("orderShipState") or ""),
+        "Order Ship ZIP": _zip5_ups(data.get("orderShipZip") or ""),
+    }
+    if not field_map["Order Ship Street 1"]:
+        return
+
+    updates = []
+    for hdr, val in field_map.items():
+        if hdr not in header_row:
+            continue
+        col_idx = header_row.index(hdr)
+
+        def _col_letter_local(idx0: int) -> str:
+            n = idx0 + 1
+            s = ""
+            while n:
+                n, rem = divmod(n - 1, 26)
+                s = chr(65 + rem) + s
+            return s
+
+        updates.append(
+            {
+                "range": f"Production Orders!{_col_letter_local(col_idx)}{row_num}",
+                "values": [[val]],
+            }
+        )
+
+    if updates:
+        sheets.values().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": updates},
+        ).execute()
+
+
 def _normalize_ups_ship_to_from_directory_row(row: dict) -> dict:
     """
     Build ShipTo for UPS REST Ship/Rating. UPS does not expose your ups.com / WorldShip
@@ -5340,10 +5437,22 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
 
     # Right cell: customer info from the first order
     cust = order_data_list[0]
-    customer_info = Paragraph(
-        f"<b>Ship To:</b><br/>{cust.get('Company Name','')}<br/>{cust.get('Address','')}<br/>{cust.get('Phone','')}",
-        normal,
-    )
+    order_ship = _order_ship_address_from_production_row(cust)
+    if order_ship.get("addr1"):
+        ship_lines = [
+            order_ship.get("name") or "",
+            order_ship.get("attention_name") or "",
+            order_ship.get("addr1") or "",
+            order_ship.get("addr2") or "",
+            f"{order_ship.get('city', '')}, {order_ship.get('state', '')} {order_ship.get('zip', '')}".strip(", "),
+            order_ship.get("phone") or "",
+        ]
+        ship_body = "<br/>".join(line for line in ship_lines if line)
+    else:
+        ship_body = (
+            f"{cust.get('Company Name','')}<br/>{cust.get('Address','')}<br/>{cust.get('Phone','')}"
+        )
+    customer_info = Paragraph(f"<b>Ship To:</b><br/>{ship_body}", normal)
 
     # shift customer info further right
     header_table = Table(
@@ -13792,6 +13901,10 @@ def submit_order():
             valueInputOption="USER_ENTERED",
             body={"values": [[sales_rep]]},
         ).execute()
+
+        # ─── ORDER-SPECIFIC SHIP ADDRESS (Order Ship * columns) ──────────────
+        if (data.get("useOrderShipAddress") or "").strip().lower() in ("1", "true", "yes"):
+            _write_order_ship_address_for_row(sheets, next_row, data)
         
         # ─── WRITE THREADS FORMULA SEPARATELY (column AF) ─────────────────────
         if threads_formula:
@@ -13890,6 +14003,9 @@ def submit_order():
                 valueInputOption="USER_ENTERED",
                 body={"values": [[sales_rep]]},
             ).execute()
+
+            if (data.get("useOrderShipAddress") or "").strip().lower() in ("1", "true", "yes"):
+                _write_order_ship_address_for_row(sheets, back_next_row, data)
             
             # ─── WRITE THREADS FORMULA SEPARATELY FOR BACK ORDER (column AF) ───
             if back_threads_formula:
@@ -17670,12 +17786,16 @@ def process_shipment():
                 }
             else:
                 company = str(all_order_data[0].get("Company Name", "") or "").strip()
-                drow = _fetch_directory_row_by_company(company)
-                if not drow:
-                    raise Exception(
-                        "Company not found in Directory; cannot create UPS labels."
-                    )
-                ship_to = _normalize_ups_ship_to_from_directory_row(drow)
+                order_ship = _order_ship_address_from_production_row(all_order_data[0])
+                if order_ship.get("addr1"):
+                    ship_to = order_ship
+                else:
+                    drow = _fetch_directory_row_by_company(company)
+                    if not drow:
+                        raise Exception(
+                            "Company not found in Directory; cannot create UPS labels."
+                        )
+                    ship_to = _normalize_ups_ship_to_from_directory_row(drow)
             if (
                 not ship_to["addr1"]
                 or not ship_to["city"]
@@ -18422,24 +18542,35 @@ def _normalize_rate_ship_to(raw) -> dict:
                 return s
         return ""
 
-    name = first(raw.get("name"), raw.get("Name")) or "Recipient"
+    name = first(
+        raw.get("name"),
+        raw.get("Name"),
+        raw.get("companyName"),
+        raw.get("company_name"),
+    ) or "Recipient"
     attention_name = first(
         raw.get("attentionName"),
         raw.get("AttentionName"),
         raw.get("attention_name"),
         raw.get("attention"),
+        raw.get("contactName"),
+        raw.get("contact_name"),
     )
     attention_name = attention_name[:35] if attention_name else None
     phone = first(raw.get("phone"), raw.get("Phone")) or "0000000000"
     addr1 = first(
         raw.get("addr1"),
         raw.get("addressLine1"),
+        raw.get("street1"),
+        raw.get("street_1"),
         nested.get("AddressLine1"),
         nested.get("addressLine1"),
     )
     addr2 = first(
         raw.get("addr2"),
         raw.get("addressLine2"),
+        raw.get("street2"),
+        raw.get("street_2"),
         nested.get("AddressLine2"),
         nested.get("addressLine2"),
     )
