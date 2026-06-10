@@ -5012,11 +5012,20 @@ def _write_order_ship_address_fields(sheets, row_num: int, field_map: dict) -> N
             }
         )
 
-    if updates:
-        sheets.values().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body={"valueInputOption": "USER_ENTERED", "data": updates},
-        ).execute()
+    if not updates:
+        missing = [h for h in ORDER_SHIP_ADDRESS_HEADERS if h not in header_row]
+        if missing:
+            logger.warning(
+                "[submit] Order Ship columns not found in Production Orders header row; "
+                "add headers: %s",
+                ", ".join(ORDER_SHIP_ADDRESS_HEADERS),
+            )
+        return
+
+    sheets.values().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={"valueInputOption": "USER_ENTERED", "data": updates},
+    ).execute()
 
 
 def _write_order_ship_address_for_row(sheets, row_num: int, data) -> None:
@@ -5025,35 +5034,52 @@ def _write_order_ship_address_for_row(sheets, row_num: int, data) -> None:
     )
 
 
-def _copy_order_ship_address_between_sheet_rows(
-    sheets, from_row_num: int, to_row_num: int
-) -> None:
-    """Copy Order Ship * values from one sheet row to another."""
+def _production_order_row_dict_by_row_num(sheets, row_num: int) -> dict:
+    """Read one Production Orders row through column AZ (includes Order Ship * cols)."""
     header_row = _production_orders_header_row(sheets)
-    if not header_row:
-        return
+    if not header_row or row_num < 1:
+        return {}
     try:
         row_vals = (
             sheets.values()
             .get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"Production Orders!{from_row_num}:{from_row_num}",
+                range=f"Production Orders!A{row_num}:AZ{row_num}",
             )
             .execute()
             .get("values", [[]])[0]
         )
     except Exception as e:
         logger.warning(
-            "Order ship address source row read failed (row %s): %s",
-            from_row_num,
+            "Production Orders row read failed (row %s): %s",
+            row_num,
             e,
         )
-        return
-
+        return {}
     padded = list(row_vals) + [""] * max(0, len(header_row) - len(row_vals))
-    source_row = dict(zip(header_row, padded))
-    _write_order_ship_address_fields(
-        sheets, to_row_num, _order_ship_field_map_from_row_dict(source_row)
+    return dict(zip(header_row, padded))
+
+
+def _copy_order_ship_address_between_sheet_rows(
+    sheets, from_row_num: int, to_row_num: int
+) -> None:
+    """Copy Order Ship * values from one sheet row to another."""
+    source_row = _production_order_row_dict_by_row_num(sheets, from_row_num)
+    field_map = _order_ship_field_map_from_row_dict(source_row)
+    if not field_map.get("Order Ship Street 1"):
+        logger.warning(
+            "[submit] No Order Ship address on source row %s to copy to row %s",
+            from_row_num,
+            to_row_num,
+        )
+        return
+    _write_order_ship_address_fields(sheets, to_row_num, field_map)
+    logger.info(
+        "[submit] Copied Order Ship address sheet row %s -> %s (order %s -> %s)",
+        from_row_num,
+        to_row_num,
+        source_row.get("Order #", ""),
+        to_row_num,
     )
 
 
@@ -5063,22 +5089,15 @@ def _production_order_row_dict_by_number(sheets, order_number) -> dict:
         order_num = str(order_number).strip()
         if not order_num:
             return {}
-        result = (
+        col_a = (
             sheets.values()
-            .get(spreadsheetId=SPREADSHEET_ID, range=ORDERS_RANGE)
+            .get(spreadsheetId=SPREADSHEET_ID, range="Production Orders!A:A")
             .execute()
+            .get("values", [])
         )
-        rows = result.get("values", [])
-        if not rows:
-            return {}
-        headers = rows[0]
-        if "Order #" not in headers:
-            return {}
-        id_col = headers.index("Order #")
-        for row in rows[1:]:
-            padded = list(row) + [""] * max(0, len(headers) - len(row))
-            if str(padded[id_col]).strip() == order_num:
-                return dict(zip(headers, padded))
+        for i, cell in enumerate(col_a[1:], start=2):
+            if cell and str(cell[0]).strip() == order_num:
+                return _production_order_row_dict_by_row_num(sheets, i)
     except Exception as e:
         logger.warning(
             "Failed to load Production Orders row for order %s: %s",
@@ -5100,6 +5119,26 @@ def _copy_order_ship_address_from_paired_front_order(
 
 def _is_back_product_name(product: str) -> bool:
     return "back" in str(product or "").strip().lower()
+
+
+def _product_creates_paired_back_order(product: str) -> bool:
+    """True when submit should auto-create order N+1 as the paired back row."""
+    p = str(product or "").strip().lower()
+    if not p or "back" in p or "full" in p:
+        return False
+    if "blade" in p or "mallet" in p:
+        return False
+    if "front" not in p:
+        return False
+    paired_patterns = (
+        "quilted driver front",
+        "quilted fairway front",
+        "quilted hybrid front",
+        "driver front",
+        "fairway front",
+        "hybrid front",
+    )
+    return any(pat in p for pat in paired_patterns)
 
 
 def _paired_front_order_number(order_number) -> int | None:
@@ -13467,8 +13506,23 @@ def write_material_log_for_order(order_number):
             t for t in table[1:]
             if str(t[0]).strip().lower() == product.lower()
         )
+        tbl = list(tbl) + [""] * max(0, len(tbl_h) - len(tbl))
 
-        ppy = float(tbl[5])
+        def tbl_float(col_name, default=0.0):
+            if col_name not in tbl_h:
+                return default
+            idx = tbl_h.index(col_name)
+            if idx >= len(tbl):
+                return default
+            try:
+                return float(tbl[idx] or 0)
+            except (TypeError, ValueError):
+                return default
+
+        ppy = float(tbl[5] or 0) if len(tbl) > 5 else 0.0
+        if ppy <= 0:
+            logger.error("[MATLOG] Product %s has invalid PPY in Table sheet", product)
+            return
         yards_needed = qty / ppy
 
         # ───────────────────────────────────────────────────────────
@@ -13600,27 +13654,23 @@ def write_material_log_for_order(order_number):
         # ───────────────────────────────────────────────────────────
         # 8) Foam, magnets, elastic, pouch items
         for mat in ["1/2\" Foam", "3/8\" Foam", "1/4\" Foam", "1/8\" Foam"]:
-            if mat in tbl_h:
-                v = float(tbl[tbl_h.index(mat)] or 0)
-                if v > 0:
-                    log(mat, compute_usage(mat, (v * qty) / ppy))
+            v = tbl_float(mat)
+            if v > 0:
+                log(mat, compute_usage(mat, (v * qty) / ppy))
 
         for mat in ["N Magnets", "S Magnets"]:
-            if mat in tbl_h:
-                v = float(tbl[tbl_h.index(mat)] or 0)
-                if v > 0:
-                    log(mat, compute_usage(mat, v * qty))
-
-        if "1/2\" Elastic" in tbl_h:
-            v = float(tbl[tbl_h.index("1/2\" Elastic")] or 0)
+            v = tbl_float(mat)
             if v > 0:
-                log("1/2\" Elastic", compute_usage("1/2\" Elastic", (v * qty) / 36))
+                log(mat, compute_usage(mat, v * qty))
+
+        v = tbl_float("1/2\" Elastic")
+        if v > 0:
+            log("1/2\" Elastic", compute_usage("1/2\" Elastic", (v * qty) / 36))
 
         for mat in ["1/4\" Black Grommets", "Paracord (ft)", "Cord Stoppers"]:
-            if mat in tbl_h:
-                v = float(tbl[tbl_h.index(mat)] or 0)
-                if v > 0:
-                    log(mat, compute_usage(mat, v * qty))
+            v = tbl_float(mat)
+            if v > 0:
+                log(mat, compute_usage(mat, v * qty))
 
         # ───────────────────────────────────────────────────────────
         # 9) Insert rows into Supabase Material Log
@@ -13784,13 +13834,13 @@ def submit_order():
         product_lower = (data.get("product") or "").strip().lower()
         product = data.get("product") or ""
         
-        # Check if this is a quilted front product that needs a back order
-        quilted_front_products = [
-            "quilted driver front",
-            "quilted fairway front", 
-            "quilted hybrid front"
-        ]
-        is_quilted_front = any(qfp in product_lower for qfp in quilted_front_products)
+        # Front products that auto-create a paired back order (N+1)
+        is_quilted_front = _product_creates_paired_back_order(product)
+        logger.info(
+            "[submit] product=%r creates_paired_back=%s",
+            product,
+            is_quilted_front,
+        )
         
         if "full" in product_lower and not data.get("backMaterial", "").strip():
             return jsonify({"error": 'Back Material is required for "Full" products.'}), 400
@@ -14039,8 +14089,20 @@ def submit_order():
         ).execute()
 
         # ─── ORDER-SPECIFIC SHIP ADDRESS (Order Ship * columns) ──────────────
-        if (data.get("useOrderShipAddress") or "").strip().lower() in ("1", "true", "yes"):
-            _write_order_ship_address_for_row(sheets, next_row, data)
+        order_ship_field_map = None
+        use_order_ship = (data.get("useOrderShipAddress") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if use_order_ship:
+            order_ship_field_map = _order_ship_field_map_from_submit_data(data)
+            _write_order_ship_address_fields(sheets, next_row, order_ship_field_map)
+            logger.info(
+                "[submit] Wrote Order Ship address to front row %s order %s",
+                next_row,
+                new_order,
+            )
         elif _is_back_product_name(product):
             front_num = _paired_front_order_number(new_order)
             if front_num is not None:
@@ -14146,10 +14208,20 @@ def submit_order():
                 body={"values": [[sales_rep]]},
             ).execute()
 
-            # Copy front row ship address down to the back row on the sheet.
-            _copy_order_ship_address_between_sheet_rows(
-                sheets, next_row, back_next_row
-            )
+            # Copy front ship address onto the back row (in-memory first, then sheet).
+            if order_ship_field_map and order_ship_field_map.get("Order Ship Street 1"):
+                _write_order_ship_address_fields(
+                    sheets, back_next_row, order_ship_field_map
+                )
+                logger.info(
+                    "[submit] Wrote Order Ship address to back row %s order %s (from submit form)",
+                    back_next_row,
+                    back_order,
+                )
+            else:
+                _copy_order_ship_address_between_sheet_rows(
+                    sheets, next_row, back_next_row
+                )
 
             # ─── WRITE THREADS FORMULA SEPARATELY FOR BACK ORDER (column AF) ───
             if back_threads_formula:
