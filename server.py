@@ -14623,6 +14623,42 @@ def _production_row_is_complete(row, ph):
     return bool(str(row[date_i] or "").strip()) and bool(str(row[prod_i] or "").strip())
 
 
+def _production_row_is_placeholder(row, ph):
+    """True when Order # is set but Date/Product are still empty (reserved row)."""
+    order_i = ph.get("Order #", 0)
+    date_i = ph.get("Date")
+    prod_i = ph.get("Product")
+    if len(row) <= order_i:
+        return False
+    if not str(row[order_i] or "").strip():
+        return False
+    if date_i is not None and len(row) > date_i and str(row[date_i] or "").strip():
+        return False
+    if prod_i is not None and len(row) > prod_i and str(row[prod_i] or "").strip():
+        return False
+    return True
+
+
+def _shopify_id_col_indices(ph):
+    """0-based column indices for Shopify order id headers (may be one or both)."""
+    out = []
+    for name in ("Shopify Order ID", "Shopify ID"):
+        idx = ph.get(name)
+        if idx is not None and idx not in out:
+            out.append(idx)
+    return out
+
+
+def _set_shopify_id_on_row(row, ph, shopify_order_id):
+    """Stamp Shopify order id into reserved placeholder row cells."""
+    sid = str(shopify_order_id or "").strip()
+    if not sid:
+        return
+    for idx in _shopify_id_col_indices(ph):
+        if idx < len(row):
+            row[idx] = sid
+
+
 def _expected_webhook_row_count(line_items, import_all_orders):
     n = 0
     for li in line_items:
@@ -15131,6 +15167,40 @@ def shopify_webhook_orders_create():
                     expected_row_count,
                     len(incomplete_slots),
                 )
+            # Recover rows reserved by a crashed/retrying webhook before Shopify ID was stamped (legacy)
+            if (
+                shopify_order_id
+                and not duplicate_rows
+                and expected_row_count > 0
+            ):
+                trail_start = max(2, next_row - expected_row_count)
+                trail_end = next_row - 1
+                if trail_end >= trail_start:
+                    trailing = sheets.get(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A{trail_start}:AP{trail_end}",
+                    ).execute().get("values", [])
+                    trail_nums = list(range(trail_start, trail_end + 1))
+                    trail_slots = []
+                    for r, sheet_row in zip(trailing or [], trail_nums):
+                        if _production_row_is_placeholder(r, pb_ph):
+                            order_col = pb_ph.get("Order #", 0)
+                            order_num = r[order_col] if order_col < len(r) else ""
+                            prod_col = pb_ph.get("Product")
+                            product = ""
+                            if prod_col is not None and prod_col < len(r):
+                                product = str(r[prod_col] or "").strip()
+                            trail_slots.append(
+                                {"row_num": sheet_row, "order_num": order_num, "product": product}
+                            )
+                    if len(trail_slots) == expected_row_count:
+                        incomplete_slots = trail_slots
+                        logger.info(
+                            "[ShopifyWebhook] Reusing %s trailing placeholder row(s) for Shopify order %s",
+                            len(trail_slots),
+                            shopify_order_id,
+                        )
+
             if duplicate_rows and order_fully_imported:
                 design_sent_col_idx = next((i for i, x in enumerate(hdr) if str(x).strip().lower() in ("design confirmation sent", "design email sent")), None)
                 first_row = duplicate_rows[0]
@@ -15296,6 +15366,7 @@ def shopify_webhook_orders_create():
             for i in range(total_rows):
                 r = [""] * num_cols_reserve
                 r[0] = prev_order + 1 + i
+                _set_shopify_id_on_row(r, pb_ph, shopify_order_id)
                 placeholder_rows.append(r)
             _last_letter = _col_letter(num_cols_reserve - 1)
             sheets.update(
