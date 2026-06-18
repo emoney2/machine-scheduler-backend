@@ -5130,15 +5130,8 @@ def _product_creates_paired_back_order(product: str) -> bool:
         return False
     if "front" not in p:
         return False
-    paired_patterns = (
-        "quilted driver front",
-        "quilted fairway front",
-        "quilted hybrid front",
-        "driver front",
-        "fairway front",
-        "hybrid front",
-    )
-    return any(pat in p for pat in paired_patterns)
+    # Only quilted front products get an auto-created back row (e.g. Quilted Driver Front).
+    return "quilted" in p
 
 
 def _paired_front_order_number(order_number) -> int | None:
