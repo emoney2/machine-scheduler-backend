@@ -9257,6 +9257,11 @@ SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 # Through column AZ so AT (Process Sheet Printed) and other late columns are included.
 # Process Sheet Printed lives in column AT on Production Orders.
 ORDERS_RANGE = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AZ")
+# Ship tab needs Order Ship * columns; always read through AZ even when ORDERS_RANGE is narrower.
+JOBS_FOR_COMPANY_RANGE = os.environ.get(
+    "JOBS_FOR_COMPANY_RANGE",
+    "Production Orders!A1:AZ",
+)
 # Overview “Upcoming Jobs” must read the Production Orders tab only. ORDERS_RANGE may be
 # overridden in env to another tab; this range is used only by build_overview_payload().
 OVERVIEW_PRODUCTION_ORDERS_RANGE = os.environ.get(
@@ -12617,8 +12622,8 @@ def jobs_for_company():
         return jsonify(cached["data"])
 
     try:
-        # Uses ORDERS_RANGE (default Production Orders!A1:AZ, includes AT Process Sheet Printed)
-        prod_data = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+        # Through AZ so Order Ship * columns are always available for the Ship tab.
+        prod_data = fetch_sheet(SPREADSHEET_ID, JOBS_FOR_COMPANY_RANGE)
         if not prod_data or not prod_data[0]:
             return jsonify({"jobs": []}), 200
 
