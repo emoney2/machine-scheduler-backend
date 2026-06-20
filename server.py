@@ -4658,26 +4658,43 @@ def api_upload_email_preview():
             return jsonify({"error": "invalid base64: " + str(e)}), 400
     if not raw or len(raw) > 10 * 1024 * 1024:
         return jsonify({"error": "image too large or empty"}), 400
+    preserve_format = bool(data.get("preserve_format"))
+    mime = "image/jpeg"
+    ext = "jpg"
+    if image_data.startswith("data:image"):
+        header_lower = image_data.split(",", 1)[0].lower()
+        if "png" in header_lower:
+            mime, ext = "image/png", "png"
+        elif "webp" in header_lower:
+            mime, ext = "image/webp", "webp"
+        elif "gif" in header_lower:
+            mime, ext = "image/gif", "gif"
+        elif "jpeg" in header_lower or "jpg" in header_lower:
+            mime, ext = "image/jpeg", "jpg"
     try:
         drive = get_drive_service()
     except Exception as e:
         logger.warning("[upload-email-preview] Drive not available: %s", e)
         return jsonify({"error": "Drive not available"}), 503
     parent_id = (os.environ.get("EMAIL_PREVIEW_DRIVE_FOLDER_ID") or "").strip() or "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
-    try:
-        from PIL import Image
-        img = Image.open(io.BytesIO(raw))
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-        buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=92)
-        raw = buf.getvalue()
-    except Exception:
-        pass
-    name = "email-preview-" + str(uuid4()) + ".jpg"
+    if not preserve_format:
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(raw))
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=92)
+            raw = buf.getvalue()
+            mime, ext = "image/jpeg", "jpg"
+        except Exception:
+            pass
+        name = "email-preview-" + str(uuid4()) + ".jpg"
+    else:
+        name = "customer-logo-" + str(uuid4()) + "." + ext
     from googleapiclient.http import MediaIoBaseUpload
-    meta = {"name": name, "mimeType": "image/jpeg", "parents": [parent_id]}
-    media = MediaIoBaseUpload(io.BytesIO(raw), mimetype="image/jpeg", resumable=False)
+    meta = {"name": name, "mimeType": mime, "parents": [parent_id]}
+    media = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=False)
     try:
         up = drive.files().create(body=meta, media_body=media, fields="id").execute()
         file_id = up.get("id")
@@ -14723,6 +14740,166 @@ def _stock_preview_urls(line_item, stock_template_row, stock_ph):
     return urls
 
 
+def _extract_drive_file_id(url):
+    """Extract a Google Drive file id from common URL formats."""
+    url = (url or "").strip()
+    if not url:
+        return None
+    m = re.search(r"/api/email-preview-image/([A-Za-z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([^&\s/#]+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"file/d/([^/]+)", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _mime_to_logo_ext(mime_type):
+    mime_type = (mime_type or "").lower()
+    if "png" in mime_type:
+        return "png"
+    if "webp" in mime_type:
+        return "webp"
+    if "gif" in mime_type:
+        return "gif"
+    if "jpeg" in mime_type or "jpg" in mime_type:
+        return "jpg"
+    return "png"
+
+
+def _upload_customer_logo_to_order_folder(
+    drive_svc, folder_id, new_order, logo_index, logo_url, logo_data_url, make_public_fn
+):
+    """Save a customer-uploaded logo into the order folder at full quality."""
+    if not drive_svc or not folder_id:
+        return False
+    from googleapiclient.http import MediaIoBaseUpload
+
+    logo_url = (logo_url or "").strip()
+    if logo_url:
+        fid = _extract_drive_file_id(logo_url)
+        if fid:
+            try:
+                src_meta = drive_svc.files().get(fileId=fid, fields="mimeType").execute()
+                ext = _mime_to_logo_ext(src_meta.get("mimeType"))
+                copied = drive_svc.files().copy(
+                    fileId=fid,
+                    body={
+                        "name": f"order_{new_order}_logo_{logo_index}.{ext}",
+                        "parents": [folder_id],
+                    },
+                    fields="id",
+                ).execute()
+                up_id = copied.get("id")
+                if up_id:
+                    make_public_fn(drive_svc, up_id)
+                    logger.info(
+                        "[ShopifyWebhook] Row %s: copied customer logo %s from Drive (%s)",
+                        new_order,
+                        logo_index,
+                        fid,
+                    )
+                    return True
+            except Exception as e:
+                logger.warning(
+                    "[ShopifyWebhook] Drive copy logo %s for row %s failed: %s",
+                    logo_index,
+                    new_order,
+                    e,
+                )
+        if logo_url.startswith(("http://", "https://")):
+            try:
+                import urllib.request
+
+                req = urllib.request.Request(
+                    logo_url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; JRCo/1.0)"},
+                )
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    raw = resp.read()
+                if raw:
+                    ext = "png"
+                    mime = "image/png"
+                    try:
+                        from PIL import Image as PILImage
+
+                        img = PILImage.open(io.BytesIO(raw))
+                        ext = _mime_to_logo_ext(getattr(img, "format", "") or "")
+                        if ext == "jpg":
+                            mime = "image/jpeg"
+                        elif ext == "webp":
+                            mime = "image/webp"
+                        elif ext == "gif":
+                            mime = "image/gif"
+                    except Exception:
+                        pass
+                    m = MediaIoBaseUpload(
+                        io.BytesIO(raw), mimetype=mime, resumable=False
+                    )
+                    up = drive_svc.files().create(
+                        body={
+                            "name": f"order_{new_order}_logo_{logo_index}.{ext}",
+                            "parents": [folder_id],
+                        },
+                        media_body=m,
+                        fields="id",
+                    ).execute()
+                    make_public_fn(drive_svc, up.get("id"))
+                    logger.info(
+                        "[ShopifyWebhook] Row %s: downloaded customer logo %s from URL (%s bytes)",
+                        new_order,
+                        logo_index,
+                        len(raw),
+                    )
+                    return True
+            except Exception as e:
+                logger.warning(
+                    "[ShopifyWebhook] Download logo URL %s for row %s: %s",
+                    logo_index,
+                    new_order,
+                    e,
+                )
+
+    logo_data_url = (logo_data_url or "").strip()
+    if logo_data_url.startswith("data:image") and "," in logo_data_url:
+        try:
+            header, b64 = logo_data_url.split(",", 1)
+            raw = base64.b64decode(b64)
+            if not raw:
+                return False
+            ext = "png"
+            mime = "image/png"
+            header_lower = header.lower()
+            if "jpeg" in header_lower or "jpg" in header_lower:
+                ext, mime = "jpg", "image/jpeg"
+            elif "webp" in header_lower:
+                ext, mime = "webp", "image/webp"
+            elif "gif" in header_lower:
+                ext, mime = "gif", "image/gif"
+            m = MediaIoBaseUpload(io.BytesIO(raw), mimetype=mime, resumable=False)
+            up = drive_svc.files().create(
+                body={
+                    "name": f"order_{new_order}_logo_{logo_index}.{ext}",
+                    "parents": [folder_id],
+                },
+                media_body=m,
+                fields="id",
+            ).execute()
+            make_public_fn(drive_svc, up.get("id"))
+            return True
+        except Exception as e:
+            logger.warning(
+                "[ShopifyWebhook] Failed to upload inline logo %s for row %s: %s",
+                logo_index,
+                new_order,
+                e,
+            )
+    return False
+
+
 def _upload_preview_to_order_folder(drive_svc, folder_id, new_order, preview_urls, make_public_fn):
     """
     Upload or copy a preview into the order Drive folder.
@@ -15603,21 +15780,21 @@ def shopify_webhook_orders_create():
                         except Exception as e:
                             logger.warning("[ShopifyWebhook] Upload preview_%s.jpg failed: %s", new_order, e)
 
-                    # Logos for this row
+                    # Customer-uploaded logos (full-quality originals, separate from design preview)
                     for i in range(1, 11):
-                        v = _prop(f"_logo_file_{i}")
-                        if not v or not isinstance(v, str) or not v.startswith("data:image"):
+                        logo_url = _prop(f"_logo_url_{i}")
+                        logo_data = _prop(f"_logo_file_{i}")
+                        if not logo_url and not logo_data:
                             continue
-                        try:
-                            _, b64 = v.split(",", 1) if "," in v else (None, None)
-                            if not b64:
-                                continue
-                            raw = base64.b64decode(b64)
-                            m = MediaIoBaseUpload(io.BytesIO(raw), mimetype="image/png", resumable=False)
-                            up = drive.files().create(body={"name": f"order_{new_order}_logo_{i}.png", "parents": [folder_id]}, media_body=m, fields="id").execute()
-                            _make_public_safe(drive, up.get("id"))
-                        except Exception as e:
-                            logger.warning("[ShopifyWebhook] Failed to upload logo %s for row %s: %s", i, new_order, e)
+                        _upload_customer_logo_to_order_folder(
+                            drive,
+                            folder_id,
+                            new_order,
+                            i,
+                            logo_url if isinstance(logo_url, str) else "",
+                            logo_data if isinstance(logo_data, str) else "",
+                            _make_public_safe,
+                        )
                 except Exception as e:
                     logger.warning("[ShopifyWebhook] Drive upload failed: %s", e)
 
