@@ -12691,6 +12691,276 @@ def jobs_for_company():
         return resp
 
 
+def _is_back_product(name: str) -> bool:
+    return bool(re.search(r"(?i)\bback\b", name or ""))
+
+
+def _normalize_product_display(name: str) -> str:
+    base = re.sub(r"(?i)\b(front|full|back)\b", "", name or "")
+    base = re.sub(r"[\(\)\[\]\-_/]+", " ", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    return base or (name or "")
+
+
+def _is_outstanding_order_row(row: dict) -> bool:
+    stage = str(row.get("Stage") or "").strip().upper()
+    return stage not in ("COMPLETE", "COMPLETED")
+
+
+def _drive_thumbnail_url(image_link: str) -> str:
+    file_id = _extract_drive_file_id(str(image_link or "").strip())
+    if file_id:
+        return f"https://drive.google.com/thumbnail?id={file_id}"
+    return ""
+
+
+def _fetch_drive_image_bytes(file_id: str):
+    if not file_id:
+        return None
+    try:
+        import urllib.request
+
+        url = "https://drive.google.com/uc?export=view&id=" + file_id
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0"
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read()
+            if data and len(data) >= 100:
+                return data
+    except Exception as e:
+        logger.warning("_fetch_drive_image_bytes urlopen failed for %s: %s", file_id, e)
+    try:
+        drive = get_drive_service()
+        request_drive = drive.files().get_media(fileId=file_id)
+        from io import BytesIO
+
+        buf = BytesIO()
+        from googleapiclient.http import MediaIoBaseDownload
+
+        downloader = MediaIoBaseDownload(buf, request_drive)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        data = buf.getvalue()
+        return data if data and len(data) >= 100 else None
+    except Exception as e:
+        logger.warning("_fetch_drive_image_bytes Drive API failed for %s: %s", file_id, e)
+    return None
+
+
+def _outstanding_orders_for_company_rows(company_lower: str):
+    prod_data = fetch_sheet(SPREADSHEET_ID, JOBS_FOR_COMPANY_RANGE)
+    if not prod_data or not prod_data[0]:
+        return []
+
+    headers = prod_data[0]
+    jobs = []
+    for r in prod_data[1:]:
+        row = dict(zip(headers, r))
+        row_company = str(row.get("Company Name", "")).strip().lower()
+        if row_company != company_lower:
+            continue
+        if not _is_outstanding_order_row(row):
+            continue
+        product_raw = str(row.get("Product", "")).strip()
+        if _is_back_product(product_raw):
+            continue
+
+        image_link = str(row.get("Image", "")).strip()
+        preview_url = _drive_thumbnail_url(image_link)
+        try:
+            unit_price = float(row.get("Price") or 0)
+        except (TypeError, ValueError):
+            unit_price = 0.0
+        try:
+            qty = int(float(row.get("Quantity") or 0))
+        except (TypeError, ValueError):
+            qty = 0
+
+        jobs.append(
+            {
+                "Order #": str(row.get("Order #", "")).strip(),
+                "Design": str(row.get("Design", "")).strip(),
+                "Product": _normalize_product_display(product_raw),
+                "ProductRaw": product_raw,
+                "Quantity": qty,
+                "Price": unit_price,
+                "LineTotal": round(unit_price * qty, 2),
+                "Stage": str(row.get("Stage", "")).strip(),
+                "Due Date": row.get("Due Date", ""),
+                "image": preview_url,
+                "orderId": str(row.get("Order #", "")).strip(),
+            }
+        )
+
+    def _sort_key(j):
+        due = _ship_queue_parse_due(j.get("Due Date"))
+        return (due or date.max, _ship_queue_order_sort_tuple(j.get("Order #")))
+
+    jobs.sort(key=_sort_key)
+    return jobs
+
+
+def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=LETTER,
+        leftMargin=0.5 * inch,
+        rightMargin=0.5 * inch,
+        topMargin=0.5 * inch,
+        bottomMargin=0.5 * inch,
+    )
+    styles = getSampleStyleSheet()
+    normal = styles["Normal"]
+    title_style = ParagraphStyle(
+        "OrderConfTitle",
+        parent=styles["Title"],
+        alignment=1,
+        spaceAfter=8,
+        fontSize=16,
+    )
+    subtitle_style = ParagraphStyle(
+        "OrderConfSubtitle",
+        parent=normal,
+        alignment=1,
+        spaceAfter=14,
+        fontSize=11,
+        textColor=colors.grey,
+    )
+
+    elems = []
+    elems.append(Paragraph("Order Confirmation", title_style))
+    elems.append(
+        Paragraph(
+            f"{company_name}<br/>Outstanding jobs (not complete) &mdash; {datetime.now(ZoneInfo('America/New_York')).strftime('%-m/%-d/%Y')}",
+            subtitle_style,
+        )
+    )
+
+    if not jobs:
+        elems.append(Paragraph("No outstanding jobs found for this customer.", normal))
+    else:
+        grand_total = 0.0
+        for job in jobs:
+            design = job.get("Design") or "(No Design)"
+            product = job.get("Product") or "?"
+            qty = job.get("Quantity") or 0
+            price = job.get("Price") or 0
+            line_total = job.get("LineTotal") or 0
+            grand_total += float(line_total or 0)
+            order_num = job.get("Order #") or ""
+
+            img_cell = Paragraph("No preview", normal)
+            file_id = _extract_drive_file_id(job.get("image") or "")
+            if not file_id:
+                image_link = str(job.get("Image", "")).strip()
+                file_id = _extract_drive_file_id(image_link)
+            img_bytes = _fetch_drive_image_bytes(file_id) if file_id else None
+            if img_bytes:
+                try:
+                    reader = ImageReader(io.BytesIO(img_bytes))
+                    orig_w, orig_h = reader.getSize()
+                    max_dim = 0.85 * inch
+                    scale = min(max_dim / orig_w, max_dim / orig_h, 1.0)
+                    img_cell = Image(
+                        io.BytesIO(img_bytes),
+                        width=orig_w * scale,
+                        height=orig_h * scale,
+                    )
+                except Exception:
+                    img_cell = Paragraph("No preview", normal)
+
+            details = Paragraph(
+                f"<b>{design}</b><br/>"
+                f"Product: {product}<br/>"
+                f"Order #: {order_num}<br/>"
+                f"Qty: {qty} &nbsp;|&nbsp; Price: ${price:,.2f} &nbsp;|&nbsp; Total: ${line_total:,.2f}",
+                normal,
+            )
+            row_table = Table(
+                [[img_cell, details]],
+                colWidths=[1.1 * inch, 5.4 * inch],
+            )
+            row_table.setStyle(
+                TableStyle(
+                    [
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("BOX", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                        ("TOPPADDING", (0, 0), (-1, -1), 8),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                    ]
+                )
+            )
+            elems.append(row_table)
+            elems.append(Spacer(1, 0.12 * inch))
+
+        elems.append(Spacer(1, 0.1 * inch))
+        elems.append(
+            Paragraph(
+                f"<b>Grand Total: ${grand_total:,.2f}</b>",
+                ParagraphStyle(
+                    "GrandTotal",
+                    parent=normal,
+                    alignment=2,
+                    fontSize=12,
+                    spaceBefore=6,
+                ),
+            )
+        )
+
+    doc.build(elems)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+
+@app.route("/api/outstanding-orders-for-company")
+@login_required_session
+def outstanding_orders_for_company():
+    company = request.args.get("company", "").strip()
+    if not company:
+        return jsonify({"error": "Missing company parameter"}), 400
+
+    try:
+        jobs = _outstanding_orders_for_company_rows(company.lower())
+        return jsonify({"company": company, "jobs": jobs})
+    except Exception as e:
+        logger.exception("outstanding-orders-for-company failed:")
+        resp = jsonify({"error": "outstanding-orders-for-company failed", "detail": str(e)})
+        resp.status_code = 500
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
+
+
+@app.route("/api/order-confirmation-pdf")
+@login_required_session
+def order_confirmation_pdf():
+    company = request.args.get("company", "").strip()
+    if not company:
+        return jsonify({"error": "Missing company parameter"}), 400
+
+    try:
+        jobs = _outstanding_orders_for_company_rows(company.lower())
+        pdf_bytes = build_order_confirmation_pdf(company, jobs)
+        safe_name = re.sub(r"[^\w\-]+", "_", company).strip("_") or "customer"
+        filename = f"order_confirmation_{safe_name}.pdf"
+        resp = make_response(pdf_bytes)
+        resp.headers["Content-Type"] = "application/pdf"
+        resp.headers["Content-Disposition"] = f'inline; filename="{filename}"'
+        return resp
+    except Exception as e:
+        logger.exception("order-confirmation-pdf failed:")
+        return jsonify({"error": "order-confirmation-pdf failed", "detail": str(e)}), 500
+
+
 @app.route("/api/shopify/admin/order", methods=["GET"])
 @login_required_session
 def api_shopify_admin_order():
