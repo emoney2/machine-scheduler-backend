@@ -12696,10 +12696,17 @@ def _is_back_product(name: str) -> bool:
 
 
 def _normalize_product_display(name: str) -> str:
-    base = re.sub(r"(?i)\b(front|full|back)\b", "", name or "")
+    s = (name or "").strip()
+    if not s:
+        return ""
+
+    # Strip trailing Front / Full / Back (spaced or hyphenated)
+    base = re.sub(r"(?i)[\s\-_/]*(front|full|back)\s*$", "", s).strip()
+    # Strip suffix on concatenated names like DriverFront
+    base = re.sub(r"(?i)(front|full|back)$", "", base).strip()
     base = re.sub(r"[\(\)\[\]\-_/]+", " ", base)
     base = re.sub(r"\s+", " ", base).strip()
-    return base or (name or "")
+    return base or s
 
 
 def _is_outstanding_order_row(row: dict) -> bool:
@@ -12821,38 +12828,75 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
         "OrderConfTitle",
         parent=styles["Title"],
         alignment=1,
-        spaceAfter=8,
+        spaceAfter=6,
         fontSize=16,
     )
-    subtitle_style = ParagraphStyle(
-        "OrderConfSubtitle",
+    company_style = ParagraphStyle(
+        "OrderConfCompany",
         parent=normal,
         alignment=1,
         spaceAfter=14,
+        fontSize=12,
+    )
+    date_style = ParagraphStyle(
+        "OrderConfDate",
+        parent=normal,
+        alignment=2,
         fontSize=11,
         textColor=colors.grey,
     )
 
     elems = []
-    elems.append(Paragraph("Order Confirmation", title_style))
-    elems.append(
-        Paragraph(
-            f"{company_name}<br/>Outstanding jobs (not complete) &mdash; {datetime.now(ZoneInfo('America/New_York')).strftime('%-m/%-d/%Y')}",
-            subtitle_style,
+
+    # Logo upper-left, date upper-right
+    logo_path = os.path.join(app.root_path, "static", "logo.png")
+    try:
+        reader = ImageReader(logo_path)
+        orig_w, orig_h = reader.getSize()
+        max_w = 1.0 * inch
+        scale = max_w / orig_w
+        logo = Image(logo_path, width=orig_w * scale, height=orig_h * scale)
+    except Exception:
+        logo = Paragraph("", normal)
+
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    date_str = f"{now_et.month}/{now_et.day}/{now_et.year}"
+    header_table = Table(
+        [[logo, Paragraph(date_str, date_style)]],
+        colWidths=[3.5 * inch, 3.5 * inch],
+    )
+    header_table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (0, 0), (0, 0), "LEFT"),
+                ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
         )
     )
+    elems.append(header_table)
+    elems.append(Spacer(1, 0.15 * inch))
+
+    elems.append(Paragraph("Order Confirmation", title_style))
+    elems.append(Paragraph(company_name, company_style))
 
     if not jobs:
         elems.append(Paragraph("No outstanding jobs found for this customer.", normal))
     else:
-        grand_total = 0.0
+        line_total_sum = 0.0
         for job in jobs:
             design = job.get("Design") or "(No Design)"
-            product = job.get("Product") or "?"
+            product = _normalize_product_display(
+                job.get("ProductRaw") or job.get("Product") or ""
+            )
             qty = job.get("Quantity") or 0
             price = job.get("Price") or 0
             line_total = job.get("LineTotal") or 0
-            grand_total += float(line_total or 0)
+            line_total_sum += float(line_total or 0)
             order_num = job.get("Order #") or ""
 
             img_cell = Paragraph("No preview", normal)
@@ -12884,7 +12928,7 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
             )
             row_table = Table(
                 [[img_cell, details]],
-                colWidths=[1.1 * inch, 5.4 * inch],
+                colWidths=[1.1 * inch, 5.9 * inch],
             )
             row_table.setStyle(
                 TableStyle(
@@ -12904,9 +12948,9 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
         elems.append(Spacer(1, 0.1 * inch))
         elems.append(
             Paragraph(
-                f"<b>Grand Total: ${grand_total:,.2f}</b>",
+                f"<b>Total: ${line_total_sum:,.2f}</b>",
                 ParagraphStyle(
-                    "GrandTotal",
+                    "OrderConfTotal",
                     parent=normal,
                     alignment=2,
                     fontSize=12,
@@ -12947,8 +12991,24 @@ def order_confirmation_pdf():
     if not company:
         return jsonify({"error": "Missing company parameter"}), 400
 
+    order_ids_raw = request.args.get("order_ids", "").strip()
+    wanted_ids = {
+        _overview_normalize_order_key(part)
+        for part in order_ids_raw.split(",")
+        if part.strip()
+    }
+
     try:
         jobs = _outstanding_orders_for_company_rows(company.lower())
+        if wanted_ids:
+            jobs = [
+                j
+                for j in jobs
+                if _overview_normalize_order_key(j.get("Order #")) in wanted_ids
+            ]
+            if not jobs:
+                return jsonify({"error": "No matching outstanding orders for selection"}), 400
+
         pdf_bytes = build_order_confirmation_pdf(company, jobs)
         safe_name = re.sub(r"[^\w\-]+", "_", company).strip("_") or "customer"
         filename = f"order_confirmation_{safe_name}.pdf"
