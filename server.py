@@ -12695,18 +12695,40 @@ def _is_back_product(name: str) -> bool:
     return bool(re.search(r"(?i)\bback\b", name or ""))
 
 
-def _normalize_product_display(name: str) -> str:
-    s = (name or "").strip()
-    if not s:
+def _normalize_product_display(name: str, design: str = "") -> str:
+    """Strip Front/Full/Back suffixes; same rules as design confirmation emails."""
+    raw = re.sub(r"[\s\u00a0]+", " ", (name or "").strip())
+    if not raw:
         return ""
 
-    # Strip trailing Front / Full / Back (spaced or hyphenated)
-    base = re.sub(r"(?i)[\s\-_/]*(front|full|back)\s*$", "", s).strip()
-    # Strip suffix on concatenated names like DriverFront
-    base = re.sub(r"(?i)(front|full|back)$", "", base).strip()
-    base = re.sub(r"[\(\)\[\]\-_/]+", " ", base)
-    base = re.sub(r"\s+", " ", base).strip()
-    return base or s
+    result = (
+        raw.replace(" Full", "")
+        .replace(" Front", "")
+        .replace(" Back", "")
+        .strip()
+    )
+    for suffix in ("Front", "Full", "Back"):
+        if len(result) > len(suffix) and result.lower().endswith(suffix.lower()):
+            result = result[: -len(suffix)].strip()
+            break
+
+    parts = re.split(r"[\s\-_/]+", raw)
+    while len(parts) > 1 and parts[-1].lower() in ("front", "full", "back"):
+        parts.pop()
+    split_result = " ".join(parts).strip()
+
+    for candidate in (result, split_result):
+        c = (candidate or "").strip()
+        if not c:
+            continue
+        # Guard against truncated labels (e.g. Drive instead of Driver)
+        if c.lower() == "drive" and (
+            re.search(r"(?i)driver", raw) or re.search(r"(?i)driver", design or "")
+        ):
+            return "Driver"
+        return c
+
+    return raw
 
 
 def _is_outstanding_order_row(row: dict) -> bool:
@@ -12792,7 +12814,9 @@ def _outstanding_orders_for_company_rows(company_lower: str):
             {
                 "Order #": str(row.get("Order #", "")).strip(),
                 "Design": str(row.get("Design", "")).strip(),
-                "Product": _normalize_product_display(product_raw),
+                "Product": _normalize_product_display(
+                    product_raw, str(row.get("Design", "")).strip()
+                ),
                 "ProductRaw": product_raw,
                 "Quantity": qty,
                 "Price": unit_price,
@@ -12845,6 +12869,13 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
         fontSize=11,
         textColor=colors.grey,
     )
+    detail_style = ParagraphStyle(
+        "OrderConfDetail",
+        parent=normal,
+        fontSize=10,
+        leading=13,
+        wordWrap="LTR",
+    )
 
     elems = []
 
@@ -12889,15 +12920,14 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
     else:
         line_total_sum = 0.0
         for job in jobs:
-            design = job.get("Design") or "(No Design)"
-            product = _normalize_product_display(
-                job.get("ProductRaw") or job.get("Product") or ""
-            )
+            design = str(job.get("Design") or "(No Design)").strip()
+            product_raw = str(job.get("ProductRaw") or job.get("Product") or "").strip()
+            product = _normalize_product_display(product_raw, design)
             qty = job.get("Quantity") or 0
             price = job.get("Price") or 0
             line_total = job.get("LineTotal") or 0
             line_total_sum += float(line_total or 0)
-            order_num = job.get("Order #") or ""
+            order_num = str(job.get("Order #") or "").strip()
 
             img_cell = Paragraph("No preview", normal)
             file_id = _extract_drive_file_id(job.get("image") or "")
@@ -12919,24 +12949,27 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
                 except Exception:
                     img_cell = Paragraph("No preview", normal)
 
-            details = Paragraph(
-                f"<b>{design}</b><br/>"
-                f"Product: {product}<br/>"
-                f"Order #: {order_num}<br/>"
-                f"Qty: {qty} &nbsp;|&nbsp; Price: ${price:,.2f} &nbsp;|&nbsp; Total: ${line_total:,.2f}",
-                normal,
-            )
+            details = [
+                Paragraph(f"<b>{_html_escape(design)}</b>", detail_style),
+                Paragraph(f"Product: {_html_escape(product)}", detail_style),
+                Paragraph(f"Order #: {_html_escape(order_num)}", detail_style),
+                Paragraph(
+                    f"Qty: {qty} &nbsp;|&nbsp; Price: ${price:,.2f} &nbsp;|&nbsp; Total: ${line_total:,.2f}",
+                    detail_style,
+                ),
+            ]
             row_table = Table(
                 [[img_cell, details]],
-                colWidths=[1.1 * inch, 5.9 * inch],
+                colWidths=[1.0 * inch, 6.0 * inch],
             )
             row_table.setStyle(
                 TableStyle(
                     [
-                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
                         ("BOX", (0, 0), (-1, -1), 0.5, colors.lightgrey),
                         ("LEFTPADDING", (0, 0), (-1, -1), 8),
-                        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                        ("RIGHTPADDING", (0, 0), (0, 0), 8),
+                        ("RIGHTPADDING", (1, 0), (1, 0), 16),
                         ("TOPPADDING", (0, 0), (-1, -1), 8),
                         ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
                     ]
