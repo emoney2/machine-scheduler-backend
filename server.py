@@ -10288,11 +10288,35 @@ def _parse_sewing_summary_top_by_order(values) -> dict:
     return out
 
 
+def _parse_qty_number(raw, default=0):
+    """Parse Quantity / Shipped style cell values to a non-negative number."""
+    if raw is None or raw is False or raw == "":
+        return default
+    if raw is True:
+        return 1.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        s = str(raw).strip().upper()
+        if s in ("YES", "Y", "TRUE", "DONE", "SHIPPED"):
+            return 1.0
+        return default
+
+
+def _order_remaining_to_ship(order_row: dict) -> float:
+    """Units still to ship: Quantity - Shipped (never below 0)."""
+    qty = _parse_qty_number(order_row.get("Quantity"), 0.0)
+    shipped = _parse_qty_number(order_row.get("Shipped"), 0.0)
+    if qty <= 0:
+        return 0.0 if shipped > 0 else 0.0
+    return max(0.0, qty - shipped)
+
+
 def _overview_exclude_completed_or_shipped(order_row: dict) -> bool:
     """
-    Drop rows that should not appear on the production overview.
-    Uses the same source as scheduling: Google Sheets. Supabase 'Production Orders TEST'
-    can lag behind the sheet, which caused stale Stage values in the Overview tab.
+    Drop rows that should not appear on the production overview / ship queue.
+    Uses Google Sheets Stage + Shipped vs Quantity. Numeric Shipped values (including 1)
+    mean units already shipped — only hide when fully shipped (Shipped >= Quantity).
     """
     stage = str(order_row.get("Stage") or "").strip().upper()
     if stage in ("COMPLETE", "COMPLETED", "SHIPPED"):
@@ -10301,7 +10325,9 @@ def _overview_exclude_completed_or_shipped(order_row: dict) -> bool:
     if shipped is True:
         return True
     s = str(shipped).strip().upper() if shipped is not None and shipped != "" else ""
-    if s in ("YES", "Y", "TRUE", "1", "DONE", "SHIPPED"):
+    # Boolean-style flags only — do NOT treat numeric "1" as fully shipped
+    # (partial ships of 1 unit were incorrectly dropping from the Ship tab).
+    if s in ("YES", "Y", "TRUE", "DONE", "SHIPPED"):
         return True
     try:
         sq = float(shipped)
@@ -13210,6 +13236,12 @@ def ship_production_queue():
             row = dict(zip(headers, r))
             if _overview_exclude_completed_or_shipped(row):
                 continue
+            qty_num = _parse_qty_number(row.get("Quantity"), 0.0)
+            shipped_num = _parse_qty_number(row.get("Shipped"), 0.0)
+            remaining = max(0.0, qty_num - shipped_num)
+            # Fully shipped orders stay off the Ship tab (even if Stage lags)
+            if qty_num > 0 and remaining <= 0:
+                continue
             stage = str(row.get("Stage") or "").strip().upper()
             if stage not in ("EMBROIDERY", "SEWING"):
                 continue
@@ -13238,6 +13270,10 @@ def ship_production_queue():
                     "Design": row.get("Design"),
                     "Product": row.get("Product"),
                     "Quantity": row.get("Quantity"),
+                    "Shipped": row.get("Shipped"),
+                    "remainingToShip": int(remaining)
+                    if abs(remaining - round(remaining)) < 1e-9
+                    else remaining,
                     "Due Date": row.get("Due Date"),
                     "Stage": row.get("Stage"),
                     "Hard Date/Soft Date": row.get("Hard Date/Soft Date"),
@@ -18453,6 +18489,12 @@ def mark_shipped():
         id_col = headers_row.index("Order #")
         shipped_col = headers_row.index("Shipped")
 
+        qty_col = None
+        try:
+            qty_col = headers_row.index("Quantity")
+        except ValueError:
+            qty_col = None
+
         updates = []
         matched = []
         for i, row in enumerate(rows[1:], start=2):
@@ -18461,13 +18503,27 @@ def mark_shipped():
                 continue
             raw = shipped_quantities.get(order_id, 0)
             try:
-                parsed_qty = int(float(raw))
+                this_ship = max(0, int(float(raw)))
             except Exception:
-                parsed_qty = 0
+                this_ship = 0
+            prev_shipped = 0
+            if shipped_col < len(row):
+                try:
+                    prev_shipped = max(0, int(float(row[shipped_col] or 0)))
+                except Exception:
+                    prev_shipped = 0
+            new_total = prev_shipped + this_ship
+            if qty_col is not None and qty_col < len(row):
+                try:
+                    order_qty = max(0, int(float(row[qty_col] or 0)))
+                except Exception:
+                    order_qty = 0
+                if order_qty > 0:
+                    new_total = min(new_total, order_qty)
             updates.append(
                 {
                     "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
-                    "values": [[str(parsed_qty)]],
+                    "values": [[str(new_total)]],
                 }
             )
             matched.append(order_id)
@@ -18578,6 +18634,10 @@ def process_shipment():
         # locate columns
         id_col = headers_row.index("Order #")
         shipped_col = headers_row.index("Shipped")
+        try:
+            qty_col = headers_row.index("Quantity")
+        except ValueError:
+            qty_col = None
 
         updates = []
         all_order_data = []
@@ -18590,15 +18650,31 @@ def process_shipment():
                 order_id_to_rownum[order_id] = i
                 raw = shipped_quantities.get(order_id, 0)
                 try:
-                    parsed_qty = int(float(raw))
+                    parsed_qty = max(0, int(float(raw)))
                 except Exception:
                     parsed_qty = 0
 
-                # queue sheet update
+                # Accumulate Shipped so partial ships keep Stage open until remaining hits 0
+                prev_shipped = 0
+                if shipped_col < len(row):
+                    try:
+                        prev_shipped = max(0, int(float(row[shipped_col] or 0)))
+                    except Exception:
+                        prev_shipped = 0
+                new_total = prev_shipped + parsed_qty
+                if qty_col is not None and qty_col < len(row):
+                    try:
+                        order_qty = max(0, int(float(row[qty_col] or 0)))
+                    except Exception:
+                        order_qty = 0
+                    if order_qty > 0:
+                        new_total = min(new_total, order_qty)
+
+                # queue sheet update (cumulative total; invoice lines use this shipment qty)
                 updates.append(
                     {
                         "range": f"{sheet_name}!{chr(shipped_col + 65)}{i}",
-                        "values": [[str(parsed_qty)]],
+                        "values": [[str(new_total)]],
                     }
                 )
 
@@ -18613,7 +18689,9 @@ def process_shipment():
                     )
                     for h in headers_row
                 }
+                # Invoice / packing slip use this shipment's qty; sheet gets cumulative total
                 order_dict["ShippedQty"] = parsed_qty
+                order_dict["Shipped"] = str(parsed_qty)
                 all_order_data.append(order_dict)
 
         if not all_order_data:
