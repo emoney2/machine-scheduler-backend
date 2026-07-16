@@ -10944,15 +10944,19 @@ def _post_google_apps_script_webapp(url, payload, timeout=240):
     POST JSON to a Google Apps Script Web App and return the response that holds the body.
 
     ContentService responses issue a 302/303 to script.googleusercontent.com. Following that
-    redirect with POST (requests allow_redirects=True) often yields an empty body, which then
-    surfaces as "Could not read JSON from Google Apps Script." Fetch the Location with GET.
+    redirect with POST often yields an empty body. Fetch Location with a fresh GET (no cookies
+    from script.google.com — reusing the session can return plain "unauthorized").
     """
-    session = requests.Session()
-    r = session.post(
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "JRCO-Scheduler/1.0",
+    }
+    r = requests.post(
         url,
         json=payload,
         timeout=timeout,
-        headers={"Content-Type": "application/json", "Accept": "application/json, text/plain, */*"},
+        headers=headers,
         allow_redirects=False,
     )
     # Follow one redirect hop via GET (ContentService one-time result URL).
@@ -10960,13 +10964,30 @@ def _post_google_apps_script_webapp(url, payload, timeout=240):
         loc = (r.headers.get("Location") or "").strip()
         if not loc:
             return r
-        r = session.get(
+        # Important: do not reuse cookies from the script.google.com POST — that often
+        # makes googleusercontent.com respond with the plain text "unauthorized".
+        r = requests.get(
             loc,
             timeout=timeout,
-            headers={"Accept": "application/json, text/plain, */*"},
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "User-Agent": "JRCO-Scheduler/1.0",
+            },
             allow_redirects=True,
         )
     return r
+
+
+def _apps_script_access_error_message(body_text):
+    """Map common Google Web App access denials to an actionable message."""
+    t = (body_text or "").strip().lower()
+    if t in ("unauthorized", "forbidden") or t.startswith("unauthorized"):
+        return (
+            "Google Apps Script returned Unauthorized. Redeploy the web app with "
+            "Execute as: Me and Who has access: Anyone (not “Anyone with Google account”), "
+            "then confirm GOOGLE_APPS_SCRIPT_WEBAPP_URL matches that deployment’s /exec URL."
+        )
+    return None
 
 
 @app.route("/overview/rebuild-materials", methods=["POST"], endpoint="overview_rebuild_materials_plain")
@@ -11025,6 +11046,15 @@ def overview_rebuild_materials():
 
     snippet = (r.text or "")[:2000]
     ct = (r.headers.get("Content-Type") or "").lower()
+    access_err = _apps_script_access_error_message(snippet)
+    if access_err:
+        app.logger.error(
+            "overview_rebuild_materials: Apps Script access denied status=%s body=%s",
+            r.status_code,
+            snippet[:200],
+        )
+        return jsonify({"success": False, "error": access_err}), 502
+
     if r.status_code >= 400 or "text/html" in ct or snippet.strip().startswith("<"):
         app.logger.error(
             "overview_rebuild_materials: bad response status=%s ct=%s body=%s",
