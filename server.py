@@ -10939,6 +10939,36 @@ def _parse_json_from_apps_script_response(resp):
     return None, f"not valid JSON (preview): {preview!r}"
 
 
+def _post_google_apps_script_webapp(url, payload, timeout=240):
+    """
+    POST JSON to a Google Apps Script Web App and return the response that holds the body.
+
+    ContentService responses issue a 302/303 to script.googleusercontent.com. Following that
+    redirect with POST (requests allow_redirects=True) often yields an empty body, which then
+    surfaces as "Could not read JSON from Google Apps Script." Fetch the Location with GET.
+    """
+    session = requests.Session()
+    r = session.post(
+        url,
+        json=payload,
+        timeout=timeout,
+        headers={"Content-Type": "application/json", "Accept": "application/json, text/plain, */*"},
+        allow_redirects=False,
+    )
+    # Follow one redirect hop via GET (ContentService one-time result URL).
+    if r.status_code in (301, 302, 303, 307, 308):
+        loc = (r.headers.get("Location") or "").strip()
+        if not loc:
+            return r
+        r = session.get(
+            loc,
+            timeout=timeout,
+            headers={"Accept": "application/json, text/plain, */*"},
+            allow_redirects=True,
+        )
+    return r
+
+
 @app.route("/overview/rebuild-materials", methods=["POST"], endpoint="overview_rebuild_materials_plain")
 @app.route("/api/overview/rebuild-materials", methods=["POST"], endpoint="overview_rebuild_materials_api")
 @login_required_session
@@ -10969,13 +10999,7 @@ def overview_rebuild_materials():
         body["secret"] = token
 
     try:
-        r = requests.post(
-            apps_script_url,
-            json=body,
-            timeout=240,
-            headers={"Content-Type": "application/json"},
-            allow_redirects=True,
-        )
+        r = _post_google_apps_script_webapp(apps_script_url, body, timeout=240)
     except requests.exceptions.Timeout:
         app.logger.exception("overview_rebuild_materials: Apps Script timeout")
         return (
@@ -11027,11 +11051,14 @@ def overview_rebuild_materials():
             parse_err,
             snippet[:800],
         )
+        err_msg = "Could not read JSON from Google Apps Script."
+        if parse_err:
+            err_msg = f"{err_msg} {parse_err}"
         return (
             jsonify(
                 {
                     "success": False,
-                    "error": "Could not read JSON from Google Apps Script.",
+                    "error": err_msg,
                     "detail": parse_err,
                 }
             ),
