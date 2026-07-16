@@ -10995,110 +10995,43 @@ def _apps_script_access_error_message(body_text):
 @login_required_session
 def overview_rebuild_materials():
     """
-    Run the bound Google Apps Script JRCO_rebuildMaterialsToOrder (writes Overview !M:!N),
-    then clear the overview in-memory cache so the next GET sees fresh lists.
-    Configure GOOGLE_APPS_SCRIPT_WEBAPP_URL. Optional shared secret:
-    GOOGLE_APPS_SCRIPT_REBUILD_TOKEN (backend) + JRCO_REBUILD_TOKEN (Apps Script script property).
+    Rebuild Overview !M:!N (materials to order) using the Google Sheets API
+    (same logic as OverviewMaterialThread / JRCO_rebuildMaterialsToOrder).
+    Does not depend on GOOGLE_APPS_SCRIPT_WEBAPP_URL.
     """
     global _overview_cache, _overview_ts
 
-    apps_script_url = (os.environ.get("GOOGLE_APPS_SCRIPT_WEBAPP_URL") or "").strip()
-    if not apps_script_url:
+    spreadsheet_id = (os.environ.get("SPREADSHEET_ID") or "").strip()
+    if not spreadsheet_id:
         return (
             jsonify(
                 {
                     "success": False,
-                    "error": "GOOGLE_APPS_SCRIPT_WEBAPP_URL is not configured on the server.",
+                    "error": "SPREADSHEET_ID is not configured on the server.",
                 }
             ),
             503,
         )
 
-    token = (os.environ.get("GOOGLE_APPS_SCRIPT_REBUILD_TOKEN") or "").strip()
-    body = {"action": "rebuildMaterialsToOrder"}
-    if token:
-        body["secret"] = token
-
     try:
-        r = _post_google_apps_script_webapp(apps_script_url, body, timeout=240)
-    except requests.exceptions.Timeout:
-        app.logger.exception("overview_rebuild_materials: Apps Script timeout")
+        from overview_rebuild_materials import rebuild_materials_to_order
+
+        with acquire_sheet_lock(timeout=240):
+            stats = rebuild_materials_to_order(get_sheets_service(), spreadsheet_id)
+    except RuntimeError as ex:
+        app.logger.exception("overview_rebuild_materials: sheets rebuild failed: %s", ex)
+        return jsonify({"success": False, "error": str(ex)}), 502
+    except Exception as ex:
+        app.logger.exception("overview_rebuild_materials: unexpected error: %s", ex)
         return (
             jsonify(
                 {
                     "success": False,
-                    "error": "Timed out waiting for Google Apps Script (rebuild may still be running).",
-                }
-            ),
-            504,
-        )
-    except requests.exceptions.RequestException as ex:
-        app.logger.exception("overview_rebuild_materials: request failed: %s", ex)
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": "Could not reach Google Apps Script.",
+                    "error": f"Failed to rebuild materials lists: {ex}",
                 }
             ),
             502,
         )
-
-    snippet = (r.text or "")[:2000]
-    ct = (r.headers.get("Content-Type") or "").lower()
-    access_err = _apps_script_access_error_message(snippet)
-    if access_err:
-        app.logger.error(
-            "overview_rebuild_materials: Apps Script access denied status=%s body=%s",
-            r.status_code,
-            snippet[:200],
-        )
-        return jsonify({"success": False, "error": access_err}), 502
-
-    if r.status_code >= 400 or "text/html" in ct or snippet.strip().startswith("<"):
-        app.logger.error(
-            "overview_rebuild_materials: bad response status=%s ct=%s body=%s",
-            r.status_code,
-            ct,
-            snippet[:500],
-        )
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": "Google Apps Script returned an error or HTML (check deployment / auth).",
-                }
-            ),
-            502,
-        )
-
-    data, parse_err = _parse_json_from_apps_script_response(r)
-    if data is None:
-        app.logger.error(
-            "overview_rebuild_materials: could not parse JSON status=%s ct=%s err=%s body=%s",
-            r.status_code,
-            ct,
-            parse_err,
-            snippet[:800],
-        )
-        err_msg = "Could not read JSON from Google Apps Script."
-        if parse_err:
-            err_msg = f"{err_msg} {parse_err}"
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": err_msg,
-                    "detail": parse_err,
-                }
-            ),
-            502,
-        )
-
-    if not data.get("success"):
-        err = data.get("error") or "Apps Script rebuild failed"
-        app.logger.warning("overview_rebuild_materials: script error: %s", err)
-        return jsonify({"success": False, "error": err}), 400
 
     _overview_cache = None
     _overview_ts = 0.0
@@ -11112,7 +11045,16 @@ def overview_rebuild_materials():
     except Exception as emit_err:
         app.logger.warning("overview_rebuild_materials: socket emit failed: %s", emit_err)
 
-    return jsonify({"success": True, "message": data.get("message")}), 200
+    return (
+        jsonify(
+            {
+                "success": True,
+                "message": f"Materials to order rebuilt (M={stats.get('mRows', 0)}, N={stats.get('nRows', 0)}).",
+                "stats": stats,
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/api/upcoming_jobs")
