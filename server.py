@@ -12952,7 +12952,6 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
             price = job.get("Price") or 0
             line_total = job.get("LineTotal") or 0
             line_total_sum += float(line_total or 0)
-            order_num = str(job.get("Order #") or "").strip()
 
             img_cell = Paragraph("No preview", normal)
             file_id = _extract_drive_file_id(job.get("image") or "")
@@ -12977,7 +12976,6 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
             details = [
                 Paragraph(f"<b>{_html_escape(design)}</b>", detail_style),
                 Paragraph(f"Product: {_html_escape(product)}", detail_style),
-                Paragraph(f"Order #: {_html_escape(order_num)}", detail_style),
                 Paragraph(
                     f"Qty: {qty} &nbsp;|&nbsp; Price: ${price:,.2f} &nbsp;|&nbsp; Total: ${line_total:,.2f}",
                     detail_style,
