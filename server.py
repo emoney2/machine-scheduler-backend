@@ -10244,8 +10244,12 @@ from datetime import date, timedelta
 def _parse_sewing_summary_top_by_order(values) -> dict:
     """
     Build Order # -> Top (numeric, max if duplicate order rows) from Sewing Summary sheet.
-    Expects row 0 = headers with 'Order #' and 'Top' columns (case-sensitive header match,
-    with fallbacks for minor naming variants).
+
+    Sewing-complete rule (Overview / Sewing Priority): only the Top column is used.
+    When Top >= Production Orders Quantity, sewingSummaryComplete is true.
+
+    Expects row 0 = headers with 'Order #' and 'Top' (exact 'Top' preferred; case-insensitive
+    fallback). Order keys are normalized so 500 / 500.0 / "500" all match.
     """
     if not values or len(values) < 2:
         return {}
@@ -10274,14 +10278,23 @@ def _parse_sewing_summary_top_by_order(values) -> dict:
         row = row or []
         if oid_idx >= len(row):
             continue
-        oid = str(row[oid_idx] or "").strip()
+        oid_raw = row[oid_idx]
+        if oid_raw is None or oid_raw == "":
+            continue
+        oid = _overview_normalize_order_key(oid_raw)
+        if not oid:
+            oid = str(oid_raw).strip()
         if not oid:
             continue
         raw = row[top_idx] if top_idx < len(row) else ""
         try:
             top_val = float(raw)
         except (TypeError, ValueError):
-            continue
+            # Tolerate values like "12" or "12.0" with stray whitespace
+            try:
+                top_val = float(str(raw).strip().replace(",", ""))
+            except (TypeError, ValueError):
+                continue
         prev = out.get(oid)
         if prev is None or top_val > prev:
             out[oid] = top_val
@@ -10399,12 +10412,17 @@ def _overview_sewing_top_for_order(sewing_map: dict, oid_raw):
     if not sewing_map or oid_raw is None:
         return None
     candidates = []
-    s = str(oid_raw).strip()
-    if s:
-        candidates.append(s)
     nk = _overview_normalize_order_key(oid_raw)
-    if nk and nk not in candidates:
+    if nk:
         candidates.append(nk)
+    s = str(oid_raw).strip()
+    if s and s not in candidates:
+        candidates.append(s)
+    # Sheets/Python sometimes stringify whole numbers as "500.0"
+    if nk and nk.isdigit():
+        dotted = f"{nk}.0"
+        if dotted not in candidates:
+            candidates.append(dotted)
     for c in candidates:
         if c in sewing_map:
             return sewing_map[c]
