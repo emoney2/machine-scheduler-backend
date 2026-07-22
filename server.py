@@ -13237,8 +13237,10 @@ def _ship_queue_order_sort_tuple(order_num_raw):
 @login_required_session
 def ship_production_queue():
     """
-    Jobs in Embroidery or Sewing stage (not complete/shipped), for Ship tab quick picks.
-    Sorted by Due Date ascending, then Order #. Same image preview rules as jobs-for-company.
+    All open jobs (any product/stage) that are not complete or fully shipped,
+    for Ship tab quick picks — includes belts, towels, etc. that never enter
+    Embroidery/Sewing. Sorted by Due Date ascending, then Order #.
+    Same image preview rules as jobs-for-company.
     """
     try:
         prod_data = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
@@ -13256,9 +13258,6 @@ def ship_production_queue():
             remaining = max(0.0, qty_num - shipped_num)
             # Fully shipped orders stay off the Ship tab (even if Stage lags)
             if qty_num > 0 and remaining <= 0:
-                continue
-            stage = str(row.get("Stage") or "").strip().upper()
-            if stage not in ("EMBROIDERY", "SEWING"):
                 continue
             image_link = str(row.get("Image", "")).strip()
             file_id = ""
