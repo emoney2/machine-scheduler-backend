@@ -3,6 +3,14 @@ Rebuild Overview columns M (order soon) and N (60+ days) via Google Sheets API.
 
 Ports Tools/OverviewMaterialThread.gs (JRCO_rebuildMaterialsToOrder) so the Overview
 "Recalculate lists" button does not depend on an Apps Script web app deployment.
+
+Material model (ledger hole + later-first list split):
+  net   = Inventory + On Order
+  toBuy = max(0, Reorder - net)          # Reorder 0 → buy back to 0
+  available = max(0, Inventory) + On Order
+  rawNow/rawLater = job shortfalls (cover now demand first with available)
+  Assign toBuy to rawLater FIRST, remainder to Now.
+  Example Leaf Green: Inv -87, On Order 74 → toBuy 14 → Now 0, Later 14.
 """
 
 from __future__ import annotations
@@ -27,6 +35,29 @@ def _as_text(v: Any) -> str:
     return str(v)
 
 
+def _as_order_text(v: Any) -> str:
+    """Normalize order # from Sheets (1114.0 / 1114 / #1114 -> 1114)."""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)):
+        fv = float(v)
+        if abs(fv - round(fv)) < 1e-9:
+            return str(int(round(fv)))
+        return str(v).strip()
+    s = str(v).strip().replace("#", "").strip()
+    if re.fullmatch(r"\d+\.0+", s):
+        return s.split(".", 1)[0]
+    try:
+        n = float(s)
+        if math.isfinite(n) and abs(n - round(n)) < 1e-9:
+            return str(int(round(n)))
+    except ValueError:
+        pass
+    return s
+
+
 def _as_num(v: Any) -> float:
     try:
         if v is None or v == "":
@@ -37,22 +68,37 @@ def _as_num(v: Any) -> float:
 
 
 def _header_index(headers: List[Any], names: List[str]) -> int:
-    want = {n.lower() for n in names}
-    for i, h in enumerate(headers):
-        key = re.sub(r"\s+", " ", _as_text(h).strip().lower())
-        if key in want:
-            return i
+    """Match headers; prefer earlier names in the names list over later ones."""
+    normalized = []
+    for h in headers:
+        normalized.append(re.sub(r"\s+", " ", _as_text(h).strip().lower()))
+    for name in names:
+        want = name.lower().strip()
+        for i, key in enumerate(normalized):
+            if key == want:
+                return i
     return -1
 
 
 def _find_due_column(headers: List[Any]) -> int:
-    for i, h in enumerate(headers):
-        key = re.sub(r"\s+", " ", _as_text(h).strip().lower())
+    """Prefer exact 'Due Date', never order/created/timestamp columns."""
+    normalized = [
+        re.sub(r"\s+", " ", _as_text(h).strip().lower()) for h in headers
+    ]
+    for i, key in enumerate(normalized):
+        if key == "due date":
+            return i
+    for i, key in enumerate(normalized):
+        if key == "due":
+            return i
+    for i, key in enumerate(normalized):
         if not key:
+            continue
+        if any(x in key for x in ("order date", "created", "timestamp", "time stamp", "date added")):
             continue
         if "ship" in key and "due" not in key:
             continue
-        if key == "due" or "due" in key:
+        if "due" in key:
             return i
         if "hard" in key and "soft" in key:
             return i
@@ -90,7 +136,7 @@ def _find_qty_column(headers: List[Any]) -> int:
 
 
 def _order_key_variants(raw: Any) -> List[str]:
-    t = _as_text(raw).strip()
+    t = _as_order_text(raw).strip()
     if not t:
         return []
     no_bom = t.lstrip("\ufeff")
@@ -131,6 +177,11 @@ def _normalize_material_name(v: Any) -> str:
 
 def _is_terminal_stage(st: str) -> bool:
     return bool(re.search(r"complete|shipped|cancel|delivered|closed", (st or "").lower()))
+
+
+def _is_open_material_stage(st: str) -> bool:
+    s = (st or "").lower().strip()
+    return s in {"ordered", "fur", "cut", "print", "embroidery", "sewing", "sew"}
 
 
 def _parse_date(v: Any) -> Optional[datetime]:
@@ -190,9 +241,22 @@ def _days_until_job_need(due_val: Any, ship_val: Any, hs_val: Any = None) -> Opt
     return int(round((latest - today).total_seconds() / 86400.0))
 
 
-def _future_qty_material(
+def _days_until_material_need(due_val: Any, ship_val: Any, hs_val: Any = None) -> Optional[int]:
+    """
+    Material buy timing follows Due Date (how you plan leather), not Ship.
+    Fall back to ship / H/S only when Due is blank/unparseable.
+    Overdue Due dates count as "now" (days <= 60).
+    """
+    due = _parse_date(due_val)
+    if due is not None:
+        due = due.replace(hour=0, minute=0, second=0, microsecond=0)
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return int(round((due - today).total_seconds() / 86400.0))
+    return _days_until_job_need(None, ship_val, hs_val)
+
+
+def _collect_material_job_demand(
     mat_name: str,
-    total: float,
     ml: List[List[Any]],
     idx_order: int,
     idx_mat: int,
@@ -202,15 +266,19 @@ def _future_qty_material(
     due_by_order: Dict[str, Any],
     ship_by_order: Dict[str, Any],
     hs_by_order: Optional[Dict[str, Any]],
-) -> int:
-    d_total = max(0, int(math.ceil(total - 1e-9)))
+    idx_panel: int = -1,
+) -> Tuple[float, float]:
+    """
+    Sum Material Log OUT demand for this material, bucketed by Due ≤60d vs later.
+    Duplicate OUT rows (same order + material + panel) count once (max qty).
+    """
+    now_keys: Dict[str, float] = {}
+    future_keys: Dict[str, float] = {}
+
     if idx_order < 0 or idx_mat < 0 or idx_inout < 0 or not ml or len(ml) < 2:
-        return 0
+        return 0.0, 0.0
 
     target = _normalize_material_name(mat_name)
-    sum_now = 0.0
-    sum_future = 0.0
-
     for row in ml[1:]:
         if idx_mat >= len(row):
             continue
@@ -219,35 +287,88 @@ def _future_qty_material(
         io = _as_text(row[idx_inout] if idx_inout < len(row) else "").strip().lower()
         if io != "out":
             continue
-        ord_ = _as_text(row[idx_order] if idx_order < len(row) else "").strip()
+        ord_ = _as_order_text(row[idx_order] if idx_order < len(row) else "").strip()
         if not ord_:
             continue
         st = _as_text(_lookup_order(stg_by_order, ord_) or "").lower()
         if _is_terminal_stage(st):
+            continue
+        if not _is_open_material_stage(st):
             continue
         qty = 0.0
         if idx_qty >= 0 and idx_qty < len(row) and row[idx_qty] not in (None, ""):
             qty = _as_num(row[idx_qty])
         if qty <= 0:
             continue
+        if idx_panel >= 0 and idx_panel < len(row):
+            panel = _as_text(row[idx_panel]).strip().upper() or "FRONT"
+        else:
+            panel = "FRONT"
+        key = f"{ord_.strip().lower()}|{target}|{panel}"
+
         due_cell = _lookup_order(due_by_order, ord_)
         ship_cell = _lookup_order(ship_by_order, ord_)
         hs_cell = _lookup_order(hs_by_order, ord_) if hs_by_order else None
-        d = _days_until_job_need(due_cell, ship_cell, hs_cell)
-        if d is None:
-            sum_future += qty
-        elif d > FUTURE_DUE_DAYS:
-            sum_future += qty
+        d = _days_until_material_need(due_cell, ship_cell, hs_cell)
+        if d is None or d > FUTURE_DUE_DAYS:
+            future_keys[key] = max(future_keys.get(key, 0.0), qty)
         else:
-            sum_now += qty
+            now_keys[key] = max(now_keys.get(key, 0.0), qty)
 
-    job_total = sum_now + sum_future
-    if job_total <= 0 or sum_future <= 0:
-        return 0
-    if sum_now <= 0:
-        return d_total
-    future_qty = int(math.floor((d_total * sum_future) / job_total))
-    return max(0, min(d_total, future_qty))
+    return float(sum(now_keys.values())), float(sum(future_keys.values()))
+
+
+def _allocate_stock_cover_near_first(
+    available: float, sum_now: float, sum_future: float
+) -> Tuple[int, int, Dict[str, Any]]:
+    """Job shortfalls: cover near demand with available first."""
+    avail = max(0.0, float(available or 0))
+    need_now = max(0, int(math.ceil(sum_now - avail - 1e-9)))
+    remain = max(0.0, avail - sum_now)
+    need_later = max(0, int(math.ceil(sum_future - remain - 1e-9)))
+    meta = {
+        "sumNow": float(sum_now),
+        "sumFuture": float(sum_future),
+        "available": avail,
+        "shortNow": need_now,
+        "shortFuture": need_later,
+    }
+    return need_now, need_later, meta
+
+
+def _material_buy_later_first(
+    on_hand: float, on_ord: float, reorder: float, sum_now: float, sum_future: float
+) -> Tuple[int, int, Dict[str, Any]]:
+    """
+    toBuy from ledger hole; assign to later job shortfall first, remainder to now.
+    """
+    inv = float(on_hand or 0)
+    oo = float(on_ord or 0)
+    net = inv + oo
+    target = max(0.0, float(reorder or 0))
+    to_buy = max(0, int(math.ceil(target - net - 1e-9)))
+    available = max(0.0, inv) + max(0.0, oo)
+    raw_now, raw_later, _ = _allocate_stock_cover_near_first(available, sum_now, sum_future)
+    meta = {
+        "net": net,
+        "toBuy": to_buy,
+        "available": available,
+        "sumNow": float(sum_now or 0),
+        "sumFuture": float(sum_future or 0),
+        "rawNow": raw_now,
+        "rawLater": raw_later,
+    }
+    if to_buy <= 0:
+        return 0, 0, meta
+    if raw_now <= 0 and raw_later <= 0:
+        meta["shortNow"] = 0
+        meta["shortFuture"] = to_buy
+        return 0, to_buy, meta
+    need_later = min(to_buy, raw_later)
+    need_now = max(0, to_buy - need_later)
+    meta["shortNow"] = need_now
+    meta["shortFuture"] = need_later
+    return need_now, need_later, meta
 
 
 def _bucket_for_thread(
@@ -340,18 +461,20 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
 
     po_hdr = po[0] if po else []
     idx_po_order = _header_index(po_hdr, ["order #", "order number", "order"])
-    idx_po_due = _header_index(
-        po_hdr,
-        [
-            "due date",
-            "due",
-            "h/s due",
-            "h/s due date",
-            "hard/soft due",
-            "hard date/soft date",
-            "hard date / soft date",
-        ],
-    )
+    # Prefer exact Due Date (not a generic "due" / days-until column with a 0)
+    idx_po_due = _header_index(po_hdr, ["due date"])
+    if idx_po_due < 0:
+        idx_po_due = _header_index(
+            po_hdr,
+            [
+                "due",
+                "h/s due",
+                "h/s due date",
+                "hard/soft due",
+                "hard date/soft date",
+                "hard date / soft date",
+            ],
+        )
     if idx_po_due < 0:
         idx_po_due = _find_due_column(po_hdr)
     idx_po_ship = _header_index(po_hdr, ["ship date", "ship"])
@@ -383,7 +506,7 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
     hs_by_order: Optional[Dict[str, Any]] = {} if idx_po_hs >= 0 else None
 
     for row in po[1:]:
-        order_raw = _as_text(_cell(row, idx_po_order)).strip()
+        order_raw = _as_order_text(_cell(row, idx_po_order)).strip()
         if not order_raw:
             continue
         _put_order_map(stg_by_order, order_raw, _as_text(_cell(row, idx_po_stage)))
@@ -396,12 +519,29 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
     idx_ml_order = _header_index(ml_hdr, ["order #", "order number", "order"])
     idx_ml_mat = _header_index(ml_hdr, ["material", "materials"])
     idx_ml_inout = _header_index(ml_hdr, ["in/out", "in out"])
-    idx_ml_qty = _header_index(ml_hdr, ["qty", "quantity"])
+    # Prefer QTY (usage) over Quantity (piece count on some logs)
+    idx_ml_qty = _header_index(ml_hdr, ["qty"])
+    if idx_ml_qty < 0:
+        idx_ml_qty = _header_index(ml_hdr, ["quantity"])
+    idx_ml_panel = _header_index(ml_hdr, ["panel"])
     if idx_ml_qty < 0:
         idx_ml_qty = _find_qty_column(ml_hdr)
 
+    logger.info(
+        "Overview materials columns: PO due=%s (%s) ship=%s | ML order=%s mat=%s inout=%s qty=%s panel=%s",
+        idx_po_due,
+        _as_text(_cell(po_hdr, idx_po_due)) if idx_po_due >= 0 else "NONE",
+        idx_po_ship,
+        idx_ml_order,
+        idx_ml_mat,
+        idx_ml_inout,
+        idx_ml_qty,
+        idx_ml_panel,
+    )
+
     items_now: List[Dict[str, Any]] = []
     items_future: List[Dict[str, Any]] = []
+    dual_bucket_debug: List[Dict[str, Any]] = []
 
     for row in mi[1:]:
         name = _as_text(_cell(row, 0)).strip()
@@ -410,17 +550,11 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
         on_hand = _as_num(_cell(row, 1))
         on_ord = _as_num(_cell(row, 2))
         unit = _as_text(_cell(row, 3))
-        min_inv = _as_num(_cell(row, 4))
         reorder = _as_num(_cell(row, 5))
         vendor = _as_text(_cell(row, 8)).strip() or "Misc."
-        total = on_hand + on_ord
-        deficit = max(0, int(math.ceil(reorder - total)))
-        need = (min_inv == 0 and on_hand < 0) or (min_inv > 0 and total < min_inv and deficit > 0)
-        if not (need and deficit > 0):
-            continue
-        future_mat = _future_qty_material(
+
+        sum_now, sum_future = _collect_material_job_demand(
             name,
-            deficit,
             ml,
             idx_ml_order,
             idx_ml_mat,
@@ -430,8 +564,35 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
             due_by_order,
             ship_by_order,
             hs_by_order,
+            idx_ml_panel,
         )
-        now_mat = max(0, deficit - future_mat)
+        now_mat, future_mat, meta = _material_buy_later_first(
+            on_hand, on_ord, reorder, sum_now, sum_future
+        )
+
+        if now_mat <= 0 and future_mat <= 0:
+            continue
+
+        if future_mat > 0 and now_mat == 0:
+            logger.info(
+                "later-only %s: needLater=%s toBuy=%s avail=%.1f ML now=%.1f later=%.1f",
+                name,
+                future_mat,
+                meta.get("toBuy") or 0,
+                meta.get("available") or 0,
+                meta.get("sumNow") or 0,
+                meta.get("sumFuture") or 0,
+            )
+        if now_mat > 0 and future_mat > 0:
+            dual_bucket_debug.append(
+                {
+                    "name": name,
+                    "deficit": deficit,
+                    "now": now_mat,
+                    "future": future_mat,
+                    **meta,
+                }
+            )
         if now_mat > 0:
             items_now.append(
                 {"vendor": vendor, "name": name, "qty": now_mat, "unit": unit, "type": "Material"}
@@ -553,17 +714,26 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
         "idxMlMat": idx_ml_mat,
         "idxMlInOut": idx_ml_inout,
         "idxMlQty": idx_ml_qty,
+        "dualBucketSamples": dual_bucket_debug[:15],
     }
     logger.info(
-        "JRCO to-order (Sheets API): M rows=%s N rows=%s | PO due=%s ship=%s hs=%s | ML order=%s mat=%s in/out=%s qty=%s",
+        "JRCO to-order (job coverage, stock covers near first): "
+        "M rows=%s N rows=%s | dual-bucket materials=%s",
         stats["mRows"],
         stats["nRows"],
-        idx_po_due,
-        idx_po_ship,
-        idx_po_hs,
-        idx_ml_order,
-        idx_ml_mat,
-        idx_ml_inout,
-        idx_ml_qty,
+        len(dual_bucket_debug),
     )
+    for sample in dual_bucket_debug[:8]:
+        logger.info(
+            "  dual %s: deficit=%s now=%s later=%s | ML demand now=%.1f later=%.1f avail=%.1f shortNow=%s shortLater=%s",
+            sample.get("name"),
+            sample.get("deficit"),
+            sample.get("now"),
+            sample.get("future"),
+            sample.get("sumNow") or 0,
+            sample.get("sumFuture") or 0,
+            sample.get("available") or 0,
+            sample.get("shortNow"),
+            sample.get("shortFuture"),
+        )
     return stats
