@@ -17137,189 +17137,242 @@ def material_inventory_colors():
         return jsonify({})
 
 
-# 3) POST new material(s) into Material Inventory!A–H
+def _retarget_material_inv_row2_formula(tpl: str, target_row: int) -> str:
+    """
+    Copy Material Inventory row-2 formulas (Inventory / On Order / Value) to target_row.
+    Only rewrites A1-style refs that end in row 2 (A2, $B2, C$2, $D$2) — not every digit 2.
+    """
+    if not tpl or not str(tpl).strip().startswith("="):
+        return str(tpl or "")
+    return re.sub(
+        r"(\$?[A-Za-z]+)\$?2(?!\d)",
+        lambda m: f"{m.group(1)}{target_row}",
+        str(tpl),
+    )
+
+
+# 3) POST new material(s) into Material Inventory!A–J
 @app.route("/api/materials", methods=["POST"])
 @login_required_session
 def add_materials():
-    raw = request.get_json(silent=True) or []
-    items = raw if isinstance(raw, list) else [raw]
-    
-    sheets_vals = get_sheets_service().spreadsheets().values()
+    """
+    Order Submission / Inventory: add new material row(s) to Material Inventory.
+    Copies Inventory (B), On Order (C), and Value (H) formulas from row 2 onto the new row.
+    """
+    try:
+        raw = request.get_json(silent=True) or []
+        items = raw if isinstance(raw, list) else [raw]
 
-    # fetch the raw formulas from row 2
-    def get_formula(col):
-        resp = (
-            sheets_vals
-            .get(
+        sheets_svc = get_sheets_service()
+        sheets_vals = sheets_svc.spreadsheets().values()
+
+        # Template formulas from row 2 (same approach as /api/materialInventory)
+        mat_formula = (
+            sheets_vals.get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"Material Inventory!{col}2",
+                range="Material Inventory!A2:H2",
                 valueRenderOption="FORMULA",
             )
             .execute()
+            .get("values", [[]])
         )
-        return resp.get("values", [[""]])[0][0] or ""
+        mat_formula = mat_formula[0] if mat_formula else []
+        rawB = str(mat_formula[1]) if len(mat_formula) > 1 else ""
+        rawC = str(mat_formula[2]) if len(mat_formula) > 2 else ""
+        rawH = str(mat_formula[7]) if len(mat_formula) > 7 else ""
 
-    rawB = get_formula("B")
-    rawC = get_formula("C")
-    rawH = get_formula("H")
-
-    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
-    inv_rows = []
-
-    # find where row 2 starts, so we can compute new rows dynamically
-    existing = (
-        sheets.values()
-        .get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A2:A")
-        .execute()
-        .get("values", [])
-    )
-    next_row = len(existing) + 2  # because A2 is first data row
-
-    color_requests = []  # Store color formatting requests
-    
-    for it in items:
-        name = it.get("materialName", "").strip()
-        unit = it.get("unit", "").strip()
-        mininv = it.get("minInv", "").strip()
-        reorder = it.get("reorder", "").strip()
-        cost = it.get("cost", "").strip()
-        vendor = it.get("vendor", "").strip()
-        color = it.get("color", "#000000").strip()
-
-        if not name:
-            continue
-
-        # rewrite the row references in each formula
-        formulaB = rawB.replace("2", str(next_row))
-        formulaC = rawC.replace("2", str(next_row))
-        formulaH = rawH.replace("2", str(next_row))
-
-        inv_rows.append(
-            [
-                name,  # A
-                formulaB,  # B: uses rawB but with "2"→next_row
-                formulaC,  # C: same
-                unit,  # D: user entry
-                mininv,  # E
-                reorder,  # F
-                cost,  # G
-                formulaH,  # H: uses rawH but with "2"→next_row
-                vendor,  # I: Vendor
-                color,  # J: Color (hex value)
-            ]
+        existing = (
+            sheets_vals.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Material Inventory!A2:A",
+            )
+            .execute()
+            .get("values", [])
+            or []
         )
 
-        # Convert hex color to RGB for Google Sheets API
+        def first_blank_row(rows):
+            return next(
+                (
+                    i + 2
+                    for i, r in enumerate(rows)
+                    if not r or not str(r[0] if len(r) > 0 else "").strip()
+                ),
+                len(rows) + 2,
+            )
+
+        next_row = first_blank_row(existing)
+        existing_names = {
+            str(r[0]).strip().lower()
+            for r in existing
+            if r and str(r[0]).strip()
+        }
+
+        written = []
+        color_requests = []
+
         def hex_to_rgb(hex_color):
-            hex_color = hex_color.lstrip('#')
+            hex_color = str(hex_color or "").lstrip("#")
             if len(hex_color) == 6:
                 return {
-                    'red': int(hex_color[0:2], 16) / 255.0,
-                    'green': int(hex_color[2:4], 16) / 255.0,
-                    'blue': int(hex_color[4:6], 16) / 255.0
+                    "red": int(hex_color[0:2], 16) / 255.0,
+                    "green": int(hex_color[2:4], 16) / 255.0,
+                    "blue": int(hex_color[4:6], 16) / 255.0,
                 }
-            return {'red': 0.0, 'green': 0.0, 'blue': 0.0}
-        
-        rgb = hex_to_rgb(color)
-        
-        # Add color formatting request for column J
-        color_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": 0,  # Material Inventory sheet (adjust if needed)
-                    "startRowIndex": next_row - 1,  # 0-based
-                    "endRowIndex": next_row,
-                    "startColumnIndex": 9,  # Column J (0-based: A=0, B=1, ..., J=9)
-                    "endColumnIndex": 10,
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": rgb
+            return {"red": 0.0, "green": 0.0, "blue": 0.0}
+
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            name = str(it.get("materialName") or "").strip()
+            unit = str(it.get("unit") or "").strip()
+            mininv = str(it.get("minInv") or "").strip()
+            reorder = str(it.get("reorder") or "").strip()
+            cost = str(it.get("cost") or "").strip()
+            vendor = str(it.get("vendor") or "").strip()
+            color = str(it.get("color") or "#000000").strip() or "#000000"
+
+            if not name:
+                continue
+            if name.lower() in existing_names:
+                # Already on the sheet — treat as success so Order Submission can continue
+                written.append({"name": name, "row": None, "skipped": True})
+                continue
+
+            formulaB = _retarget_material_inv_row2_formula(rawB, next_row)
+            formulaC = _retarget_material_inv_row2_formula(rawC, next_row)
+            formulaH = _retarget_material_inv_row2_formula(rawH, next_row)
+
+            row_vals = [
+                [
+                    name,  # A Materials
+                    formulaB,  # B Inventory
+                    formulaC,  # C On Order
+                    unit,  # D Unit
+                    mininv,  # E Min. Inv.
+                    reorder,  # F Reorder
+                    cost,  # G Cost
+                    formulaH,  # H Value
+                    vendor,  # I Vendor
+                    color,  # J Color
+                ]
+            ]
+
+            sheets_vals.update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!A{next_row}:J{next_row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": row_vals},
+            ).execute()
+
+            color_requests.append(
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": 0,
+                            "startRowIndex": next_row - 1,
+                            "endRowIndex": next_row,
+                            "startColumnIndex": 9,
+                            "endColumnIndex": 10,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": hex_to_rgb(color)
+                            }
+                        },
+                        "fields": "userEnteredFormat.backgroundColor",
                     }
-                },
-                "fields": "userEnteredFormat.backgroundColor"
-            }
-        })
+                }
+            )
 
-        next_row += 1
-    # end for
+            written.append({"name": name, "row": next_row, "skipped": False})
+            existing_names.add(name.lower())
+            while len(existing) < next_row - 1:
+                existing.append([])
+            if len(existing) == next_row - 2:
+                existing.append([name])
+            else:
+                existing[next_row - 2] = [name]
+            next_row = first_blank_row(existing)
 
-    # append the rows you've built
-    if inv_rows:
-        sheets_vals.append(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Material Inventory!A2:J",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": inv_rows},
-        ).execute()
-        
-        # Apply color formatting if we have color requests
+        if not written:
+            return jsonify({"error": "No material name provided"}), 400
+
         if color_requests:
             try:
-                # Get the sheet ID for Material Inventory
-                sheets_service = get_sheets_service()
-                sheet_metadata = sheets_service.spreadsheets().get(
+                sheet_metadata = sheets_svc.spreadsheets().get(
                     spreadsheetId=SPREADSHEET_ID
                 ).execute()
                 sheet_id = None
-                for sheet in sheet_metadata.get('sheets', []):
-                    if sheet['properties']['title'] == 'Material Inventory':
-                        sheet_id = sheet['properties']['sheetId']
+                for sh_meta in sheet_metadata.get("sheets", []):
+                    if sh_meta["properties"]["title"] == "Material Inventory":
+                        sheet_id = sh_meta["properties"]["sheetId"]
                         break
-                
                 if sheet_id is not None:
-                    # Update color_requests with correct sheet_id
                     for req in color_requests:
-                        req['repeatCell']['range']['sheetId'] = sheet_id
-                    
-                    # Apply formatting
-                    sheets_service.spreadsheets().batchUpdate(
+                        req["repeatCell"]["range"]["sheetId"] = sheet_id
+                    sheets_svc.spreadsheets().batchUpdate(
                         spreadsheetId=SPREADSHEET_ID,
-                        body={'requests': color_requests}
+                        body={"requests": color_requests},
                     ).execute()
             except Exception as e:
-                logger.warning(f"Failed to apply color formatting: {e}")
+                logger.warning("Failed to apply color formatting: %s", e)
 
-        # ─── Mirror into Supabase Material Inventory ───────────────
+        # Mirror into Supabase (non-fatal — sheet write is source of truth)
         if supabase:
             try:
-                for r in inv_rows:
+                for w in written:
+                    if w.get("skipped"):
+                        continue
+                    name = w["name"]
+                    # Find matching payload fields from request items
+                    src = next(
+                        (
+                            it
+                            for it in items
+                            if (it.get("materialName") or "").strip().lower()
+                            == name.lower()
+                        ),
+                        {},
+                    )
                     supabase_payload = {
-                        "Materials": r[0],
-                        "Unit": r[3],
-                        "Min. Inv.": r[4],
-                        "Reorder": r[5],
-                        "Cost": r[6],
+                        "Materials": name,
+                        "Unit": (src.get("unit") or "").strip(),
+                        "Min. Inv.": (src.get("minInv") or "").strip(),
+                        "Reorder": (src.get("reorder") or "").strip(),
+                        "Cost": (src.get("cost") or "").strip(),
                     }
-
                     logger.info(
                         "[SUPABASE] Material Inventory payload:\n%s",
                         json.dumps(supabase_payload, indent=2),
                     )
-
                     resp = supabase.table("Material Inventory").insert(
                         supabase_payload
                     ).execute()
-
                     logger.info(
                         "[SUPABASE] Material Inventory insert response: %s", resp
                     )
-
             except Exception as e:
-                logger.error("[SUPABASE] Material Inventory insert failed: %s", e)
-                raise
+                logger.error(
+                    "[SUPABASE] Material Inventory insert failed (sheet OK): %s", e
+                )
 
         invalidate_upcoming_cache()
         invalidate_materials_needed_cache()
-        
-        # Emit socket event to notify clients that materials have been updated
-        try:
-            socketio.emit("materialsUpdated", {"status": "ok", "count": len(inv_rows)})
-        except Exception as e:
-            logger.warning(f"Failed to emit materialsUpdated event: {e}")
 
-        return jsonify({"status": "ok"}), 200
+        try:
+            socketio.emit(
+                "materialsUpdated",
+                {"status": "ok", "count": len([w for w in written if not w.get("skipped")])},
+            )
+        except Exception as e:
+            logger.warning("Failed to emit materialsUpdated event: %s", e)
+
+        return jsonify({"status": "ok", "written": written}), 200
+
+    except Exception as e:
+        logging.exception("❌ add_materials failed")
+        return jsonify({"error": str(e)}), 500
 
 
 # ─── THREAD INVENTORY STATUS (for scheduler color coding) ──────────────────
@@ -17545,8 +17598,9 @@ def submit_material_inventory():
         items = items if isinstance(items, list) else [items]
 
         sheet = get_sheets_service().spreadsheets().values()
+        # Portable timestamp — avoid %-m/%-d (crashes on some platforms)
         timestamp = datetime.now(ZoneInfo("America/New_York")).strftime(
-            "%-m/%-d/%Y %H:%M:%S"
+            "%m/%d/%Y %H:%M:%S"
         )
 
         material_log_rows = []
@@ -17589,22 +17643,34 @@ def submit_material_inventory():
         # ========= Thread Data header-based mapping =========
         # Fetch Thread Data headers so we can place values by name
         td_rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
-        td_headers = td_rows[0] if td_rows else []
-        td_idx = {h: i for i, h in enumerate(td_headers)}
+        td_headers = [str(h or "").strip() for h in (td_rows[0] if td_rows else [])]
+        td_idx = {h.lower(): i for i, h in enumerate(td_headers)}
+
+        def _td_col(*names):
+            for n in names:
+                i = td_idx.get(n.lower())
+                if i is not None:
+                    return i
+            return None
 
         def build_thread_log_row(dt, color, feet, action):
             """Map values into a row aligned to Thread Data headers."""
-            row = [""] * len(td_headers)
-            if "Date" in td_idx:
-                row[td_idx["Date"]] = dt
-            if "Color" in td_idx:
-                row[td_idx["Color"]] = color
-            if "Length (ft)" in td_idx:
-                row[td_idx["Length (ft)"]] = feet
-            if "IN/OUT" in td_idx:
-                row[td_idx["IN/OUT"]] = "IN"
-            if "O/R" in td_idx:
-                row[td_idx["O/R"]] = action  # Ordered/Received
+            row = [""] * max(len(td_headers), 8)
+            i_date = _td_col("Date")
+            i_color = _td_col("Color")
+            i_len = _td_col("Length (ft)")
+            i_inout = _td_col("IN/OUT")
+            i_or = _td_col("O/R")
+            if i_date is not None:
+                row[i_date] = dt
+            if i_color is not None:
+                row[i_color] = color
+            if i_len is not None:
+                row[i_len] = feet
+            if i_inout is not None:
+                row[i_inout] = "IN"
+            if i_or is not None:
+                row[i_or] = action  # Ordered/Received
             return row
 
         ordered_material_totals = {}
@@ -17631,16 +17697,10 @@ def submit_material_inventory():
                 if is_new:
                     target = first_blank_row(mat_rows)
 
-                    # build formulas for the new target row
-                    inv_f = re.sub(
-                        r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_inv_tpl
-                    )
-                    oo_f = re.sub(
-                        r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_oo_tpl
-                    )
-                    val_f = re.sub(
-                        r"([A-Za-z]+)2", lambda m: f"{m.group(1)}{target}", mat_val_tpl
-                    )
+                    # build formulas for the new target row (Inventory / On Order / Value)
+                    inv_f = _retarget_material_inv_row2_formula(mat_inv_tpl, target)
+                    oo_f = _retarget_material_inv_row2_formula(mat_oo_tpl, target)
+                    val_f = _retarget_material_inv_row2_formula(mat_val_tpl, target)
 
                     row_vals = [
                         [name, inv_f, oo_f, unit, min_inv, reorder, cost, val_f]
@@ -17696,14 +17756,18 @@ def submit_material_inventory():
 
             else:
                 # === THREAD: DO NOT write to "Thread Inventory"; ONLY log to "Thread Data" ===
+                # Prefer 4-digit Madeira code when present (same as /threadInventory)
+                m = re.search(r"\b(\d{4})\b", name)
+                color = m.group(1) if m else name
+                action_t = (action or "Ordered").strip() or "Ordered"
                 try:
-                    cones = int(str(qty_raw).strip())
+                    cones = int(float(str(qty_raw).strip().replace(",", "")))
                     feet = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
                 except Exception:
                     feet = ""
 
                 thread_log_rows.append(
-                    build_thread_log_row(timestamp, name, feet, action)
+                    build_thread_log_row(timestamp, color, feet, action_t)
                 )
 
         # 6) Append to logs
@@ -17825,62 +17889,104 @@ def get_inventory():
 @app.route("/api/threadInventory", methods=["POST"])
 @login_required_session
 def submit_thread_inventory():
-    entries = request.get_json(silent=True) or []
-    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-m/%-d/%Y %H:%M:%S")
+    """
+    Log Ordered/Received thread cones to the Thread Data tab.
+    Writes by header name (Date, Color, Length (ft), IN/OUT, O/R).
+    Does NOT write to Thread Inventory (stock there is formula-driven from Thread Data).
+    """
+    try:
+        entries = request.get_json(silent=True) or []
+        # Portable timestamp — avoid %-m/%-d (crashes on some platforms)
+        now = datetime.now(ZoneInfo("America/New_York")).strftime("%m/%d/%Y %H:%M:%S")
 
-    # Fetch Thread Data headers so we can place values by name
-    td_rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
-    headers = td_rows[0] if td_rows else []
-    h_idx = {h: i for i, h in enumerate(headers)}
+        # Fetch Thread Data headers so we can place values by name
+        td_rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
+        headers = [str(h or "").strip() for h in (td_rows[0] if td_rows else [])]
+        # Case-insensitive header lookup (matches thread_relog robustness)
+        h_idx = {h.lower(): i for i, h in enumerate(headers)}
 
-    def build_row(color, feet, action):
-        row = [""] * len(headers)
-        if "Date" in h_idx:
-            row[h_idx["Date"]] = now
-        if "Color" in h_idx:
-            row[h_idx["Color"]] = color
-        if "Length (ft)" in h_idx:
-            row[h_idx["Length (ft)"]] = feet
-        if "IN/OUT" in h_idx:
-            row[h_idx["IN/OUT"]] = "IN"
-        if "O/R" in h_idx:
-            row[h_idx["O/R"]] = action  # Ordered / Received
-        return row
+        def col(*names):
+            for n in names:
+                i = h_idx.get(n.lower())
+                if i is not None:
+                    return i
+            return None
 
-    to_log = []
-    for e in (entries if isinstance(entries, list) else [entries]):
-        raw_value = (e.get("value") or "").strip()
+        i_date = col("Date")
+        i_color = col("Color")
+        i_len = col("Length (ft)")
+        i_inout = col("IN/OUT")
+        i_or = col("O/R")
 
-        # Extract ONLY the 4-digit Madeira code (e.g., "1800")
-        m = re.search(r"\b(\d{4})\b", raw_value)
-        color = m.group(1) if m else raw_value  # fallback to raw if no match
+        if i_color is None or i_len is None:
+            return (
+                jsonify(
+                    {
+                        "error": "Thread Data headers missing 'Color' or 'Length (ft)'. Check tab.",
+                        "headers": headers,
+                    }
+                ),
+                500,
+            )
 
-        action = (e.get("action") or "").strip()
-        qty_cones = (e.get("quantity") or "").strip()
-        if not (color and action and qty_cones):
-            continue
+        def build_row(color, feet, action):
+            row = [""] * max(len(headers), 8)
+            if i_date is not None:
+                row[i_date] = now
+            if i_color is not None:
+                row[i_color] = color
+            if i_len is not None:
+                row[i_len] = feet
+            if i_inout is not None:
+                row[i_inout] = "IN"
+            if i_or is not None:
+                row[i_or] = action  # Ordered / Received
+            return row
 
+        to_log = []
+        for e in entries if isinstance(entries, list) else [entries]:
+            raw_value = str(
+                e.get("value") or e.get("materialName") or e.get("threadColor") or ""
+            ).strip()
+
+            # Extract ONLY the 4-digit Madeira code (e.g., "1800")
+            m = re.search(r"\b(\d{4})\b", raw_value)
+            color = m.group(1) if m else raw_value  # fallback to raw if no match
+
+            action = str(e.get("action") or "Ordered").strip() or "Ordered"
+            qty_cones = str(e.get("quantity") or "").strip()
+            if not (color and qty_cones):
+                continue
+
+            try:
+                cones = int(float(qty_cones.replace(",", "")))
+                feet = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
+            except Exception:
+                feet = ""
+
+            to_log.append(build_row(color, feet, action))
+
+        if to_log:
+            # Use refreshed credentials (same as materialInventory), not startup-global sheets
+            get_sheets_service().spreadsheets().values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range="Thread Data!A2:Z",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": to_log},
+            ).execute()
+
+        invalidate_materials_needed_cache()
         try:
-            cones = int(qty_cones)
-            feet = cones * 5500 * 3  # Quantity × 5500 yards × 3 ft/yd
+            invalidate_overview_combined_cache()
         except Exception:
-            feet = ""
+            pass
 
-        to_log.append(build_row(color, feet, action))
+        return jsonify({"added": len(to_log)}), 200
 
-    if to_log:
-        sheets.values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range="Thread Data!A2:Z",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": to_log},
-        ).execute()
-
-    # ✅ invalidate materials-needed cache
-    invalidate_materials_needed_cache()
-
-    return jsonify({"added": len(to_log)}), 200
+    except Exception as e:
+        logging.exception("❌ submit_thread_inventory failed")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/inventoryOrdered", methods=["GET"])
