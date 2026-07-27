@@ -1513,7 +1513,7 @@ def _kanban_upsert_item(item_obj):
 
 
 def _drive_upload_image_jpeg(file_stream, filename, folder_id=None):
-    """Upload image/jpeg to Drive; returns (fileId, publicish URL via your thumbnail proxy)."""
+    """Upload image/jpeg to Drive; returns (fileId, absolute thumbnail URL)."""
     folder_id = folder_id or KANBAN_PHOTOS_FOLDER_ID
     if not folder_id:
         raise RuntimeError("KANBAN_PHOTOS_FOLDER_ID is not configured")
@@ -1524,9 +1524,40 @@ def _drive_upload_image_jpeg(file_stream, filename, folder_id=None):
         svc.files().create(body=file_metadata, media_body=media, fields="id").execute()
     )
     fid = created.get("id")
-    # Use your fast thumbnail proxy (already in server): /api/drive/thumbnail
-    photo_url = f"/api/drive/thumbnail?fileId={fid}&sz=w640"
+    # Absolute URL so Sheets / Netlify img tags can load it
+    public_base = (
+        os.environ.get("BACKEND_PUBLIC_URL")
+        or "https://machine-scheduler-backend.onrender.com"
+    ).rstrip("/")
+    photo_url = f"{public_base}/api/drive/thumbnail?fileId={fid}&sz=w640"
     return fid, photo_url
+
+
+def _kanban_photo_url_from_maybe_data(photo, kid):
+    """
+    If photo is a data:image URL, upload to Drive and return a short absolute URL.
+    Google Sheets cells max out at 50k chars, so base64 photos cannot be stored.
+    """
+    photo = (photo or "").strip()
+    if not photo:
+        return photo
+    if not photo.startswith("data:image"):
+        # Guard against accidentally storing huge strings
+        if len(photo) > 45000:
+            raise ValueError(
+                "Photo URL is too long for Google Sheets. Upload the image instead of pasting base64."
+            )
+        return photo
+    if "," not in photo:
+        raise ValueError("Invalid data URL for photo")
+    b64 = photo.split(",", 1)[1]
+    raw = base64.b64decode(b64)
+    stream = io.BytesIO(raw)
+    stream.seek(0)
+    _fid, photo_url = _drive_upload_image_jpeg(
+        stream, f"{(kid or 'KANBAN').strip() or 'KANBAN'}.jpg", KANBAN_PHOTOS_FOLDER_ID
+    )
+    return photo_url
 
 
 def _now_iso_utc():
@@ -3859,6 +3890,10 @@ def kanban_upsert_item():
             return jsonify({"ok": False, "error": "Cost (per pkg) required"}), 400
         if not photo:
             return jsonify({"ok": False, "error": "Photo URL required"}), 400
+        try:
+            photo = _kanban_photo_url_from_maybe_data(photo, kid)
+        except Exception as pe:
+            return jsonify({"ok": False, "error": f"Photo upload failed: {pe}"}), 400
         if om not in ("Online", "Email"):
             return (
                 jsonify({"ok": False, "error": "Order Method must be Online or Email"}),
