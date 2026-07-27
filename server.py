@@ -3853,7 +3853,7 @@ def kanban_upsert_item():
         if not name:
             return jsonify({"ok": False, "error": "Item Name required"}), 400
         if not pkg:
-            return jsonify({"ok": False, "error": "Package Size required"}), 400
+            pkg = "—"
         if not cost:
             return jsonify({"ok": False, "error": "Cost (per pkg) required"}), 400
         if not photo:
