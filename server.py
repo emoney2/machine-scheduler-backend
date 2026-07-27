@@ -3830,7 +3830,8 @@ def kanban_upsert_item():
     - Else append a new ITEM row at the bottom.
     Required JSON (frontend names):
       kanbanId, itemName, orderMethod, (orderUrl | orderEmail),
-      packageSize, costPerPkg, photoUrl
+      costPerPkg, photoUrl
+    Optional: packageSize (defaults to —)
     """
     data = request.get_json(silent=True) or {}
     try:
