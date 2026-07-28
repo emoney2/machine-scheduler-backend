@@ -7065,7 +7065,11 @@ def _qbo_ensure_invoice_shipping_complete(
 ):
     """
     Final pass after create + sparse patches: ensure native ShipAmt and Ship Via match the
-    shipment (like a manually completed invoice). Falls back to a Shipping sales line if needed.
+    shipment (like a manually completed invoice).
+
+    Always fill header ShipAmt when it is empty, even if a Shipping sales line already exists
+    (temporary: both places until freight is cleaned up to one field). Only append a Shipping
+    sales line when ShipAmt still cannot be set and no shipping line is present.
     """
     try:
         want_amt = round(float(ship_amt_r or 0), 2)
@@ -7098,8 +7102,16 @@ def _qbo_ensure_invoice_shipping_complete(
         else ""
     )
 
-    need_amt = want_amt > 0.001 and cur_amt <= 0.001 and not has_line
+    # Prefer native ShipAmt even when a Shipping sales line already exists (both for now).
+    need_amt = want_amt > 0.001 and cur_amt <= 0.001
     need_sm = bool(want_sm_val) and not has_sm
+    if need_amt and has_line:
+        logging.info(
+            "QBO ensure shipping: invoice %s has Shipping sales line but empty ShipAmt — "
+            "filling header Shipping field $%s as well (duplicate until cleaned up)",
+            invoice_id,
+            want_amt,
+        )
 
     if need_amt or need_sm:
         overlays = {}
@@ -7159,6 +7171,12 @@ def _qbo_ensure_invoice_shipping_complete(
                 want_amt,
                 ship_via_label,
                 env_override,
+            )
+        elif want_amt > 0.001 and cur_amt2 <= 0.001 and has_line2:
+            logging.warning(
+                "QBO ensure shipping: invoice %s still has empty ShipAmt after patch "
+                "(Shipping sales line present). Header Shipping field may be blocked by QBO API.",
+                invoice_id,
             )
         if want_sm_val and not has_sm2:
             _ensure_qbo_invoice_ship_via(
@@ -8591,8 +8609,8 @@ def create_consolidated_invoice_in_quickbooks(
     if qbo_native_ship_off and (ship_amt_r > 0 or track_parts):
         logging.warning(
             "QBO ShipMethod API unavailable for this company (native ShipAmt/Ship Via may fail). "
-            "Freight will post on a Sales line without header ShipAmt first; auto shipping-line retry "
-            "before minimal create is enabled. In QBO: Account and settings → Sales — Intuit may still "
+            "Freight will post as a Sales line plus header ShipAmt when QBO allows; otherwise "
+            "line-only then patch ShipAmt. In QBO: Account and settings → Sales — Intuit may still "
             "hide ShipMethod from the API (code 4001) even when Shipping is on."
         )
     # Line-item freight on first POST only when opted in. Keep native ShipAmt first;
@@ -8654,15 +8672,14 @@ def create_consolidated_invoice_in_quickbooks(
         if res.status_code in (200, 201):
             used_force_line = True
 
-    # ShipMethod metadata missing ⇒ ShipAmt / Ship Via sparse patches get 2010; prefer freight on a Sales line
-    # up front instead of minimal invoice + CustomerMemo fallback.
+    # ShipMethod metadata missing ⇒ Ship Via sparse patches often 2010. Prefer BOTH a Shipping
+    # sales line and header ShipAmt for now; fall back to line-only if the combo 2010s.
     if not used_force_line and qbo_native_ship_off and ship_amt_r > 0:
         freight_line_only_for_native_off = True
-        # Omit header ShipAmt: duplicate line + ShipAmt commonly 2010 when ShipMethod metadata is missing.
-        invoice_payload = _fallback_invoice_payload(include_header_ship_amt=False)
+        invoice_payload = _fallback_invoice_payload(include_header_ship_amt=True)
         logging.info(
-            "📦 Invoice payload (freight Sales line — ShipMethod entity unavailable; "
-            "header ShipAmt omitted to avoid 2010):\n%s",
+            "📦 Invoice payload (freight Sales line + header ShipAmt — ShipMethod entity "
+            "unavailable; both for now):\n%s",
             json.dumps(invoice_payload, indent=2),
         )
         res = _post_inv(invoice_payload)
@@ -8676,7 +8693,7 @@ def create_consolidated_invoice_in_quickbooks(
                 k: v for k, v in invoice_payload.items() if k != "CustomerMemo"
             }
             logging.warning(
-                "QBO invoice 2010 (freight line ShipMethod-off): retrying without CustomerMemo"
+                "QBO invoice 2010 (freight line + header ShipAmt): retrying without CustomerMemo"
             )
             res = _post_inv(invoice_payload)
             le = (res.text or "") if _line_native_off_bad() else ""
@@ -8685,7 +8702,7 @@ def create_consolidated_invoice_in_quickbooks(
                 k: v for k, v in invoice_payload.items() if k != "SalesTermRef"
             }
             logging.warning(
-                "QBO invoice 2010 (freight line ShipMethod-off): retrying without SalesTermRef"
+                "QBO invoice 2010 (freight line + header ShipAmt): retrying without SalesTermRef"
             )
             res = _post_inv(invoice_payload)
             le = (res.text or "") if _line_native_off_bad() else ""
@@ -8694,16 +8711,17 @@ def create_consolidated_invoice_in_quickbooks(
                 k: v for k, v in invoice_payload.items() if k != "BillEmail"
             }
             logging.warning(
-                "QBO invoice 2010 (freight line ShipMethod-off): retrying without BillEmail"
+                "QBO invoice 2010 (freight line + header ShipAmt): retrying without BillEmail"
             )
             res = _post_inv(invoice_payload)
         if res.status_code in (200, 201):
             used_force_line = True
         elif "2010" in (res.text or ""):
-            # Second attempt: some orgs accept duplicate header+line; try if line-only failed.
-            invoice_payload = _fallback_invoice_payload(include_header_ship_amt=True)
+            # Combo rejected: keep the sales line so freight is not lost; patch ShipAmt after create.
+            invoice_payload = _fallback_invoice_payload(include_header_ship_amt=False)
             logging.warning(
-                "QBO freight line (no header ShipAmt) still 2010; retrying with header ShipAmt + line"
+                "QBO freight line + header ShipAmt still 2010; retrying with Shipping sales "
+                "line only (will sparse-patch ShipAmt after create)"
             )
             res = _post_inv(invoice_payload)
             le = (res.text or "") if res.status_code not in (200, 201) else ""
@@ -8712,7 +8730,7 @@ def create_consolidated_invoice_in_quickbooks(
                     k: v for k, v in invoice_payload.items() if k != "CustomerMemo"
                 }
                 logging.warning(
-                    "QBO invoice 2010 (freight line + header ShipAmt): retrying without CustomerMemo"
+                    "QBO invoice 2010 (freight line ShipMethod-off): retrying without CustomerMemo"
                 )
                 res = _post_inv(invoice_payload)
                 le = (res.text or "") if res.status_code not in (200, 201) else ""
@@ -8721,7 +8739,7 @@ def create_consolidated_invoice_in_quickbooks(
                     k: v for k, v in invoice_payload.items() if k != "SalesTermRef"
                 }
                 logging.warning(
-                    "QBO invoice 2010 (freight line + header ShipAmt): retrying without SalesTermRef"
+                    "QBO invoice 2010 (freight line ShipMethod-off): retrying without SalesTermRef"
                 )
                 res = _post_inv(invoice_payload)
                 le = (res.text or "") if res.status_code not in (200, 201) else ""
@@ -8730,7 +8748,7 @@ def create_consolidated_invoice_in_quickbooks(
                     k: v for k, v in invoice_payload.items() if k != "BillEmail"
                 }
                 logging.warning(
-                    "QBO invoice 2010 (freight line + header ShipAmt): retrying without BillEmail"
+                    "QBO invoice 2010 (freight line ShipMethod-off): retrying without BillEmail"
                 )
                 res = _post_inv(invoice_payload)
             if res.status_code in (200, 201):
@@ -8794,14 +8812,12 @@ def create_consolidated_invoice_in_quickbooks(
         and not (freight_line_only_for_native_off and qbo_native_ship_off)
     ):
         logging.warning(
-            "QBO invoice 2010: shipping as Sales line before minimal create "
-            "(avoids empty ShipAmt when delivery sparse-update does not stick)"
+            "QBO invoice 2010: shipping as Sales line + header ShipAmt before minimal create "
+            "(both for now; avoids empty ShipAmt when delivery sparse-update does not stick)"
         )
-        invoice_payload = _fallback_invoice_payload(
-            include_header_ship_amt=not qbo_native_ship_off
-        )
+        invoice_payload = _fallback_invoice_payload(include_header_ship_amt=True)
         logging.info(
-            "📦 Invoice payload (auto shipping line before minimal create):\n%s",
+            "📦 Invoice payload (auto shipping line + ShipAmt before minimal create):\n%s",
             json.dumps(invoice_payload, indent=2),
         )
         res = _post_inv(invoice_payload)
@@ -8825,6 +8841,39 @@ def create_consolidated_invoice_in_quickbooks(
             logging.warning("QBO invoice 2010 (auto shipping line): retrying without BillEmail")
             res = _post_inv(invoice_payload)
             err_txt = (res.text or "") if _qbo_still_bad() else ""
+        if (
+            _qbo_still_bad()
+            and _qbo_is_2010()
+            and "ShipAmt" in (invoice_payload or {})
+        ):
+            logging.warning(
+                "QBO invoice 2010 (auto shipping line + ShipAmt): retrying with sales line only"
+            )
+            invoice_payload = _fallback_invoice_payload(include_header_ship_amt=False)
+            if "CustomerMemo" in invoice_payload and err_txt and "CustomerMemo" in err_txt:
+                invoice_payload = {
+                    k: v for k, v in invoice_payload.items() if k != "CustomerMemo"
+                }
+            res = _post_inv(invoice_payload)
+            err_txt = (res.text or "") if _qbo_still_bad() else ""
+            if err_txt and "2010" in err_txt and "CustomerMemo" in (invoice_payload or {}):
+                invoice_payload = {
+                    k: v for k, v in invoice_payload.items() if k != "CustomerMemo"
+                }
+                res = _post_inv(invoice_payload)
+                err_txt = (res.text or "") if _qbo_still_bad() else ""
+            if err_txt and "2010" in err_txt and "SalesTermRef" in (invoice_payload or {}):
+                invoice_payload = {
+                    k: v for k, v in invoice_payload.items() if k != "SalesTermRef"
+                }
+                res = _post_inv(invoice_payload)
+                err_txt = (res.text or "") if _qbo_still_bad() else ""
+            if err_txt and "2010" in err_txt and "BillEmail" in (invoice_payload or {}):
+                invoice_payload = {
+                    k: v for k, v in invoice_payload.items() if k != "BillEmail"
+                }
+                res = _post_inv(invoice_payload)
+                err_txt = (res.text or "") if _qbo_still_bad() else ""
         if res.status_code in (200, 201):
             used_force_line = True
     elif _qbo_still_bad() and _qbo_is_2010() and not used_force_line and (ship_amt_r > 0 or track_parts):
