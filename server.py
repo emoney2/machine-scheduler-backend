@@ -13322,9 +13322,8 @@ def _ship_queue_order_sort_tuple(order_num_raw):
 @login_required_session
 def ship_production_queue():
     """
-    All open jobs (any product/stage) that are not complete or fully shipped,
-    for Ship tab quick picks — includes belts, towels, etc. that never enter
-    Embroidery/Sewing. Sorted by Due Date ascending, then Order #.
+    Open Embroidery / Sewing jobs that are not complete or fully shipped,
+    for Ship tab quick-pick cards. Sorted by Due Date ascending, then Order #.
     Same image preview rules as jobs-for-company.
     """
     try:
@@ -13337,6 +13336,10 @@ def ship_production_queue():
         for r in prod_data[1:]:
             row = dict(zip(headers, r))
             if _overview_exclude_completed_or_shipped(row):
+                continue
+            stage = str(row.get("Stage") or "").strip().upper()
+            # Ship tab cards: embroidery / sewing only (not cut/print/fur/etc.)
+            if stage not in ("EMBROIDERY", "SEWING", "SEW"):
                 continue
             qty_num = _parse_qty_number(row.get("Quantity"), 0.0)
             shipped_num = _parse_qty_number(row.get("Shipped"), 0.0)
