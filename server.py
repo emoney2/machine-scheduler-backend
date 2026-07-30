@@ -9791,23 +9791,84 @@ def _overview_sql_coalesce_total_qty(rows):
         return None
 
 
-def compute_products_sold_per_day_ytd(
-    sales_year=None,
-    log=None,
-):
+def compute_products_sold_ytd_qty_from_sheets(sales_year=None, log=None):
     """
-    Units per USPS business day YTD: sum(Quantity) for orders dated in sales_year in
-    SUPABASE_PB_ORDERS_TABLE, excluding rows whose Product contains 'back'
-    (case-insensitive), divided by Mon–Fri days elapsed YTD excluding USPS
-    federal holiday closures (about.usps.com schedule).
-    Dates stored as M/D/YYYY ... strings are matched safely.
-    If sales_year is omitted, uses the current calendar year in UTC.
-    Returns None if Supabase or RPC fails.
+    Sum Quantity on Production Orders (Google Sheet) for rows dated in sales_year.
+    Excludes Product names containing 'back'. Returns None on read/parse failure.
     """
+    logger = log or app.logger
+    if sales_year is None:
+        sales_year = datetime.now(ZoneInfo("America/New_York")).year
+    try:
+        with acquire_sheet_lock():
+            svc = get_sheets_service().spreadsheets().values()
+            resp = svc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=OVERVIEW_PRODUCTION_ORDERS_RANGE,
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        values = resp.get("values") or []
+        if len(values) < 2:
+            return 0.0
+
+        headers = [str(h).strip() for h in values[0]]
+        lower_h = {h.lower(): h for h in headers}
+
+        def _col(*names):
+            for n in names:
+                if n in headers:
+                    return n
+                ln = n.lower()
+                if ln in lower_h:
+                    return lower_h[ln]
+            return None
+
+        date_col = _col("Date", "Order Date")
+        prod_col = _col("Product")
+        qty_col = _col("Quantity", "Qty")
+        order_col = _col("Order #", "Order#")
+        if not date_col or not prod_col or not qty_col:
+            logger.warning(
+                "products_sold_ytd sheets: missing column (Date=%s Product=%s Quantity=%s)",
+                date_col,
+                prod_col,
+                qty_col,
+            )
+            return None
+
+        total = 0.0
+        for raw in values[1:]:
+            row = raw or []
+            if len(row) < len(headers):
+                row = row + [""] * (len(headers) - len(row))
+            rec = dict(zip(headers, row))
+            if order_col and not str(rec.get(order_col) or "").strip():
+                continue
+            d = _ship_queue_parse_due(rec.get(date_col))
+            if d is None or d.year != sales_year:
+                continue
+            prod = rec.get(prod_col)
+            if prod is not None and "back" in str(prod).lower():
+                continue
+            qraw = rec.get(qty_col)
+            try:
+                q = float(qraw) if qraw not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                q = 0.0
+            if q == q:
+                total += q
+        return total
+    except Exception as e:
+        logger.warning("products_sold_ytd sheets: %s", e)
+        return None
+
+
+def compute_products_sold_ytd_qty_from_supabase(sales_year=None, log=None):
+    """Sum Quantity via Supabase RPC for sales_year; excludes Product containing 'back'."""
     if supabase is None:
         return None
     if sales_year is None:
-        sales_year = datetime.now(ZoneInfo("UTC")).year
+        sales_year = datetime.now(ZoneInfo("America/New_York")).year
     logger = log or app.logger
     try:
         tbl = _safe_pb_orders_table_sql_ident(SUPABASE_PB_ORDERS_TABLE)
@@ -9827,21 +9888,56 @@ def compute_products_sold_per_day_ytd(
       or lower(trim(cast("Product" as text))) not like '%back%'
     )
     """
-
     try:
         rows = _overview_rpc_sql_rows(query, log=logger)
     except Exception as e:
-        logger.warning("products_sold_per_day: RPC failed: %s", e)
+        logger.warning("products_sold_ytd supabase: RPC failed: %s", e)
         return None
+    return _overview_sql_coalesce_total_qty(rows)
 
-    total_qty = _overview_sql_coalesce_total_qty(rows)
+
+def compute_products_sold_per_day_ytd(
+    sales_year=None,
+    log=None,
+):
+    """
+    Units per USPS business day YTD: sum(Quantity) for orders dated in sales_year,
+    excluding rows whose Product contains 'back' (case-insensitive), divided by
+    Mon–Fri days elapsed YTD excluding USPS federal holiday closures.
+
+    Prefers Google Sheets (same source as Sold This Week), then Supabase RPC.
+    Returns (rate, meta) where meta has source/qty/days, or (None, meta) on failure.
+    """
+    logger = log or app.logger
+    if sales_year is None:
+        sales_year = datetime.now(ZoneInfo("America/New_York")).year
+
+    meta = {
+        "sales_year": sales_year,
+        "source": None,
+        "total_qty": None,
+        "business_days": None,
+    }
+
+    total_qty = compute_products_sold_ytd_qty_from_sheets(sales_year, log=logger)
+    if total_qty is not None:
+        meta["source"] = "sheets"
+    else:
+        total_qty = compute_products_sold_ytd_qty_from_supabase(sales_year, log=logger)
+        if total_qty is not None:
+            meta["source"] = "supabase"
+
     if total_qty is None:
-        return None
+        return None, meta
 
-    days = _business_days_elapsed_in_year(sales_year)
+    days = _business_days_elapsed_in_year(
+        sales_year, today=datetime.now(ZoneInfo("America/New_York")).date()
+    )
     if days < 1:
         days = 1
-    return total_qty / float(days)
+    meta["total_qty"] = float(total_qty)
+    meta["business_days"] = int(days)
+    return float(total_qty) / float(days), meta
 
 
 def _sql_pb_order_like_calendar_days(start: date, end: date) -> str:
@@ -11604,12 +11700,21 @@ def overview_metrics():
             emb_weeks = round(float(turnaround.get("weeks") or 0), 2)
 
         # ─── 3️⃣ MERGED METRICS (KEEP EXISTING KEYS) ───────
-        sold_per_day_live = compute_products_sold_per_day_ytd(log=app.logger)
+        sold_per_day_live, sold_per_day_meta = compute_products_sold_per_day_ytd(
+            log=app.logger
+        )
         if sold_per_day_live is not None:
             headcovers_sold = round(float(sold_per_day_live), 2)
         else:
+            # Last resort: stale Supabase metrics row (may still be calendar-day based)
             headcovers_sold = round(
                 float(metrics_row.get("headcovers_sold_per_day") or 0), 2
+            )
+            sold_per_day_meta = dict(sold_per_day_meta or {})
+            sold_per_day_meta["source"] = "metrics_table_fallback"
+            app.logger.warning(
+                "products_sold_per_day: using metrics table fallback %.2f (sheets/supabase qty unavailable)",
+                headcovers_sold,
             )
 
         sold_this_week = compute_headcovers_sold_this_week_from_sheets(log=app.logger)
@@ -11629,6 +11734,11 @@ def overview_metrics():
 
             # Calendar week Mon–Sun (ET), summed through today; excludes Product containing "back"
             "headcovers_sold_this_week": headcovers_sold_this_week,
+
+            # Debug / verify USPS business-day rate
+            "sold_per_day_source": (sold_per_day_meta or {}).get("source"),
+            "sold_per_day_total_qty": (sold_per_day_meta or {}).get("total_qty"),
+            "sold_per_day_business_days": (sold_per_day_meta or {}).get("business_days"),
 
             # 🧵 Embroidery backlog: from Overview sheet cells (open jobs) or Supabase fallback
             "embroidery_backlog_hours": emb_hours,
