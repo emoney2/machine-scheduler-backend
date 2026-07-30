@@ -5240,7 +5240,8 @@ def _normalize_ups_ship_to_from_directory_row(row: dict) -> dict:
     if not phone:
         phone = "0000000000"
     a2 = str(row.get("Street Address 2", "") or "").strip()
-    return {
+    email = str(row.get("Contact Email Address", "") or "").strip()
+    out = {
         "name": name,
         "attention_name": attention_name,
         "phone": phone,
@@ -5251,6 +5252,9 @@ def _normalize_ups_ship_to_from_directory_row(row: dict) -> dict:
         "zip": _zip5_ups(row.get("Zip Code", "")),
         "country": "US",
     }
+    if email:
+        out["email"] = email
+    return out
 
 
 def _print_packing_slip_pdf(pdf_path: str) -> None:
@@ -9726,6 +9730,38 @@ def _business_days_elapsed_in_year(year: int, today=None) -> int:
     return max(days, 1)
 
 
+def _business_days_in_range(start: date, end: date) -> int:
+    """Inclusive USPS business days (Mon–Fri minus USPS holidays) from start through end."""
+    if end < start:
+        return 1
+    years = set()
+    d = start
+    while d <= end:
+        years.add(d.year)
+        d += timedelta(days=1)
+    holidays = set()
+    for y in years:
+        holidays |= _usps_delivery_closure_dates(y)
+    days = 0
+    d = start
+    while d <= end:
+        if d.weekday() < 5 and d not in holidays:
+            days += 1
+        d += timedelta(days=1)
+    return max(days, 1)
+
+
+# Word-boundary exclude for sold averages (matches Sewing Priority catch-up filter).
+_SOLD_AVG_EXCLUDE_PRODUCT_RE = re.compile(r"\b(back|towels?|belts?)\b", re.IGNORECASE)
+
+
+def _exclude_from_sold_avg_product(prod) -> bool:
+    """True if Product should be excluded from sold averages (back / towel / belt)."""
+    if prod is None:
+        return False
+    return bool(_SOLD_AVG_EXCLUDE_PRODUCT_RE.search(str(prod)))
+
+
 def _overview_rpc_sql_rows(query: str, log=None):
     """Run read-only SQL via Supabase RPC; supports execute_sql or exec_sql responses."""
     logger = log or app.logger
@@ -10105,6 +10141,181 @@ def compute_headcovers_sold_this_week_from_sheets(log=None):
     except Exception as e:
         logger.warning("headcovers_sold_this_week sheets: %s", e)
         return None
+
+
+def compute_products_sold_qty_last_n_weeks_from_sheets(weeks=6, log=None):
+    """
+    Sum Quantity on Production Orders for the last `weeks` calendar weeks ending today
+    (America/New_York): inclusive window of weeks*7 days through today.
+
+    Excludes Product names containing the words back, towel(s), or belt(s)
+    (word-boundary match, same idea as Sewing Priority catch-up).
+    Returns 0.0 when readable but empty; None on read/parse failure.
+    """
+    logger = log or app.logger
+    weeks = max(int(weeks or 6), 1)
+    try:
+        tz = ZoneInfo("America/New_York")
+        today = datetime.now(tz).date()
+        range_start = today - timedelta(days=weeks * 7 - 1)
+
+        with acquire_sheet_lock():
+            svc = get_sheets_service().spreadsheets().values()
+            resp = svc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=OVERVIEW_PRODUCTION_ORDERS_RANGE,
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+        values = resp.get("values") or []
+        if len(values) < 2:
+            return 0.0
+
+        headers = [str(h).strip() for h in values[0]]
+        lower_h = {h.lower(): h for h in headers}
+
+        def _col(*names):
+            for n in names:
+                if n in headers:
+                    return n
+                ln = n.lower()
+                if ln in lower_h:
+                    return lower_h[ln]
+            return None
+
+        date_col = _col("Date", "Order Date")
+        prod_col = _col("Product")
+        qty_col = _col("Quantity", "Qty")
+        order_col = _col("Order #", "Order#")
+        if not date_col or not prod_col or not qty_col:
+            logger.warning(
+                "products_sold_last_%sw sheets: missing column (Date=%s Product=%s Quantity=%s)",
+                weeks,
+                date_col,
+                prod_col,
+                qty_col,
+            )
+            return None
+
+        total = 0.0
+        for raw in values[1:]:
+            row = raw or []
+            if len(row) < len(headers):
+                row = row + [""] * (len(headers) - len(row))
+            rec = dict(zip(headers, row))
+            if order_col and not str(rec.get(order_col) or "").strip():
+                continue
+            d = _ship_queue_parse_due(rec.get(date_col))
+            if d is None or d < range_start or d > today:
+                continue
+            if _exclude_from_sold_avg_product(rec.get(prod_col)):
+                continue
+            qraw = rec.get(qty_col)
+            try:
+                q = float(qraw) if qraw not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                q = 0.0
+            if q == q:
+                total += q
+        return total
+    except Exception as e:
+        logger.warning("products_sold_last_%sw sheets: %s", weeks, e)
+        return None
+
+
+def compute_products_sold_qty_last_n_weeks_from_supabase(weeks=6, log=None):
+    """
+    Supabase fallback for last-N-weeks sold qty. Chunks into week-sized date
+    predicates (RPC day-match helper is capped near 7 days). Excludes back/towel/belt.
+    """
+    if supabase is None:
+        return None
+    logger = log or app.logger
+    weeks = max(int(weeks or 6), 1)
+    try:
+        tbl = _safe_pb_orders_table_sql_ident(SUPABASE_PB_ORDERS_TABLE)
+    except ValueError:
+        return None
+
+    tz = ZoneInfo("America/New_York")
+    today = datetime.now(tz).date()
+    range_start = today - timedelta(days=weeks * 7 - 1)
+    product_excl = """
+    and (
+      "Product" is null
+      or (
+        lower(trim(cast("Product" as text))) !~ '\\yback\\y'
+        and lower(trim(cast("Product" as text))) !~ '\\ytowels?\\y'
+        and lower(trim(cast("Product" as text))) !~ '\\ybelts?\\y'
+      )
+    )
+    """
+
+    total = 0.0
+    chunk_start = range_start
+    while chunk_start <= today:
+        chunk_end = min(chunk_start + timedelta(days=6), today)
+        date_pred = _sql_pb_order_like_calendar_days(chunk_start, chunk_end)
+        query = f"""
+        select coalesce(sum(coalesce("Quantity"::numeric, 0)), 0) as total_qty
+        from "{tbl}"
+        where {date_pred}
+        {product_excl}
+        """
+        try:
+            rows = _overview_rpc_sql_rows(query, log=logger)
+        except Exception as e:
+            logger.warning(
+                "products_sold_last_%sw supabase chunk %s..%s failed: %s",
+                weeks,
+                chunk_start,
+                chunk_end,
+                e,
+            )
+            return None
+        part = _overview_sql_coalesce_total_qty(rows)
+        if part is None:
+            return None
+        total += float(part)
+        chunk_start = chunk_end + timedelta(days=1)
+    return total
+
+
+def compute_products_sold_per_day_last_n_weeks(weeks=6, log=None):
+    """
+    Average pieces sold per USPS business day over the last `weeks` weeks.
+    Excludes Product names with the words back, towel(s), or belt(s).
+    Prefers Google Sheets, then Supabase. Returns (rate, meta).
+    """
+    logger = log or app.logger
+    weeks = max(int(weeks or 6), 1)
+    tz = ZoneInfo("America/New_York")
+    today = datetime.now(tz).date()
+    range_start = today - timedelta(days=weeks * 7 - 1)
+
+    meta = {
+        "weeks": weeks,
+        "range_start": range_start.isoformat(),
+        "range_end": today.isoformat(),
+        "source": None,
+        "total_qty": None,
+        "business_days": None,
+    }
+
+    total_qty = compute_products_sold_qty_last_n_weeks_from_sheets(weeks, log=logger)
+    if total_qty is not None:
+        meta["source"] = "sheets"
+    else:
+        total_qty = compute_products_sold_qty_last_n_weeks_from_supabase(weeks, log=logger)
+        if total_qty is not None:
+            meta["source"] = "supabase"
+
+    if total_qty is None:
+        return None, meta
+
+    days = _business_days_in_range(range_start, today)
+    meta["total_qty"] = float(total_qty)
+    meta["business_days"] = int(days)
+    return float(total_qty) / float(days), meta
 
 
 # ─── Google client singletons ───────────────────────────────────────────────
@@ -11724,6 +11935,13 @@ def overview_metrics():
             round(float(sold_this_week), 2) if sold_this_week is not None else None
         )
 
+        sold_per_day_6w, sold_per_day_6w_meta = compute_products_sold_per_day_last_n_weeks(
+            weeks=6, log=app.logger
+        )
+        headcovers_sold_per_day_6w = (
+            round(float(sold_per_day_6w), 1) if sold_per_day_6w is not None else None
+        )
+
         metrics = {
             # 🔒 EXISTING (DO NOT CHANGE)
             "headcovers_sold_per_day": headcovers_sold,
@@ -11734,6 +11952,14 @@ def overview_metrics():
 
             # Calendar week Mon–Sun (ET), summed through today; excludes Product containing "back"
             "headcovers_sold_this_week": headcovers_sold_this_week,
+
+            # Last 6 weeks avg pcs/business-day; excludes back / towel / belt
+            "headcovers_sold_per_day_6w": headcovers_sold_per_day_6w,
+            "sold_per_day_6w_source": (sold_per_day_6w_meta or {}).get("source"),
+            "sold_per_day_6w_total_qty": (sold_per_day_6w_meta or {}).get("total_qty"),
+            "sold_per_day_6w_business_days": (sold_per_day_6w_meta or {}).get(
+                "business_days"
+            ),
 
             # Debug / verify USPS business-day rate
             "sold_per_day_source": (sold_per_day_meta or {}).get("source"),
@@ -19204,6 +19430,7 @@ def process_shipment():
         label_relative_urls = []
         labels_copied_ok = False
         ups_ship_billed_usd = None
+        ups_notify_email = ""
         do_ups = (
             (not skip_ups)
             and bool(service_code and str(service_code).strip())
@@ -19253,6 +19480,35 @@ def process_shipment():
                 raise Exception(
                     "Incomplete ship-to address in Directory for UPS "
                     "(need street, city, 2-letter state, 5-digit ZIP)."
+                )
+            # UPS Quantum View ship/delivery emails use Directory Contact Email Address
+            # (same source as QBO BillEmail) when not already on ship_to.
+            if not str(ship_to.get("email") or "").strip():
+                company_for_email = str(
+                    all_order_data[0].get("Company Name", "") or ""
+                ).strip()
+                if not company_for_email:
+                    company_for_email = str(ship_to.get("name") or "").strip()
+                try:
+                    bill_email = fetch_customer_email_from_directory(
+                        service, company_for_email
+                    )
+                except Exception:
+                    logging.exception(
+                        "Directory email lookup failed for UPS notifications"
+                    )
+                    bill_email = ""
+                if bill_email and str(bill_email).strip():
+                    ship_to["email"] = str(bill_email).strip()
+            ups_notify_email = str(ship_to.get("email") or "").strip()
+            if ups_notify_email:
+                logging.info(
+                    "UPS ship notifications will go to %s", ups_notify_email
+                )
+            else:
+                logging.warning(
+                    "No Contact Email Address for this customer — "
+                    "UPS will not send tracking/ship notifications"
                 )
             sc = str(service_code).strip()
             if len(sc) > 2:
@@ -19643,6 +19899,8 @@ def process_shipment():
             "labels_copied_to_folder": bool(labels_copied_ok),
             "tracking_numbers": tracking_list,
             "labels_api_raw": full_label_raw_urls,
+            "ups_notify_email": ups_notify_email or None,
+            "ups_notifications_requested": bool(ups_notify_email),
         }
         if not skip_invoice and qbo_invoice_id:
             canonical_invoice_url = _qbo_invoice_record_url(
@@ -20042,7 +20300,15 @@ def _normalize_rate_ship_to(raw) -> dict:
         nested.get("CountryCode"),
         nested.get("countryCode"),
     ) or "US"
-    return {
+    email = first(
+        raw.get("email"),
+        raw.get("Email"),
+        raw.get("notify_email"),
+        raw.get("notifyEmail"),
+        raw.get("contactEmail"),
+        raw.get("contact_email"),
+    )
+    out = {
         "name": name[:200],
         "attention_name": attention_name,
         "phone": phone,
@@ -20053,6 +20319,9 @@ def _normalize_rate_ship_to(raw) -> dict:
         "zip": zipc,
         "country": country,
     }
+    if email:
+        out["email"] = email
+    return out
 
 
 def _normalize_rate_packages(raw_list):
