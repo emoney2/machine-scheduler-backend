@@ -17816,6 +17816,22 @@ def _retarget_material_inv_row2_formula(tpl: str, target_row: int) -> str:
     )
 
 
+def _material_inventory_next_append_row(col_a_rows):
+    """
+    Sheet row (1-based) after the last non-empty Materials name in column A.
+    Always appends at the bottom — never fills mid-list blank gaps (which overwrote rows).
+    col_a_rows is A2:A values (no header).
+    """
+    last = 1  # header row
+    for i, r in enumerate(col_a_rows or []):
+        name = ""
+        if r:
+            name = str(r[0] if len(r) > 0 else "").strip()
+        if name:
+            last = i + 2
+    return last + 1
+
+
 # 3) POST new material(s) into Material Inventory!A–J
 @app.route("/api/materials", methods=["POST"])
 @login_required_session
@@ -17845,6 +17861,10 @@ def add_materials():
         rawB = str(mat_formula[1]) if len(mat_formula) > 1 else ""
         rawC = str(mat_formula[2]) if len(mat_formula) > 2 else ""
         rawH = str(mat_formula[7]) if len(mat_formula) > 7 else ""
+        if not str(rawB).strip().startswith("="):
+            logger.warning(
+                "[MaterialInventory] B2 has no formula to copy; new Inventory cells may be blank"
+            )
 
         existing = (
             sheets_vals.get(
@@ -17856,17 +17876,7 @@ def add_materials():
             or []
         )
 
-        def first_blank_row(rows):
-            return next(
-                (
-                    i + 2
-                    for i, r in enumerate(rows)
-                    if not r or not str(r[0] if len(r) > 0 else "").strip()
-                ),
-                len(rows) + 2,
-            )
-
-        next_row = first_blank_row(existing)
+        next_row = _material_inventory_next_append_row(existing)
         existing_names = {
             str(r[0]).strip().lower()
             for r in existing
@@ -17952,13 +17962,14 @@ def add_materials():
 
             written.append({"name": name, "row": next_row, "skipped": False})
             existing_names.add(name.lower())
-            while len(existing) < next_row - 1:
+            # Keep in-memory column A aligned so the next item appends below this one
+            while len(existing) < next_row - 2:
                 existing.append([])
             if len(existing) == next_row - 2:
                 existing.append([name])
             else:
                 existing[next_row - 2] = [name]
-            next_row = first_blank_row(existing)
+            next_row += 1
 
         if not written:
             return jsonify({"error": "No material name provided"}), 400
@@ -18286,24 +18297,19 @@ def submit_material_inventory():
         mat_oo_tpl = str(mat_formula[2]) if len(mat_formula) > 2 else ""
         mat_val_tpl = str(mat_formula[7]) if len(mat_formula) > 7 else ""
 
-        # 3) Fetch existing rows for Material Inventory
+        # 3) Fetch existing rows for Material Inventory (no hard row cap — append below last name)
         mat_rows = (
-            sheet.get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A1:H1000")
+            sheet.get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A2:A")
             .execute()
-            .get("values", [])[1:]
-        )  # skip header
-        existing_mats = {r[0].strip().lower() for r in mat_rows if r and r[0].strip()}
-
-        # Helper: find first blank row (1-based index + header) in a sheet's col A
-        def first_blank_row(rows):
-            return next(
-                (
-                    i + 2
-                    for i, r in enumerate(rows)
-                    if not r or not (r[0].strip() if len(r) > 0 else "")
-                ),
-                len(rows) + 2,
-            )
+            .get("values", [])
+            or []
+        )
+        existing_mats = {
+            str(r[0]).strip().lower()
+            for r in mat_rows
+            if r and str(r[0]).strip()
+        }
+        next_mat_row = _material_inventory_next_append_row(mat_rows)
 
         # ========= Thread Data header-based mapping =========
         # Fetch Thread Data headers so we can place values by name
@@ -18360,9 +18366,9 @@ def submit_material_inventory():
                 # === MATERIAL: add to Material Inventory if new, always log to Material Log ===
                 is_new = name.lower() not in existing_mats
                 if is_new:
-                    target = first_blank_row(mat_rows)
+                    target = next_mat_row
 
-                    # build formulas for the new target row (Inventory / On Order / Value)
+                    # Copy B2 / C2 / H2 formulas onto the new row with retargeted row refs
                     inv_f = _retarget_material_inv_row2_formula(mat_inv_tpl, target)
                     oo_f = _retarget_material_inv_row2_formula(mat_oo_tpl, target)
                     val_f = _retarget_material_inv_row2_formula(mat_val_tpl, target)
@@ -18371,7 +18377,7 @@ def submit_material_inventory():
                         [name, inv_f, oo_f, unit, min_inv, reorder, cost, val_f]
                     ]
 
-                    # write the new inventory row
+                    # Append at bottom of Material Inventory (never mid-list gaps)
                     sheet.update(
                         spreadsheetId=SPREADSHEET_ID,
                         range=f"Material Inventory!A{target}:H{target}",
@@ -18381,9 +18387,13 @@ def submit_material_inventory():
 
                     # keep in-memory sets/rows up to date for subsequent items
                     existing_mats.add(name.lower())
-                    while len(mat_rows) < target - 1:
+                    while len(mat_rows) < target - 2:
                         mat_rows.append([])
-                    mat_rows.append([name])
+                    if len(mat_rows) == target - 2:
+                        mat_rows.append([name])
+                    else:
+                        mat_rows[target - 2] = [name]
+                    next_mat_row = target + 1
 
                 # ALWAYS log the material movement (even if not new)
                 #
@@ -20314,14 +20324,13 @@ def set_product_specs():
         "N": data.get("volume", ""),  # Volume
     }
 
-    # 3) Write each one cell
+    # 3) Write each one cell on the Table sheet (not Material Inventory)
     for col, val in updates.items():
-        target = f"Table!{col}{row_index}"
         sheet.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"Material Inventory!A{target_row}:P{target_row}",  # <- now includes column P
+            range=f"Table!{col}{row_index}",
             valueInputOption="USER_ENTERED",
-            body={"values": [inventory_row]},
+            body={"values": [[val]]},
         ).execute()
 
     return jsonify({"status": "ok"}), 200
