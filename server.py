@@ -13491,28 +13491,121 @@ def _ship_queue_order_sort_tuple(order_num_raw):
     return (1, s.lower())
 
 
+def _ship_queue_stage_token(stage_raw) -> str:
+    """Letters-only uppercase stage so '✅ SEWING' / 'Embroidery' still match."""
+    return re.sub(r"[^A-Z]", "", str(stage_raw or "").upper())
+
+
+def _ship_queue_resolve_stage(row: dict) -> str:
+    """
+    Prefer Production Orders Stage; if it looks like a Print/Fur flag (PRINT/NO/YES/FUR),
+    fall back to Job Stage / Status — same idea as Overview getStageForDisplay.
+    """
+    non_stage = {"PRINT", "NO", "YES", "FUR", "TRUE", "FALSE"}
+    candidates = (
+        row.get("Stage"),
+        row.get("Job Stage"),
+        row.get("JobStage"),
+        row.get("Status"),
+    )
+    primary = _ship_queue_stage_token(candidates[0])
+    if primary and primary not in non_stage:
+        return primary
+    for cand in candidates[1:]:
+        tok = _ship_queue_stage_token(cand)
+        if tok and tok not in non_stage:
+            return tok
+    return primary
+
+
+def _ship_queue_is_embroidery_or_sewing(stage_token: str) -> bool:
+    """Embroidery / sewing / ship-ready stages (not cut/print/fur/ordered/complete)."""
+    s = (stage_token or "").strip().upper()
+    if not s or s in ("COMPLETE", "COMPLETED", "SHIPPED"):
+        return False
+    if "EMBROID" in s:
+        return True
+    if s in ("SEWING", "SEW", "SHIP", "SHIPPING"):
+        return True
+    if s.startswith("SEW"):
+        return True
+    # Ready-to-ship alias used on some Stage formulas (exclude SHIPPED above)
+    if s.startswith("SHIP"):
+        return True
+    return False
+
+
+def _ship_queue_active_embroidery_order_keys() -> set:
+    """
+    Order # keys currently in Embroidery List with Status NEEDS WORK.
+    Catches embroidery jobs when Production Orders Stage is stale / misaligned.
+    """
+    out = set()
+    try:
+        emb_rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE) or []
+        if not emb_rows or not emb_rows[0]:
+            return out
+        headers = [str(h or "").strip() for h in emb_rows[0]]
+        # Prefer named Status column; formula uses Embroidery List col U (index 20)
+        try:
+            status_i = next(
+                i
+                for i, h in enumerate(headers)
+                if h.lower() == "status"
+            )
+        except StopIteration:
+            status_i = 20 if len(headers) > 20 else None
+        try:
+            order_i = next(
+                i
+                for i, h in enumerate(headers)
+                if h.lower() in ("order #", "order#", "order")
+            )
+        except StopIteration:
+            order_i = 0
+        if status_i is None:
+            return out
+        for r in emb_rows[1:]:
+            if not r or order_i >= len(r) or status_i >= len(r):
+                continue
+            st = str(r[status_i] or "").strip().upper()
+            if st != "NEEDS WORK":
+                continue
+            key = _overview_normalize_order_key(r[order_i])
+            if key:
+                out.add(key)
+    except Exception:
+        logger.exception("ship-production-queue: embroidery list lookup failed")
+    return out
+
+
 @app.route("/api/ship-production-queue")
 @login_required_session
 def ship_production_queue():
     """
-    Open Embroidery / Sewing jobs that are not complete or fully shipped,
-    for Ship tab quick-pick cards. Sorted by Due Date ascending, then Order #.
-    Same image preview rules as jobs-for-company.
+    Open Embroidery / Sewing (and ship-ready) jobs that are not complete or fully
+    shipped, for Ship tab quick-pick cards. Also includes orders marked NEEDS WORK
+    on Embroidery List when Stage is stale. Sorted by Due Date, then Order #.
     """
     try:
         prod_data = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
         if not prod_data or not prod_data[0]:
             return jsonify({"jobs": []}), 200
 
+        emb_active = _ship_queue_active_embroidery_order_keys()
         headers = prod_data[0]
         jobs = []
         for r in prod_data[1:]:
             row = dict(zip(headers, r))
             if _overview_exclude_completed_or_shipped(row):
                 continue
-            stage = str(row.get("Stage") or "").strip().upper()
-            # Ship tab cards: embroidery / sewing only (not cut/print/fur/etc.)
-            if stage not in ("EMBROIDERY", "SEWING", "SEW"):
+            stage_tok = _ship_queue_resolve_stage(row)
+            oid_key = _overview_normalize_order_key(row.get("Order #"))
+            # Ship tab cards: embroidery / sewing / ship-ready (not cut/print/fur/etc.)
+            if not (
+                _ship_queue_is_embroidery_or_sewing(stage_tok)
+                or (oid_key and oid_key in emb_active)
+            ):
                 continue
             qty_num = _parse_qty_number(row.get("Quantity"), 0.0)
             shipped_num = _parse_qty_number(row.get("Shipped"), 0.0)
@@ -13538,6 +13631,26 @@ def ship_production_queue():
             if not company or not oid:
                 continue
 
+            stage_display = str(row.get("Stage") or "").strip()
+            if oid_key and oid_key in emb_active and not _ship_queue_is_embroidery_or_sewing(
+                stage_tok
+            ):
+                stage_display = "EMBROIDERY"
+            elif stage_tok in ("EMBROIDERY", "SEWING", "SHIP", "SHIPPING", "SEW"):
+                # Prefer canonical token when Stage cell had junk (PRINT/FUR/etc.)
+                if _ship_queue_stage_token(stage_display) in {
+                    "PRINT",
+                    "NO",
+                    "YES",
+                    "FUR",
+                    "TRUE",
+                    "FALSE",
+                    "",
+                }:
+                    stage_display = stage_tok
+            elif not stage_display and stage_tok:
+                stage_display = stage_tok
+
             jobs.append(
                 {
                     "Order #": row.get("Order #"),
@@ -13550,7 +13663,7 @@ def ship_production_queue():
                     if abs(remaining - round(remaining)) < 1e-9
                     else remaining,
                     "Due Date": row.get("Due Date"),
-                    "Stage": row.get("Stage"),
+                    "Stage": stage_display or row.get("Stage"),
                     "Hard Date/Soft Date": row.get("Hard Date/Soft Date"),
                     "image": preview_url,
                     "orderId": oid,
