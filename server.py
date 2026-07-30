@@ -161,6 +161,7 @@ from ups_service import (
     quantum_view_fetch_shipment_rows,
 )
 import ship_qbo_file_log as sqlog
+import packing_history as packhist
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
@@ -12936,6 +12937,70 @@ def material_log_recut_append():
     return jsonify({"added": len(rows)}), 200
 
 
+@app.route("/api/suggest-boxes", methods=["OPTIONS", "POST"])
+@login_required_session
+def suggest_boxes_api():
+    """
+    Suggest box sizes/counts from packing history for the given pieces.
+    Body: { pieces: [{ order_id, product, design, qty }, ...] }
+    """
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Requested-With, Accept"
+        )
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
+    data = request.get_json(silent=True) or {}
+    pieces = data.get("pieces") or []
+    volume_map = {}
+    try:
+        volume_map = packhist.load_product_volume_map(fetch_sheet, SPREADSHEET_ID)
+    except Exception:
+        logging.exception("suggest-boxes: volume map unavailable")
+    try:
+        result = packhist.suggest_boxes(pieces, volume_map=volume_map)
+    except Exception as e:
+        logging.exception("suggest-boxes failed")
+        result = {
+            "status": "error",
+            "error": str(e),
+            "suggestion": {
+                "box_counts": {p["id"]: 0 for p in packhist.SHIP_BOX_PRESETS},
+                "custom_boxes": [],
+                "boxes_summary": [],
+                "confidence": "none",
+                "reason": "Suggestion failed.",
+                "source": "none",
+            },
+            "history_count": 0,
+            "pieces": [],
+        }
+    resp = jsonify(result)
+    resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
+
+@app.route("/api/packing-history", methods=["GET"])
+@login_required_session
+def packing_history_list():
+    """Recent packing records (for debugging / future history UI)."""
+    try:
+        limit = int(request.args.get("limit") or 50)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 500))
+    rows = packhist.load_history()
+    rows = list(reversed(rows[-limit:]))
+    resp = jsonify({"status": "ok", "count": len(rows), "records": rows})
+    resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
+
 @app.route("/api/prepare-shipment", methods=["POST"])
 @login_required_session
 def prepare_shipment():
@@ -19890,6 +19955,45 @@ def process_shipment():
             )
         except Exception:
             pass
+
+        # Record boxes + pieces for future suggestions (best-effort; never fail shipment)
+        packing_record_id = None
+        try:
+            pieces_payload = data.get("pieces")
+            if not isinstance(pieces_payload, list) or not pieces_payload:
+                pieces_payload = []
+                for od in all_order_data:
+                    prod = str(od.get("Product") or "").strip()
+                    design = str(od.get("Design") or "").strip()
+                    if packhist.normalize_product_name(prod, design):
+                        pieces_payload.append(
+                            {
+                                "order_id": str(od.get("Order #") or "").strip(),
+                                "product": prod,
+                                "design": design,
+                                "qty": od.get("ShippedQty") or od.get("Shipped") or 0,
+                            }
+                        )
+            company_name = ""
+            if all_order_data:
+                company_name = str(
+                    all_order_data[0].get("Company Name") or ""
+                ).strip()
+            prec = packhist.record_shipment_packing(
+                company=company_name,
+                order_ids=order_ids,
+                boxes=boxes_summary or boxes,
+                pieces=pieces_payload,
+                box_contents=data.get("box_contents"),
+                tracking_numbers=tracking_list,
+                sheets_service=service,
+                spreadsheet_id=sheet_id,
+            )
+            if prec:
+                packing_record_id = prec.get("id")
+        except Exception:
+            logging.exception("packing history record skipped")
+
         resp_payload = {
             "labels": full_label_urls,
             "invoice": invoice_url,
@@ -19901,6 +20005,7 @@ def process_shipment():
             "labels_api_raw": full_label_raw_urls,
             "ups_notify_email": ups_notify_email or None,
             "ups_notifications_requested": bool(ups_notify_email),
+            "packing_record_id": packing_record_id,
         }
         if not skip_invoice and qbo_invoice_id:
             canonical_invoice_url = _qbo_invoice_record_url(

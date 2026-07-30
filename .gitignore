@@ -19,3 +19,7 @@ Thumbs.db
 new.json
 token.json
 token.b64.txt
+
+# Local packing history (also mirrored to Google Sheet tab Packing History)
+data/packing_history.json
+data/packing_history.tmp
