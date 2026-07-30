@@ -11,6 +11,13 @@ Material model (ledger hole + later-first list split):
   rawNow/rawLater = job shortfalls (cover now demand first with available)
   Assign toBuy to rawLater FIRST, remainder to Now.
   Example Leaf Green: Inv -87, On Order 74 → toBuy 14 → Now 0, Later 14.
+
+Thread model:
+  currentCones = Thread Inventory + max(sheet On Order, Thread Data Ordered cones)
+  Ordered cones come from Thread Data rows with IN/OUT=IN and O/R=Ordered
+  (feet / 16500). Sheet On Order alone often stays 0 after /threadInventory logs
+  because Color is the 4-digit code while inventory labels include color names.
+  Zero stock with inbound Ordered cones does NOT re-queue a pod.
 """
 
 from __future__ import annotations
@@ -26,6 +33,8 @@ logger = logging.getLogger(__name__)
 FUTURE_DUE_DAYS = 60
 HEADS = 6
 START_ROW = 3
+# Madeira Polyneon: cones logged to Thread Data as feet (qty × 5500 yd × 3 ft/yd)
+FEET_PER_CONE = 5500 * 3
 ALLOWED_THREAD_STAGES = frozenset({"ordered", "fur", "cut", "print", "embroidery"})
 
 
@@ -401,6 +410,64 @@ def _first_four_digits(s: Any) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _thread_inv_columns(headers: List[Any]) -> Tuple[int, int, int]:
+    """
+    Thread Inventory: Thread Colors / Inventory / On Order (header-flexible).
+    Falls back to A/B/C when headers are missing.
+    """
+    col_thread = _header_index(headers, ["thread colors", "thread color", "color", "colors"])
+    col_inv = _header_index(headers, ["inventory..", "inventory"])
+    col_oo = _header_index(headers, ["on order..", "on order"])
+    if col_thread < 0:
+        col_thread = 0
+    if col_inv < 0:
+        col_inv = 1
+    if col_oo < 0:
+        col_oo = col_inv + 1 if col_inv >= 0 else 2
+    return col_thread, col_inv, col_oo
+
+
+def _thread_data_columns(headers: List[Any]) -> Dict[str, int]:
+    """Thread Data columns by header; fall back to documented A–H layout."""
+    return {
+        "order": _header_index(headers, ["order number", "order #", "order"]),
+        "color": _header_index(headers, ["color", "thread color", "thread colors"]),
+        "length": _header_index(headers, ["length (ft)", "length", "length ft", "feet"]),
+        "inout": _header_index(headers, ["in/out", "in out", "inout"]),
+        "or_": _header_index(headers, ["o/r", "o / r", "ordered/received"]),
+    }
+
+
+def _thread_on_order_cones_from_td(
+    td: List[List[Any]], col_color: int, col_len: int, col_inout: int, col_or: int
+) -> Dict[str, float]:
+    """
+    Cones on order from Thread Data rows logged by /threadInventory:
+    IN/OUT=IN and O/R=Ordered. Length is feet → cones via FEET_PER_CONE.
+
+    Thread Inventory!On Order sheet formulas often miss these rows (Color is
+    just the 4-digit code while inventory labels include the color name), so
+    rebuild must not rely solely on column C.
+    """
+    by_code: Dict[str, float] = {}
+    if col_color < 0 or col_inout < 0 or col_or < 0:
+        return by_code
+    for row in td[1:]:
+        inout = _as_text(_cell(row, col_inout)).strip().lower()
+        o_r = _as_text(_cell(row, col_or)).strip().lower()
+        if inout != "in" or o_r != "ordered":
+            continue
+        code = _first_four_digits(_cell(row, col_color))
+        if not code:
+            continue
+        feet = _as_num(_cell(row, col_len)) if col_len >= 0 else 0.0
+        cones = (feet / FEET_PER_CONE) if feet else 0.0
+        if cones <= 0:
+            continue
+        by_code[code] = by_code.get(code, 0.0) + cones
+    return by_code
+
+
 def _sort_items(items: List[Dict[str, Any]]) -> None:
     items.sort(
         key=lambda a: (
@@ -608,21 +675,60 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
                 }
             )
 
+    ti_hdr = ti[0] if ti else []
+    col_ti_thread, col_ti_inv, col_ti_oo = _thread_inv_columns(ti_hdr)
+
     inv_by_code: Dict[str, float] = {}
-    ord_by_code: Dict[str, float] = {}
+    sheet_ord_by_code: Dict[str, float] = {}
     for row in ti[1:]:
-        code = _first_four_digits(_cell(row, 0))
+        code = _first_four_digits(_cell(row, col_ti_thread))
         if not code:
             continue
-        inv_by_code[code] = inv_by_code.get(code, 0) + _as_num(_cell(row, 1))
-        ord_by_code[code] = ord_by_code.get(code, 0) + _as_num(_cell(row, 2))
+        inv_by_code[code] = inv_by_code.get(code, 0) + _as_num(_cell(row, col_ti_inv))
+        sheet_ord_by_code[code] = sheet_ord_by_code.get(code, 0) + _as_num(
+            _cell(row, col_ti_oo)
+        )
+
+    td_hdr = td[0] if td else []
+    td_cols = _thread_data_columns(td_hdr)
+    # Documented layout fallback: B=Order#, C=Color, E=Length, G=IN/OUT, H=O/R
+    idx_td_order = td_cols["order"] if td_cols["order"] >= 0 else 1
+    idx_td_color = td_cols["color"] if td_cols["color"] >= 0 else 2
+    idx_td_len = td_cols["length"] if td_cols["length"] >= 0 else 4
+    idx_td_inout = td_cols["inout"] if td_cols["inout"] >= 0 else 6
+    idx_td_or = td_cols["or_"] if td_cols["or_"] >= 0 else 7
+
+    td_ord_by_code = _thread_on_order_cones_from_td(
+        td, idx_td_color, idx_td_len, idx_td_inout, idx_td_or
+    )
+    # Prefer the larger of sheet On Order vs Thread Data Ordered (app logs).
+    # Sheet formulas often return 0 when Color labels don't exact-match.
+    ord_by_code: Dict[str, float] = {}
+    for code in set(sheet_ord_by_code) | set(td_ord_by_code):
+        ord_by_code[code] = max(
+            sheet_ord_by_code.get(code, 0.0), td_ord_by_code.get(code, 0.0)
+        )
+
+    logger.info(
+        "Thread cols: TI thread=%s inv=%s oo=%s | TD order=%s color=%s len=%s inout=%s or=%s | "
+        "tdOrderedCodes=%s",
+        col_ti_thread,
+        col_ti_inv,
+        col_ti_oo,
+        idx_td_order,
+        idx_td_color,
+        idx_td_len,
+        idx_td_inout,
+        idx_td_or,
+        len(td_ord_by_code),
+    )
 
     active_codes: Dict[str, bool] = {}
     usage_by_code: Dict[str, Dict[str, bool]] = {}
     for row in td[1:]:
-        td_order = _as_text(_cell(row, 1)).strip()
-        td_color = _as_text(_cell(row, 2))
-        inout = _as_text(_cell(row, 6)).lower()
+        td_order = _as_text(_cell(row, idx_td_order)).strip()
+        td_color = _as_text(_cell(row, idx_td_color))
+        inout = _as_text(_cell(row, idx_td_inout)).lower()
         if not td_order or not td_color or inout != "out":
             continue
         st = _as_text(_lookup_order(stg_by_order, td_order) or "").lower()
@@ -634,17 +740,20 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
             usage_by_code.setdefault(code_found, {})[td_order] = True
 
     for code_key in sorted(active_codes.keys(), key=lambda x: (len(x), x)):
-        current_cones = inv_by_code.get(code_key, 0) + ord_by_code.get(code_key, 0)
+        on_hand = inv_by_code.get(code_key, 0)
+        on_ord = ord_by_code.get(code_key, 0)
+        current_cones = on_hand + on_ord
         remaining_pct = (current_cones / HEADS) * 100
         usage_map = usage_by_code.get(code_key) or {}
         usage_count = len(usage_map)
         pods_to_order = 0
         if current_cones < 0:
             pods_to_order = int(math.ceil((-current_cones) / HEADS))
-        else:
-            if remaining_pct <= 0:
-                pods_to_order = 1
-            elif usage_count > 30 and remaining_pct < 25:
+        elif current_cones == 0 and on_ord <= 0:
+            # Truly empty (nothing on hand, nothing inbound) → one pod
+            pods_to_order = 1
+        elif remaining_pct > 0:
+            if usage_count > 30 and remaining_pct < 25:
                 pods_to_order = 1
             elif usage_count > 10 and remaining_pct < 10:
                 pods_to_order = 1
