@@ -9652,17 +9652,78 @@ def _safe_pb_orders_table_sql_ident(table_name: str) -> str:
     return t.replace('"', '""')
 
 
-def _calendar_days_elapsed_in_year(year: int, today=None) -> int:
-    """Inclusive day count from Jan 1 through today when still in `year`; full year if past `year`."""
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
+    """Return the n-th weekday in month (weekday Mon=0..Sun=6). n=-1 means last."""
+    if n == -1:
+        if month == 12:
+            d = date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            d = date(year, month + 1, 1) - timedelta(days=1)
+        while d.weekday() != weekday:
+            d -= timedelta(days=1)
+        return d
+    d = date(year, month, 1)
+    while d.weekday() != weekday:
+        d += timedelta(days=1)
+    return d + timedelta(days=7 * (n - 1))
+
+
+def _usps_observed_delivery_closure(holiday: date) -> date | None:
+    """
+    Weekday USPS retail/delivery is closed for a holiday date.
+    Saturday holidays do not close the preceding Friday (USPS retail schedule).
+    Sunday holidays observe the following Monday.
+    """
+    if holiday.weekday() < 5:
+        return holiday
+    if holiday.weekday() == 6:  # Sunday → Monday
+        return holiday + timedelta(days=1)
+    return None  # Saturday — no weekday retail/delivery closure
+
+
+def _usps_delivery_closure_dates(year: int) -> set:
+    """
+    USPS federal holiday closures for mail delivery / retail (about.usps.com).
+    Returns weekday dates only (weekends are already non-business days).
+    """
+    raw = [
+        date(year, 1, 1),  # New Year's Day
+        _nth_weekday_of_month(year, 1, 0, 3),  # MLK Day — 3rd Monday Jan
+        _nth_weekday_of_month(year, 2, 0, 3),  # Presidents Day — 3rd Monday Feb
+        _nth_weekday_of_month(year, 5, 0, -1),  # Memorial Day — last Monday May
+        date(year, 6, 19),  # Juneteenth
+        date(year, 7, 4),  # Independence Day
+        _nth_weekday_of_month(year, 9, 0, 1),  # Labor Day — 1st Monday Sep
+        _nth_weekday_of_month(year, 10, 0, 2),  # Columbus Day — 2nd Monday Oct
+        date(year, 11, 11),  # Veterans Day
+        _nth_weekday_of_month(year, 11, 3, 4),  # Thanksgiving — 4th Thursday Nov
+        date(year, 12, 25),  # Christmas Day
+    ]
+    out = set()
+    for h in raw:
+        observed = _usps_observed_delivery_closure(h)
+        if observed is not None and observed.year == year:
+            out.add(observed)
+    return out
+
+
+def _business_days_elapsed_in_year(year: int, today=None) -> int:
+    """Inclusive USPS business days (Mon–Fri minus USPS holidays) from Jan 1 through today."""
     if today is None:
         today = datetime.now(ZoneInfo("UTC")).date()
     jan1 = date(year, 1, 1)
     dec31 = date(year, 12, 31)
     if today < jan1:
         return 1
-    if today.year > year:
-        return (dec31 - jan1).days + 1
-    return (today - jan1).days + 1
+    end = dec31 if today.year > year else today
+    holidays = _usps_delivery_closure_dates(year)
+    days = 0
+    d = jan1
+    while d <= end:
+        if d.weekday() < 5 and d not in holidays:
+            days += 1
+        d += timedelta(days=1)
+    return max(days, 1)
 
 
 def _overview_rpc_sql_rows(query: str, log=None):
@@ -9735,9 +9796,11 @@ def compute_products_sold_per_day_ytd(
     log=None,
 ):
     """
-    Units per calendar day YTD: sum(Quantity) for orders dated in sales_year in
+    Units per USPS business day YTD: sum(Quantity) for orders dated in sales_year in
     SUPABASE_PB_ORDERS_TABLE, excluding rows whose Product contains 'back'
-    (case-insensitive). Dates stored as M/D/YYYY ... strings are matched safely.
+    (case-insensitive), divided by Mon–Fri days elapsed YTD excluding USPS
+    federal holiday closures (about.usps.com schedule).
+    Dates stored as M/D/YYYY ... strings are matched safely.
     If sales_year is omitted, uses the current calendar year in UTC.
     Returns None if Supabase or RPC fails.
     """
@@ -9775,7 +9838,7 @@ def compute_products_sold_per_day_ytd(
     if total_qty is None:
         return None
 
-    days = _calendar_days_elapsed_in_year(sales_year)
+    days = _business_days_elapsed_in_year(sales_year)
     if days < 1:
         days = 1
     return total_qty / float(days)
