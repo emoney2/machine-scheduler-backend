@@ -527,43 +527,14 @@ def _scale_boxes(boxes: List[Dict[str, Any]], factor: float) -> List[Dict[str, A
     return out
 
 
-def _learn_capacity(history: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
-    """
-    product_norm(lower) -> box_key -> observed max pieces in one physical box.
-    Also derives from homogeneous single-box-type shipments (qty / box_count).
-    """
-    cap: Dict[str, Dict[str, int]] = defaultdict(dict)
-
-    def _bump(prod: str, bkey: str, n: int) -> None:
-        if not prod or not bkey or n <= 0:
-            return
-        prev = cap[prod].get(bkey, 0)
-        if n > prev:
-            cap[prod][bkey] = n
-
-    for rec in history:
-        contents = rec.get("box_contents") or []
-        for box in contents:
-            bkey = box.get("box_key") or box_key(
-                box.get("L"), box.get("W"), box.get("H"), box.get("weight")
-            )
-            for p in box.get("pieces") or []:
-                prod = str(p.get("product_norm") or "").strip().lower()
-                _bump(prod, bkey, _safe_int(p.get("qty"), 0))
-
-        pieces = rec.get("pieces") or []
-        boxes = rec.get("boxes") or []
-        totals = mix_totals(pieces)
-        packages = expand_boxes_to_packages(boxes)
-        if len(totals) == 1 and packages:
-            prod = next(iter(totals.keys()))
-            # Only trust when all packages same size
-            keys = {p.get("box_key") for p in packages}
-            if len(keys) == 1:
-                bkey = next(iter(keys))
-                per = max(1, int(round(totals[prod] / len(packages))))
-                _bump(prod, bkey, per)
-    return {k: dict(v) for k, v in cap.items()}
+def _median_int(values: List[int]) -> int:
+    if not values:
+        return 0
+    s = sorted(values)
+    mid = len(s) // 2
+    if len(s) % 2:
+        return int(s[mid])
+    return max(1, int(round((s[mid - 1] + s[mid]) / 2.0)))
 
 
 def _preset_by_id(pid: str) -> Optional[Dict[str, Any]]:
@@ -573,58 +544,126 @@ def _preset_by_id(pid: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _pack_by_capacity(
-    totals: Dict[str, int], capacity: Dict[str, Dict[str, int]]
-) -> Optional[List[Dict[str, Any]]]:
-    """Greedy: pack largest remaining product into best-known box repeatedly."""
-    remaining = dict(totals)
-    if not remaining:
-        return None
-    # Prefer larger known capacities / larger boxes
-    preset_keys = {
-        p["id"]: box_key(p["L"], p["W"], p["H"], p["weight"]) for p in SHIP_BOX_PRESETS
-    }
-    used: Counter = Counter()
-    guard = 0
-    while any(v > 0 for v in remaining.values()) and guard < 200:
-        guard += 1
-        # pick product with most remaining
-        prod = max(remaining.keys(), key=lambda k: remaining[k])
-        if remaining[prod] <= 0:
-            remaining.pop(prod, None)
+def _preset_vol(p: Dict[str, Any]) -> float:
+    return float(p["L"]) * float(p["W"]) * float(p["H"])
+
+
+def _match_preset_id_for_box_key(bkey: str) -> Optional[str]:
+    dim = str(bkey or "").split("@")[0]
+    for p in SHIP_BOX_PRESETS:
+        pk = box_key(p["L"], p["W"], p["H"], p["weight"]).split("@")[0]
+        if pk == dim:
+            return p["id"]
+    return None
+
+
+def _learn_capacity(history: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
+    """
+    product_norm(lower) -> box_key -> typical pieces per physical box.
+
+    Learns from:
+    - explicit per-box contents (if present)
+    - single-product shipments using one box size (qty / box count)
+    - single-box shipments of one product (all qty in that box)
+    """
+    samples: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
+
+    def _sample(prod: str, bkey: str, n: int) -> None:
+        if not prod or not bkey or n <= 0:
+            return
+        samples[prod][bkey].append(int(n))
+
+    for rec in history:
+        contents = rec.get("box_contents") or []
+        for box in contents:
+            bkey = box.get("box_key") or box_key(
+                box.get("L"), box.get("W"), box.get("H"), box.get("weight")
+            )
+            for p in box.get("pieces") or []:
+                prod = str(p.get("product_norm") or "").strip().lower()
+                _sample(prod, bkey, _safe_int(p.get("qty"), 0))
+
+        pieces = rec.get("pieces") or []
+        boxes = rec.get("boxes") or []
+        totals = mix_totals(pieces)
+        packages = expand_boxes_to_packages(boxes)
+        if not packages or not totals:
             continue
-        caps = capacity.get(prod) or {}
-        # Map box_key -> preset id when possible
-        best_pid = None
-        best_cap = 0
-        for pid, bkey in preset_keys.items():
-            c = caps.get(bkey, 0)
-            if c > best_cap:
-                best_cap = c
-                best_pid = pid
-        if not best_pid or best_cap <= 0:
-            # try any learned key matching a preset by dims only
-            for bkey, c in caps.items():
-                for pid, pk in preset_keys.items():
-                    # compare without weight
-                    if bkey.split("@")[0] == pk.split("@")[0] and c > best_cap:
-                        best_cap = c
-                        best_pid = pid
-        if not best_pid or best_cap <= 0:
-            return None
-        take = min(remaining[prod], best_cap)
-        # Also try to fill same box with other products if we know they fit — skip for simplicity
-        remaining[prod] -= take
-        if remaining[prod] <= 0:
-            remaining.pop(prod, None)
-        used[best_pid] += 1
-        # If other products remain and this box has spare capacity for them, leave for next iteration
-    if any(v > 0 for v in remaining.values()):
-        return None
+
+        # One product type + one box size → pieces-per-box = qty / boxes
+        if len(totals) == 1:
+            prod = next(iter(totals.keys()))
+            keys = {p.get("box_key") for p in packages}
+            if len(keys) == 1:
+                bkey = next(iter(keys))
+                per = max(1, int(round(totals[prod] / float(len(packages)))))
+                _sample(prod, bkey, per)
+
+        # One physical box (any mix) with a single product type
+        if len(packages) == 1 and len(totals) == 1:
+            prod = next(iter(totals.keys()))
+            bkey = packages[0].get("box_key") or box_key(
+                packages[0].get("L"),
+                packages[0].get("W"),
+                packages[0].get("H"),
+                packages[0].get("weight"),
+            )
+            _sample(prod, bkey, totals[prod])
+
+    out: Dict[str, Dict[str, int]] = {}
+    for prod, by_box in samples.items():
+        out[prod] = {}
+        for bkey, vals in by_box.items():
+            med = _median_int(vals)
+            if med > 0:
+                out[prod][bkey] = med
+    return out
+
+
+def _volumes_from_capacity(capacity: Dict[str, Dict[str, int]]) -> Dict[str, float]:
+    """Infer cubic-inch volume per product from learned pieces-per-box."""
+    vols: Dict[str, float] = {}
+    for prod, by_box in capacity.items():
+        samples: List[float] = []
+        for bkey, cap in by_box.items():
+            if cap <= 0:
+                continue
+            pid = _match_preset_id_for_box_key(bkey)
+            p = _preset_by_id(pid) if pid else None
+            if not p:
+                continue
+            samples.append(_preset_vol(p) / float(cap))
+        if samples:
+            samples.sort()
+            mid = len(samples) // 2
+            if len(samples) % 2:
+                vols[prod] = samples[mid]
+            else:
+                vols[prod] = (samples[mid - 1] + samples[mid]) / 2.0
+    return vols
+
+
+def _merge_volume_maps(*maps: Optional[Dict[str, float]]) -> Dict[str, float]:
+    """Later maps win (prefer learned packing volumes over sheet defaults)."""
+    out: Dict[str, float] = {}
+    for m in maps:
+        if not m:
+            continue
+        for k, v in m.items():
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv > 0:
+                out[str(k).lower()] = fv
+    return out
+
+
+def _boxes_from_used(used: Counter) -> List[Dict[str, Any]]:
     out = []
     for pid, qty in used.items():
         p = _preset_by_id(pid)
-        if not p:
+        if not p or qty <= 0:
             continue
         out.append(
             {
@@ -633,72 +672,153 @@ def _pack_by_capacity(
                 "W": p["W"],
                 "H": p["H"],
                 "weight": p["weight"],
-                "qty": qty,
+                "qty": int(qty),
                 "preset_id": pid,
                 "box_key": box_key(p["L"], p["W"], p["H"], p["weight"]),
             }
         )
-    return out or None
+    return out
+
+
+def _pack_by_capacity(
+    totals: Dict[str, int], capacity: Dict[str, Dict[str, int]]
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Pack mixed products using learned fill fractions.
+    Each product uses 1/capacity of a box; fill boxes smallest-first.
+    """
+    remaining = Counter({k: int(v) for k, v in totals.items() if int(v) > 0})
+    if not remaining:
+        return None
+
+    # prod -> preset_id -> capacity
+    cap_by_preset: Dict[str, Dict[str, int]] = defaultdict(dict)
+    for prod, by_box in capacity.items():
+        for bkey, cap in by_box.items():
+            pid = _match_preset_id_for_box_key(bkey)
+            if pid and cap > 0:
+                cap_by_preset[prod][pid] = int(cap)
+
+    if any(p not in cap_by_preset for p in remaining):
+        return None
+
+    presets_small_first = sorted(SHIP_BOX_PRESETS, key=_preset_vol)
+    used: Counter = Counter()
+    guard = 0
+    while sum(remaining.values()) > 0 and guard < 400:
+        guard += 1
+        opened = False
+        for preset in presets_small_first:
+            pid = preset["id"]
+            # Need capacity data for at least one remaining product in this box
+            if not any(pid in cap_by_preset.get(prod, {}) for prod in remaining):
+                continue
+            fill_left = 1.0
+            box_took = False
+            # Prefer denser products first (higher 1/cap)
+            prods = sorted(
+                [p for p in remaining if pid in cap_by_preset.get(p, {})],
+                key=lambda p: 1.0 / float(cap_by_preset[p][pid]),
+                reverse=True,
+            )
+            progressed = True
+            while progressed and fill_left > 1e-9:
+                progressed = False
+                for prod in prods:
+                    if remaining[prod] <= 0:
+                        continue
+                    cap = cap_by_preset[prod][pid]
+                    unit = 1.0 / float(cap)
+                    if unit <= fill_left + 1e-9:
+                        remaining[prod] -= 1
+                        if remaining[prod] <= 0:
+                            del remaining[prod]
+                        fill_left -= unit
+                        box_took = True
+                        progressed = True
+            if box_took:
+                used[pid] += 1
+                opened = True
+                break
+        if not opened:
+            return None
+
+    return _boxes_from_used(used) or None
+
+
+def _preferred_preset_order(
+    totals: Dict[str, int], capacity: Dict[str, Dict[str, int]]
+) -> List[Dict[str, Any]]:
+    """
+    Prefer box sizes actually used for these products historically.
+    Fall back to largest→smallest so we don't spam tiny cartons.
+    """
+    votes: Counter = Counter()
+    for prod in totals:
+        for bkey in (capacity.get(prod) or {}):
+            pid = _match_preset_id_for_box_key(bkey)
+            if pid:
+                votes[pid] += 1
+    if votes:
+        ranked = [pid for pid, _ in votes.most_common()]
+        preferred = [_preset_by_id(pid) for pid in ranked if _preset_by_id(pid)]
+        rest = [
+            p
+            for p in sorted(SHIP_BOX_PRESETS, key=_preset_vol, reverse=True)
+            if p["id"] not in votes
+        ]
+        return preferred + rest
+    # No history: larger boxes first (fewer cartons for mixed orders)
+    return sorted(SHIP_BOX_PRESETS, key=_preset_vol, reverse=True)
 
 
 def _pack_by_volume(
     totals: Dict[str, int],
     volume_map: Dict[str, float],
+    *,
+    capacity: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> Optional[List[Dict[str, Any]]]:
-    """Fallback using product volumes + preset box volumes (largest-first greedy fill)."""
-    items: List[float] = []
-    missing = []
+    """Pack by cubic volume into historically preferred / larger boxes."""
+    items: List[Tuple[str, float]] = []
     for prod, qty in totals.items():
         vol = volume_map.get(prod.lower())
         if vol is None or vol <= 0:
-            missing.append(prod)
-            continue
-        items.extend([vol] * qty)
-    if missing or not items:
+            return None
+        items.extend([(prod, float(vol))] * int(qty))
+    if not items:
         return None
-    presets = sorted(
-        SHIP_BOX_PRESETS,
-        key=lambda p: p["L"] * p["W"] * p["H"],
-    )
-    largest_vol = presets[-1]["L"] * presets[-1]["W"] * presets[-1]["H"]
+
+    items.sort(key=lambda x: x[1], reverse=True)
+    preset_order = _preferred_preset_order(totals, capacity or {})
+    largest_vol = max(_preset_vol(p) for p in SHIP_BOX_PRESETS)
     remaining = list(items)
     used: Counter = Counter()
     guard = 0
-    while remaining and guard < 200:
+    while remaining and guard < 400:
         guard += 1
-        group = [remaining.pop(0)]
-        total = group[0]
-        i = 0
-        while i < len(remaining):
-            if total + remaining[i] <= largest_vol:
-                total += remaining[i]
-                group.append(remaining.pop(i))
-            else:
-                i += 1
+        first = remaining[0]
+        if first[1] > largest_vol + 1e-9:
+            used[sorted(SHIP_BOX_PRESETS, key=_preset_vol)[-1]["id"]] += 1
+            remaining.pop(0)
+            continue
+
         chosen = None
-        for p in presets:
-            if p["L"] * p["W"] * p["H"] >= total:
+        for p in preset_order:
+            if _preset_vol(p) + 1e-9 >= first[1]:
                 chosen = p
                 break
-        chosen = chosen or presets[-1]
+        chosen = chosen or sorted(SHIP_BOX_PRESETS, key=_preset_vol)[-1]
+        space = _preset_vol(chosen)
+        i = 0
+        while i < len(remaining):
+            if remaining[i][1] <= space + 1e-9:
+                space -= remaining[i][1]
+                remaining.pop(i)
+            else:
+                i += 1
         used[chosen["id"]] += 1
-    out = []
-    for pid, qty in used.items():
-        p = _preset_by_id(pid)
-        if p:
-            out.append(
-                {
-                    "label": p["label"],
-                    "L": p["L"],
-                    "W": p["W"],
-                    "H": p["H"],
-                    "weight": p["weight"],
-                    "qty": qty,
-                    "preset_id": pid,
-                    "box_key": box_key(p["L"], p["W"], p["H"], p["weight"]),
-                }
-            )
-    return out or None
+
+    return _boxes_from_used(used) or None
 
 
 def suggest_boxes(
@@ -709,7 +829,9 @@ def suggest_boxes(
 ) -> Dict[str, Any]:
     """
     Suggest preset box counts for the given piece list.
-    Returns { status, suggestion, history_count }.
+
+    Primary engine: learned product capacity → inferred volumes → pack math.
+    Exact mix replay is only a rare bonus.
     """
     norm_pieces = normalize_pieces(pieces)
     totals = mix_totals(norm_pieces)
@@ -750,27 +872,54 @@ def suggest_boxes(
             "pieces": [],
         }
 
-    # 1) Exact mix signature matches
+    capacity = _learn_capacity(hist)
+    learned_vols = _volumes_from_capacity(capacity)
+    # Prefer volumes learned from real packs; sheet volumes fill gaps
+    merged_vols = _merge_volume_maps(volume_map or {}, learned_vols)
+
+    # 1) Volume math (works for never-seen mixes once products have volumes)
+    if merged_vols and all(p in merged_vols for p in totals):
+        packed_v = _pack_by_volume(totals, merged_vols, capacity=capacity)
+        if packed_v:
+            src = "capacity_volume" if learned_vols else "volume"
+            conf = "medium" if learned_vols else "low"
+            why = (
+                "Packed from learned product volumes (how many fit per box historically)."
+                if learned_vols
+                else "Packed from product volume table (still learning from shipments)."
+            )
+            return _result(packed_v, src, conf, why)
+
+    # 2) Capacity fill fractions when every product has learned box fit
+    packed = _pack_by_capacity(totals, capacity)
+    if packed:
+        return _result(
+            packed,
+            "capacity",
+            "medium",
+            "Packed from learned pieces-per-box for each product.",
+        )
+
+    # 3) Rare bonus: exact same mix seen before
     exact = [
         r
         for r in hist
         if r.get("mix_signature") == sig and (r.get("boxes") or [])
     ]
     if exact:
-        # Prefer most recent
         exact_sorted = sorted(
             exact, key=lambda r: str(r.get("shipped_at") or ""), reverse=True
         )
-        # Majority vote on box_key counts among last few
         recent = exact_sorted[:8]
         vote: Counter = Counter()
         box_meta: Dict[str, Dict[str, Any]] = {}
         for r in recent:
             for b in r.get("boxes") or []:
-                bk = b.get("box_key") or box_key(b.get("L"), b.get("W"), b.get("H"), b.get("weight"))
+                bk = b.get("box_key") or box_key(
+                    b.get("L"), b.get("W"), b.get("H"), b.get("weight")
+                )
                 vote[bk] += _safe_int(b.get("qty"), 1)
                 box_meta[bk] = b
-        # Average qty per box_key across recent
         n = max(1, len(recent))
         boxes = []
         for bk, total_qty in vote.items():
@@ -793,65 +942,14 @@ def suggest_boxes(
             boxes,
             "history_exact",
             "high",
-            f"Matched {len(exact)} past shipment(s) with the same product mix.",
+            f"Optional match: same mix on {len(exact)} past shipment(s).",
         )
-
-    # 2) Similar mixes (same products, scalable qty)
-    best = None
-    best_score = 0.0
-    for r in hist:
-        if not (r.get("boxes") or []):
-            continue
-        rt = mix_totals(r.get("pieces") or [])
-        if set(rt.keys()) != set(totals.keys()):
-            # still allow subset similarity
-            if not set(totals.keys()) & set(rt.keys()):
-                continue
-        score = _similarity(totals, rt)
-        if score > best_score:
-            best_score = score
-            best = r
-    if best and best_score >= 0.75:
-        rt = mix_totals(best.get("pieces") or [])
-        # Scale by total piece ratio
-        sum_a = sum(totals.values()) or 1
-        sum_b = sum(rt.values()) or 1
-        factor = sum_a / sum_b
-        scaled = _scale_boxes(best.get("boxes") or [], factor)
-        return _result(
-            scaled,
-            "history_similar",
-            "medium" if best_score >= 0.9 else "low",
-            f"Scaled a similar past shipment (similarity {best_score:.0%}).",
-        )
-
-    # 3) Learned per-product capacity
-    capacity = _learn_capacity(hist)
-    packed = _pack_by_capacity(totals, capacity)
-    if packed:
-        return _result(
-            packed,
-            "capacity",
-            "medium",
-            "Estimated from how many of each product fit in boxes on past shipments.",
-        )
-
-    # 4) Volume fallback from Table sheet map
-    if volume_map:
-        packed_v = _pack_by_volume(totals, volume_map)
-        if packed_v:
-            return _result(
-                packed_v,
-                "volume",
-                "low",
-                "Estimated from product volumes (no strong packing history yet).",
-            )
 
     return _result(
         [],
         "none",
         "none",
-        "Not enough packing history yet — pick boxes manually; this shipment will teach the next one.",
+        "Not enough packing history yet for these products — pick boxes manually; this ship teaches the next one.",
     )
 
 
