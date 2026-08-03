@@ -13445,6 +13445,77 @@ def _fetch_drive_image_bytes(file_id: str):
     return None
 
 
+def _fetch_drive_thumbnail_bytes(file_id: str, sz: str = "w400"):
+    """Fetch a small Drive thumbnail (avoids full-res images for PDF previews)."""
+    if not file_id:
+        return None
+    try:
+        import urllib.request
+
+        url = f"https://drive.google.com/thumbnail?id={file_id}&sz={sz}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0",
+                "Accept": "image/*",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read()
+            if data and len(data) >= 100:
+                return data
+    except Exception as e:
+        logger.warning("_fetch_drive_thumbnail_bytes failed for %s: %s", file_id, e)
+    return None
+
+
+def _prepare_pdf_preview_image(img_bytes: bytes, max_px: int = 400):
+    """
+    Downsample image bytes for reportlab PDF embedding.
+    Temporarily disables Pillow's decompression-bomb limit so huge Drive originals
+    can be opened, then immediately shrunk for the PDF thumbnail slot.
+    Returns (BytesIO jpeg, width_px, height_px) or None.
+    """
+    if not img_bytes:
+        return None
+    try:
+        from PIL import Image as PILImage
+
+        prev_limit = PILImage.MAX_IMAGE_PIXELS
+        PILImage.MAX_IMAGE_PIXELS = None
+        try:
+            img = PILImage.open(io.BytesIO(img_bytes))
+            img.load()
+        finally:
+            PILImage.MAX_IMAGE_PIXELS = prev_limit
+
+        if img.mode in ("RGBA", "LA"):
+            background = PILImage.new("RGB", img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[-1])
+            img = background
+        elif img.mode == "P":
+            img = img.convert("RGBA")
+            background = PILImage.new("RGB", img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[-1])
+            img = background
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        try:
+            resample = PILImage.Resampling.LANCZOS
+        except AttributeError:
+            resample = PILImage.LANCZOS
+        img.thumbnail((max_px, max_px), resample)
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+        buf.seek(0)
+        return buf, img.width, img.height
+    except Exception as e:
+        logger.warning("_prepare_pdf_preview_image failed: %s", e)
+        return None
+
+
 def _outstanding_orders_for_company_rows(company_lower: str):
     prod_data = fetch_sheet(SPREADSHEET_ID, JOBS_FOR_COMPANY_RANGE)
     if not prod_data or not prod_data[0]:
@@ -13597,15 +13668,24 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
             if not file_id:
                 image_link = str(job.get("Image", "")).strip()
                 file_id = _extract_drive_file_id(image_link)
-            img_bytes = _fetch_drive_image_bytes(file_id) if file_id else None
-            if img_bytes:
+            # Prefer Drive thumbnail; full originals can exceed Pillow's pixel limit
+            # (~89M) and OOM the PDF builder (DecompressionBombWarning).
+            prepared = None
+            if file_id:
+                for fetcher in (_fetch_drive_thumbnail_bytes, _fetch_drive_image_bytes):
+                    img_bytes = fetcher(file_id)
+                    if not img_bytes:
+                        continue
+                    prepared = _prepare_pdf_preview_image(img_bytes)
+                    if prepared:
+                        break
+            if prepared:
                 try:
-                    reader = ImageReader(io.BytesIO(img_bytes))
-                    orig_w, orig_h = reader.getSize()
+                    buf, orig_w, orig_h = prepared
                     max_dim = 0.85 * inch
                     scale = min(max_dim / orig_w, max_dim / orig_h, 1.0)
                     img_cell = Image(
-                        io.BytesIO(img_bytes),
+                        buf,
                         width=orig_w * scale,
                         height=orig_h * scale,
                     )
