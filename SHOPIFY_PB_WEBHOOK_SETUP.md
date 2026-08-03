@@ -1,6 +1,6 @@
-# Shopify Product Builder Webhook Setup
+# Shopify Order Webhook Setup
 
-When a customer places an order in Shopify that includes product-builder line items (custom Material/Fur, etc.), the backend creates one production order row per line item in:
+When a customer places an order in Shopify, the backend creates one production order row per line item in:
 
 1. **Google Sheets** – tab **`Production Orders`** by default (override with `PRODUCTION_ORDERS_PB_SHEET_TAB`)
 2. **Supabase** – table **`Production Orders TEST`** by default (override with `SUPABASE_PB_ORDERS_TABLE`)
@@ -27,6 +27,7 @@ Set on your backend (e.g. Render):
 | Variable | Description |
 |----------|-------------|
 | `SHOPIFY_WEBHOOK_SECRET` | Webhook signing secret from Shopify (required for HMAC verification). |
+| `SHOPIFY_WEBHOOK_ALL_ORDERS` | (Optional) Import **all** Shopify line items, not only product-builder.custom items. Default: **`1`** (on). Set to `0` or `false` to only import custom builder orders. |
 | `ORDERS_RANGE` | (Optional) A1 range for Production Orders reads (default `Production Orders!A1:AP`). |
 | `PRODUCTION_ORDERS_PB_SHEET_TAB` | (Optional) Sheet tab for Shopify webhook rows. Default: **`Production Orders`**. |
 | `SUPABASE_PB_ORDERS_TABLE` | (Optional) Supabase table for PB webhook rows. Default: **`Production Orders TEST`**. |

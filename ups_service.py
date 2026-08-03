@@ -197,6 +197,50 @@ def _addr(
         out["AttentionName"] = attn[:35]
     return out
 
+
+def _parse_ups_notify_emails(raw: str | None) -> List[str]:
+    """Split Directory / override emails into UPS QVN addresses (max 5, 50 chars each)."""
+    parts = re.split(r"[;,\s]+", str(raw or "").strip())
+    out: List[str] = []
+    seen = set()
+    for p in parts:
+        e = (p or "").strip()
+        if not e or "@" not in e:
+            continue
+        local, _, domain = e.partition("@")
+        if not local or "." not in domain:
+            continue
+        e = e[:50]
+        key = e.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+        if len(out) >= 5:
+            break
+    return out
+
+
+def _shipment_qv_notifications(emails: List[str]) -> List[Dict[str, Any]]:
+    """
+    UPS Quantum View Notification (QVN) — same pre-built emails as WorldShip / ups.com.
+    6 = Ship Notification, 8 = Delivery Notification. Max 3 notification types per shipment.
+    FromName / UndeliverableEMailAddress may appear only once on the shipment.
+    """
+    if not emails:
+        return []
+    from_name = (FROM.get("name") or "JR & Co.")[:35]
+    undeliverable = (os.getenv("UPS_NOTIFY_UNDELIVERABLE_EMAIL") or "").strip()[:50]
+    out: List[Dict[str, Any]] = []
+    for i, code in enumerate(("6", "8")):
+        email_node: Dict[str, Any] = {"EMailAddress": list(emails)}
+        if i == 0:
+            email_node["FromName"] = from_name
+            if undeliverable and "@" in undeliverable:
+                email_node["UndeliverableEMailAddress"] = undeliverable
+        out.append({"NotificationCode": code, "EMail": email_node})
+    return out
+
 def _shipper() -> Dict[str, Any]:
     return {
         "Name": FROM["name"][:35],
@@ -1382,6 +1426,14 @@ def create_shipment(
         "transactionSrc": "JRCO",
     }
 
+    notify_emails = _parse_ups_notify_emails(
+        ship_to.get("email") or ship_to.get("Email") or ship_to.get("notify_email")
+    )
+    service_opts: Dict[str, Any] = {}
+    qv_notifications = _shipment_qv_notifications(notify_emails)
+    if qv_notifications:
+        service_opts["Notification"] = qv_notifications
+
     shipment = {
         "ShipmentRequest": {
             "Request": {"SubVersion": "1707"},
@@ -1403,7 +1455,7 @@ def create_shipment(
                     }]
                 },
                 "Package": [_pkg_ship(p, p.get("weight", 1.0)) for p in packages],
-                "ShipmentServiceOptions": {}
+                "ShipmentServiceOptions": service_opts,
             },
             "LabelSpecification": _label_spec()
         }
@@ -1411,6 +1463,16 @@ def create_shipment(
 
     if NEGOTIATED:
         shipment["ShipmentRequest"]["Shipment"]["ShipmentRatingOptions"] = {"NegotiatedRatesIndicator": "Y"}
+
+    if notify_emails:
+        logging.info(
+            "UPS QV notifications requested for %s (ship+delivery)",
+            ", ".join(notify_emails),
+        )
+    else:
+        logging.warning(
+            "UPS shipment has no recipient email — skipping Quantum View ship/delivery notifications"
+        )
 
     resp = requests.post(url, headers=headers, json=shipment, timeout=35)
     try:

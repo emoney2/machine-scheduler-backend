@@ -1,3 +1,4 @@
 # Minimal deps for Render Cron Job only (POST to /api/sales/cron/sync-qbo).
 # Keeps install off Python 3.14–incompatible packages (e.g. greenlet via eventlet).
+# QBO OAuth lives on the web service (qbo_token.json or QBO_TOKEN_JSON on boot).
 requests>=2.28.0,<3
