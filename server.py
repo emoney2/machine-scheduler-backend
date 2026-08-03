@@ -14026,9 +14026,9 @@ def _ship_queue_active_embroidery_order_keys() -> set:
 @login_required_session
 def ship_production_queue():
     """
-    Open Embroidery / Sewing (and ship-ready) jobs that are not complete or fully
-    shipped, for Ship tab quick-pick cards. Also includes orders marked NEEDS WORK
-    on Embroidery List when Stage is stale. Sorted by Due Date, then Order #.
+    Outstanding (not complete / not fully shipped) jobs for Ship tab quick-pick
+    cards: due on or before today+6 weeks (includes overdue and missing due dates).
+    Sorted by Due Date, then Order #.
     """
     try:
         prod_data = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
@@ -14036,20 +14036,20 @@ def ship_production_queue():
             return jsonify({"jobs": []}), 200
 
         emb_active = _ship_queue_active_embroidery_order_keys()
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        due_horizon = today + timedelta(weeks=6)
         headers = prod_data[0]
         jobs = []
         for r in prod_data[1:]:
             row = dict(zip(headers, r))
             if _overview_exclude_completed_or_shipped(row):
                 continue
+            due = _ship_queue_parse_due(row.get("Due Date"))
+            # Keep overdue + through next 6 weeks; missing due dates stay visible
+            if due is not None and due > due_horizon:
+                continue
             stage_tok = _ship_queue_resolve_stage(row)
             oid_key = _overview_normalize_order_key(row.get("Order #"))
-            # Ship tab cards: embroidery / sewing / ship-ready (not cut/print/fur/etc.)
-            if not (
-                _ship_queue_is_embroidery_or_sewing(stage_tok)
-                or (oid_key and oid_key in emb_active)
-            ):
-                continue
             qty_num = _parse_qty_number(row.get("Quantity"), 0.0)
             shipped_num = _parse_qty_number(row.get("Shipped"), 0.0)
             remaining = max(0.0, qty_num - shipped_num)
