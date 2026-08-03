@@ -162,6 +162,7 @@ from ups_service import (
 )
 import ship_qbo_file_log as sqlog
 import packing_history as packhist
+import sewing_priority_waiting as sew_waiting
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
@@ -12996,6 +12997,77 @@ def packing_history_list():
     rows = packhist.load_history()
     rows = list(reversed(rows[-limit:]))
     resp = jsonify({"status": "ok", "count": len(rows), "records": rows})
+    resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
+
+@app.route("/api/sewing-priority/waiting", methods=["GET", "OPTIONS"])
+@login_required_session
+def sewing_priority_waiting_list():
+    """Shared Waiting tile keys for Sewing Priority (visible to all clients)."""
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Requested-With, Accept"
+        )
+        resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        return resp
+    try:
+        sheets_svc = get_sheets_service()
+    except Exception:
+        sheets_svc = None
+    keys = sew_waiting.load_keys(sheets_svc, SPREADSHEET_ID)
+    resp = jsonify({"status": "ok", "keys": keys})
+    resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
+
+@app.route("/api/sewing-priority/waiting/toggle", methods=["POST", "OPTIONS"])
+@login_required_session
+def sewing_priority_waiting_toggle():
+    """Toggle Waiting on a Sewing Priority tile; broadcasts to all clients."""
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Requested-With, Accept"
+        )
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
+    data = request.get_json(silent=True) or {}
+    key = data.get("key")
+    try:
+        try:
+            sheets_svc = get_sheets_service()
+        except Exception:
+            sheets_svc = None
+        result = sew_waiting.toggle_key(key, sheets_svc, SPREADSHEET_ID)
+    except ValueError as e:
+        resp = jsonify({"status": "error", "error": str(e)})
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp, 400
+    except Exception as e:
+        logging.exception("sewing-priority waiting toggle failed")
+        resp = jsonify({"status": "error", "error": str(e)})
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp, 500
+
+    try:
+        socketio.emit(
+            "sewingPriorityWaitingUpdated",
+            {"keys": result["keys"], "key": result["key"], "waiting": result["waiting"]},
+        )
+    except Exception as emit_err:
+        logging.warning("sewing-priority waiting socket emit failed: %s", emit_err)
+
+    resp = jsonify({"status": "ok", **result})
     resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
     resp.headers["Access-Control-Allow-Credentials"] = "true"
     return resp
