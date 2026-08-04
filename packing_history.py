@@ -527,14 +527,11 @@ def _scale_boxes(boxes: List[Dict[str, Any]], factor: float) -> List[Dict[str, A
     return out
 
 
-def _median_int(values: List[int]) -> int:
+def _max_int(values: List[int]) -> int:
+    """Best observed fill — 'how many fit', not typical order size."""
     if not values:
         return 0
-    s = sorted(values)
-    mid = len(s) // 2
-    if len(s) % 2:
-        return int(s[mid])
-    return max(1, int(round((s[mid - 1] + s[mid]) / 2.0)))
+    return max(int(v) for v in values if int(v) > 0)
 
 
 def _preset_by_id(pid: str) -> Optional[Dict[str, Any]]:
@@ -559,12 +556,11 @@ def _match_preset_id_for_box_key(bkey: str) -> Optional[str]:
 
 def _learn_capacity(history: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
     """
-    product_norm(lower) -> box_key -> typical pieces per physical box.
+    product_norm(lower) -> box_key -> max pieces that have fit in that box.
 
-    Learns from:
-    - explicit per-box contents (if present)
-    - single-product shipments using one box size (qty / box count)
-    - single-box shipments of one product (all qty in that box)
+    Capacity means densest observed fill (how many fit), not median order size.
+    Mixed boxes count total pieces in the carton for every product present, so
+    6 Mallet + 6 CS Mallet in one box teaches 12/box — not 6/box each.
     """
     samples: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
 
@@ -579,9 +575,15 @@ def _learn_capacity(history: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
             bkey = box.get("box_key") or box_key(
                 box.get("L"), box.get("W"), box.get("H"), box.get("weight")
             )
-            for p in box.get("pieces") or []:
+            box_pieces = box.get("pieces") or []
+            # Total pieces sharing this physical carton (same-size mix)
+            total_in_box = sum(_safe_int(p.get("qty"), 0) for p in box_pieces)
+            if total_in_box <= 0:
+                continue
+            for p in box_pieces:
                 prod = str(p.get("product_norm") or "").strip().lower()
-                _sample(prod, bkey, _safe_int(p.get("qty"), 0))
+                if prod:
+                    _sample(prod, bkey, total_in_box)
 
         pieces = rec.get("pieces") or []
         boxes = rec.get("boxes") or []
@@ -599,29 +601,30 @@ def _learn_capacity(history: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
                 per = max(1, int(round(totals[prod] / float(len(packages)))))
                 _sample(prod, bkey, per)
 
-        # One physical box (any mix) with a single product type
-        if len(packages) == 1 and len(totals) == 1:
-            prod = next(iter(totals.keys()))
+        # One physical box (any mix) → every product learns total piece count
+        if len(packages) == 1:
             bkey = packages[0].get("box_key") or box_key(
                 packages[0].get("L"),
                 packages[0].get("W"),
                 packages[0].get("H"),
                 packages[0].get("weight"),
             )
-            _sample(prod, bkey, totals[prod])
+            total = sum(int(v) for v in totals.values())
+            for prod in totals:
+                _sample(prod, bkey, total)
 
     out: Dict[str, Dict[str, int]] = {}
     for prod, by_box in samples.items():
         out[prod] = {}
         for bkey, vals in by_box.items():
-            med = _median_int(vals)
-            if med > 0:
-                out[prod][bkey] = med
+            cap = _max_int(vals)
+            if cap > 0:
+                out[prod][bkey] = cap
     return out
 
 
 def _volumes_from_capacity(capacity: Dict[str, Dict[str, int]]) -> Dict[str, float]:
-    """Infer cubic-inch volume per product from learned pieces-per-box."""
+    """Infer cubic-inch volume per product from densest learned pieces-per-box."""
     vols: Dict[str, float] = {}
     for prod, by_box in capacity.items():
         samples: List[float] = []
@@ -634,17 +637,17 @@ def _volumes_from_capacity(capacity: Dict[str, Dict[str, int]]) -> Dict[str, flo
                 continue
             samples.append(_preset_vol(p) / float(cap))
         if samples:
-            samples.sort()
-            mid = len(samples) // 2
-            if len(samples) % 2:
-                vols[prod] = samples[mid]
-            else:
-                vols[prod] = (samples[mid - 1] + samples[mid]) / 2.0
+            # Smallest inferred piece volume = densest pack observed
+            vols[prod] = min(samples)
     return vols
 
 
 def _merge_volume_maps(*maps: Optional[Dict[str, float]]) -> Dict[str, float]:
-    """Later maps win (prefer learned packing volumes over sheet defaults)."""
+    """
+    Merge volume maps. When the same product appears in multiple maps, keep the
+    smaller volume (denser pack). Underfilled shipment history must not inflate
+    piece volume past a tighter sheet default or denser learned pack.
+    """
     out: Dict[str, float] = {}
     for m in maps:
         if not m:
@@ -654,8 +657,11 @@ def _merge_volume_maps(*maps: Optional[Dict[str, float]]) -> Dict[str, float]:
                 fv = float(v)
             except (TypeError, ValueError):
                 continue
-            if fv > 0:
-                out[str(k).lower()] = fv
+            if fv <= 0:
+                continue
+            key = str(k).lower()
+            if key not in out or fv < out[key]:
+                out[key] = fv
     return out
 
 
@@ -874,7 +880,7 @@ def suggest_boxes(
 
     capacity = _learn_capacity(hist)
     learned_vols = _volumes_from_capacity(capacity)
-    # Prefer volumes learned from real packs; sheet volumes fill gaps
+    # Keep densest volume when sheet + learned both exist (min wins)
     merged_vols = _merge_volume_maps(volume_map or {}, learned_vols)
 
     # 1) Volume math (works for never-seen mixes once products have volumes)
