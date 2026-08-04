@@ -545,6 +545,27 @@ def _preset_vol(p: Dict[str, Any]) -> float:
     return float(p["L"]) * float(p["W"]) * float(p["H"])
 
 
+def _box_interior_vol(
+    L: Any = None,
+    W: Any = None,
+    H: Any = None,
+    *,
+    preset_id: Optional[str] = None,
+    bkey: Optional[str] = None,
+) -> float:
+    """Cubic inches of box interior (catalog preset when dims match, else L×W×H)."""
+    pid = preset_id or (_match_preset_id_for_box_key(bkey) if bkey else None)
+    if not pid and L is not None and W is not None and H is not None:
+        pid = preset_id_for_dims(L, W, H)
+    p = _preset_by_id(pid) if pid else None
+    if p:
+        return _preset_vol(p)
+    lv, wv, hv = _safe_float(L), _safe_float(W), _safe_float(H)
+    if lv > 0 and wv > 0 and hv > 0:
+        return lv * wv * hv
+    return 0.0
+
+
 def _match_preset_id_for_box_key(bkey: str) -> Optional[str]:
     dim = str(bkey or "").split("@")[0]
     for p in SHIP_BOX_PRESETS:
@@ -554,13 +575,115 @@ def _match_preset_id_for_box_key(bkey: str) -> Optional[str]:
     return None
 
 
+def _piece_qty_totals(pieces: Any) -> Dict[str, int]:
+    totals: Dict[str, int] = defaultdict(int)
+    if not isinstance(pieces, list):
+        return {}
+    for p in pieces:
+        if not isinstance(p, dict):
+            continue
+        prod = str(p.get("product_norm") or "").strip().lower()
+        qty = _safe_int(p.get("qty"), 0)
+        if prod and qty > 0:
+            totals[prod] += qty
+    return dict(totals)
+
+
+def _learn_product_volumes(history: List[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Learn cubic-inch volume used per product unit from past packs.
+
+    For each physical box with known contents:
+      share_i = qty_i / total_pieces_in_box
+      volume attributed to product i = box_interior_vol × share_i
+      volume per unit = attributed / qty_i
+                     (= box_interior_vol / total_pieces — equal piece share)
+
+    Suggestion uses the least (smallest) volume observed per product.
+    """
+    samples: Dict[str, List[float]] = defaultdict(list)
+
+    def _observe(prod: str, vol_per_unit: float) -> None:
+        if prod and vol_per_unit > 0:
+            samples[prod].append(float(vol_per_unit))
+
+    def _observe_box(box_vol: float, piece_totals: Dict[str, int]) -> None:
+        total = sum(int(v) for v in piece_totals.values())
+        if box_vol <= 0 or total <= 0:
+            return
+        for prod, qty in piece_totals.items():
+            q = int(qty)
+            if q <= 0:
+                continue
+            share = q / float(total)
+            attributed = box_vol * share
+            _observe(prod, attributed / float(q))
+
+    for rec in history:
+        contents = rec.get("box_contents") or []
+        for box in contents:
+            bkey = box.get("box_key") or box_key(
+                box.get("L"), box.get("W"), box.get("H"), box.get("weight")
+            )
+            box_vol = _box_interior_vol(
+                box.get("L"),
+                box.get("W"),
+                box.get("H"),
+                preset_id=box.get("preset_id"),
+                bkey=bkey,
+            )
+            _observe_box(box_vol, _piece_qty_totals(box.get("pieces") or []))
+
+        pieces = rec.get("pieces") or []
+        boxes = rec.get("boxes") or []
+        totals = mix_totals(pieces)
+        packages = expand_boxes_to_packages(boxes)
+        if not packages or not totals:
+            continue
+
+        # No per-box breakdown: one product + one box size → split total carton volume
+        if len(totals) == 1 and not contents:
+            prod = next(iter(totals.keys()))
+            keys = {p.get("box_key") for p in packages}
+            if len(keys) == 1:
+                pkg = packages[0]
+                unit_box = _box_interior_vol(
+                    pkg.get("L"),
+                    pkg.get("W"),
+                    pkg.get("H"),
+                    preset_id=pkg.get("preset_id"),
+                    bkey=pkg.get("box_key"),
+                )
+                total_box_vol = unit_box * len(packages)
+                qty = int(totals[prod])
+                if total_box_vol > 0 and qty > 0:
+                    _observe(prod, total_box_vol / float(qty))
+
+        # One physical box, any mix, no contents detail → share by piece %
+        if len(packages) == 1 and not contents:
+            pkg = packages[0]
+            box_vol = _box_interior_vol(
+                pkg.get("L"),
+                pkg.get("W"),
+                pkg.get("H"),
+                preset_id=pkg.get("preset_id"),
+                bkey=pkg.get("box_key"),
+            )
+            _observe_box(box_vol, totals)
+
+    out: Dict[str, float] = {}
+    for prod, vals in samples.items():
+        if vals:
+            out[prod] = min(vals)
+    return out
+
+
 def _learn_capacity(history: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
     """
     product_norm(lower) -> box_key -> max pieces that have fit in that box.
 
-    Capacity means densest observed fill (how many fit), not median order size.
-    Mixed boxes count total pieces in the carton for every product present, so
-    6 Mallet + 6 CS Mallet in one box teaches 12/box — not 6/box each.
+    Used for preferred box-size ranking and capacity-fill fallback.
+    Mixed boxes count total pieces in the carton for every product present.
     """
     samples: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
 
@@ -576,7 +699,6 @@ def _learn_capacity(history: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
                 box.get("L"), box.get("W"), box.get("H"), box.get("weight")
             )
             box_pieces = box.get("pieces") or []
-            # Total pieces sharing this physical carton (same-size mix)
             total_in_box = sum(_safe_int(p.get("qty"), 0) for p in box_pieces)
             if total_in_box <= 0:
                 continue
@@ -592,7 +714,6 @@ def _learn_capacity(history: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
         if not packages or not totals:
             continue
 
-        # One product type + one box size → pieces-per-box = qty / boxes
         if len(totals) == 1:
             prod = next(iter(totals.keys()))
             keys = {p.get("box_key") for p in packages}
@@ -601,7 +722,6 @@ def _learn_capacity(history: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
                 per = max(1, int(round(totals[prod] / float(len(packages)))))
                 _sample(prod, bkey, per)
 
-        # One physical box (any mix) → every product learns total piece count
         if len(packages) == 1:
             bkey = packages[0].get("box_key") or box_key(
                 packages[0].get("L"),
@@ -623,31 +743,8 @@ def _learn_capacity(history: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
     return out
 
 
-def _volumes_from_capacity(capacity: Dict[str, Dict[str, int]]) -> Dict[str, float]:
-    """Infer cubic-inch volume per product from densest learned pieces-per-box."""
-    vols: Dict[str, float] = {}
-    for prod, by_box in capacity.items():
-        samples: List[float] = []
-        for bkey, cap in by_box.items():
-            if cap <= 0:
-                continue
-            pid = _match_preset_id_for_box_key(bkey)
-            p = _preset_by_id(pid) if pid else None
-            if not p:
-                continue
-            samples.append(_preset_vol(p) / float(cap))
-        if samples:
-            # Smallest inferred piece volume = densest pack observed
-            vols[prod] = min(samples)
-    return vols
-
-
 def _merge_volume_maps(*maps: Optional[Dict[str, float]]) -> Dict[str, float]:
-    """
-    Merge volume maps. When the same product appears in multiple maps, keep the
-    smaller volume (denser pack). Underfilled shipment history must not inflate
-    piece volume past a tighter sheet default or denser learned pack.
-    """
+    """Merge volume maps; keep the least (smallest) volume per product."""
     out: Dict[str, float] = {}
     for m in maps:
         if not m:
@@ -836,7 +933,8 @@ def suggest_boxes(
     """
     Suggest preset box counts for the given piece list.
 
-    Primary engine: learned product capacity → inferred volumes → pack math.
+    Primary engine: learn per-unit volume from box interior × product share,
+    keep the least volume per product, then pack by volume.
     Exact mix replay is only a rare bonus.
     """
     norm_pieces = normalize_pieces(pieces)
@@ -879,8 +977,8 @@ def suggest_boxes(
         }
 
     capacity = _learn_capacity(hist)
-    learned_vols = _volumes_from_capacity(capacity)
-    # Keep densest volume when sheet + learned both exist (min wins)
+    # Box interior vol × product share → per-unit vol; keep least seen per product
+    learned_vols = _learn_product_volumes(hist)
     merged_vols = _merge_volume_maps(volume_map or {}, learned_vols)
 
     # 1) Volume math (works for never-seen mixes once products have volumes)
@@ -890,7 +988,7 @@ def suggest_boxes(
             src = "capacity_volume" if learned_vols else "volume"
             conf = "medium" if learned_vols else "low"
             why = (
-                "Packed from learned product volumes (how many fit per box historically)."
+                "Packed from least learned product volumes (box volume × product share in past shipments)."
                 if learned_vols
                 else "Packed from product volume table (still learning from shipments)."
             )
