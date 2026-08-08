@@ -18211,26 +18211,40 @@ _thread_inventory_cache = {"ts": 0.0, "data": {}, "ttl": 45}  # 45 second TTL
 @login_required_session
 def get_thread_inventory_status():
     """
-    Returns a map of thread color -> status ("green", "yellow", "red")
+    Returns a map of thread color -> detail object:
+      { "status": "green"|"yellow"|"red", "inventory": <cones>, "onOrder": <cones> }
+
+    Status rules (unchanged):
     - green: Inventory > 0 (in stock)
-    - yellow: Inventory <= 0 AND On Order > 0 AND (Inventory + On Order) > 0 (on order brings total positive)
+    - yellow: Inventory <= 0 AND On Order > 0 AND (Inventory + On Order) > 0
     - red: No on order, or on order not enough to bring total positive
-    
+
+    Inventory values are cone counts from the Thread Inventory sheet.
+    Query ?legacy=1 to get the old color -> status-string map.
+
     Cached for 45 seconds to avoid excessive API calls.
     """
     global _thread_inventory_cache
     now = time.time()
-    
+    legacy = str(request.args.get("legacy", "")).strip().lower() in ("1", "true", "yes")
+
+    def _as_legacy(data):
+        out = {}
+        for k, v in (data or {}).items():
+            out[k] = v.get("status") if isinstance(v, dict) else v
+        return out
+
     # Check cache
     if now - _thread_inventory_cache["ts"] < _thread_inventory_cache["ttl"]:
-        return jsonify(_thread_inventory_cache["data"]), 200
-    
+        data = _thread_inventory_cache["data"]
+        return jsonify(_as_legacy(data) if legacy else data), 200
+
     try:
         # Fetch Thread Inventory sheet
         rows = fetch_sheet(SPREADSHEET_ID, "Thread Inventory!A1:G")
         if not rows or len(rows) < 2:
             return jsonify({}), 200
-        
+
         raw_headers = rows[0]
         headers_lower = [str(h).strip().lower() for h in raw_headers]
         # Flexible column matching (like Material Inventory): accept "Thread Colors", "Inventory"/"Inventory..", "On Order"/"On Order.."
@@ -18250,24 +18264,24 @@ def get_thread_inventory_status():
         # Default on-order column if not found (e.g. next column after inventory)
         if col_on_order is None and col_inventory is not None:
             col_on_order = col_inventory + 1 if col_inventory + 1 < len(raw_headers) else col_inventory
-        
+
         status_map = {}
-        
+
         # Process each row
         for row in rows[1:]:
             if len(row) <= max(col_thread, col_inventory, col_on_order):
                 continue
-            
+
             thread_color = str(row[col_thread]).strip()
             if not thread_color:
                 continue
-            
-            # Parse inventory
+
+            # Parse inventory (cone counts)
             try:
                 inventory = float(str(row[col_inventory]).replace(",", "").strip() or "0")
             except (ValueError, TypeError):
                 inventory = 0.0
-            
+
             # Parse on_order: numeric value, or any non-empty text (e.g. "Yes", "Ordered") = treat as on order
             on_order = 0.0
             if col_on_order is not None and len(row) > col_on_order:
@@ -18278,7 +18292,7 @@ def get_thread_inventory_status():
                     except (ValueError, TypeError):
                         # Non-numeric but non-empty (e.g. "Yes", "Ordered", "X") = on order
                         on_order = 1.0
-            
+
             # Determine status: green = in stock; yellow = on order and it brings total positive; red = on order not enough or none
             total_after_order = inventory + on_order
             if inventory > 0:
@@ -18287,19 +18301,24 @@ def get_thread_inventory_status():
                 status = "yellow"  # on order is enough to bring inventory positive
             else:
                 status = "red"  # no on order, or on order not enough to bring positive
-            status_map[thread_color] = status
-        
+            status_map[thread_color] = {
+                "status": status,
+                "inventory": inventory,
+                "onOrder": on_order,
+            }
+
         # Update cache
         _thread_inventory_cache["ts"] = now
         _thread_inventory_cache["data"] = status_map
-        
-        return jsonify(status_map), 200
-        
+
+        return jsonify(_as_legacy(status_map) if legacy else status_map), 200
+
     except Exception as e:
         logger.exception("Error fetching thread inventory status")
         # Return cached data if available, otherwise empty
         if _thread_inventory_cache["data"]:
-            return jsonify(_thread_inventory_cache["data"]), 200
+            data = _thread_inventory_cache["data"]
+            return jsonify(_as_legacy(data) if legacy else data), 200
         return jsonify({}), 200
 
 
