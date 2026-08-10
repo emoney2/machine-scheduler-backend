@@ -654,7 +654,7 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
             dual_bucket_debug.append(
                 {
                     "name": name,
-                    "deficit": deficit,
+                    "deficit": meta.get("toBuy") or 0,
                     "now": now_mat,
                     "future": future_mat,
                     **meta,
