@@ -11203,6 +11203,9 @@ def build_overview_payload():
             "Image": r.get("Image") or r.get("Preview") or r.get("Art Link"),
             "Art Link": r.get("Art Link") or r.get("Preview") or r.get("Image"),
             "Print": r.get("Print"),
+            "Stitch Count": r.get("Stitch Count"),
+            "Fur Status": r.get("Fur Status") or r.get("Status"),
+            "Cut Status": r.get("Cut Status"),
             # True when Sewing Summary row for this Order # has Top >= Quantity
             "sewingSummaryComplete": sewing_summary_complete,
         }
