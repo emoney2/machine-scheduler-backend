@@ -10397,11 +10397,88 @@ def invalidate_overview_combined_cache():
     _overview_ts = 0.0
 
 
+def invalidate_material_inventory_status_cache():
+    """Clear scheduler M-square material status cache after order/receive."""
+    global _material_inventory_status_cache
+    _material_inventory_status_cache = {"ts": 0.0, "data": {}, "ttl": 45}
+
+
 def _invalidate_combined_orders_cache():
     """Clear `/api/combined` caches so Fur List sees sheet updates on all clients."""
     global _json_cache
     for key in ("combined-v2", "combined"):
         _json_cache.pop(key, None)
+
+
+def _material_on_order_qty_from_log(log_rows):
+    """
+    Sum Material Log inbound Ordered quantities by material name (lowercased).
+
+    Material Inventory!On Order formulas often stay 0 after /materialInventory logs
+    Ordered (formula lag, Order # filters, etc.). Scheduler M yellow must also see
+    these rows — same idea as Thread Data Ordered cones for thread status.
+    Columns: Material, QTY, IN/OUT, O/R (header-flexible).
+    """
+    by_name = {}
+    if not log_rows or len(log_rows) < 2:
+        return by_name
+    headers = [re.sub(r"\s+", " ", str(h or "").strip().lower()) for h in log_rows[0]]
+
+    def _col(names, start_at=0):
+        for want in names:
+            want = want.lower().strip()
+            for i, key in enumerate(headers):
+                if i < start_at:
+                    continue
+                if key == want:
+                    return i
+        return -1
+
+    col_mat = _col(["material", "materials"])
+    # Prefer QTY (material usage) over Quantity (order piece count). Prefer cols at/after Material.
+    mat_start = col_mat if col_mat >= 0 else 0
+    col_qty = _col(["qty"], start_at=mat_start)
+    if col_qty < 0:
+        col_qty = _col(["qty"])
+    if col_qty < 0:
+        col_qty = _col(["quantity", "qnty"], start_at=mat_start)
+    if col_qty < 0:
+        col_qty = _col(["quantity", "qnty"])
+    col_inout = _col(["in/out", "in out", "inout"])
+    col_or = _col(["o/r", "o / r", "ordered/received"])
+    if col_mat < 0 or col_inout < 0 or col_or < 0:
+        # Fallback to historical layout: F=Material, G=QTY, H=IN/OUT, I=O/R
+        col_mat = 5 if col_mat < 0 else col_mat
+        col_qty = 6 if col_qty < 0 else col_qty
+        col_inout = 7 if col_inout < 0 else col_inout
+        col_or = 8 if col_or < 0 else col_or
+
+    for row in log_rows[1:]:
+        if not row:
+            continue
+
+        def _cell(idx):
+            if idx < 0 or idx >= len(row):
+                return ""
+            return row[idx]
+
+        inout = str(_cell(col_inout) or "").strip().lower()
+        o_r = str(_cell(col_or) or "").strip().lower()
+        if inout != "in" or o_r != "ordered":
+            continue
+        name = re.sub(r"\s+", " ", str(_cell(col_mat) or "").strip().lower())
+        if not name:
+            continue
+        qty = 0.0
+        raw_qty = _cell(col_qty)
+        if raw_qty is not None and raw_qty != "":
+            try:
+                qty = float(str(raw_qty).replace(",", "").strip())
+            except (TypeError, ValueError):
+                qty = 0.0
+        # Count the row even if qty is blank/unparseable — Ordered means on the way
+        by_name[name] = by_name.get(name, 0.0) + (qty if qty > 0 else 1.0)
+    return by_name
 
 
 def _bump_material_inventory_on_order_plain(
@@ -18337,7 +18414,8 @@ def get_material_inventory_status():
     - green: Inventory > 0
     - yellow: Inventory <= 0 AND On Order > 0 (material on the way)
     - red: Inventory <= 0 AND On Order <= 0
-    Cached 45s. Uses Material Inventory sheet: name (col A), Inventory, On Order.
+    Cached 45s. Uses Material Inventory Inventory/On Order, plus Material Log
+    IN+Ordered rows when sheet On Order lags (same pattern as thread status).
     """
     global _material_inventory_status_cache
     now = time.time()
@@ -18363,6 +18441,17 @@ def get_material_inventory_status():
         if col_on_order is None:
             col_on_order = 2 if len(raw_headers) > 2 else None
 
+        # Prefer the larger of sheet On Order vs Material Log Ordered (app logs).
+        log_on_order = {}
+        try:
+            log_rows = fetch_sheet(SPREADSHEET_ID, "Material Log!A1:Z")
+            log_on_order = _material_on_order_qty_from_log(log_rows)
+        except Exception as log_err:
+            logger.warning(
+                "material-inventory-status: Material Log Ordered fallback failed: %s",
+                log_err,
+            )
+
         status_map = {}
         for row in rows[1:]:
             if not row or len(row) <= name_col:
@@ -18378,10 +18467,16 @@ def get_material_inventory_status():
                 except (ValueError, TypeError):
                     pass
             if col_on_order is not None and len(row) > col_on_order:
-                try:
-                    on_order = float(str(row[col_on_order]).replace(",", "").strip() or "0")
-                except (ValueError, TypeError):
-                    pass
+                raw_oo = str(row[col_on_order]).strip()
+                if raw_oo:
+                    try:
+                        on_order = float(raw_oo.replace(",", ""))
+                    except (ValueError, TypeError):
+                        # Non-numeric but non-empty (e.g. "Yes", "Ordered") = on order
+                        on_order = 1.0
+            log_oo = float(log_on_order.get(re.sub(r"\s+", " ", name.lower()), 0.0) or 0.0)
+            if log_oo > on_order:
+                on_order = log_oo
             if inventory > 0:
                 status = "green"
             elif inventory <= 0 and on_order > 0:
@@ -18647,6 +18742,10 @@ def submit_material_inventory():
 
         invalidate_overview_combined_cache()
         invalidate_materials_needed_cache()
+        try:
+            invalidate_material_inventory_status_cache()
+        except Exception:
+            pass
 
         return jsonify({"status": "submitted"}), 200
 
@@ -19130,6 +19229,15 @@ def mark_inventory_received():
         app.logger.exception("Receive failed for %s row %s", sheet, row)
         return jsonify({"ok": False, "error": str(e)}), 500
 
+    try:
+        invalidate_materials_needed_cache()
+    except Exception:
+        pass
+    try:
+        invalidate_material_inventory_status_cache()
+    except Exception:
+        pass
+
     resp = jsonify({"ok": True})
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
@@ -19209,6 +19317,10 @@ def mark_inventory_received_batch():
     # (Optional) kick any caches
     try:
         invalidate_materials_needed_cache()
+    except Exception:
+        pass
+    try:
+        invalidate_material_inventory_status_cache()
     except Exception:
         pass
 
