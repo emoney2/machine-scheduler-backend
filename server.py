@@ -11073,7 +11073,7 @@ def build_overview_payload():
     orders_full_for_pairing = []
     try:
         svc = get_sheets_service().spreadsheets().values()
-        with sheet_lock:
+        with acquire_sheet_lock(timeout=45):
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
                 ranges=[OVERVIEW_PRODUCTION_ORDERS_RANGE, FUR_RANGE, CUT_RANGE],
@@ -11412,23 +11412,39 @@ def overview_combined():
     # Build fresh (serialized so two tabs can't run two heavy Sheet builds at once)
     try:
         with _overview_payload_lock:
-            payload = build_overview_payload()
-            app.logger.info(
-                f"📦 Overview payload built: {len(payload.get('upcoming', []))} upcoming, "
-                f"{len(payload.get('materials', []))} material vendor groups (now), "
-                f"{len(payload.get('materialsFuture', []))} (plan ahead)"
-            )
-            _overview_cache = payload
-            _overview_ts = now
+            # Another request may have filled the cache while we waited for the lock
+            now2 = time.time()
+            if (
+                use_cache
+                and _overview_cache
+                and (now2 - _overview_ts) < TTL
+            ):
+                payload = _overview_cache
+            else:
+                payload = build_overview_payload()
+                app.logger.info(
+                    f"📦 Overview payload built: {len(payload.get('upcoming', []))} upcoming, "
+                    f"{len(payload.get('materials', []))} material vendor groups (now), "
+                    f"{len(payload.get('materialsFuture', []))} (plan ahead)"
+                )
+                _overview_cache = payload
+                _overview_ts = now2
     except Exception as e:
         app.logger.exception("overview_combined failed")
-        payload = {
-            "upcoming": [],
-            "materials": [],
-            "materialsFuture": [],
-            "daysWindow": "7",
-            "error": str(e),
-        }
+        # Prefer last good cache over wiping Materials To Order to empty
+        if _overview_cache:
+            app.logger.warning(
+                "overview_combined: serving stale cache after build failure"
+            )
+            payload = _overview_cache
+        else:
+            payload = {
+                "upcoming": [],
+                "materials": [],
+                "materialsFuture": [],
+                "daysWindow": "7",
+                "error": str(e),
+            }
 
     payload_bytes = json.dumps(payload).encode("utf-8")
     resp = Response(payload_bytes, mimetype="application/json")
@@ -11571,8 +11587,16 @@ def overview_rebuild_materials():
     try:
         from overview_rebuild_materials import rebuild_materials_to_order
 
+        app.logger.info("overview_rebuild_materials: starting Sheets rebuild")
+        t0 = time.time()
         with acquire_sheet_lock(timeout=240):
             stats = rebuild_materials_to_order(get_sheets_service(), spreadsheet_id)
+        app.logger.info(
+            "overview_rebuild_materials: done in %.1fs (M=%s N=%s)",
+            time.time() - t0,
+            stats.get("mRows", 0),
+            stats.get("nRows", 0),
+        )
     except RuntimeError as ex:
         app.logger.exception("overview_rebuild_materials: sheets rebuild failed: %s", ex)
         return jsonify({"success": False, "error": str(ex)}), 502
