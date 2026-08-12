@@ -1654,32 +1654,90 @@ def _order_hash(obj: dict) -> str:
 # ------------------------------------------------------------------------------
 # Cached snapshot of Production Orders (rows + by_id) with short TTL
 # ------------------------------------------------------------------------------
-_orders_rows_cache = {"ts": 0.0, "ttl": 15.0, "rows": None, "by_id": {}}
+import threading
+
+_orders_rows_cache = {"ts": 0.0, "ttl": 45.0, "rows": None, "by_id": {}}
+_orders_rows_inflight = False
+_orders_rows_inflight_lock = threading.Lock()
 # When Sheets is slow, return this from /api/changes so Render does not 502 (browser shows fake CORS).
 _changes_last_ok = {"data": None, "etag": "", "ts": 0.0}
+
+
+def _orders_rows_apply(rows):
+    by = {}
+    for r in rows or []:
+        try:
+            oid = str(r.get("Order #", "")).strip()
+            if oid:
+                by[oid] = r
+        except Exception:
+            continue
+    c = _orders_rows_cache
+    c["rows"] = rows or []
+    c["by_id"] = by
+    c["ts"] = time.time()
+    return c["rows"], c["by_id"]
+
+
+def _orders_rows_refresh_worker():
+    global _orders_rows_inflight
+    try:
+        rows = _orders_list_for_changes()
+        _orders_rows_apply(rows)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "_orders_rows_refresh_worker: Production Orders read failed"
+        )
+    finally:
+        with _orders_rows_inflight_lock:
+            _orders_rows_inflight = False
+
+
+def _orders_rows_try_start_refresh():
+    global _orders_rows_inflight
+    with _orders_rows_inflight_lock:
+        if _orders_rows_inflight:
+            return False
+        _orders_rows_inflight = True
+        return True
 
 
 def _orders_rows_snapshot():
     """
     Return (rows, by_id) for Production Orders with a short-lived cache.
-    Builds the cache if expired or empty.
+
+    Stale-while-revalidate: if we already have rows, return them immediately and
+    refresh in the background when TTL expired. Only blocks on a cold cache.
     """
+    global _orders_rows_inflight
     now = time.time()
     c = _orders_rows_cache
-    if (now - c["ts"]) > c["ttl"] or not c["rows"] or not c["by_id"]:
-        rows = _orders_list_for_changes()  # existing helper
-        by = {}
-        for r in rows:
-            try:
-                oid = str(r.get("Order #", "")).strip()
-                if oid:
-                    by[oid] = r
-            except Exception:
-                continue
-        c["rows"] = rows
-        c["by_id"] = by
-        c["ts"] = now
-    return c["rows"], c["by_id"]
+    # ts>0 means we have successfully populated at least once (rows may be [])
+    has_data = c["ts"] > 0 and c.get("rows") is not None
+
+    if has_data and (now - c["ts"]) <= c["ttl"]:
+        return c["rows"], c["by_id"]
+
+    if has_data:
+        if _orders_rows_try_start_refresh():
+            eventlet.spawn_n(_orders_rows_refresh_worker)
+        return c["rows"], c["by_id"]
+
+    # Cold miss — one builder; others wait briefly for rows
+    if not _orders_rows_try_start_refresh():
+        deadline = now + 22
+        while time.time() < deadline:
+            eventlet.sleep(0.25)
+            if c["ts"] > 0 and c.get("rows") is not None:
+                return c["rows"], c["by_id"]
+        raise TimeoutError("orders snapshot still cold after wait")
+
+    try:
+        rows = _orders_list_for_changes()
+        return _orders_rows_apply(rows)
+    finally:
+        with _orders_rows_inflight_lock:
+            _orders_rows_inflight = False
 
 
 def _orders_get_by_id_cached(order_number: str):
@@ -1848,7 +1906,10 @@ _json_cache_max_size = int(
 
 
 def _cache_cleanup():
-    """Remove expired entries and enforce size limit."""
+    """Remove very-old entries and enforce size limit.
+
+    Keep recently-expired entries for stale-while-revalidate (do not delete at TTL).
+    """
     global _json_cache_last_cleanup, _json_cache
     now = time.time()
     
@@ -1857,11 +1918,12 @@ def _cache_cleanup():
         return
     
     _json_cache_last_cleanup = now
+    stale_grace = float(os.environ.get("JSON_CACHE_STALE_GRACE_SEC", "300"))
     with _cache_lock:
-        # Remove expired entries
+        # Remove only after TTL + grace (keep expired for SWR)
         expired_keys = [
             k for k, v in _json_cache.items()
-            if (now - v["ts"]) >= v["ttl"]
+            if (now - v["ts"]) >= (v["ttl"] + stale_grace)
         ]
         for k in expired_keys:
             _json_cache.pop(k, None)
@@ -1880,7 +1942,7 @@ def _cache_cleanup():
 def _cache_get(key):
     """
     Return a fresh cache entry or None.
-    Freshness is handled here based on ts + ttl.
+    Expired entries are left in place for _cache_peek (stale-while-revalidate).
     """
     now = time.time()
     with _cache_lock:
@@ -1888,8 +1950,6 @@ def _cache_get(key):
         if not ent:
             return None
         if (now - ent["ts"]) >= ent["ttl"]:
-            # expired – remove it
-            _json_cache.pop(key, None)
             return None
         return ent
 
@@ -1900,6 +1960,8 @@ def _cache_set(key, data, ttl=30):
     Periodically cleans up expired entries.
     """
     ts = time.time()
+    # Unquoted opaque tag — clients / If-None-Match compare as strings.
+    # Do not pass through Response.set_etag (strict Werkzeug validation).
     etag = f'"{key}-{int(ts)}"'
     with _cache_lock:
         _json_cache[key] = {
@@ -1926,6 +1988,16 @@ def _maybe_304(etag):
     return bool(etag and inm and etag in inm)
 
 
+def _response_with_etag(data, etag, cache_control, *, warning=None):
+    resp = Response(data, mimetype="application/json")
+    if etag:
+        resp.headers["ETag"] = etag
+    resp.headers["Cache-Control"] = cache_control
+    if warning:
+        resp.headers["Warning"] = warning
+    return resp
+
+
 def _json_bg_refresh_try_acquire(cache_key):
     with _json_bg_inflight_lock:
         if cache_key in _json_bg_inflight:
@@ -1944,6 +2016,7 @@ def send_cached_json(key, ttl, payload_obj_builder):
     If cached and fresh, return cached (and 304 on ETag match).
     If cached but stale, return stale immediately and refresh in background.
     Otherwise build payload, cache, and send with ETag.
+    Cold misses are single-flight so concurrent tabs don't stampede Sheets.
     """
     # 1) Try fresh cache
     ent = _cache_get(key)
@@ -1956,19 +2029,9 @@ def send_cached_json(key, ttl, payload_obj_builder):
             resp.headers["ETag"] = etag
             return resp
 
-
-        resp = Response(ent["data"], mimetype="application/json")
-
-        if etag:
-            try:
-                resp.set_etag(etag)
-            except Exception as e:
-                current_app.logger.warning(
-                    f"[CACHE] Skipped invalid cached ETag: {etag} ({e})"
-                )
-
-        resp.headers["Cache-Control"] = f"public, max-age={ttl}"
-        return resp
+        return _response_with_etag(
+            ent["data"], etag, f"public, max-age={ttl}"
+        )
 
     # 2) Serve stale immediately and refresh in background
     stale = _cache_peek(key)
@@ -1989,34 +2052,49 @@ def send_cached_json(key, ttl, payload_obj_builder):
         if _json_bg_refresh_try_acquire(key):
             eventlet.spawn_n(_bg_refresh)
 
-        resp = Response(stale["data"], mimetype="application/json")
-        etag = stale.get("etag")
-        if etag:
-            try:
-                resp.set_etag(etag)
-            except Exception as e:
-                current_app.logger.warning(
-                    f"[CACHE] Skipped invalid stale ETag: {etag} ({e})"
+        return _response_with_etag(
+            stale["data"],
+            stale.get("etag"),
+            "public, max-age=5, stale-while-revalidate=300",
+            warning='110 - "stale response served while refreshing"',
+        )
+
+    # 3) No cache at all — single-flight build (avoid N concurrent Sheets reads)
+    if not _json_bg_refresh_try_acquire(key):
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            eventlet.sleep(0.25)
+            peeked = _cache_peek(key)
+            if peeked:
+                etag = peeked.get("etag")
+                if etag and _maybe_304(etag):
+                    resp = make_response("", 304)
+                    resp.headers["ETag"] = etag
+                    return resp
+                return _response_with_etag(
+                    peeked["data"],
+                    etag,
+                    f"public, max-age={ttl}",
                 )
+        current_app.logger.error(
+            "send_cached_json: timed out waiting for in-flight build of %s", key
+        )
+        return None
 
-        resp.headers["Cache-Control"] = "public, max-age=5, stale-while-revalidate=300"
-        resp.headers["Warning"] = '110 - "stale response served while refreshing"'
-        return resp
-
-    # 3) No cache at all - build fresh payload
     try:
         payload_obj = payload_obj_builder()
         payload_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
         etag = _cache_set(key, payload_bytes, ttl)
 
-        resp = Response(payload_bytes, mimetype="application/json")
-        resp.headers["ETag"] = etag
-        resp.headers["Cache-Control"] = f"public, max-age={ttl}"
-        return resp
+        return _response_with_etag(
+            payload_bytes, etag, f"public, max-age={ttl}"
+        )
     except Exception as e:
         current_app.logger.error(f"send_cached_json: build_payload failed for {key}: {e}")
         # Return None to signal failure - caller should handle
         return None
+    finally:
+        _json_bg_refresh_release(key)
 
 
 def login_required_session(f):
@@ -2957,12 +3035,17 @@ def api_changes():
 
     rows = None
     try:
+        # Snapshot is stale-while-revalidate; Timeout only covers rare cold Sheets reads.
         with Timeout(wait_sec):
             rows, _ = _orders_rows_snapshot()
     except Timeout:
         current_app.logger.warning(
             "api_changes: timed out after %ss waiting for orders snapshot",
             wait_sec,
+        )
+    except TimeoutError:
+        current_app.logger.warning(
+            "api_changes: timed out waiting for in-flight orders snapshot"
         )
     except Exception:
         current_app.logger.exception("api_changes: orders snapshot failed")
@@ -11396,7 +11479,7 @@ def overview_combined():
     # allow cache bypass for debugging
     use_cache = request.args.get("nocache") != "1"
 
-    # Serve cache
+    # Serve fresh cache
     if use_cache and _overview_cache and (now - _overview_ts) < TTL:
         payload_bytes = json.dumps(_overview_cache).encode("utf-8")
         etag = _json_etag(payload_bytes)
@@ -11407,6 +11490,35 @@ def overview_combined():
         resp = Response(payload_bytes, mimetype="application/json")
         resp.headers["ETag"] = etag
         resp.headers["Cache-Control"] = f"public, max-age={TTL}"
+        return resp
+
+    # Stale-while-revalidate: return last good overview immediately, rebuild in background
+    if use_cache and _overview_cache:
+        acquired = _overview_payload_lock.acquire(blocking=False)
+        if acquired:
+
+            def _bg_overview_rebuild():
+                global _overview_cache, _overview_ts
+                try:
+                    payload = build_overview_payload()
+                    _overview_cache = payload
+                    _overview_ts = time.time()
+                    app.logger.info(
+                        "📦 Overview payload rebuilt (bg): %s upcoming",
+                        len(payload.get("upcoming", [])),
+                    )
+                except Exception:
+                    app.logger.exception("overview background rebuild failed")
+                finally:
+                    _overview_payload_lock.release()
+
+            eventlet.spawn_n(_bg_overview_rebuild)
+
+        payload_bytes = json.dumps(_overview_cache).encode("utf-8")
+        resp = Response(payload_bytes, mimetype="application/json")
+        resp.headers["ETag"] = _json_etag(payload_bytes)
+        resp.headers["Cache-Control"] = "public, max-age=5, stale-while-revalidate=300"
+        resp.headers["Warning"] = '110 - "stale overview while refreshing"'
         return resp
 
     # Build fresh (serialized so two tabs can't run two heavy Sheet builds at once)
@@ -14475,8 +14587,8 @@ def get_combined():
             "links": _links_store if isinstance(_links_store, dict) else {},
         }
 
-    # Use caching to reduce Google Sheets API calls (15 second TTL)
-    TTL = 15
+    # Use caching to reduce Google Sheets API calls (stale-while-revalidate on expiry)
+    TTL = int(os.environ.get("COMBINED_CACHE_TTL", "45"))
     try:
         result = send_cached_json("combined-v2", TTL, build_payload)
         if result is None:
