@@ -18058,6 +18058,98 @@ def material_inventory_colors():
         return jsonify({})
 
 
+@app.route("/api/suggest-materials", methods=["POST", "OPTIONS"])
+@login_required_session
+def suggest_materials_api():
+    """
+    Optional artwork → Material Inventory name/% suggestions for Order Submission.
+
+    multipart form field: image (or file)
+    optional: maxMaterials (1–5, default 5)
+
+    Never required for submit — client applies suggestions only if the user clicks.
+    """
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
+
+    try:
+        from suggest_materials import (
+            load_inventory_colors_from_rows,
+            suggest_materials_from_image,
+        )
+    except Exception as e:
+        logger.exception("suggest_materials import failed")
+        return jsonify({"ok": False, "error": f"Suggest module unavailable: {e}"}), 500
+
+    f = request.files.get("image") or request.files.get("file")
+    if not f or not getattr(f, "filename", None):
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Upload an artwork image (PNG/JPG). PDF/EMB alone cannot be sampled yet.",
+                }
+            ),
+            400,
+        )
+
+    try:
+        max_materials = int(request.form.get("maxMaterials") or request.args.get("maxMaterials") or 5)
+    except (TypeError, ValueError):
+        max_materials = 5
+    max_materials = max(1, min(5, max_materials))
+
+    raw = f.read()
+    if not raw or len(raw) < 32:
+        return jsonify({"ok": False, "error": "Empty or invalid image upload."}), 400
+    # Soft size cap (~8MB)
+    if len(raw) > 8 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "Image too large (max 8MB)."}), 400
+
+    try:
+        rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:Z") or []
+        inventory = load_inventory_colors_from_rows(rows)
+    except Exception as e:
+        logger.exception("suggest_materials: inventory fetch failed")
+        return jsonify({"ok": False, "error": f"Could not read Material Inventory: {e}"}), 502
+
+    if not inventory:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Material Inventory has no Color values to match against. Add hex colors on inventory rows first.",
+                    "suggestions": [],
+                }
+            ),
+            200,
+        )
+
+    try:
+        result = suggest_materials_from_image(raw, inventory, max_materials=max_materials)
+    except Exception as e:
+        logger.exception("suggest_materials: analyze failed")
+        return jsonify({"ok": False, "error": str(e), "suggestions": []}), 500
+
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "suggestions": result.get("suggestions") or [],
+                "dominantColors": result.get("dominantColors") or [],
+                "confidence": result.get("confidence") or 0,
+                "message": result.get("message") or "",
+                "inventoryMatched": len(inventory),
+            }
+        ),
+        200,
+    )
+
+
 def _retarget_material_inv_row2_formula(tpl: str, target_row: int) -> str:
     """
     Copy Material Inventory row-2 formulas (Inventory / On Order / Value) to target_row.

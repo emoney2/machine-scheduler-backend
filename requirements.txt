@@ -16,6 +16,7 @@ reportlab
 httpx
 psutil==5.9.8
 pypdf>=4.0
+Pillow>=10.0.0
 beautifulsoup4
 lxml
 supabase>=2.5.0
