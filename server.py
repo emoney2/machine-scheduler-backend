@@ -15023,6 +15023,33 @@ def write_material_log_for_order(order_number):
         if ppy <= 0:
             logger.error("[MATLOG] Product %s has invalid PPY in Table sheet", product)
             return
+
+        def _table_ppy(name):
+            match = next(
+                (
+                    t
+                    for t in table[1:]
+                    if t and str(t[0]).strip().lower() == str(name).strip().lower()
+                ),
+                None,
+            )
+            if not match or len(match) <= 5:
+                return None
+            try:
+                val = float(match[5] or 0)
+            except (TypeError, ValueError):
+                return None
+            return val if val > 0 else None
+
+        key = product.lower()
+        if "long neck" in key:
+            sibling = " ".join(product.replace("Long Neck", " ").replace("long neck", " ").split())
+            sib_ppy = _table_ppy(sibling) if sibling else None
+            if sib_ppy is None and "blade" in key:
+                sib_ppy = _table_ppy("Blade")
+            if sib_ppy and ppy > sib_ppy:
+                ppy = sib_ppy
+
         yards_needed = qty / ppy
 
         # ───────────────────────────────────────────────────────────
@@ -15057,12 +15084,15 @@ def write_material_log_for_order(order_number):
         def compute_usage(mat, base):
             unit = normalize_unit(inv_map.get(mat, ""))
             if unit in {"sqft", "squarefeet", "squarefoot"}:
-                return base * 13.5
+                usage = base * 13.5
+                if "driver" in key:
+                    usage *= 1.11
+                return usage
             return base
 
         # ───────────────────────────────────────────────────────────
         # 4) Front / back yard rules
-        key = product.lower()
+        is_long_neck = "long neck" in key
         if "blade" in key or "mallet" in key:
             front_yards, back_yards = yards_needed, 0
         elif "full" in key:
@@ -15071,6 +15101,9 @@ def write_material_log_for_order(order_number):
             front_yards, back_yards = 0, yards_needed
         else:
             front_yards, back_yards = yards_needed, 0
+        if is_long_neck:
+            front_yards *= 1.15
+            back_yards *= 1.15
 
         log_rows = []
 
@@ -15102,8 +15135,8 @@ def write_material_log_for_order(order_number):
             len(h),
         )
 
-        # 5) Front materials with % logic
-        for i in range(5):
+        # 5) Front materials with % logic (Material1–10; extra colors were dropped at 5)
+        for i in range(10):
             mat = ""
             pct_raw = ""
 
@@ -15148,6 +15181,8 @@ def write_material_log_for_order(order_number):
             else:
                 fur_qty = base * 2
 
+            if is_long_neck and fur_qty > 0:
+                fur_qty *= 1.15
             if fur_qty > 0:
                 log(fur, compute_usage(fur, fur_qty))
 
