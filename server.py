@@ -18571,12 +18571,96 @@ def _thread_inventory_code(raw):
         pass
     return s
 
+
+# Madeira Polyneon: orders are logged as cones, stored as feet (qty × 5500 yd × 3).
+_THREAD_FEET_PER_CONE = 5500 * 3
+_THREAD_HEADS = 6
+
+
+def _thread_data_received_cones(td_rows):
+    """
+    Integer cones received per 4-digit code from Thread Data IN rows.
+    Ordered (not yet received) is excluded — that is on-order, not on-hand.
+    IN rows are whole-cone purchases; OUT job usage is feet and is not counted here.
+    """
+    by_code = {}
+    if not td_rows or len(td_rows) < 2:
+        return by_code
+    headers = [str(h or "").strip().lower() for h in td_rows[0]]
+
+    def _idx(*names):
+        for n in names:
+            if n in headers:
+                return headers.index(n)
+        return None
+
+    col_color = _idx("color", "thread color", "thread colors")
+    col_len = _idx("length (ft)", "length", "length ft", "feet")
+    col_inout = _idx("in/out", "in out", "inout")
+    col_or = _idx("o/r", "o / r", "ordered/received")
+    if col_color is None or col_inout is None:
+        return by_code
+
+    for row in td_rows[1:]:
+        if not row or col_color >= len(row) or col_inout >= len(row):
+            continue
+        if str(row[col_inout] or "").strip().lower() != "in":
+            continue
+        o_r = ""
+        if col_or is not None and col_or < len(row):
+            o_r = str(row[col_or] or "").strip().lower()
+        if o_r == "ordered":
+            continue
+        code = _thread_inventory_code(row[col_color])
+        if not code:
+            continue
+        feet = 0.0
+        if col_len is not None and col_len < len(row):
+            try:
+                feet = float(str(row[col_len]).replace(",", "").strip() or "0")
+            except (TypeError, ValueError):
+                feet = 0.0
+        cones = int(round(feet / _THREAD_FEET_PER_CONE)) if feet else 0
+        if cones <= 0:
+            continue
+        by_code[code] = by_code.get(code, 0) + cones
+    return by_code
+
+
+def _physical_cones_on_hand(remaining_eq, cones_received):
+    """
+    Loadable cones for a 6-head machine.
+
+    remaining_eq is leftover length in cone-equivalents (feet / 16500).
+    cones_received is whole cones from purchase logs.
+
+    A machine pulls evenly from 6 cones; unused cones sit full. Whole 6-packs
+    drop off only after that set's length is used up. If there is no purchase
+    history, leftover length is spread across 6-cone sets.
+    """
+    try:
+        remaining = float(remaining_eq or 0)
+    except (TypeError, ValueError):
+        remaining = 0.0
+    if remaining <= 0:
+        return 0
+    try:
+        received = int(cones_received or 0)
+    except (TypeError, ValueError):
+        received = 0
+    if received <= 0:
+        return int(ceil(remaining / float(_THREAD_HEADS) - 1e-9) * _THREAD_HEADS)
+    used = max(0.0, received - remaining)
+    emptied = int(used // _THREAD_HEADS) * _THREAD_HEADS
+    return max(0, received - emptied)
+
 @app.route("/api/thread-inventory-status", methods=["GET"])
 @login_required_session
 def get_thread_inventory_status():
     """
     Returns a map of thread color -> detail object:
-      { "status": "green"|"yellow"|"red", "inventory": <cones>, "onOrder": <cones> }
+      { "status": "green"|"yellow"|"red", "inventory": <length cone-eq>,
+        "onOrder": <cones>, "cones": <loadable physical cones> }
 
     Status rules (unchanged):
     - green: Inventory > 0 (in stock)
@@ -18680,6 +18764,22 @@ def get_thread_inventory_status():
                 "inventory": inventory,
                 "onOrder": on_order,
             }
+
+        received_by_code = {}
+        try:
+            td_rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
+            received_by_code = _thread_data_received_cones(td_rows)
+        except Exception as td_err:
+            logger.warning(
+                "thread-inventory-status: Thread Data cone count failed: %s",
+                td_err,
+            )
+
+        for code, entry in status_map.items():
+            entry["cones"] = _physical_cones_on_hand(
+                entry.get("inventory"),
+                received_by_code.get(code, 0),
+            )
 
         # Update cache
         _thread_inventory_cache["ts"] = now
