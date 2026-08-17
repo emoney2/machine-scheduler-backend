@@ -18550,6 +18550,27 @@ def add_materials():
 # Simple cache for thread inventory status
 _thread_inventory_cache = {"ts": 0.0, "data": {}, "ttl": 45}  # 45 second TTL
 
+
+def _thread_inventory_code(raw):
+    """4-digit Madeira code from a Thread Inventory label ("1800", "1800.00", "1800 Polyneon")."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    m = re.search(r"\b(\d{4})\b", s)
+    if m:
+        return m.group(1)
+    m = re.match(r"^(\d{4})(?:\.0+)?$", s)
+    if m:
+        return m.group(1)
+    try:
+        n = float(s.replace(",", ""))
+        ni = int(n)
+        if n == ni and 1000 <= ni <= 9999:
+            return f"{ni:04d}"
+    except (TypeError, ValueError):
+        pass
+    return s
+
 @app.route("/api/thread-inventory-status", methods=["GET"])
 @login_required_session
 def get_thread_inventory_status():
@@ -18610,24 +18631,29 @@ def get_thread_inventory_status():
 
         status_map = {}
 
-        # Process each row
+        # Process each row. Do not skip short rows (trailing On Order is often blank).
         for row in rows[1:]:
-            if len(row) <= max(col_thread, col_inventory, col_on_order):
+            if not row or col_thread >= len(row):
                 continue
 
             thread_color = str(row[col_thread]).strip()
             if not thread_color:
                 continue
+            code = _thread_inventory_code(thread_color)
+            if not code:
+                continue
 
             # Parse inventory (cone counts)
-            try:
-                inventory = float(str(row[col_inventory]).replace(",", "").strip() or "0")
-            except (ValueError, TypeError):
-                inventory = 0.0
+            inventory = 0.0
+            if col_inventory is not None and col_inventory < len(row):
+                try:
+                    inventory = float(str(row[col_inventory]).replace(",", "").strip() or "0")
+                except (ValueError, TypeError):
+                    inventory = 0.0
 
             # Parse on_order: numeric value, or any non-empty text (e.g. "Yes", "Ordered") = treat as on order
             on_order = 0.0
-            if col_on_order is not None and len(row) > col_on_order:
+            if col_on_order is not None and col_on_order < len(row):
                 raw = str(row[col_on_order]).strip()
                 if raw:
                     try:
@@ -18635,6 +18661,11 @@ def get_thread_inventory_status():
                     except (ValueError, TypeError):
                         # Non-numeric but non-empty (e.g. "Yes", "Ordered", "X") = on order
                         on_order = 1.0
+
+            prev = status_map.get(code)
+            if prev:
+                inventory += float(prev.get("inventory") or 0)
+                on_order += float(prev.get("onOrder") or 0)
 
             # Determine status: green = in stock; yellow = on order and it brings total positive; red = on order not enough or none
             total_after_order = inventory + on_order
@@ -18644,7 +18675,7 @@ def get_thread_inventory_status():
                 status = "yellow"  # on order is enough to bring inventory positive
             else:
                 status = "red"  # no on order, or on order not enough to bring positive
-            status_map[thread_color] = {
+            status_map[code] = {
                 "status": status,
                 "inventory": inventory,
                 "onOrder": on_order,
