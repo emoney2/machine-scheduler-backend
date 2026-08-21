@@ -15394,32 +15394,8 @@ def submit_order():
                         "error": f'Material{idx+1} percentage ("{pct}") must be a number.'
                     }), 400
 
-        # Always add unknown materials to Material Inventory (including reorders)
-        try:
-            inv_items = []
-            seen_names = set()
-            for mat in list(materials) + [
-                data.get("backMaterial") or "",
-                data.get("furColor") or "",
-            ]:
-                name = str(mat or "").strip()
-                key = name.lower()
-                if not name or key in seen_names:
-                    continue
-                seen_names.add(key)
-                inv_items.append({"materialName": name})
-            if inv_items:
-                written_inv = _ensure_materials_in_inventory(inv_items)
-                added = [w["name"] for w in written_inv if not w.get("skipped")]
-                if added:
-                    logger.info(
-                        "[/submit] added new Material Inventory rows: %s", added
-                    )
-        except Exception as inv_err:
-            logger.exception(
-                "[/submit] failed to add new materials to Material Inventory: %s",
-                inv_err,
-            )
+        # Unknown materials must be saved via the Add New Material modal
+        # (unit / min / reorder / cost). Do not insert name-only stub rows here.
 
         try:
             qty_db = _form_quantity_for_db(data.get("quantity"))
@@ -18184,8 +18160,16 @@ def materials_preflight():
 def get_materials():
     from flask import make_response
 
+    details = str(request.args.get("details") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
     def build():
         try:
+            if details:
+                return _material_inventory_detail_rows()
             rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A2:A") or []
             return [str(r[0]).strip() for r in rows if r and str(r[0]).strip()]
         except Exception:
@@ -18447,6 +18431,66 @@ def _hex_to_sheets_rgb(hex_color):
     return {"red": 0.0, "green": 0.0, "blue": 0.0}
 
 
+def _material_payload_details(it):
+    unit = str(it.get("unit") or "").strip()
+    mininv = str(it.get("minInv") if it.get("minInv") not in (None, "") else "").strip()
+    reorder = str(
+        it.get("reorder") if it.get("reorder") not in (None, "") else ""
+    ).strip()
+    cost = str(it.get("cost") if it.get("cost") not in (None, "") else "").strip()
+    vendor = str(it.get("vendor") or "").strip()
+    color = str(it.get("color") or "").strip()
+    return {
+        "unit": unit,
+        "min_inv": mininv,
+        "reorder": reorder,
+        "cost": cost,
+        "vendor": vendor,
+        "color": color,
+        "has_required": bool(unit and mininv and reorder and cost),
+        "has_any": bool(unit or mininv or reorder or cost or vendor or color),
+    }
+
+
+def _material_inventory_detail_rows():
+    """Name + unit/min/reorder/cost/vendor/color and whether the row is complete."""
+    rows = fetch_sheet(SPREADSHEET_ID, "Material Inventory!A1:J") or []
+    if not rows:
+        return []
+    colmap = _material_inventory_colmap(rows[0])
+    name_i = colmap.get("materials", 0)
+    out = []
+    for r in rows[1:]:
+        r = r or []
+        if name_i >= len(r) or not str(r[name_i] or "").strip():
+            continue
+        name = str(r[name_i]).strip()
+
+        def cell(field):
+            i = colmap.get(field)
+            if i is None or i >= len(r):
+                return ""
+            return str(r[i] or "").strip()
+
+        unit = cell("unit")
+        mininv = cell("min_inv")
+        reorder = cell("reorder")
+        cost = cell("cost")
+        out.append(
+            {
+                "name": name,
+                "unit": unit,
+                "minInv": mininv,
+                "reorder": reorder,
+                "cost": cost,
+                "vendor": cell("vendor"),
+                "color": cell("color"),
+                "complete": bool(unit and mininv and reorder and cost),
+            }
+        )
+    return out
+
+
 def _ensure_materials_in_inventory(items):
     """
     Append missing materials to the Material Inventory tab.
@@ -18544,12 +18588,124 @@ def _ensure_materials_in_inventory(items):
             return ""
         return str(tpl_row_vals[idx] or "")
 
+    existing_row_num = {}
+    for i, r in enumerate(name_rows):
+        if r and str(r[0]).strip():
+            existing_row_num[str(r[0]).strip().lower()] = i + 2
+
     written = []
     color_requests = []
 
+    def _color_req(target, color_val, color_idx):
+        if not color_val or color_idx is None or color_idx > last_col_idx:
+            return
+        color_requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": 0,
+                        "startRowIndex": target - 1,
+                        "endRowIndex": target,
+                        "startColumnIndex": color_idx,
+                        "endColumnIndex": color_idx + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": _hex_to_sheets_rgb(color_val)
+                        }
+                    },
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            }
+        )
+
+    def _write_row(target, name, det, base_vals=None, updated=False):
+        row_vals = list(base_vals or [])
+        if len(row_vals) < last_col_idx + 1:
+            row_vals = row_vals + [""] * (last_col_idx + 1 - len(row_vals))
+        row_vals = row_vals[: last_col_idx + 1]
+        row_vals[name_idx] = name
+        for field in ("unit", "min_inv", "reorder", "cost", "vendor", "color"):
+            idx = colmap.get(field)
+            val = det.get(field) or ""
+            if idx is not None and idx <= last_col_idx and val:
+                row_vals[idx] = val
+        for field in ("inventory", "on_order", "value"):
+            idx = colmap.get(field)
+            if idx is None or idx > last_col_idx:
+                continue
+            current = str(row_vals[idx] or "").strip()
+            if updated and current.startswith("="):
+                continue
+            row_vals[idx] = _retarget_material_inv_formula(
+                tpl_at(field), tpl_from_row, target
+            )
+        retry_google_api_call(
+            lambda t=target, rv=row_vals: sheets_vals.update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!A{t}:{last_col}{t}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [rv]},
+            ).execute()
+        )
+        logger.info(
+            "[MaterialInventory] %s %r at row %s (unit=%r vendor=%r)",
+            "updated" if updated else "appended",
+            name,
+            target,
+            det.get("unit"),
+            det.get("vendor"),
+        )
+        _color_req(target, det.get("color"), colmap.get("color"))
+        written.append(
+            {"name": name, "row": target, "skipped": False, "updated": updated}
+        )
+
     for name, it in wanted:
-        if name.lower() in existing_names:
-            written.append({"name": name, "row": None, "skipped": True})
+        det = _material_payload_details(it)
+        existing_row = existing_row_num.get(name.lower())
+
+        if existing_row:
+            if not det["has_any"]:
+                written.append({"name": name, "row": existing_row, "skipped": True})
+                continue
+            # Fill in a stub row (name only) with the modal details
+            cur = (
+                retry_google_api_call(
+                    lambda t=existing_row: sheets_vals.get(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"Material Inventory!A{t}:{last_col}{t}",
+                        valueRenderOption="FORMULA",
+                    ).execute()
+                )
+                or {}
+            )
+            base = (cur.get("values") or [[]])[0] if cur.get("values") else []
+
+            def _existing_cell(field):
+                i = colmap.get(field)
+                if i is None or i >= len(base):
+                    return ""
+                return str(base[i] or "").strip()
+
+            if all(
+                _existing_cell(f) for f in ("unit", "min_inv", "reorder", "cost")
+            ):
+                written.append(
+                    {"name": name, "row": existing_row, "skipped": True}
+                )
+                continue
+
+            _write_row(existing_row, name, det, base_vals=base, updated=True)
+            continue
+
+        if not det["has_required"]:
+            logger.warning(
+                "[MaterialInventory] skip name-only stub for %r — "
+                "need unit, min inv, reorder, and cost",
+                name,
+            )
+            written.append({"name": name, "row": None, "skipped": True, "incomplete": True})
             continue
 
         target = next_row
@@ -18577,74 +18733,9 @@ def _ensure_materials_in_inventory(items):
             )
             target += 1
 
-        unit = str(it.get("unit") or "").strip()
-        mininv = str(it.get("minInv") if it.get("minInv") not in (None, "") else "").strip()
-        reorder = str(it.get("reorder") if it.get("reorder") not in (None, "") else "").strip()
-        cost = str(it.get("cost") if it.get("cost") not in (None, "") else "").strip()
-        vendor = str(it.get("vendor") or "").strip()
-        color = str(it.get("color") or "").strip()
-
-        row_vals = [""] * (last_col_idx + 1)
-        row_vals[name_idx] = name
-        for field, value in (
-            ("unit", unit),
-            ("min_inv", mininv),
-            ("reorder", reorder),
-            ("cost", cost),
-            ("vendor", vendor),
-            ("color", color),
-        ):
-            idx = colmap.get(field)
-            if idx is not None and idx <= last_col_idx:
-                row_vals[idx] = value
-        for field in ("inventory", "on_order", "value"):
-            idx = colmap.get(field)
-            if idx is None or idx > last_col_idx:
-                continue
-            row_vals[idx] = _retarget_material_inv_formula(
-                tpl_at(field), tpl_from_row, target
-            )
-
-        retry_google_api_call(
-            lambda t=target, rv=row_vals: sheets_vals.update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"Material Inventory!A{t}:{last_col}{t}",
-                valueInputOption="USER_ENTERED",
-                body={"values": [rv]},
-            ).execute()
-        )
-        logger.info(
-            "[MaterialInventory] appended %r at row %s (unit=%r vendor=%r)",
-            name,
-            target,
-            unit,
-            vendor,
-        )
-
-        color_idx = colmap.get("color")
-        if color and color_idx is not None and color_idx <= last_col_idx:
-            color_requests.append(
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": 0,
-                            "startRowIndex": target - 1,
-                            "endRowIndex": target,
-                            "startColumnIndex": color_idx,
-                            "endColumnIndex": color_idx + 1,
-                        },
-                        "cell": {
-                            "userEnteredFormat": {
-                                "backgroundColor": _hex_to_sheets_rgb(color)
-                            }
-                        },
-                        "fields": "userEnteredFormat.backgroundColor",
-                    }
-                }
-            )
-
-        written.append({"name": name, "row": target, "skipped": False})
+        _write_row(target, name, det, base_vals=None, updated=False)
         existing_names.add(name.lower())
+        existing_row_num[name.lower()] = target
         while len(name_rows) < target - 2:
             name_rows.append([])
         if len(name_rows) == target - 2:
@@ -18694,6 +18785,14 @@ def add_materials():
         written = _ensure_materials_in_inventory(items)
         if not written:
             return jsonify({"error": "No material name provided"}), 400
+        if any(w.get("incomplete") for w in written) and not any(
+            not w.get("skipped") for w in written
+        ):
+            return jsonify(
+                {
+                    "error": "Unit, Min Inv, Reorder, and Cost are required to save a material."
+                }
+            ), 400
 
         # Mirror into Supabase (non-fatal — sheet write is source of truth)
         if supabase:
