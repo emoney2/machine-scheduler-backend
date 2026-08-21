@@ -15394,6 +15394,33 @@ def submit_order():
                         "error": f'Material{idx+1} percentage ("{pct}") must be a number.'
                     }), 400
 
+        # Always add unknown materials to Material Inventory (including reorders)
+        try:
+            inv_items = []
+            seen_names = set()
+            for mat in list(materials) + [
+                data.get("backMaterial") or "",
+                data.get("furColor") or "",
+            ]:
+                name = str(mat or "").strip()
+                key = name.lower()
+                if not name or key in seen_names:
+                    continue
+                seen_names.add(key)
+                inv_items.append({"materialName": name})
+            if inv_items:
+                written_inv = _ensure_materials_in_inventory(inv_items)
+                added = [w["name"] for w in written_inv if not w.get("skipped")]
+                if added:
+                    logger.info(
+                        "[/submit] added new Material Inventory rows: %s", added
+                    )
+        except Exception as inv_err:
+            logger.exception(
+                "[/submit] failed to add new materials to Material Inventory: %s",
+                inv_err,
+            )
+
         try:
             qty_db = _form_quantity_for_db(data.get("quantity"))
         except ValueError:
@@ -18297,18 +18324,45 @@ def suggest_materials_api():
     )
 
 
+def _a1_col(idx0):
+    """0-based column index → A1 letter(s)."""
+    n = int(idx0) + 1
+    s = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+
+def _norm_inv_header(h):
+    return re.sub(r"[\s.]+$", "", str(h or "").strip().lower())
+
+
+def _retarget_material_inv_formula(tpl: str, from_row: int, target_row: int) -> str:
+    """
+    Copy Material Inventory formulas to target_row.
+    Only rewrites A1-style refs that end in from_row (A2, $B2, C$2) — not every digit.
+    """
+    if not tpl or not str(tpl).strip().startswith("="):
+        return str(tpl or "")
+    try:
+        src = int(from_row)
+        dest = int(target_row)
+    except (TypeError, ValueError):
+        return str(tpl)
+    return re.sub(
+        rf"(\$?[A-Za-z]+)\$?{src}(?!\d)",
+        lambda m: f"{m.group(1)}{dest}",
+        str(tpl),
+    )
+
+
 def _retarget_material_inv_row2_formula(tpl: str, target_row: int) -> str:
     """
     Copy Material Inventory row-2 formulas (Inventory / On Order / Value) to target_row.
     Only rewrites A1-style refs that end in row 2 (A2, $B2, C$2, $D$2) — not every digit 2.
     """
-    if not tpl or not str(tpl).strip().startswith("="):
-        return str(tpl or "")
-    return re.sub(
-        r"(\$?[A-Za-z]+)\$?2(?!\d)",
-        lambda m: f"{m.group(1)}{target_row}",
-        str(tpl),
-    )
+    return _retarget_material_inv_formula(tpl, 2, target_row)
 
 
 def _material_inventory_next_append_row(col_a_rows):
@@ -18327,127 +18381,261 @@ def _material_inventory_next_append_row(col_a_rows):
     return last + 1
 
 
-# 3) POST new material(s) into Material Inventory!A–J
-@app.route("/api/materials", methods=["POST"])
-@login_required_session
-def add_materials():
-    """
-    Order Submission / Inventory: add new material row(s) to Material Inventory.
-    Copies Inventory (B), On Order (C), and Value (H) formulas from row 2 onto the new row.
-    """
-    try:
-        raw = request.get_json(silent=True) or []
-        items = raw if isinstance(raw, list) else [raw]
+# Per-material fields live in A–J. K–O is the vendor contact directory (do not write there).
+_MATERIAL_INV_DATA_MAX_COL = 9  # J
 
-        sheets_svc = get_sheets_service()
-        sheets_vals = sheets_svc.spreadsheets().values()
+_MATERIAL_INV_HEADER_ALIASES = {
+    "materials": ("materials", "material"),
+    "inventory": ("inventory",),
+    "on_order": ("on order", "on-order"),
+    "unit": ("unit",),
+    "min_inv": ("min. inv", "min inv", "mininv"),
+    "reorder": ("reorder",),
+    "cost": ("cost",),
+    "value": ("value",),
+    "vendor": ("vendor",),
+    "color": ("color",),
+}
 
-        # Template formulas from row 2 (same approach as /api/materialInventory)
-        mat_formula = (
-            sheets_vals.get(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Material Inventory!A2:H2",
-                valueRenderOption="FORMULA",
-            )
-            .execute()
-            .get("values", [[]])
-        )
-        mat_formula = mat_formula[0] if mat_formula else []
-        rawB = str(mat_formula[1]) if len(mat_formula) > 1 else ""
-        rawC = str(mat_formula[2]) if len(mat_formula) > 2 else ""
-        rawH = str(mat_formula[7]) if len(mat_formula) > 7 else ""
-        if not str(rawB).strip().startswith("="):
-            logger.warning(
-                "[MaterialInventory] B2 has no formula to copy; new Inventory cells may be blank"
-            )
 
-        existing = (
-            sheets_vals.get(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Material Inventory!A2:A",
-            )
-            .execute()
-            .get("values", [])
-            or []
-        )
+def _material_inventory_colmap(headers):
+    """Map logical fields → 0-based indexes, restricted to columns A–J."""
+    headers = [str(h or "") for h in (headers or [])]
+    norms = [_norm_inv_header(h) for h in headers]
+    out = {}
+    for field, aliases in _MATERIAL_INV_HEADER_ALIASES.items():
+        for i, n in enumerate(norms):
+            if i > _MATERIAL_INV_DATA_MAX_COL:
+                break
+            if n in aliases:
+                out[field] = i
+                break
+    # Classic layout fallback when headers are missing / renamed
+    defaults = {
+        "materials": 0,
+        "inventory": 1,
+        "on_order": 2,
+        "unit": 3,
+        "min_inv": 4,
+        "reorder": 5,
+        "cost": 6,
+        "value": 7,
+        "vendor": 8,
+        "color": 9,
+    }
+    for field, idx in defaults.items():
+        out.setdefault(field, idx)
+    return out
 
-        next_row = _material_inventory_next_append_row(existing)
-        existing_names = {
-            str(r[0]).strip().lower()
-            for r in existing
-            if r and str(r[0]).strip()
+
+def _material_inventory_sheet_id(sheets_svc):
+    meta = sheets_svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    for sh_meta in meta.get("sheets", []):
+        if sh_meta.get("properties", {}).get("title") == "Material Inventory":
+            return sh_meta["properties"]["sheetId"]
+    return None
+
+
+def _hex_to_sheets_rgb(hex_color):
+    hex_color = str(hex_color or "").lstrip("#")
+    if len(hex_color) == 6:
+        return {
+            "red": int(hex_color[0:2], 16) / 255.0,
+            "green": int(hex_color[2:4], 16) / 255.0,
+            "blue": int(hex_color[4:6], 16) / 255.0,
         }
+    return {"red": 0.0, "green": 0.0, "blue": 0.0}
 
-        written = []
-        color_requests = []
 
-        def hex_to_rgb(hex_color):
-            hex_color = str(hex_color or "").lstrip("#")
-            if len(hex_color) == 6:
-                return {
-                    "red": int(hex_color[0:2], 16) / 255.0,
-                    "green": int(hex_color[2:4], 16) / 255.0,
-                    "blue": int(hex_color[4:6], 16) / 255.0,
-                }
-            return {"red": 0.0, "green": 0.0, "blue": 0.0}
+def _ensure_materials_in_inventory(items):
+    """
+    Append missing materials to the Material Inventory tab.
 
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            name = str(it.get("materialName") or "").strip()
-            unit = str(it.get("unit") or "").strip()
-            mininv = str(it.get("minInv") or "").strip()
-            reorder = str(it.get("reorder") or "").strip()
-            cost = str(it.get("cost") or "").strip()
-            vendor = str(it.get("vendor") or "").strip()
-            color = str(it.get("color") or "#000000").strip() or "#000000"
+    items: iterable of dicts with materialName (or name/value) plus optional
+    unit, minInv, reorder, cost, vendor, color.
 
-            if not name:
-                continue
-            if name.lower() in existing_names:
-                # Already on the sheet — treat as success so Order Submission can continue
-                written.append({"name": name, "row": None, "skipped": True})
-                continue
+    Writes by header name into columns A–J only, copies Inventory / On Order /
+    Value formulas from a template row, and never overwrites an existing name.
+    Returns [{name, row, skipped}, ...].
+    """
+    raw_items = items if isinstance(items, list) else [items]
+    wanted = []
+    for it in raw_items:
+        if not isinstance(it, dict):
+            continue
+        name = str(
+            it.get("materialName") or it.get("name") or it.get("value") or ""
+        ).strip()
+        if not name:
+            continue
+        wanted.append((name, it))
+    if not wanted:
+        return []
 
-            formulaB = _retarget_material_inv_row2_formula(rawB, next_row)
-            formulaC = _retarget_material_inv_row2_formula(rawC, next_row)
-            formulaH = _retarget_material_inv_row2_formula(rawH, next_row)
+    sheets_svc = get_sheets_service()
+    sheets_vals = sheets_svc.spreadsheets().values()
 
-            row_vals = [
-                [
-                    name,  # A Materials
-                    formulaB,  # B Inventory
-                    formulaC,  # C On Order
-                    unit,  # D Unit
-                    mininv,  # E Min. Inv.
-                    reorder,  # F Reorder
-                    cost,  # G Cost
-                    formulaH,  # H Value
-                    vendor,  # I Vendor
-                    color,  # J Color
-                ]
-            ]
-
-            sheets_vals.update(
+    header_resp = (
+        retry_google_api_call(
+            lambda: sheets_vals.get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"Material Inventory!A{next_row}:J{next_row}",
-                valueInputOption="USER_ENTERED",
-                body={"values": row_vals},
+                range="Material Inventory!A1:J1",
             ).execute()
+        )
+        or {}
+    )
+    headers = (header_resp.get("values") or [["Materials"]])[0]
+    colmap = _material_inventory_colmap(headers)
+    name_idx = colmap["materials"]
+    name_col = _a1_col(name_idx)
+    last_col_idx = max(colmap.values())
+    last_col_idx = min(last_col_idx, _MATERIAL_INV_DATA_MAX_COL)
+    last_col = _a1_col(last_col_idx)
 
+    names_resp = (
+        retry_google_api_call(
+            lambda: sheets_vals.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!{name_col}2:{name_col}",
+            ).execute()
+        )
+        or {}
+    )
+    name_rows = names_resp.get("values") or []
+    existing_names = {
+        str(r[0]).strip().lower()
+        for r in name_rows
+        if r and str(r[0]).strip()
+    }
+    next_row = _material_inventory_next_append_row(name_rows)
+
+    # Template formulas: first data row whose Inventory cell is a formula
+    formula_grid = (
+        retry_google_api_call(
+            lambda: sheets_vals.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!A2:{last_col}11",
+                valueRenderOption="FORMULA",
+            ).execute()
+        )
+        or {}
+    ).get("values") or []
+    tpl_row_vals = []
+    tpl_from_row = 2
+    inv_idx = colmap.get("inventory", 1)
+    for offset, prow in enumerate(formula_grid):
+        cell = str(prow[inv_idx] if len(prow) > inv_idx else "")
+        if cell.strip().startswith("="):
+            tpl_row_vals = prow
+            tpl_from_row = offset + 2
+            break
+    if not tpl_row_vals and formula_grid:
+        tpl_row_vals = formula_grid[0]
+        tpl_from_row = 2
+    if not tpl_row_vals:
+        logger.warning(
+            "[MaterialInventory] no template formulas found in rows 2–11; "
+            "new Inventory/On Order/Value cells may be blank"
+        )
+
+    def tpl_at(field):
+        idx = colmap.get(field)
+        if idx is None or idx >= len(tpl_row_vals):
+            return ""
+        return str(tpl_row_vals[idx] or "")
+
+    written = []
+    color_requests = []
+
+    for name, it in wanted:
+        if name.lower() in existing_names:
+            written.append({"name": name, "row": None, "skipped": True})
+            continue
+
+        target = next_row
+        # Never overwrite a row that already has a material name
+        for _ in range(50):
+            probe = (
+                retry_google_api_call(
+                    lambda t=target: sheets_vals.get(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"Material Inventory!{name_col}{t}",
+                    ).execute()
+                )
+                or {}
+            )
+            existing_cell = ""
+            vals = probe.get("values") or []
+            if vals and vals[0]:
+                existing_cell = str(vals[0][0] or "").strip()
+            if not existing_cell:
+                break
+            logger.warning(
+                "[MaterialInventory] row %s already has %r — appending lower",
+                target,
+                existing_cell,
+            )
+            target += 1
+
+        unit = str(it.get("unit") or "").strip()
+        mininv = str(it.get("minInv") if it.get("minInv") not in (None, "") else "").strip()
+        reorder = str(it.get("reorder") if it.get("reorder") not in (None, "") else "").strip()
+        cost = str(it.get("cost") if it.get("cost") not in (None, "") else "").strip()
+        vendor = str(it.get("vendor") or "").strip()
+        color = str(it.get("color") or "").strip()
+
+        row_vals = [""] * (last_col_idx + 1)
+        row_vals[name_idx] = name
+        for field, value in (
+            ("unit", unit),
+            ("min_inv", mininv),
+            ("reorder", reorder),
+            ("cost", cost),
+            ("vendor", vendor),
+            ("color", color),
+        ):
+            idx = colmap.get(field)
+            if idx is not None and idx <= last_col_idx:
+                row_vals[idx] = value
+        for field in ("inventory", "on_order", "value"):
+            idx = colmap.get(field)
+            if idx is None or idx > last_col_idx:
+                continue
+            row_vals[idx] = _retarget_material_inv_formula(
+                tpl_at(field), tpl_from_row, target
+            )
+
+        retry_google_api_call(
+            lambda t=target, rv=row_vals: sheets_vals.update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Material Inventory!A{t}:{last_col}{t}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [rv]},
+            ).execute()
+        )
+        logger.info(
+            "[MaterialInventory] appended %r at row %s (unit=%r vendor=%r)",
+            name,
+            target,
+            unit,
+            vendor,
+        )
+
+        color_idx = colmap.get("color")
+        if color and color_idx is not None and color_idx <= last_col_idx:
             color_requests.append(
                 {
                     "repeatCell": {
                         "range": {
                             "sheetId": 0,
-                            "startRowIndex": next_row - 1,
-                            "endRowIndex": next_row,
-                            "startColumnIndex": 9,
-                            "endColumnIndex": 10,
+                            "startRowIndex": target - 1,
+                            "endRowIndex": target,
+                            "startColumnIndex": color_idx,
+                            "endColumnIndex": color_idx + 1,
                         },
                         "cell": {
                             "userEnteredFormat": {
-                                "backgroundColor": hex_to_rgb(color)
+                                "backgroundColor": _hex_to_sheets_rgb(color)
                             }
                         },
                         "fields": "userEnteredFormat.backgroundColor",
@@ -18455,39 +18643,57 @@ def add_materials():
                 }
             )
 
-            written.append({"name": name, "row": next_row, "skipped": False})
-            existing_names.add(name.lower())
-            # Keep in-memory column A aligned so the next item appends below this one
-            while len(existing) < next_row - 2:
-                existing.append([])
-            if len(existing) == next_row - 2:
-                existing.append([name])
-            else:
-                existing[next_row - 2] = [name]
-            next_row += 1
+        written.append({"name": name, "row": target, "skipped": False})
+        existing_names.add(name.lower())
+        while len(name_rows) < target - 2:
+            name_rows.append([])
+        if len(name_rows) == target - 2:
+            name_rows.append([name])
+        else:
+            name_rows[target - 2] = [name]
+        next_row = target + 1
 
-        if not written:
-            return jsonify({"error": "No material name provided"}), 400
-
-        if color_requests:
-            try:
-                sheet_metadata = sheets_svc.spreadsheets().get(
-                    spreadsheetId=SPREADSHEET_ID
-                ).execute()
-                sheet_id = None
-                for sh_meta in sheet_metadata.get("sheets", []):
-                    if sh_meta["properties"]["title"] == "Material Inventory":
-                        sheet_id = sh_meta["properties"]["sheetId"]
-                        break
-                if sheet_id is not None:
-                    for req in color_requests:
-                        req["repeatCell"]["range"]["sheetId"] = sheet_id
-                    sheets_svc.spreadsheets().batchUpdate(
+    if color_requests:
+        try:
+            sheet_id = _material_inventory_sheet_id(sheets_svc)
+            if sheet_id is not None:
+                for req in color_requests:
+                    req["repeatCell"]["range"]["sheetId"] = sheet_id
+                retry_google_api_call(
+                    lambda: sheets_svc.spreadsheets().batchUpdate(
                         spreadsheetId=SPREADSHEET_ID,
                         body={"requests": color_requests},
                     ).execute()
-            except Exception as e:
-                logger.warning("Failed to apply color formatting: %s", e)
+                )
+        except Exception as e:
+            logger.warning("[MaterialInventory] color formatting failed: %s", e)
+
+    if any(not w.get("skipped") for w in written):
+        try:
+            invalidate_upcoming_cache()
+            invalidate_materials_needed_cache()
+            invalidate_material_inventory_status_cache()
+            invalidate_overview_combined_cache()
+        except Exception as e:
+            logger.warning("[MaterialInventory] cache invalidate failed: %s", e)
+
+    return written
+
+
+# 3) POST new material(s) into Material Inventory!A–J
+@app.route("/api/materials", methods=["POST"])
+@login_required_session
+def add_materials():
+    """
+    Order Submission / Inventory: add new material row(s) to Material Inventory.
+    Copies Inventory / On Order / Value formulas onto the new row.
+    """
+    try:
+        raw = request.get_json(silent=True) or []
+        items = raw if isinstance(raw, list) else [raw]
+        written = _ensure_materials_in_inventory(items)
+        if not written:
+            return jsonify({"error": "No material name provided"}), 400
 
         # Mirror into Supabase (non-fatal — sheet write is source of truth)
         if supabase:
@@ -18496,12 +18702,19 @@ def add_materials():
                     if w.get("skipped"):
                         continue
                     name = w["name"]
-                    # Find matching payload fields from request items
                     src = next(
                         (
                             it
                             for it in items
-                            if (it.get("materialName") or "").strip().lower()
+                            if isinstance(it, dict)
+                            and (
+                                it.get("materialName")
+                                or it.get("name")
+                                or it.get("value")
+                                or ""
+                            )
+                            .strip()
+                            .lower()
                             == name.lower()
                         ),
                         {},
@@ -18509,9 +18722,9 @@ def add_materials():
                     supabase_payload = {
                         "Materials": name,
                         "Unit": (src.get("unit") or "").strip(),
-                        "Min. Inv.": (src.get("minInv") or "").strip(),
-                        "Reorder": (src.get("reorder") or "").strip(),
-                        "Cost": (src.get("cost") or "").strip(),
+                        "Min. Inv.": str(src.get("minInv") or "").strip(),
+                        "Reorder": str(src.get("reorder") or "").strip(),
+                        "Cost": str(src.get("cost") or "").strip(),
                     }
                     logger.info(
                         "[SUPABASE] Material Inventory payload:\n%s",
@@ -18527,9 +18740,6 @@ def add_materials():
                 logger.error(
                     "[SUPABASE] Material Inventory insert failed (sheet OK): %s", e
                 )
-
-        invalidate_upcoming_cache()
-        invalidate_materials_needed_cache()
 
         try:
             socketio.emit(
@@ -18945,35 +19155,6 @@ def submit_material_inventory():
         material_log_rows = []
         thread_log_rows = []
 
-        # ========= Material Inventory setup (unchanged behavior) =========
-        # 2) Fetch row 2 formulas for Material Inventory (A2:H2)
-        mat_formula = (
-            sheet.get(
-                spreadsheetId=SPREADSHEET_ID,
-                range="Material Inventory!A2:H2",
-                valueRenderOption="FORMULA",
-            )
-            .execute()
-            .get("values", [[]])[0]
-        )
-        mat_inv_tpl = str(mat_formula[1]) if len(mat_formula) > 1 else ""
-        mat_oo_tpl = str(mat_formula[2]) if len(mat_formula) > 2 else ""
-        mat_val_tpl = str(mat_formula[7]) if len(mat_formula) > 7 else ""
-
-        # 3) Fetch existing rows for Material Inventory (no hard row cap — append below last name)
-        mat_rows = (
-            sheet.get(spreadsheetId=SPREADSHEET_ID, range="Material Inventory!A2:A")
-            .execute()
-            .get("values", [])
-            or []
-        )
-        existing_mats = {
-            str(r[0]).strip().lower()
-            for r in mat_rows
-            if r and str(r[0]).strip()
-        }
-        next_mat_row = _material_inventory_next_append_row(mat_rows)
-
         # ========= Thread Data header-based mapping =========
         # Fetch Thread Data headers so we can place values by name
         td_rows = fetch_sheet(SPREADSHEET_ID, "Thread Data!A1:Z")
@@ -19010,6 +19191,21 @@ def submit_material_inventory():
         ordered_material_totals = {}
         ordered_material_canonical = {}
 
+        try:
+            _ensure_materials_in_inventory(
+                [
+                    it
+                    for it in items
+                    if isinstance(it, dict)
+                    and ((it.get("type") or "Material").strip() or "Material") == "Material"
+                ]
+            )
+        except Exception as inv_err:
+            logger.exception(
+                "[materialInventory] failed to add new rows to Material Inventory: %s",
+                inv_err,
+            )
+
         # 5) Process each item
         for it in items:
             name = (it.get("materialName") or it.get("value") or "").strip()
@@ -19026,39 +19222,7 @@ def submit_material_inventory():
                 continue
 
             if type_ == "Material":
-                # === MATERIAL: add to Material Inventory if new, always log to Material Log ===
-                is_new = name.lower() not in existing_mats
-                if is_new:
-                    target = next_mat_row
-
-                    # Copy B2 / C2 / H2 formulas onto the new row with retargeted row refs
-                    inv_f = _retarget_material_inv_row2_formula(mat_inv_tpl, target)
-                    oo_f = _retarget_material_inv_row2_formula(mat_oo_tpl, target)
-                    val_f = _retarget_material_inv_row2_formula(mat_val_tpl, target)
-
-                    row_vals = [
-                        [name, inv_f, oo_f, unit, min_inv, reorder, cost, val_f]
-                    ]
-
-                    # Append at bottom of Material Inventory (never mid-list gaps)
-                    sheet.update(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range=f"Material Inventory!A{target}:H{target}",
-                        valueInputOption="USER_ENTERED",
-                        body={"values": row_vals},
-                    ).execute()
-
-                    # keep in-memory sets/rows up to date for subsequent items
-                    existing_mats.add(name.lower())
-                    while len(mat_rows) < target - 2:
-                        mat_rows.append([])
-                    if len(mat_rows) == target - 2:
-                        mat_rows.append([name])
-                    else:
-                        mat_rows[target - 2] = [name]
-                    next_mat_row = target + 1
-
-                # ALWAYS log the material movement (even if not new)
+                # ALWAYS log the material movement (inventory row already ensured above)
                 #
                 # Use a sentinel Order # for vendor-facing purchases so sheet formulas that
                 # SUMIFS(..., Material Log Order #, "<>", "") still count replenishment orders.
