@@ -15530,6 +15530,7 @@ def submit_order():
                 ).execute()
                 make_public(up["id"])
                 prod_links.append(up["webViewLink"])
+                _queue_corel_vectorize_job(drive, order_folder_id, f.filename, new_order)
                 buf.seek(0)
                 m2 = MediaIoBaseUpload(buf, mimetype=f.mimetype)
                 up2 = drive.files().create(
@@ -15539,6 +15540,7 @@ def submit_order():
                 ).execute()
                 make_public(up2["id"])
                 back_prod_links.append(up2["webViewLink"])
+                _queue_corel_vectorize_job(drive, back_order_folder_id, f.filename, back_order)
                 del buf
         else:
             # One prod file at a time to avoid holding multiple large files in memory
@@ -15552,6 +15554,7 @@ def submit_order():
                 ).execute()
                 make_public(up["id"])
                 prod_links.append(up["webViewLink"])
+                _queue_corel_vectorize_job(drive, order_folder_id, f.filename, new_order)
                 del buf
 
         # Create Print Files subfolder if user uploaded print files OR checked the Print checkbox
@@ -16280,6 +16283,51 @@ def _extract_drive_file_id(url):
     return None
 
 
+_VECTORIZE_RASTER_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
+
+
+def _is_raster_for_corel_vectorize(filename):
+    name = os.path.basename(filename or "").strip()
+    if not name:
+        return False
+    lower = name.lower()
+    stem, ext = os.path.splitext(lower)
+    if ext not in _VECTORIZE_RASTER_EXTS:
+        return False
+    if stem.endswith("_vector") or lower.startswith("preview_") or "_stamped" in lower:
+        return False
+    return True
+
+
+def _queue_corel_vectorize_job(drive, folder_id, filename, order_num):
+    """Drop a sidecar in the order folder so the local Corel watcher traces this raster."""
+    if not drive or not folder_id or not _is_raster_for_corel_vectorize(filename):
+        return
+    try:
+        job_name = f"{os.path.basename(filename)}.vectorize.json"
+        payload = json.dumps(
+            {
+                "order": str(order_num),
+                "fileName": os.path.basename(filename),
+                "queuedAt": datetime.now(ZoneInfo("America/New_York")).isoformat(),
+            }
+        ).encode("utf-8")
+        media = MediaIoBaseUpload(BytesIO(payload), mimetype="application/json", resumable=False)
+        drive.files().create(
+            body={"name": job_name, "parents": [folder_id]},
+            media_body=media,
+            fields="id",
+        ).execute()
+        logger.info("[CorelTrace] Queued vectorize job for order %s file %s", order_num, filename)
+    except Exception as e:
+        logger.warning(
+            "[CorelTrace] Failed to queue job for order %s file %s: %s",
+            order_num,
+            filename,
+            e,
+        )
+
+
 def _mime_to_logo_ext(mime_type):
     mime_type = (mime_type or "").lower()
     if "png" in mime_type:
@@ -16324,6 +16372,12 @@ def _upload_customer_logo_to_order_folder(
                         new_order,
                         logo_index,
                         fid,
+                    )
+                    _queue_corel_vectorize_job(
+                        drive_svc,
+                        folder_id,
+                        f"order_{new_order}_logo_{logo_index}.{ext}",
+                        new_order,
                     )
                     return True
             except Exception as e:
@@ -16377,6 +16431,12 @@ def _upload_customer_logo_to_order_folder(
                         logo_index,
                         len(raw),
                     )
+                    _queue_corel_vectorize_job(
+                        drive_svc,
+                        folder_id,
+                        f"order_{new_order}_logo_{logo_index}.{ext}",
+                        new_order,
+                    )
                     return True
             except Exception as e:
                 logger.warning(
@@ -16412,6 +16472,12 @@ def _upload_customer_logo_to_order_folder(
                 fields="id",
             ).execute()
             make_public_fn(drive_svc, up.get("id"))
+            _queue_corel_vectorize_job(
+                drive_svc,
+                folder_id,
+                f"order_{new_order}_logo_{logo_index}.{ext}",
+                new_order,
+            )
             return True
         except Exception as e:
             logger.warning(
