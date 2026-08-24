@@ -163,6 +163,7 @@ from ups_service import (
 import ship_qbo_file_log as sqlog
 import packing_history as packhist
 import sewing_priority_waiting as sew_waiting
+import embroidery_progress as emb_progress
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
@@ -2210,9 +2211,16 @@ except Exception:
 app.config.update(
     SESSION_COOKIE_SAMESITE="None",  # Required for cross-domain cookies
     SESSION_COOKIE_SECURE=True,  # Required when using SAMESITE=None
+    # iOS Safari drops cookies with no Expires; keep the cookie for a week.
+    # login_required_session still enforces the 12-hour idle timeout.
+    PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+    SESSION_COOKIE_HTTPONLY=True,
 )
-
-app.config["SESSION_COOKIE_HTTPONLY"] = True
+try:
+    # Chrome CHIPS (ignored by older Flask/Werkzeug)
+    app.config["SESSION_COOKIE_PARTITIONED"] = True
+except Exception:
+    pass
 # app.config["SESSION_COOKIE_DOMAIN"] = "machine-scheduler-backend.onrender.com"
 
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -9208,10 +9216,12 @@ def index():
     return jsonify({"status": "ok", "message": "Backend is running"}), 200
 
 
-# allow cross-site cookies
+# allow cross-site cookies (keep in sync with the config block near ProxyFix)
 app.config.update(
     SESSION_COOKIE_SAMESITE="None",
     SESSION_COOKIE_SECURE=True,
+    PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+    SESSION_COOKIE_HTTPONLY=True,
 )
 
 # Do not call CORS(app) again here — a second registration narrows origins to FRONTEND_URL
@@ -10784,16 +10794,65 @@ def get_sheet_password():
 # ─── Minimal Login Page (HTML) ───────────────────────────────────────────────
 _login_page = """
 <!DOCTYPE html>
-<html>
-<head><title>Login</title></head>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>JR &amp; Co. Login</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Arial, sans-serif;
+      background: #f3f4f6;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    form {
+      width: 100%;
+      max-width: 420px;
+      background: #fff;
+      padding: 24px;
+      border-radius: 16px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+    }
+    h2 { margin: 0 0 16px; font-size: 28px; }
+    label { display: block; font-weight: 700; margin: 12px 0 6px; }
+    input {
+      width: 100%;
+      min-height: 52px;
+      font-size: 18px;
+      padding: 10px 12px;
+      border: 2px solid #111827;
+      border-radius: 10px;
+    }
+    button {
+      width: 100%;
+      min-height: 56px;
+      margin-top: 20px;
+      font-size: 20px;
+      font-weight: 800;
+      color: #fff;
+      background: #111827;
+      border: none;
+      border-radius: 10px;
+    }
+    .error { color: #b91c1c; font-weight: 700; margin: 0 0 12px; }
+  </style>
+</head>
 <body>
-  <h2>Login</h2>
-  {% if error %}
-    <p style="color: red;">{{ error }}</p>
-  {% endif %}
-  <form method="POST">
-    <input type="text" name="username" placeholder="Username" required><br><br>
-    <input type="password" name="password" placeholder="Password" required><br><br>
+  <form method="POST" action="/login">
+    <h2>Login</h2>
+    {% if error %}
+      <p class="error">{{ error }}</p>
+    {% endif %}
+    <label for="username">Username</label>
+    <input id="username" type="text" name="username" autocomplete="username" autocapitalize="none" />
+    <label for="password">Password</label>
+    <input id="password" type="password" name="password" autocomplete="current-password" required />
     <input type="hidden" name="next" value="{{ next }}">
     <button type="submit">Login</button>
   </form>
@@ -10801,11 +10860,70 @@ _login_page = """
 </html>
 """
 
+_login_success_page = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="refresh" content="0;url={{ next }}">
+  <title>Signed in</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 32px; text-align: center; }
+  </style>
+</head>
+<body>
+  <p>Signed in. Opening the scheduler…</p>
+  <p><a href="{{ next }}">Continue</a></p>
+  <script>window.location.replace({{ next|tojson }});</script>
+</body>
+</html>
+"""
+
+
+def _safe_login_next(raw):
+    """Only send the browser back to our frontend (or FRONTEND_URL)."""
+    fallback = (FRONTEND_URL or "https://machineschedule.netlify.app").strip().rstrip("/")
+    allowed = {fallback}
+    try:
+        allowed |= {str(o).rstrip("/") for o in _cors_allowed_origins()}
+    except Exception:
+        pass
+
+    s = (raw or "").strip()
+    if not s or s.lower() in ("none", "null", "undefined"):
+        return fallback + "/"
+
+    if s.startswith("/"):
+        if s.startswith("//"):
+            return fallback + "/"
+        if s.startswith("/login"):
+            return fallback + "/"
+        return fallback + s
+
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(s)
+        origin = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        host = (parsed.netloc or "").split(":")[0].lower()
+        path = parsed.path or "/"
+        if path.startswith("/login"):
+            return fallback + "/"
+        if origin in allowed or host.endswith(".netlify.app") or host.endswith(".netlify.com"):
+            q = ("?" + parsed.query) if parsed.query else ""
+            return origin + path + q
+    except Exception:
+        pass
+    return fallback + "/"
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
-    next_url = request.args.get("next") or request.form.get("next") or FRONTEND_URL
+    next_url = _safe_login_next(
+        request.args.get("next") or request.form.get("next") or FRONTEND_URL
+    )
 
     if request.method == "POST":
         # We only care about the password. Username can be anything.
@@ -10817,16 +10935,19 @@ def login():
             error = "Server is missing ADMIN_PASSWORD. Ask the admin to set it."
         elif p == ADMIN_PW:
             session.clear()
+            session.permanent = True
             session["user"] = "admin"  # single-user auth
             session["token_at_login"] = ADMIN_TOKEN
             session["last_activity"] = datetime.utcnow().isoformat()
             session["login_time"] = time.time()
             session["login_ts"] = datetime.utcnow().timestamp()
-
-            # If they posted a backend path, still send them to the frontend root
-            if next_url.startswith("/"):
-                return redirect(FRONTEND_URL)
-            return redirect(next_url)
+            session.modified = True
+            # 200 + JS redirect (not 302): iPhone Safari often drops Set-Cookie on redirects.
+            resp = make_response(
+                render_template_string(_login_success_page, next=next_url)
+            )
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
         else:
             error = "Invalid credentials"
 
@@ -14424,6 +14545,451 @@ def get_embroidery_list():
     except Exception:
         logger.exception("Error fetching embroidery list")
         return jsonify([]), 200
+
+
+def _emb_floor_col_letter(idx0: int) -> str:
+    n = idx0 + 1
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _emb_floor_header_index(headers, names):
+    lowered = [str(h or "").strip().lower() for h in headers]
+    want = [str(n).strip().lower() for n in names]
+    for w in want:
+        for i, h in enumerate(lowered):
+            if h == w:
+                return i
+    return None
+
+
+def _emb_floor_drive_file_id(image_link) -> str:
+    s = str(image_link or "").strip()
+    if not s:
+        return ""
+    if "id=" in s:
+        return s.split("id=")[-1].split("&")[0].split("#")[0].strip()
+    if "file/d/" in s:
+        return s.split("file/d/")[-1].split("/")[0].strip()
+    return ""
+
+
+def _emb_floor_load_order_row(order_id: str):
+    """Return (order_dict, embroidery_status) for an Order #."""
+    oid = _overview_normalize_order_key(order_id)
+    if not oid:
+        return None, ""
+
+    prod_data = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE) or []
+    order = None
+    if prod_data:
+        headers = [str(h or "").strip() for h in prod_data[0]]
+        for r in prod_data[1:]:
+            row = dict(zip(headers, r or []))
+            if _overview_normalize_order_key(row.get("Order #")) == oid:
+                order = row
+                break
+
+    emb_status = ""
+    try:
+        emb_rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE) or []
+        if emb_rows:
+            eh = [str(h or "").strip() for h in emb_rows[0]]
+            status_i = _emb_floor_header_index(eh, ["status"])
+            if status_i is None:
+                status_i = 20 if len(eh) > 20 else None
+            order_i = _emb_floor_header_index(eh, ["order #", "order#", "order"])
+            if order_i is None:
+                order_i = 0
+            if status_i is not None:
+                for r in emb_rows[1:]:
+                    r = r or []
+                    if order_i >= len(r):
+                        continue
+                    if _overview_normalize_order_key(r[order_i]) != oid:
+                        continue
+                    if status_i < len(r):
+                        emb_status = str(r[status_i] or "").strip()
+                    break
+    except Exception:
+        logger.exception("embroidery floor: Embroidery List lookup failed for %s", oid)
+
+    return order, emb_status
+
+
+def _emb_floor_job_payload(order_id: str, sheets_svc=None):
+    oid = _overview_normalize_order_key(order_id)
+    order, emb_status = _emb_floor_load_order_row(oid)
+    if not order:
+        return None
+
+    qty = int(round(_parse_qty_number(order.get("Quantity"), 0.0)))
+    completed = emb_progress.get_qty(oid, sheets_svc, SPREADSHEET_ID)
+    if completed > qty > 0:
+        completed = qty
+    pieces_left = max(0, qty - completed)
+    status_u = str(emb_status or "").strip().upper()
+    stage = str(order.get("Stage") or "").strip()
+    embroidery_complete = status_u == "COMPLETE" or stage.upper() in (
+        "SEWING",
+        "COMPLETE",
+        "COMPLETED",
+    )
+    image_link = str(order.get("Image") or "").strip()
+    file_id = _emb_floor_drive_file_id(image_link)
+    return {
+        "orderId": oid,
+        "company": str(order.get("Company Name") or "").strip(),
+        "product": str(order.get("Product") or "").strip(),
+        "design": str(order.get("Design") or "").strip(),
+        "quantity": qty,
+        "completedQty": completed,
+        "piecesLeft": pieces_left,
+        "stitchCount": int(round(_parse_qty_number(order.get("Stitch Count"), 0.0))),
+        "dueDate": order.get("Due Date") or "",
+        "shipDate": order.get("Ship Date") or "",
+        "stage": stage,
+        "embroideryStatus": emb_status,
+        "embroideryComplete": embroidery_complete,
+        "imageLink": image_link,
+        "imageFileId": file_id,
+        "threads": str(order.get("Threads") or "").strip(),
+    }
+
+
+def _emb_floor_mark_list_complete(order_id: str, completed_qty: int) -> bool:
+    """Set Embroidery List Status to COMPLETE (and Qty Completed if that column exists)."""
+    global _emb_cache, _emb_ts
+    oid = _overview_normalize_order_key(order_id)
+    if not oid:
+        return False
+    svc = get_sheets_service().spreadsheets().values()
+    with acquire_sheet_lock():
+        resp = svc.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Embroidery List!A1:ZZ",
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+    rows = resp.get("values") or []
+    if not rows:
+        return False
+    headers = [str(h or "").strip() for h in rows[0]]
+    order_i = _emb_floor_header_index(headers, ["order #", "order#", "order"])
+    if order_i is None:
+        order_i = 0
+    status_i = _emb_floor_header_index(headers, ["status"])
+    if status_i is None:
+        status_i = 20 if len(headers) > 20 else None
+    qty_i = _emb_floor_header_index(
+        headers,
+        [
+            "qty completed",
+            "quantity made",
+            "completed qty",
+            "pieces done",
+            "pieces completed",
+            "qty done",
+        ],
+    )
+    row_num = None
+    for i in range(1, len(rows)):
+        r = rows[i] or []
+        val = r[order_i] if order_i < len(r) else ""
+        if _overview_normalize_order_key(val) == oid:
+            row_num = i + 1
+            break
+    if not row_num:
+        logger.warning("embroidery floor: order %s not in Embroidery List", oid)
+        return False
+
+    updates = []
+    if status_i is not None:
+        updates.append(
+            {
+                "range": f"Embroidery List!{_emb_floor_col_letter(status_i)}{row_num}",
+                "values": [["COMPLETE"]],
+            }
+        )
+    if qty_i is not None:
+        updates.append(
+            {
+                "range": f"Embroidery List!{_emb_floor_col_letter(qty_i)}{row_num}",
+                "values": [[int(completed_qty)]],
+            }
+        )
+    if not updates:
+        return False
+    with acquire_sheet_lock():
+        svc.batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": updates},
+        ).execute()
+    _emb_cache = None
+    _emb_ts = 0
+    _invalidate_combined_orders_cache()
+    invalidate_overview_combined_cache()
+    return True
+
+
+def _send_embroidery_recut_email(payload: dict) -> bool:
+    """Email Brendan that a recut is needed. Uses the same SMTP as design confirmation."""
+    to_email = (
+        os.environ.get("RECUT_NOTIFY_EMAIL")
+        or os.environ.get("EMBROIDERY_MANAGER_EMAIL")
+        or "Brendan.eckard@jrcogolf.com"
+    ).strip()
+    from_email = (os.environ.get("DESIGN_CONFIRMATION_FROM_EMAIL") or "info@jrco.us").strip()
+    smtp_host = (os.environ.get("SMTP_HOST") or "").strip()
+    smtp_port = int(os.environ.get("SMTP_PORT") or "587")
+    smtp_user = (os.environ.get("SMTP_USER") or "").strip()
+    smtp_password = (os.environ.get("SMTP_PASSWORD") or "").strip()
+    if not to_email:
+        logger.warning("[EmbroideryRecut] no recipient email")
+        return False
+    if not smtp_host or not smtp_user or not smtp_password:
+        logger.info("[EmbroideryRecut] SMTP not configured — skipping email")
+        return False
+
+    order_id = _html_escape(payload.get("orderId") or "—")
+    machine = _html_escape(payload.get("machine") or "—")
+    company = _html_escape(payload.get("company") or "—")
+    product = _html_escape(payload.get("product") or "—")
+    design = _html_escape(payload.get("design") or "—")
+    quantity = _html_escape(payload.get("quantity") or "—")
+    note = _html_escape(payload.get("note") or "")
+    image_url = str(payload.get("imageUrl") or "").strip()
+
+    subject = f"Embroidery recut needed — Order #{payload.get('orderId') or '?'}"
+    html_body = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: Arial, sans-serif; color: #111; line-height: 1.5;">
+<p><strong>Recut requested from the embroidery floor.</strong></p>
+<p>
+<strong>Order #:</strong> {order_id}<br>
+<strong>Machine:</strong> {machine}<br>
+<strong>Customer:</strong> {company}<br>
+<strong>Product:</strong> {product}<br>
+<strong>Design:</strong> {design}<br>
+<strong>Quantity:</strong> {quantity}
+</p>
+"""
+    if note:
+        html_body += f"<p><strong>Note:</strong> {note}</p>\n"
+    if image_url:
+        html_body += f'<p><img src="{_html_escape(image_url)}" alt="Job image" width="480" style="max-width:100%;border:1px solid #ddd;border-radius:8px;" /></p>\n'
+    html_body += "<p>Sent from the embroidery machine tablet.</p></body></html>"
+
+    plain = (
+        f"Recut requested from the embroidery floor.\n\n"
+        f"Order #: {payload.get('orderId')}\n"
+        f"Machine: {payload.get('machine')}\n"
+        f"Customer: {payload.get('company')}\n"
+        f"Product: {payload.get('product')}\n"
+        f"Design: {payload.get('design')}\n"
+        f"Quantity: {payload.get('quantity')}\n"
+    )
+    if payload.get("note"):
+        plain += f"\nNote: {payload.get('note')}\n"
+
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.attach(MIMEText(plain, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(from_email, [to_email], msg.as_string())
+    logger.info("[EmbroideryRecut] emailed %s for order %s", to_email, payload.get("orderId"))
+    return True
+
+
+@app.route("/api/embroidery/floor-job/<order_id>", methods=["GET", "OPTIONS"])
+@login_required_session
+def embroidery_floor_job(order_id):
+    """Job details + pieces remaining for the embroidery tablet page."""
+    if request.method == "OPTIONS":
+        return make_response("", 204)
+    try:
+        try:
+            sheets_svc = get_sheets_service()
+        except Exception:
+            sheets_svc = None
+        payload = _emb_floor_job_payload(order_id, sheets_svc)
+        if not payload:
+            return jsonify({"error": "order not found"}), 404
+        return jsonify(payload), 200
+    except Exception:
+        logger.exception("embroidery floor-job failed")
+        return jsonify({"error": "server error"}), 500
+
+
+@app.route("/api/embroidery/progress", methods=["POST", "OPTIONS"])
+@login_required_session
+def embroidery_floor_progress():
+    """
+    Body: { orderId, increment?: int, completedQty?: int, piecesLeft?: int }
+    Records pieces just embroidered, or sets remaining / completed count.
+    """
+    if request.method == "OPTIONS":
+        return make_response("", 204)
+    data = request.get_json(silent=True) or {}
+    oid = str(data.get("orderId") or "").strip()
+    if not oid:
+        return jsonify({"error": "orderId is required"}), 400
+    try:
+        try:
+            sheets_svc = get_sheets_service()
+        except Exception:
+            sheets_svc = None
+        payload = _emb_floor_job_payload(oid, sheets_svc)
+        if not payload:
+            return jsonify({"error": "order not found"}), 404
+        qty = int(payload["quantity"] or 0)
+        current = int(payload["completedQty"] or 0)
+        if data.get("piecesLeft") is not None:
+            try:
+                left = int(data.get("piecesLeft"))
+            except (TypeError, ValueError):
+                return jsonify({"error": "piecesLeft must be a whole number"}), 400
+            completed = max(0, qty - max(0, left))
+        elif data.get("completedQty") is not None:
+            try:
+                completed = int(data.get("completedQty"))
+            except (TypeError, ValueError):
+                return jsonify({"error": "completedQty must be a whole number"}), 400
+        elif data.get("increment") is not None:
+            try:
+                inc = int(data.get("increment"))
+            except (TypeError, ValueError):
+                return jsonify({"error": "increment must be a whole number"}), 400
+            if inc <= 0:
+                return jsonify({"error": "increment must be positive"}), 400
+            completed = current + inc
+        else:
+            return jsonify({"error": "increment, completedQty, or piecesLeft required"}), 400
+
+        if qty > 0:
+            completed = max(0, min(qty, completed))
+        else:
+            completed = max(0, completed)
+
+        result = emb_progress.set_qty(oid, completed, sheets_svc, SPREADSHEET_ID)
+        updated = _emb_floor_job_payload(oid, sheets_svc) or {}
+        updated.update(result)
+        try:
+            socketio.emit("embroideryProgressUpdated", updated)
+        except Exception:
+            logger.exception("embroideryProgressUpdated emit failed")
+        return jsonify(updated), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception:
+        logger.exception("embroidery progress failed")
+        return jsonify({"error": "server error"}), 500
+
+
+@app.route("/api/embroidery/finish", methods=["POST", "OPTIONS"])
+@login_required_session
+def embroidery_floor_finish():
+    """Mark a job embroidery-complete (Embroidery List Status = COMPLETE)."""
+    if request.method == "OPTIONS":
+        return make_response("", 204)
+    data = request.get_json(silent=True) or {}
+    oid = str(data.get("orderId") or "").strip()
+    if not oid:
+        return jsonify({"error": "orderId is required"}), 400
+    try:
+        try:
+            sheets_svc = get_sheets_service()
+        except Exception:
+            sheets_svc = None
+        payload = _emb_floor_job_payload(oid, sheets_svc)
+        if not payload:
+            return jsonify({"error": "order not found"}), 404
+        qty = int(payload["quantity"] or 0)
+        completed = qty if qty > 0 else int(payload["completedQty"] or 0)
+        emb_progress.set_qty(oid, completed, sheets_svc, SPREADSHEET_ID)
+        marked = False
+        try:
+            marked = _emb_floor_mark_list_complete(oid, completed)
+        except Exception:
+            logger.exception("embroidery finish: Embroidery List write failed")
+        updated = _emb_floor_job_payload(oid, sheets_svc) or payload
+        updated["embroideryComplete"] = True
+        updated["completedQty"] = completed
+        updated["piecesLeft"] = 0
+        updated["listMarked"] = marked
+        try:
+            socketio.emit("embroideryProgressUpdated", updated)
+            socketio.emit("embroideryFinished", {"orderId": oid})
+        except Exception:
+            logger.exception("embroidery finish emit failed")
+        return jsonify(updated), 200
+    except Exception:
+        logger.exception("embroidery finish failed")
+        return jsonify({"error": "server error"}), 500
+
+
+@app.route("/api/embroidery/recut", methods=["POST", "OPTIONS"])
+@login_required_session
+def embroidery_floor_recut():
+    """Email the manager immediately when embroidery needs a recut."""
+    if request.method == "OPTIONS":
+        return make_response("", 204)
+    data = request.get_json(silent=True) or {}
+    oid = str(data.get("orderId") or "").strip()
+    if not oid:
+        return jsonify({"error": "orderId is required"}), 400
+    try:
+        try:
+            sheets_svc = get_sheets_service()
+        except Exception:
+            sheets_svc = None
+        payload = _emb_floor_job_payload(oid, sheets_svc) or {}
+        file_id = payload.get("imageFileId") or ""
+        image_url = (
+            f"https://drive.google.com/thumbnail?id={file_id}&sz=w800" if file_id else ""
+        )
+        sent = _send_embroidery_recut_email(
+            {
+                "orderId": payload.get("orderId") or oid,
+                "machine": str(data.get("machine") or "").strip(),
+                "company": payload.get("company") or "",
+                "product": payload.get("product") or "",
+                "design": payload.get("design") or "",
+                "quantity": payload.get("quantity") or "",
+                "note": str(data.get("note") or "").strip(),
+                "imageUrl": image_url,
+            }
+        )
+        if not sent:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "Could not send email. SMTP (SMTP_HOST / SMTP_USER / SMTP_PASSWORD) is not set on the server.",
+                    }
+                ),
+                503,
+            )
+        try:
+            socketio.emit("embroideryRecutRequested", {"orderId": oid})
+        except Exception:
+            pass
+        return jsonify({"ok": True, "orderId": oid}), 200
+    except Exception:
+        logger.exception("embroidery recut email failed")
+        return jsonify({"ok": False, "error": "Failed to send recut email"}), 500
 
 
 # ─── GET A SINGLE ORDER ───────────────────────────────────────────
