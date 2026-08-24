@@ -2098,6 +2098,54 @@ def send_cached_json(key, ttl, payload_obj_builder):
         _json_bg_refresh_release(key)
 
 
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+
+
+_LOGIN_TOKEN_SALT = "ms-web-login"
+_LOGIN_TOKEN_MAX_AGE = 12 * 3600
+
+
+def _login_serializer():
+    return URLSafeTimedSerializer(app.secret_key, salt=_LOGIN_TOKEN_SALT)
+
+
+def _issue_login_token():
+    return _login_serializer().dumps(
+        {
+            "user": "admin",
+            "token": os.environ.get("ADMIN_TOKEN", ""),
+            "login_time": time.time(),
+        }
+    )
+
+
+def _load_login_token(raw):
+    try:
+        data = _login_serializer().loads(raw, max_age=_LOGIN_TOKEN_MAX_AGE)
+        if data.get("user") != "admin":
+            return None
+        if data.get("token") != os.environ.get("ADMIN_TOKEN", ""):
+            return None
+        return data
+    except (BadSignature, SignatureExpired, Exception):
+        return None
+
+
+def _apply_bearer_session():
+    """Accept Authorization: Bearer <signed login token> (phones block cross-site cookies)."""
+    auth = (request.headers.get("Authorization") or "").strip()
+    if len(auth) < 8 or auth[:7].lower() != "bearer ":
+        return False
+    data = _load_login_token(auth[7:].strip())
+    if not data:
+        return False
+    session["user"] = "admin"
+    session["token_at_login"] = data.get("token", "")
+    session["login_time"] = float(data.get("login_time") or 0)
+    session["last_activity"] = datetime.utcnow().isoformat()
+    return True
+
+
 def login_required_session(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -2142,6 +2190,11 @@ def login_required_session(f):
             )
             response.headers["Vary"] = "Origin"
             return response
+
+        # Phones block the Render session cookie when the app is on Netlify.
+        # Login puts a signed token in the redirect hash; the app sends it as Bearer.
+        if not session.get("user"):
+            _apply_bearer_session()
 
         # 2) Must be logged in at all
         if not session.get("user"):
@@ -2216,11 +2269,8 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
     SESSION_COOKIE_HTTPONLY=True,
 )
-try:
-    # Chrome CHIPS (ignored by older Flask/Werkzeug)
-    app.config["SESSION_COOKIE_PARTITIONED"] = True
-except Exception:
-    pass
+# Do not set SESSION_COOKIE_PARTITIONED. CHIPS cookies set on Render are not
+# sent later from machineschedule.netlify.app, so phones bounce back to login.
 # app.config["SESSION_COOKIE_DOMAIN"] = "machine-scheduler-backend.onrender.com"
 
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -10866,7 +10916,6 @@ _login_success_page = """
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="refresh" content="0;url={{ next }}">
   <title>Signed in</title>
   <style>
     body { font-family: Arial, sans-serif; padding: 32px; text-align: center; }
@@ -10879,6 +10928,14 @@ _login_success_page = """
 </body>
 </html>
 """
+
+
+def _attach_login_token(next_url, token):
+    """Put the signed login token in the URL hash (not query) so phones can auth without cookies."""
+    base = str(next_url or "").split("#")[0].strip()
+    if not base:
+        base = (FRONTEND_URL or "https://machineschedule.netlify.app").rstrip("/") + "/"
+    return f"{base}#ms={token}"
 
 
 def _safe_login_next(raw):
@@ -10942,9 +10999,10 @@ def login():
             session["login_time"] = time.time()
             session["login_ts"] = datetime.utcnow().timestamp()
             session.modified = True
+            dest = _attach_login_token(next_url, _issue_login_token())
             # 200 + JS redirect (not 302): iPhone Safari often drops Set-Cookie on redirects.
             resp = make_response(
-                render_template_string(_login_success_page, next=next_url)
+                render_template_string(_login_success_page, next=dest)
             )
             resp.headers["Cache-Control"] = "no-store"
             return resp
