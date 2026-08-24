@@ -14718,8 +14718,27 @@ def _emb_floor_job_payload(order_id: str, sheets_svc=None):
     }
 
 
-def _emb_floor_mark_list_complete(order_id: str, completed_qty: int) -> bool:
-    """Set Embroidery List Status to COMPLETE (and Qty Completed if that column exists)."""
+def _emb_floor_qty_header_index(headers):
+    return _emb_floor_header_index(
+        headers,
+        [
+            "quantity made",
+            "qty completed",
+            "quantity completed",
+            "completed qty",
+            "qty made",
+            "pieces done",
+            "pieces completed",
+            "qty done",
+        ],
+    )
+
+
+def _emb_floor_write_list_progress(order_id: str, completed_qty: int, mark_complete: bool) -> bool:
+    """
+    Write completed count to Embroidery List (Quantity Made / Qty Completed).
+    When mark_complete is True, also set Status to COMPLETE so Stage → SEWING.
+    """
     global _emb_cache, _emb_ts
     oid = _overview_normalize_order_key(order_id)
     if not oid:
@@ -14741,17 +14760,7 @@ def _emb_floor_mark_list_complete(order_id: str, completed_qty: int) -> bool:
     status_i = _emb_floor_header_index(headers, ["status"])
     if status_i is None:
         status_i = 20 if len(headers) > 20 else None
-    qty_i = _emb_floor_header_index(
-        headers,
-        [
-            "qty completed",
-            "quantity made",
-            "completed qty",
-            "pieces done",
-            "pieces completed",
-            "qty done",
-        ],
-    )
+    qty_i = _emb_floor_qty_header_index(headers)
     row_num = None
     for i in range(1, len(rows)):
         r = rows[i] or []
@@ -14764,13 +14773,6 @@ def _emb_floor_mark_list_complete(order_id: str, completed_qty: int) -> bool:
         return False
 
     updates = []
-    if status_i is not None:
-        updates.append(
-            {
-                "range": f"Embroidery List!{_emb_floor_col_letter(status_i)}{row_num}",
-                "values": [["COMPLETE"]],
-            }
-        )
     if qty_i is not None:
         updates.append(
             {
@@ -14778,18 +14780,41 @@ def _emb_floor_mark_list_complete(order_id: str, completed_qty: int) -> bool:
                 "values": [[int(completed_qty)]],
             }
         )
+    if mark_complete and status_i is not None:
+        updates.append(
+            {
+                "range": f"Embroidery List!{_emb_floor_col_letter(status_i)}{row_num}",
+                "values": [["COMPLETE"]],
+            }
+        )
     if not updates:
+        logger.warning(
+            "embroidery floor: no Quantity Made/Status columns to write for %s (headers=%s)",
+            oid,
+            headers[:30],
+        )
         return False
     with acquire_sheet_lock():
         svc.batchUpdate(
             spreadsheetId=SPREADSHEET_ID,
             body={"valueInputOption": "USER_ENTERED", "data": updates},
         ).execute()
+    logger.info(
+        "embroidery floor: wrote Embroidery List order %s qty=%s complete=%s",
+        oid,
+        completed_qty,
+        mark_complete,
+    )
     _emb_cache = None
     _emb_ts = 0
     _invalidate_combined_orders_cache()
     invalidate_overview_combined_cache()
     return True
+
+
+def _emb_floor_mark_list_complete(order_id: str, completed_qty: int) -> bool:
+    """Set Embroidery List quantity and Status COMPLETE."""
+    return _emb_floor_write_list_progress(order_id, completed_qty, True)
 
 
 def _send_embroidery_recut_email(payload: dict) -> bool:
@@ -14942,10 +14967,22 @@ def embroidery_floor_progress():
             completed = max(0, completed)
 
         result = emb_progress.set_qty(oid, completed, sheets_svc, SPREADSHEET_ID)
+        done = qty > 0 and completed >= qty
+        marked = False
+        try:
+            marked = _emb_floor_write_list_progress(oid, completed, done)
+        except Exception:
+            logger.exception("embroidery progress: Embroidery List write failed")
         updated = _emb_floor_job_payload(oid, sheets_svc) or {}
         updated.update(result)
+        updated["listMarked"] = marked
+        if done:
+            updated["embroideryComplete"] = True
+            updated["piecesLeft"] = 0
         try:
             socketio.emit("embroideryProgressUpdated", updated)
+            if done:
+                socketio.emit("embroideryFinished", {"orderId": oid})
         except Exception:
             logger.exception("embroideryProgressUpdated emit failed")
         return jsonify(updated), 200
