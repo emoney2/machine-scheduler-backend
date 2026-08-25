@@ -5215,6 +5215,85 @@ ORDER_SHIP_ADDRESS_HEADERS = (
     "Order Ship ZIP",
 )
 
+# Customer PO on Production Orders (Order Submission + order confirmation PDF).
+PO_NUMBER_HEADER = "PO #"
+PO_NUMBER_HEADER_CANDIDATES = ("PO #", "PO#", "PO Number", "Customer PO", "PO")
+
+
+def _normalize_po_header_key(name) -> str:
+    return re.sub(r"\s+", "", str(name or "").strip().lower())
+
+
+def _po_header_index(header_row) -> int | None:
+    by_key = {}
+    for i, h in enumerate(header_row or []):
+        key = _normalize_po_header_key(h)
+        if key and key not in by_key:
+            by_key[key] = i
+    for cand in PO_NUMBER_HEADER_CANDIDATES:
+        idx = by_key.get(_normalize_po_header_key(cand))
+        if idx is not None:
+            return idx
+    return None
+
+
+def _po_number_from_row(row: dict) -> str:
+    if not isinstance(row, dict):
+        return ""
+    by_key = {_normalize_po_header_key(k): v for k, v in row.items()}
+    for h in PO_NUMBER_HEADER_CANDIDATES:
+        val = str(by_key.get(_normalize_po_header_key(h), "") or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _ensure_po_header_index(sheets) -> int | None:
+    header_row = list(_production_orders_header_row(sheets) or [])
+    idx = _po_header_index(header_row)
+    if idx is not None:
+        return idx
+    last = -1
+    for i, h in enumerate(header_row):
+        if str(h).strip():
+            last = i
+    col_idx = last + 1
+    try:
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!{_col_letter_local(col_idx)}1",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[PO_NUMBER_HEADER]]},
+        ).execute()
+        logger.info(
+            "[submit] Created %s header on Production Orders column %s",
+            PO_NUMBER_HEADER,
+            _col_letter_local(col_idx),
+        )
+        return col_idx
+    except Exception as e:
+        logger.warning("Failed to create Production Orders %s header: %s", PO_NUMBER_HEADER, e)
+        return None
+
+
+def _write_po_number(sheets, row_num: int, po_number: str) -> None:
+    po = str(po_number or "").strip()
+    if not po or row_num < 2:
+        return
+    try:
+        col_idx = _ensure_po_header_index(sheets)
+        if col_idx is None:
+            return
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!{_col_letter_local(col_idx)}{row_num}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[po]]},
+        ).execute()
+        logger.info("[submit] Wrote PO # %s to Production Orders row %s", po, row_num)
+    except Exception as e:
+        logger.warning("[submit] Failed to write PO # for row %s: %s", row_num, e)
+
 
 def _order_ship_address_from_production_row(row: dict) -> dict:
     """Order-specific ship address saved on Production Orders at submit time."""
@@ -14085,6 +14164,7 @@ def _outstanding_orders_for_company_rows(company_lower: str):
                 "LineTotal": round(unit_price * qty, 2),
                 "Stage": str(row.get("Stage", "")).strip(),
                 "Due Date": row.get("Due Date", ""),
+                "PO #": _po_number_from_row(row),
                 "image": preview_url,
                 "orderId": str(row.get("Order #", "")).strip(),
             }
@@ -14177,6 +14257,19 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
     elems.append(Paragraph("Order Confirmation", title_style))
     elems.append(Paragraph(company_name, company_style))
 
+    po_values = [str(job.get("PO #") or "").strip() for job in (jobs or [])]
+    unique_pos = {p for p in po_values if p}
+    shared_po = next(iter(unique_pos)) if len(unique_pos) == 1 else ""
+    if shared_po:
+        po_header_style = ParagraphStyle(
+            "OrderConfPO",
+            parent=company_style,
+            spaceAfter=14,
+            spaceBefore=-8,
+            fontSize=11,
+        )
+        elems.append(Paragraph(f"PO #: {_html_escape(shared_po)}", po_header_style))
+
     if not jobs:
         elems.append(Paragraph("No outstanding jobs found for this customer.", normal))
     else:
@@ -14227,6 +14320,11 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
                     detail_style,
                 ),
             ]
+            job_po = str(job.get("PO #") or "").strip()
+            if job_po and (not shared_po or job_po != shared_po):
+                details.append(
+                    Paragraph(f"PO #: {_html_escape(job_po)}", detail_style)
+                )
             row_table = Table(
                 [[img_cell, details]],
                 colWidths=[1.0 * inch, 6.0 * inch],
@@ -16452,6 +16550,12 @@ def submit_order():
             body={"values": [[sales_rep]]},
         ).execute()
 
+        # ─── CUSTOMER PO # (PO column, created on first use if missing) ──────
+        po_number = (
+            data.get("poNumber") or data.get("po") or data.get("PO #") or ""
+        ).strip()
+        _write_po_number(sheets, next_row, po_number)
+
         # ─── ORDER-SPECIFIC SHIP ADDRESS (Order Ship * columns) ──────────────
         order_ship_field_map = None
         use_order_ship = (data.get("useOrderShipAddress") or "").strip().lower() in (
@@ -16571,6 +16675,8 @@ def submit_order():
                 valueInputOption="USER_ENTERED",
                 body={"values": [[sales_rep]]},
             ).execute()
+
+            _write_po_number(sheets, back_next_row, po_number)
 
             # Copy front ship address onto the back row (in-memory first, then sheet).
             if order_ship_field_map and order_ship_field_map.get("Order Ship Street 1"):
