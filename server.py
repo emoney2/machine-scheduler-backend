@@ -1743,8 +1743,10 @@ def _bump_embroidery_scheduler_signal():
     _embroidery_scheduler_rev += 1
     try:
         _json_cache.pop("changes-v1", None)
-        _json_cache.pop("combined-v2", None)
+        _json_cache.pop("combined-v5", None)
+        _json_cache.pop("combined-v4", None)
         _json_cache.pop("combined-v3", None)
+        _json_cache.pop("combined-v2", None)
         _json_cache.pop("combined", None)
     except Exception:
         pass
@@ -9713,7 +9715,7 @@ SALES_REP_LIST_RANGE = os.environ.get("SALES_REP_LIST_RANGE", "Sales Rep!A2:A10"
 CUT_RANGE = os.environ.get("CUT_RANGE", "Cut List!A1:Z")
 # Sewing Summary tab: Order # + Top (when Top >= order qty, overview shows sewing-complete check in Stage)
 SEWING_SUMMARY_RANGE = os.environ.get("SEWING_SUMMARY_RANGE", "Sewing Summary!A1:Z")
-EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:AM")
+EMBROIDERY_RANGE = os.environ.get("EMBROIDERY_RANGE", "Embroidery List!A1:ZZ")
 MANUAL_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 MANUAL_CLEAR_RANGE = os.environ.get("MANUAL_RANGE", "Manual State!A2:H")
 BOM_TABLE_RANGE = os.environ.get("BOM_TABLE_RANGE", "Table!A1:AF")
@@ -10760,7 +10762,7 @@ def invalidate_material_inventory_status_cache():
 def _invalidate_combined_orders_cache():
     """Clear `/api/combined` caches so Fur List sees sheet updates on all clients."""
     global _json_cache
-    for key in ("combined-v3", "combined-v2", "combined"):
+    for key in ("combined-v5", "combined-v4", "combined-v3", "combined-v2", "combined"):
         _json_cache.pop(key, None)
 
 
@@ -11320,6 +11322,12 @@ def _parse_qty_number(raw, default=0):
         s = str(raw).strip().upper()
         if s in ("YES", "Y", "TRUE", "DONE", "SHIPPED"):
             return 1.0
+        m = re.search(r"[-+]?\d*\.?\d+", str(raw).replace(",", ""))
+        if m:
+            try:
+                return max(0.0, float(m.group(0)))
+            except (TypeError, ValueError):
+                return default
         return default
 
 
@@ -14844,13 +14852,20 @@ def _emb_floor_col_letter(idx0: int) -> str:
     return s
 
 
-def _emb_floor_header_index(headers, names):
+def _emb_floor_header_index(headers, names, contains=False):
     lowered = [str(h or "").strip().lower() for h in headers]
     want = [str(n).strip().lower() for n in names]
     for w in want:
         for i, h in enumerate(lowered):
             if h == w:
                 return i
+    if contains:
+        for w in want:
+            if not w:
+                continue
+            for i, h in enumerate(lowered):
+                if w in h:
+                    return i
     return None
 
 
@@ -14866,10 +14881,10 @@ def _emb_floor_drive_file_id(image_link) -> str:
 
 
 def _emb_floor_load_order_row(order_id: str):
-    """Return (order_dict, embroidery_status) for an Order #."""
+    """Return (order_dict, embroidery_status, list_qty_made) for an Order #."""
     oid = _overview_normalize_order_key(order_id)
     if not oid:
-        return None, ""
+        return None, "", 0
 
     prod_data = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE) or []
     order = None
@@ -14882,6 +14897,7 @@ def _emb_floor_load_order_row(order_id: str):
                 break
 
     emb_status = ""
+    list_qty = 0
     try:
         emb_rows = fetch_sheet(SPREADSHEET_ID, EMBROIDERY_RANGE) or []
         if emb_rows:
@@ -14892,32 +14908,34 @@ def _emb_floor_load_order_row(order_id: str):
             order_i = _emb_floor_header_index(eh, ["order #", "order#", "order"])
             if order_i is None:
                 order_i = 0
-            if status_i is not None:
-                for r in emb_rows[1:]:
-                    r = r or []
-                    if order_i >= len(r):
-                        continue
-                    if _overview_normalize_order_key(r[order_i]) != oid:
-                        continue
-                    if status_i < len(r):
-                        emb_status = str(r[status_i] or "").strip()
-                    break
+            qty_i = _emb_floor_qty_header_index(eh)
+            for r in emb_rows[1:]:
+                r = r or []
+                if order_i >= len(r):
+                    continue
+                if _overview_normalize_order_key(r[order_i]) != oid:
+                    continue
+                if status_i is not None and status_i < len(r):
+                    emb_status = str(r[status_i] or "").strip()
+                if qty_i is not None and qty_i < len(r):
+                    list_qty = int(round(_parse_qty_number(r[qty_i], 0.0)))
+                break
     except Exception:
         logger.exception("embroidery floor: Embroidery List lookup failed for %s", oid)
 
-    return order, emb_status
+    return order, emb_status, list_qty
 
 
 def _emb_floor_job_payload(order_id: str, sheets_svc=None):
     oid = _overview_normalize_order_key(order_id)
-    order, emb_status = _emb_floor_load_order_row(oid)
+    order, emb_status, list_qty = _emb_floor_load_order_row(oid)
     if not order:
         return None
 
     qty = int(round(_parse_qty_number(order.get("Quantity"), 0.0)))
     prow = emb_progress.get_row(oid, sheets_svc, SPREADSHEET_ID)
     timing = emb_progress.compute_timing(prow)
-    completed = int(prow.get("completedQty") or 0)
+    completed = max(int(prow.get("completedQty") or 0), int(list_qty or 0))
     if completed > qty > 0:
         completed = qty
     pieces_left = max(0, qty - completed)
@@ -14956,7 +14974,7 @@ def _emb_floor_job_payload(order_id: str, sheets_svc=None):
 
 
 def _emb_floor_qty_header_index(headers):
-    return _emb_floor_header_index(
+    i = _emb_floor_header_index(
         headers,
         [
             "quantity made",
@@ -14967,8 +14985,22 @@ def _emb_floor_qty_header_index(headers):
             "pieces done",
             "pieces completed",
             "qty done",
+            "made qty",
+            "pcs made",
+            "pieces made",
         ],
     )
+    if i is not None:
+        return i
+    lowered = [str(h or "").strip().lower() for h in headers]
+    for idx, h in enumerate(lowered):
+        if not h:
+            continue
+        if "made" in h and any(t in h for t in ("qty", "quantity", "piece", "pcs")):
+            return idx
+        if "completed" in h and any(t in h for t in ("qty", "quantity", "piece", "pcs")):
+            return idx
+    return None
 
 
 def _emb_floor_write_list_progress(order_id: str, completed_qty: int, mark_complete: bool) -> bool:
@@ -15385,18 +15417,31 @@ def get_combined():
         svc = get_sheets_service().spreadsheets().values()
         # Use acquire_sheet_lock (bounded wait) — raw sheet_lock can wait behind
         # slow batchGets and contribute to Gunicorn worker timeout + restarts.
+        progress_range = f"'{emb_progress.SHEET_TAB}'!A1:Z"
+        ranges_main = [ORDERS_RANGE, FUR_RANGE, CUT_RANGE, EMBROIDERY_RANGE]
         with acquire_sheet_lock():
-            resp = svc.batchGet(
-                spreadsheetId=SPREADSHEET_ID,
-                ranges=[ORDERS_RANGE, FUR_RANGE, CUT_RANGE, EMBROIDERY_RANGE],
-                valueRenderOption="UNFORMATTED_VALUE",
-            ).execute()
+            try:
+                resp = svc.batchGet(
+                    spreadsheetId=SPREADSHEET_ID,
+                    ranges=ranges_main + [progress_range],
+                    valueRenderOption="UNFORMATTED_VALUE",
+                ).execute()
+            except Exception:
+                current_app.logger.warning(
+                    "combined: Embroidery Progress tab missing or unread; retrying without it"
+                )
+                resp = svc.batchGet(
+                    spreadsheetId=SPREADSHEET_ID,
+                    ranges=ranges_main,
+                    valueRenderOption="UNFORMATTED_VALUE",
+                ).execute()
 
         vrs = resp.get("valueRanges", [])
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
         fur_rows = (vrs[1].get("values") if len(vrs) > 1 else []) or []
         cut_rows = (vrs[2].get("values") if len(vrs) > 2 else []) or []
         emb_rows = (vrs[3].get("values") if len(vrs) > 3 else []) or []
+        prog_tab_rows = (vrs[4].get("values") if len(vrs) > 4 else []) or []
 
         def rows_to_dicts(rows):
             if not rows:
@@ -15463,6 +15508,7 @@ def get_combined():
                 o["Cut Status"] = cr.get("Status", "")
 
         emb_status_map = {}
+        emb_made_map = {}
         if emb_rows:
             eh = [str(h or "").strip() for h in emb_rows[0]]
             e_order_i = _emb_floor_header_index(eh, ["order #", "order#", "order"])
@@ -15471,22 +15517,38 @@ def get_combined():
             e_status_i = _emb_floor_header_index(eh, ["status"])
             if e_status_i is None:
                 e_status_i = 20 if len(eh) > 20 else None
-            if e_status_i is not None:
-                for r in emb_rows[1:]:
-                    r = r or []
-                    if e_order_i >= len(r):
-                        continue
-                    ek = _overview_normalize_order_key(r[e_order_i])
-                    if not ek:
-                        continue
+            e_qty_i = _emb_floor_qty_header_index(eh)
+            for r in emb_rows[1:]:
+                r = r or []
+                if e_order_i >= len(r):
+                    continue
+                ek = _overview_normalize_order_key(r[e_order_i])
+                if not ek:
+                    continue
+                if e_status_i is not None:
                     st = r[e_status_i] if e_status_i < len(r) else ""
                     emb_status_map[ek] = str(st or "").strip()
+                if e_qty_i is not None and e_qty_i < len(r):
+                    try:
+                        q = int(round(_parse_qty_number(r[e_qty_i], 0.0)))
+                    except Exception:
+                        q = 0
+                    if q > 0:
+                        emb_made_map[ek] = max(int(emb_made_map.get(ek) or 0), q)
 
         prog = {}
         try:
-            prog = emb_progress.load_all(None, None) or {}
+            file_prog = emb_progress.load_all(None, None) or {}
         except Exception:
-            prog = {}
+            file_prog = {}
+        try:
+            tab_prog = emb_progress.parse_sheet_values(prog_tab_rows) if prog_tab_rows else {}
+        except Exception:
+            tab_prog = {}
+        try:
+            prog = emb_progress.combine_loaded(file_prog, tab_prog if tab_prog else None)
+        except Exception:
+            prog = file_prog or {}
 
         for o in orders_full:
             oid = str(o.get("Order #", "")).strip()
@@ -15496,9 +15558,12 @@ def get_combined():
             if nk in emb_status_map:
                 o["Embroidery List Status"] = emb_status_map[nk]
             prow = prog.get(nk) or prog.get(oid) or {}
+            file_done = int(prow.get("completedQty") or 0) if prow else 0
+            list_done = int(emb_made_map.get(nk) or 0)
+            done = max(file_done, list_done)
+            o["Embroidery Completed Qty"] = done
             if prow:
                 timing = emb_progress.compute_timing(prow)
-                o["Embroidery Completed Qty"] = int(prow.get("completedQty") or 0)
                 o["Embroidery Avg Cycle Ms"] = int(timing.get("avgCycleMs") or 0)
                 o["Embroidery Last Run At"] = str(timing.get("lastRunAt") or "")
 
@@ -15511,7 +15576,7 @@ def get_combined():
     # Use caching to reduce Google Sheets API calls (stale-while-revalidate on expiry)
     TTL = int(os.environ.get("COMBINED_CACHE_TTL", "45"))
     try:
-        result = send_cached_json("combined-v3", TTL, build_payload)
+        result = send_cached_json("combined-v5", TTL, build_payload)
         if result is None:
             # If send_cached_json failed, fall through to exception handler
             raise Exception("send_cached_json returned None")
