@@ -98,7 +98,7 @@ def _parse_iso(val: Any) -> Optional[datetime]:
 
 
 def expected_cycle_ms(stitch_count: Any, pieces: Any, head_count: Any) -> int:
-    """One +N cycle: stitches/35k hours times ceil(pieces/heads)."""
+    """One +N cycle: stitches/30k hours times ceil(pieces/heads)."""
     try:
         heads = max(1, int(head_count or 6))
     except (TypeError, ValueError):
@@ -114,7 +114,7 @@ def expected_cycle_ms(stitch_count: Any, pieces: Any, head_count: Any) -> int:
         stitches = 0
     if stitches <= 0:
         stitches = 30000
-    return int(round((stitches / 35000.0) * runs * 3600000))
+    return int(round((stitches / 30000.0) * runs * 3600000))
 
 
 def _ms_to_min(ms: Any) -> float:
