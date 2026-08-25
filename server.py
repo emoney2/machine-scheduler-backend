@@ -1584,16 +1584,86 @@ def _within_seconds(iso_ts, seconds):
         return False
 
 
+# httplib2 is not safe to share across eventlet greenlets. A process-wide
+# Drive client caused BadStatusLine / reentrant BufferedReader / TimeoutError
+# when /submit, /print, and /drive/metaBatch overlapped.
+try:
+    from eventlet.corolocal import local as _GreenLocal
+except Exception:  # pragma: no cover
+    from threading import local as _GreenLocal
+
+_drive_tls = _GreenLocal()
+_DRIVE_SERVICE_TTL = 900
+_drive_meta_cache = {}
+_drive_meta_ttl = 60 * 60 * 12  # 12h
+
+
 def get_drive_service():
     import time as _t
 
-    global _drive_service, _service_ts
-    if _drive_service and (_t.time() - _service_ts) < SERVICE_TTL:
-        return _drive_service
+    now = _t.time()
+    svc = getattr(_drive_tls, "svc", None)
+    ts = getattr(_drive_tls, "ts", 0)
+    if svc and (now - ts) < _DRIVE_SERVICE_TTL:
+        return svc
+
     creds = get_oauth_credentials()
-    _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    _service_ts = _t.time()
-    return _drive_service
+    http = AuthorizedHttp(creds, http=Http(timeout=60))
+    svc = build("drive", "v3", http=http, cache_discovery=False)
+    _drive_tls.svc = svc
+    _drive_tls.ts = now
+    return svc
+
+
+def _drive_authorized_session():
+    creds = get_oauth_credentials()
+    if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+        creds.refresh(GoogleRequest())
+    return AuthorizedSession(creds)
+
+
+def _drive_file_version_token(fid, sess):
+    """md5Checksum or modifiedTime for a Drive file. Empty string on failure."""
+    now = time.time()
+    hit = _drive_meta_cache.get(fid)
+    if hit and (now - hit.get("ts", 0) < _drive_meta_ttl):
+        return hit.get("etag") or hit.get("modified") or ""
+
+    url = (
+        f"https://www.googleapis.com/drive/v3/files/{urllib.parse.quote(fid, safe='')}"
+        f"?fields=id,md5Checksum,modifiedTime&supportsAllDrives=true"
+    )
+    for attempt in range(3):
+        try:
+            r = sess.get(url, timeout=(3, 8))
+            if r.status_code == 200:
+                meta = r.json() or {}
+                etag = meta.get("md5Checksum") or ""
+                modified = meta.get("modifiedTime") or ""
+                prev = _drive_meta_cache.get(fid) or {}
+                _drive_meta_cache[fid] = {
+                    "thumb_url": prev.get("thumb_url") or "",
+                    "mime": prev.get("mime") or "",
+                    "etag": etag,
+                    "modified": modified,
+                    "ts": time.time(),
+                }
+                return etag or modified or ""
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                eventlet.sleep(0.4 * (2 ** attempt))
+                continue
+            logger.warning("drive_meta_batch: HTTP %s for %s", r.status_code, fid)
+            return ""
+        except (TimeoutError, ReqTimeout, ReqConnError, OSError) as e:
+            if attempt < 2:
+                eventlet.sleep(0.4 * (2 ** attempt))
+                continue
+            logger.warning("drive_meta_batch: failed for %s: %s", fid, e)
+            return ""
+        except Exception as e:
+            logger.warning("drive_meta_batch: failed for %s: %s", fid, e)
+            return ""
+    return ""
 
 
 # === Delta hashing helpers (place near other helpers) ===
@@ -14908,45 +14978,23 @@ def _send_embroidery_recut_email(payload: dict) -> bool:
 
     order_id = _html_escape(payload.get("orderId") or "—")
     machine = _html_escape(payload.get("machine") or "—")
-    company = _html_escape(payload.get("company") or "—")
-    product = _html_escape(payload.get("product") or "—")
-    design = _html_escape(payload.get("design") or "—")
-    quantity = _html_escape(payload.get("quantity") or "—")
-    note = _html_escape(payload.get("note") or "")
-    image_url = str(payload.get("imageUrl") or "").strip()
+    pieces = _html_escape(payload.get("pieces") or "")
 
-    subject = f"Embroidery recut needed — Order #{payload.get('orderId') or '?'}"
+    subject = f"Embroidery recut — Order #{payload.get('orderId') or '?'} — {payload.get('pieces') or '?'} pieces"
     html_body = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"></head>
 <body style="font-family: Arial, sans-serif; color: #111; line-height: 1.5;">
-<p><strong>Recut requested from the embroidery floor.</strong></p>
-<p>
-<strong>Order #:</strong> {order_id}<br>
-<strong>Machine:</strong> {machine}<br>
-<strong>Customer:</strong> {company}<br>
-<strong>Product:</strong> {product}<br>
-<strong>Design:</strong> {design}<br>
-<strong>Quantity:</strong> {quantity}
-</p>
-"""
-    if note:
-        html_body += f"<p><strong>Note:</strong> {note}</p>\n"
-    if image_url:
-        html_body += f'<p><img src="{_html_escape(image_url)}" alt="Job image" width="480" style="max-width:100%;border:1px solid #ddd;border-radius:8px;" /></p>\n'
-    html_body += "<p>Sent from the embroidery machine tablet.</p></body></html>"
+<p><strong>Pieces to recut: {pieces}</strong></p>
+<p>Order #{order_id} on {machine}.</p>
+<p>Sent from the embroidery machine tablet.</p>
+</body></html>"""
 
     plain = (
-        f"Recut requested from the embroidery floor.\n\n"
+        f"Pieces to recut: {payload.get('pieces')}\n"
         f"Order #: {payload.get('orderId')}\n"
         f"Machine: {payload.get('machine')}\n"
-        f"Customer: {payload.get('company')}\n"
-        f"Product: {payload.get('product')}\n"
-        f"Design: {payload.get('design')}\n"
-        f"Quantity: {payload.get('quantity')}\n"
     )
-    if payload.get("note"):
-        plain += f"\nNote: {payload.get('note')}\n"
 
     import smtplib
     from email.mime.multipart import MIMEMultipart
@@ -15126,20 +15174,17 @@ def embroidery_floor_recut():
         except Exception:
             sheets_svc = None
         payload = _emb_floor_job_payload(oid, sheets_svc) or {}
-        file_id = payload.get("imageFileId") or ""
-        image_url = (
-            f"https://drive.google.com/thumbnail?id={file_id}&sz=w800" if file_id else ""
-        )
+        try:
+            pieces = int(data.get("pieces") or 0)
+        except (TypeError, ValueError):
+            return jsonify({"error": "pieces must be a whole number"}), 400
+        if pieces <= 0:
+            return jsonify({"error": "pieces must be greater than 0"}), 400
         sent = _send_embroidery_recut_email(
             {
                 "orderId": payload.get("orderId") or oid,
                 "machine": str(data.get("machine") or "").strip(),
-                "company": payload.get("company") or "",
-                "product": payload.get("product") or "",
-                "design": payload.get("design") or "",
-                "quantity": payload.get("quantity") or "",
-                "note": str(data.get("note") or "").strip(),
-                "imageUrl": image_url,
+                "pieces": pieces,
             }
         )
         if not sent:
@@ -22459,24 +22504,25 @@ def drive_meta_batch():
     """
     try:
         data = request.get_json(force=True) or {}
-        ids = [str(x).strip() for x in (data.get("ids") or []) if str(x).strip()]
+        seen = set()
+        ids = []
+        for x in data.get("ids") or []:
+            fid = str(x).strip()
+            if fid and fid not in seen:
+                seen.add(fid)
+                ids.append(fid)
+        ids = ids[:40]
         versions = {}
         if not ids:
             return jsonify({"versions": versions}), 200
 
-        svc = get_drive_service()
+        sess = _drive_authorized_session()
+        deadline = time.time() + 12
         for fid in ids:
-            try:
-                info = (
-                    svc.files()
-                    .get(fileId=fid, fields="id, md5Checksum, modifiedTime")
-                    .execute()
-                )
-                ver = info.get("md5Checksum") or info.get("modifiedTime") or ""
-                versions[fid] = ver
-            except Exception:
-                logger.exception(f"drive_meta_batch: failed for {fid}")
+            if time.time() > deadline:
                 versions[fid] = ""
+                continue
+            versions[fid] = _drive_file_version_token(fid, sess)
 
         return jsonify({"versions": versions}), 200
     except Exception as e:
