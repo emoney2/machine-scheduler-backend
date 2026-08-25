@@ -2210,10 +2210,10 @@ def login_required_session(f):
             response.headers["Vary"] = "Origin"
             return response
 
-        # Phones block the Render session cookie when the app is on Netlify.
-        # Login puts a signed token in the redirect hash; the app sends it as Bearer.
-        if not session.get("user"):
-            _apply_bearer_session()
+        # Prefer a valid Bearer token. Desktop Chrome still sends the Render
+        # session cookie; if that cookie is idle/stale it was winning over a
+        # good phone-style login token and kicking the app back to /login.
+        _apply_bearer_session()
 
         # 2) Must be logged in at all
         if not session.get("user"):
