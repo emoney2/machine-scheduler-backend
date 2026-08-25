@@ -133,10 +133,28 @@ def compute_timing(row: Optional[dict]) -> dict:
             cycles.append(ms)
     avg = int(round(sum(cycles) / len(cycles))) if cycles else 0
     last = runs[-1]["at"] if runs else str((row or {}).get("updatedAt") or "")
+    recent = []
+    for i, r in enumerate(runs):
+        cycle_ms = 0
+        if i > 0:
+            t0 = _parse_iso(runs[i - 1].get("at"))
+            t1 = _parse_iso(r.get("at"))
+            if t0 and t1:
+                ms = (t1 - t0).total_seconds() * 1000.0
+                if 2 * 60 * 1000 <= ms <= 4 * 60 * 60 * 1000:
+                    cycle_ms = int(round(ms))
+        recent.append(
+            {
+                "at": r.get("at"),
+                "increment": int(r.get("increment") or 0),
+                "cycleMs": cycle_ms,
+            }
+        )
     return {
         "avgCycleMs": avg,
         "lastRunAt": last,
         "runCount": len(runs),
+        "recentRuns": recent[-3:],
     }
 
 

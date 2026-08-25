@@ -14968,6 +14968,7 @@ def _emb_floor_job_payload(order_id: str, sheets_svc=None):
         "avgCycleMs": int(timing.get("avgCycleMs") or 0),
         "lastRunAt": str(timing.get("lastRunAt") or ""),
         "runCount": int(timing.get("runCount") or 0),
+        "recentRuns": timing.get("recentRuns") or [],
         "manualStart": bool(prow.get("manualStart")),
         "manualStartAt": str(prow.get("manualStartAt") or ""),
     }
@@ -15566,6 +15567,7 @@ def get_combined():
                 timing = emb_progress.compute_timing(prow)
                 o["Embroidery Avg Cycle Ms"] = int(timing.get("avgCycleMs") or 0)
                 o["Embroidery Last Run At"] = str(timing.get("lastRunAt") or "")
+                o["Embroidery Recent Runs"] = timing.get("recentRuns") or []
 
         return {
             "orders": orders_full,
