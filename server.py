@@ -1640,6 +1640,8 @@ _HASH_FIELDS = [
     "Embroidery Start Time",
     "Stitch Count",
     "Threads",
+    "Embroidery Completed Qty",
+    "Embroidery List Status",
 ]
 
 
@@ -1662,6 +1664,23 @@ _orders_rows_inflight = False
 _orders_rows_inflight_lock = threading.Lock()
 # When Sheets is slow, return this from /api/changes so Render does not 502 (browser shows fake CORS).
 _changes_last_ok = {"data": None, "etag": "", "ts": 0.0}
+_embroidery_scheduler_rev = 0
+
+
+def _bump_embroidery_scheduler_signal():
+    """Force scheduler /changes + /combined to refresh after floor writes."""
+    global _embroidery_scheduler_rev
+    _embroidery_scheduler_rev += 1
+    try:
+        _json_cache.pop("changes-v1", None)
+        _json_cache.pop("combined-v2", None)
+        _json_cache.pop("combined-v3", None)
+        _json_cache.pop("combined", None)
+    except Exception:
+        pass
+    _changes_last_ok["data"] = None
+    _changes_last_ok["etag"] = ""
+    _changes_last_ok["ts"] = 0.0
 
 
 def _orders_rows_apply(rows):
@@ -3123,12 +3142,26 @@ def api_changes():
 
     try:
         mapping = {}
+        prog = {}
+        try:
+            prog = emb_progress.load_all(None, None) or {}
+        except Exception:
+            prog = {}
         for o in rows:
             oid = str(o.get("Order #", "")).strip()
-            if oid:
-                mapping[oid] = _order_hash(o)
+            if not oid:
+                continue
+            nk = _overview_normalize_order_key(oid)
+            prow = prog.get(nk) or prog.get(oid) or {}
+            hashed = dict(o)
+            hashed["Embroidery Completed Qty"] = int(prow.get("completedQty") or 0)
+            mapping[oid] = _order_hash(hashed)
 
-        payload = {"hashes": mapping, "ts": time.time()}
+        payload = {
+            "hashes": mapping,
+            "ts": time.time(),
+            "embRev": int(_embroidery_scheduler_rev),
+        }
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         etag = _cache_set(key, data, ttl)
 
@@ -9700,8 +9733,26 @@ def update_start_time():
     if col_start < len(row):
         current_val = str(row[col_start]).strip()
 
+    source = str(data.get("source") or "").strip().lower()
+    locked = False
+    try:
+        prow = emb_progress.get_row(order_number, None, None)
+        locked = bool(prow.get("manualStart"))
+    except Exception:
+        locked = False
+
+    # scheduler estimate: write only if blank
+    # floor +N inference: overwrite estimate unless operator pressed Start
+    # manual Start button: always write and lock
     wrote = False
-    if not current_val:
+    allow = False
+    if source in ("manual", "floor-start", "start"):
+        allow = True
+    elif source in ("floor", "inferred"):
+        allow = not locked
+    else:
+        allow = not current_val
+    if allow:
         # Write start time (as-is) into the target cell
         # Convert zero-based row to 1-based, plus header: +1 for header row, +1 to switch to 1-based = +1
         sheet_row_1_based = (
@@ -9726,6 +9777,16 @@ def update_start_time():
 
         write_sheet(SPREADSHEET_ID, a1_cell, [[iso_start]])
         wrote = True
+        if source in ("manual", "floor-start", "start"):
+            try:
+                emb_progress.mark_manual_start(order_number, iso_start)
+            except Exception:
+                logger.exception("mark_manual_start failed for %s", order_number)
+        try:
+            _invalidate_combined_orders_cache()
+            _bump_embroidery_scheduler_signal()
+        except Exception:
+            pass
 
     # Nudge clients
     try:
@@ -9743,6 +9804,7 @@ def update_start_time():
                 "orderNumber": order_number,
                 "startTime": iso_start,
                 "wrote": wrote,
+                "manualStart": bool(locked or source in ("manual", "floor-start", "start")),
             }
         ),
         200,
@@ -10549,7 +10611,7 @@ def invalidate_material_inventory_status_cache():
 def _invalidate_combined_orders_cache():
     """Clear `/api/combined` caches so Fur List sees sheet updates on all clients."""
     global _json_cache
-    for key in ("combined-v2", "combined"):
+    for key in ("combined-v3", "combined-v2", "combined"):
         _json_cache.pop(key, None)
 
 
@@ -14685,7 +14747,9 @@ def _emb_floor_job_payload(order_id: str, sheets_svc=None):
         return None
 
     qty = int(round(_parse_qty_number(order.get("Quantity"), 0.0)))
-    completed = emb_progress.get_qty(oid, sheets_svc, SPREADSHEET_ID)
+    prow = emb_progress.get_row(oid, sheets_svc, SPREADSHEET_ID)
+    timing = emb_progress.compute_timing(prow)
+    completed = int(prow.get("completedQty") or 0)
     if completed > qty > 0:
         completed = qty
     pieces_left = max(0, qty - completed)
@@ -14715,6 +14779,11 @@ def _emb_floor_job_payload(order_id: str, sheets_svc=None):
         "imageLink": image_link,
         "imageFileId": file_id,
         "threads": str(order.get("Threads") or "").strip(),
+        "avgCycleMs": int(timing.get("avgCycleMs") or 0),
+        "lastRunAt": str(timing.get("lastRunAt") or ""),
+        "runCount": int(timing.get("runCount") or 0),
+        "manualStart": bool(prow.get("manualStart")),
+        "manualStartAt": str(prow.get("manualStartAt") or ""),
     }
 
 
@@ -14809,6 +14878,7 @@ def _emb_floor_write_list_progress(order_id: str, completed_qty: int, mark_compl
     _emb_ts = 0
     _invalidate_combined_orders_cache()
     invalidate_overview_combined_cache()
+    _bump_embroidery_scheduler_signal()
     return True
 
 
@@ -14939,6 +15009,7 @@ def embroidery_floor_progress():
             return jsonify({"error": "order not found"}), 404
         qty = int(payload["quantity"] or 0)
         current = int(payload["completedQty"] or 0)
+        increment = None
         if data.get("piecesLeft") is not None:
             try:
                 left = int(data.get("piecesLeft"))
@@ -14952,12 +15023,12 @@ def embroidery_floor_progress():
                 return jsonify({"error": "completedQty must be a whole number"}), 400
         elif data.get("increment") is not None:
             try:
-                inc = int(data.get("increment"))
+                increment = int(data.get("increment"))
             except (TypeError, ValueError):
                 return jsonify({"error": "increment must be a whole number"}), 400
-            if inc <= 0:
+            if increment <= 0:
                 return jsonify({"error": "increment must be positive"}), 400
-            completed = current + inc
+            completed = current + increment
         else:
             return jsonify({"error": "increment, completedQty, or piecesLeft required"}), 400
 
@@ -14966,7 +15037,10 @@ def embroidery_floor_progress():
         else:
             completed = max(0, completed)
 
-        result = emb_progress.set_qty(oid, completed, sheets_svc, SPREADSHEET_ID)
+        result = emb_progress.set_qty(
+            oid, completed, sheets_svc, SPREADSHEET_ID, increment=increment
+        )
+        _bump_embroidery_scheduler_signal()
         done = qty > 0 and completed >= qty
         marked = False
         try:
@@ -15014,6 +15088,7 @@ def embroidery_floor_finish():
         qty = int(payload["quantity"] or 0)
         completed = qty if qty > 0 else int(payload["completedQty"] or 0)
         emb_progress.set_qty(oid, completed, sheets_svc, SPREADSHEET_ID)
+        _bump_embroidery_scheduler_signal()
         marked = False
         try:
             marked = _emb_floor_mark_list_complete(oid, completed)
@@ -15170,7 +15245,7 @@ def get_combined():
         with acquire_sheet_lock():
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
-                ranges=[ORDERS_RANGE, FUR_RANGE, CUT_RANGE],
+                ranges=[ORDERS_RANGE, FUR_RANGE, CUT_RANGE, EMBROIDERY_RANGE],
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
 
@@ -15178,6 +15253,7 @@ def get_combined():
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
         fur_rows = (vrs[1].get("values") if len(vrs) > 1 else []) or []
         cut_rows = (vrs[2].get("values") if len(vrs) > 2 else []) or []
+        emb_rows = (vrs[3].get("values") if len(vrs) > 3 else []) or []
 
         def rows_to_dicts(rows):
             if not rows:
@@ -15243,15 +15319,56 @@ def get_combined():
             if cr and "Status" in cr:
                 o["Cut Status"] = cr.get("Status", "")
 
+        emb_status_map = {}
+        if emb_rows:
+            eh = [str(h or "").strip() for h in emb_rows[0]]
+            e_order_i = _emb_floor_header_index(eh, ["order #", "order#", "order"])
+            if e_order_i is None:
+                e_order_i = 0
+            e_status_i = _emb_floor_header_index(eh, ["status"])
+            if e_status_i is None:
+                e_status_i = 20 if len(eh) > 20 else None
+            if e_status_i is not None:
+                for r in emb_rows[1:]:
+                    r = r or []
+                    if e_order_i >= len(r):
+                        continue
+                    ek = _overview_normalize_order_key(r[e_order_i])
+                    if not ek:
+                        continue
+                    st = r[e_status_i] if e_status_i < len(r) else ""
+                    emb_status_map[ek] = str(st or "").strip()
+
+        prog = {}
+        try:
+            prog = emb_progress.load_all(None, None) or {}
+        except Exception:
+            prog = {}
+
+        for o in orders_full:
+            oid = str(o.get("Order #", "")).strip()
+            if not oid:
+                continue
+            nk = _overview_normalize_order_key(oid)
+            if nk in emb_status_map:
+                o["Embroidery List Status"] = emb_status_map[nk]
+            prow = prog.get(nk) or prog.get(oid) or {}
+            if prow:
+                timing = emb_progress.compute_timing(prow)
+                o["Embroidery Completed Qty"] = int(prow.get("completedQty") or 0)
+                o["Embroidery Avg Cycle Ms"] = int(timing.get("avgCycleMs") or 0)
+                o["Embroidery Last Run At"] = str(timing.get("lastRunAt") or "")
+
         return {
             "orders": orders_full,
             "links": _links_store if isinstance(_links_store, dict) else {},
+            "embRev": int(_embroidery_scheduler_rev),
         }
 
     # Use caching to reduce Google Sheets API calls (stale-while-revalidate on expiry)
     TTL = int(os.environ.get("COMBINED_CACHE_TTL", "45"))
     try:
-        result = send_cached_json("combined-v2", TTL, build_payload)
+        result = send_cached_json("combined-v3", TTL, build_payload)
         if result is None:
             # If send_cached_json failed, fall through to exception handler
             raise Exception("send_cached_json returned None")
