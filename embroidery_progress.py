@@ -2,8 +2,9 @@
 Embroidery floor progress: pieces completed per order.
 
 Local cache: backend/data/embroidery_progress.json
-Durable store: Google Sheet tab "Embroidery Progress"
-  A: Order #  B: Qty Completed  C: Updated At
+Durable store:
+  Google Sheet tab "Embroidery Progress" — one row per order (current qty)
+  Google Sheet tab "Embroidery Run Log" — one row per +N (never overwritten)
 
 Floor tablets read/write via API; server emits socket updates.
 """
@@ -11,12 +12,18 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +32,20 @@ _BASE = Path(__file__).resolve().parent
 DATA_DIR = _BASE / "data"
 PROGRESS_PATH = DATA_DIR / "embroidery_progress.json"
 SHEET_TAB = os.environ.get("EMBROIDERY_PROGRESS_TAB", "Embroidery Progress")
+LOG_TAB = os.environ.get("EMBROIDERY_RUN_LOG_TAB", "Embroidery Run Log")
+LOG_HEADERS = [
+    "Posted At",
+    "Order #",
+    "Machine",
+    "+N",
+    "Qty After",
+    "Actual Min",
+    "Expected Min",
+    "Ahead Min",
+    "Stitch Count",
+    "Heads",
+]
+_ET = ZoneInfo("America/New_York") if ZoneInfo else None
 # Same-process overlay so combined/changes see +N even if this worker's disk is empty.
 _MEM: Dict[str, dict] = {}
 
@@ -76,6 +97,58 @@ def _parse_iso(val: Any) -> Optional[datetime]:
         return None
 
 
+def expected_cycle_ms(stitch_count: Any, pieces: Any, head_count: Any) -> int:
+    """One +N cycle: stitches/35k hours times ceil(pieces/heads)."""
+    try:
+        heads = max(1, int(head_count or 6))
+    except (TypeError, ValueError):
+        heads = 6
+    try:
+        left = max(0, int(pieces or 0))
+    except (TypeError, ValueError):
+        left = 0
+    runs = math.ceil(left / heads) if left else 0
+    try:
+        stitches = float(stitch_count or 0)
+    except (TypeError, ValueError):
+        stitches = 0
+    if stitches <= 0:
+        stitches = 30000
+    return int(round((stitches / 35000.0) * runs * 3600000))
+
+
+def _ms_to_min(ms: Any) -> float:
+    try:
+        n = float(ms or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if n <= 0:
+        return 0.0
+    return round(n / 60000.0, 2)
+
+
+def _et_sheet_time(iso: str) -> str:
+    dt = _parse_iso(iso) or datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if _ET is not None:
+        dt = dt.astimezone(_ET)
+    ampm = dt.strftime("%p")
+    hour = dt.hour % 12 or 12
+    return f"{dt.month}/{dt.day}/{dt.year} {hour}:{dt.minute:02d}:{dt.second:02d} {ampm}"
+
+
+def _cycle_ms_between(earlier_iso: str, later_iso: str) -> int:
+    t0 = _parse_iso(earlier_iso)
+    t1 = _parse_iso(later_iso)
+    if not t0 or not t1:
+        return 0
+    ms = (t1 - t0).total_seconds() * 1000.0
+    if 2 * 60 * 1000 <= ms <= 4 * 60 * 60 * 1000:
+        return int(round(ms))
+    return 0
+
+
 def _clean_runs(raw: Any) -> list:
     if not isinstance(raw, list):
         return []
@@ -89,8 +162,17 @@ def _clean_runs(raw: Any) -> list:
             continue
         at = str(item.get("at") or "").strip()
         if inc > 0 and at:
-            out.append({"at": at, "increment": inc})
-    return out[-24:]
+            rec = {"at": at, "increment": inc}
+            try:
+                rec["cycleMs"] = max(0, int(item.get("cycleMs") or 0))
+            except (TypeError, ValueError):
+                rec["cycleMs"] = 0
+            try:
+                rec["expectedMs"] = max(0, int(item.get("expectedMs") or 0))
+            except (TypeError, ValueError):
+                rec["expectedMs"] = 0
+            out.append(rec)
+    return out[-200:]
 
 
 def _normalize_row(v: Any) -> Optional[dict]:
@@ -118,43 +200,44 @@ def _normalize_row(v: Any) -> Optional[dict]:
         return None
 
 
-def compute_timing(row: Optional[dict]) -> dict:
+def compute_timing(
+    row: Optional[dict],
+    stitch_count: Any = 0,
+    head_count: Any = 6,
+) -> dict:
     """Average +N-to-+N cycle time, skipping tiny taps and long breaks."""
     runs = _clean_runs((row or {}).get("runs"))
+    start_at = str((row or {}).get("manualStartAt") or "")
     cycles = []
-    for i in range(1, len(runs)):
-        t0 = _parse_iso(runs[i - 1].get("at"))
-        t1 = _parse_iso(runs[i].get("at"))
-        if not t0 or not t1:
-            continue
-        ms = (t1 - t0).total_seconds() * 1000.0
-        # Ignore double-taps and lunch/overnight gaps
-        if 2 * 60 * 1000 <= ms <= 4 * 60 * 60 * 1000:
-            cycles.append(ms)
-    avg = int(round(sum(cycles) / len(cycles))) if cycles else 0
-    last = runs[-1]["at"] if runs else str((row or {}).get("updatedAt") or "")
     recent = []
     for i, r in enumerate(runs):
-        cycle_ms = 0
-        if i > 0:
-            t0 = _parse_iso(runs[i - 1].get("at"))
-            t1 = _parse_iso(r.get("at"))
-            if t0 and t1:
-                ms = (t1 - t0).total_seconds() * 1000.0
-                if 2 * 60 * 1000 <= ms <= 4 * 60 * 60 * 1000:
-                    cycle_ms = int(round(ms))
+        prev_at = runs[i - 1].get("at") if i > 0 else start_at
+        cycle_ms = int(r.get("cycleMs") or 0) or _cycle_ms_between(prev_at, r.get("at"))
+        if cycle_ms:
+            cycles.append(cycle_ms)
+        inc = int(r.get("increment") or 0)
+        expected_ms = int(r.get("expectedMs") or 0) or expected_cycle_ms(
+            stitch_count, inc, head_count
+        )
+        ahead_ms = (expected_ms - cycle_ms) if cycle_ms and expected_ms else 0
         recent.append(
             {
                 "at": r.get("at"),
-                "increment": int(r.get("increment") or 0),
+                "increment": inc,
                 "cycleMs": cycle_ms,
+                "expectedMs": expected_ms,
+                "aheadMs": ahead_ms,
             }
         )
+    avg = int(round(sum(cycles) / len(cycles))) if cycles else 0
+    last = runs[-1]["at"] if runs else str((row or {}).get("updatedAt") or "")
+    typical = expected_cycle_ms(stitch_count, head_count, head_count)
     return {
         "avgCycleMs": avg,
         "lastRunAt": last,
         "runCount": len(runs),
         "recentRuns": recent[-3:],
+        "expectedRunMs": typical,
     }
 
 
@@ -214,9 +297,69 @@ def ensure_sheet_tab(sheets_service, spreadsheet_id: str) -> bool:
                 body={"values": [["Order #", "Qty Completed", "Updated At"]]},
             ).execute()
             logger.info("Created Google Sheet tab %r", SHEET_TAB)
+        if LOG_TAB not in titles:
+            sheets_service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": LOG_TAB}}}]},
+            ).execute()
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{LOG_TAB}'!A1:J1",
+                valueInputOption="RAW",
+                body={"values": [LOG_HEADERS]},
+            ).execute()
+            logger.info("Created Google Sheet tab %r", LOG_TAB)
         return True
     except Exception:
         logger.exception("ensure_sheet_tab(%s) failed", SHEET_TAB)
+        return False
+
+
+def append_run_log(
+    sheets_service,
+    spreadsheet_id: str,
+    *,
+    oid: str,
+    machine: str,
+    increment: int,
+    qty_after: int,
+    cycle_ms: int,
+    expected_ms: int,
+    stitch_count: int,
+    head_count: int,
+    posted_at: str,
+) -> bool:
+    """Append one +N row. Never updates or deletes existing log rows."""
+    if not sheets_service or not spreadsheet_id or not oid or increment <= 0:
+        return False
+    try:
+        if not ensure_sheet_tab(sheets_service, spreadsheet_id):
+            return False
+        actual_min = _ms_to_min(cycle_ms)
+        expected_min = _ms_to_min(expected_ms)
+        ahead_min = round(expected_min - actual_min, 2) if actual_min and expected_min else ""
+        row = [
+            _et_sheet_time(posted_at),
+            oid,
+            str(machine or ""),
+            int(increment),
+            int(qty_after),
+            actual_min or "",
+            expected_min or "",
+            ahead_min,
+            int(stitch_count or 0),
+            int(head_count or 0),
+        ]
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{LOG_TAB}'!A:J",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
+        return True
+    except Exception:
+        logger.exception("Failed to append embroidery run log for %s", oid)
         return False
 
 
@@ -501,11 +644,15 @@ def set_qty(
     sheets_service: Any = None,
     spreadsheet_id: Optional[str] = None,
     increment: Optional[int] = None,
+    machine: str = "",
+    stitch_count: int = 0,
+    head_count: int = 6,
 ) -> dict:
     oid = _norm_oid(order_id)
     if not oid:
         raise ValueError("orderId is required")
     qty = max(0, int(completed_qty))
+    log_payload = None
     with _LOCK:
         file_rows = _load_from_file()
         sheet_rows = load_from_sheet(sheets_service, spreadsheet_id or "")
@@ -517,9 +664,44 @@ def set_qty(
             inc = int(increment) if increment is not None else 0
         except (TypeError, ValueError):
             inc = 0
+        cycle_ms = 0
+        expected_ms = 0
+        try:
+            heads = max(1, int(head_count or 6))
+        except (TypeError, ValueError):
+            heads = 6
+        try:
+            stitches = int(stitch_count or 0)
+        except (TypeError, ValueError):
+            stitches = 0
         if inc > 0:
-            runs.append({"at": now, "increment": inc})
-            runs = runs[-24:]
+            prev_at = ""
+            if runs:
+                prev_at = str(runs[-1].get("at") or "")
+            if not prev_at:
+                prev_at = str(prev.get("manualStartAt") or "")
+            cycle_ms = _cycle_ms_between(prev_at, now)
+            expected_ms = expected_cycle_ms(stitches, inc, heads)
+            runs.append(
+                {
+                    "at": now,
+                    "increment": inc,
+                    "cycleMs": cycle_ms,
+                    "expectedMs": expected_ms,
+                }
+            )
+            runs = runs[-200:]
+            log_payload = {
+                "oid": oid,
+                "machine": str(machine or ""),
+                "increment": inc,
+                "qty_after": qty,
+                "cycle_ms": cycle_ms,
+                "expected_ms": expected_ms,
+                "stitch_count": stitches,
+                "head_count": heads,
+                "posted_at": now,
+            }
         rows[oid] = {
             "completedQty": qty,
             "updatedAt": now,
@@ -530,7 +712,9 @@ def set_qty(
         _MEM[oid] = rows[oid]
         _save_to_file(rows)
         upsert_sheet_row(sheets_service, spreadsheet_id or "", oid, qty, now)
-        timing = compute_timing(rows[oid])
+        timing = compute_timing(rows[oid], stitches, heads)
+    if log_payload:
+        append_run_log(sheets_service, spreadsheet_id or "", **log_payload)
     return {
         "orderId": oid,
         "completedQty": qty,

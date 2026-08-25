@@ -15066,15 +15066,24 @@ def _emb_floor_load_order_row(order_id: str):
     return order, emb_status, list_qty
 
 
-def _emb_floor_job_payload(order_id: str, sheets_svc=None):
+def _emb_floor_head_count(machine_key: str) -> int:
+    k = str(machine_key or "").strip().lower()
+    if k in ("machine1", "1") or k.endswith("(1)") or "(1)" in k:
+        return 1
+    return 6
+
+
+def _emb_floor_job_payload(order_id: str, sheets_svc=None, head_count: int = 6):
     oid = _overview_normalize_order_key(order_id)
     order, emb_status, list_qty = _emb_floor_load_order_row(oid)
     if not order:
         return None
 
     qty = int(round(_parse_qty_number(order.get("Quantity"), 0.0)))
+    stitches = int(round(_parse_qty_number(order.get("Stitch Count"), 0.0)))
+    heads = max(1, int(head_count or 6))
     prow = emb_progress.get_row(oid, sheets_svc, SPREADSHEET_ID)
-    timing = emb_progress.compute_timing(prow)
+    timing = emb_progress.compute_timing(prow, stitches, heads)
     completed = max(int(prow.get("completedQty") or 0), int(list_qty or 0))
     if completed > qty > 0:
         completed = qty
@@ -15096,7 +15105,7 @@ def _emb_floor_job_payload(order_id: str, sheets_svc=None):
         "quantity": qty,
         "completedQty": completed,
         "piecesLeft": pieces_left,
-        "stitchCount": int(round(_parse_qty_number(order.get("Stitch Count"), 0.0))),
+        "stitchCount": stitches,
         "dueDate": order.get("Due Date") or "",
         "shipDate": order.get("Ship Date") or "",
         "stage": stage,
@@ -15109,6 +15118,8 @@ def _emb_floor_job_payload(order_id: str, sheets_svc=None):
         "lastRunAt": str(timing.get("lastRunAt") or ""),
         "runCount": int(timing.get("runCount") or 0),
         "recentRuns": timing.get("recentRuns") or [],
+        "expectedRunMs": int(timing.get("expectedRunMs") or 0),
+        "headCount": heads,
         "manualStart": bool(prow.get("manualStart")),
         "manualStartAt": str(prow.get("manualStartAt") or ""),
     }
@@ -15296,7 +15307,13 @@ def embroidery_floor_job(order_id):
             sheets_svc = get_sheets_service()
         except Exception:
             sheets_svc = None
-        payload = _emb_floor_job_payload(order_id, sheets_svc)
+        payload = _emb_floor_job_payload(
+            order_id,
+            sheets_svc,
+            head_count=_emb_floor_head_count(
+                request.args.get("machine") or request.args.get("machineId") or ""
+            ),
+        )
         if not payload:
             return jsonify({"error": "order not found"}), 404
         return jsonify(payload), 200
@@ -15356,8 +15373,23 @@ def embroidery_floor_progress():
         else:
             completed = max(0, completed)
 
+        try:
+            heads = int(data.get("headCount") or 0)
+        except (TypeError, ValueError):
+            heads = 0
+        if heads <= 0:
+            heads = _emb_floor_head_count(
+                str(data.get("machineId") or data.get("machine") or "")
+            )
         result = emb_progress.set_qty(
-            oid, completed, sheets_svc, SPREADSHEET_ID, increment=increment
+            oid,
+            completed,
+            sheets_svc,
+            SPREADSHEET_ID,
+            increment=increment,
+            machine=str(data.get("machine") or data.get("machineId") or "").strip(),
+            stitch_count=int(payload.get("stitchCount") or 0),
+            head_count=heads,
         )
         _bump_embroidery_scheduler_signal()
         done = qty > 0 and completed >= qty
@@ -15366,7 +15398,7 @@ def embroidery_floor_progress():
             marked = _emb_floor_write_list_progress(oid, completed, done)
         except Exception:
             logger.exception("embroidery progress: Embroidery List write failed")
-        updated = _emb_floor_job_payload(oid, sheets_svc) or {}
+        updated = _emb_floor_job_payload(oid, sheets_svc, head_count=heads) or {}
         updated.update(result)
         updated["listMarked"] = marked
         if done:
@@ -15704,10 +15736,12 @@ def get_combined():
             done = max(file_done, list_done)
             o["Embroidery Completed Qty"] = done
             if prow:
-                timing = emb_progress.compute_timing(prow)
+                stitch = int(round(_parse_qty_number(o.get("Stitch Count"), 0.0)))
+                timing = emb_progress.compute_timing(prow, stitch, 6)
                 o["Embroidery Avg Cycle Ms"] = int(timing.get("avgCycleMs") or 0)
                 o["Embroidery Last Run At"] = str(timing.get("lastRunAt") or "")
                 o["Embroidery Recent Runs"] = timing.get("recentRuns") or []
+                o["Embroidery Expected Run Ms"] = int(timing.get("expectedRunMs") or 0)
 
         return {
             "orders": orders_full,
