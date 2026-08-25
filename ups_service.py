@@ -168,6 +168,18 @@ def get_access_token() -> str:
     return _token_cache["access_token"]
 
 # ------- Helpers to build UPS address/package JSON -------
+def _ups_address_lines(a1, a2: str | None = None, a3: str | None = None) -> list:
+    lines = []
+    for x in (a1, a2, a3):
+        s = str(x or "").strip()
+        if not s:
+            continue
+        lines.append(s[:35])
+        if len(lines) >= 3:
+            break
+    return lines or [""]
+
+
 def _addr(
     name: str,
     phone: str,
@@ -178,6 +190,7 @@ def _addr(
     country: str,
     a2: str | None = None,
     attention_name: str | None = None,
+    a3: str | None = None,
 ) -> Dict[str, Any]:
     """
     UPS ShipTo/ShipFrom: Name = company (or person if no company); AttentionName = contact person.
@@ -187,7 +200,7 @@ def _addr(
         "Name": name[:35] if name else "Recipient",
         "Phone": {"Number": phone or "0000000000"},
         "Address": {
-            "AddressLine": [a1] if not a2 else [a1, a2],
+            "AddressLine": _ups_address_lines(a1, a2, a3),
             "City": city, "StateProvinceCode": state,
             "PostalCode": postal, "CountryCode": country
         },
@@ -273,14 +286,25 @@ def _pkg(dim: Dict[str, Any], weight_lbs: float|int) -> Dict[str, Any]:
     }
 
 
-def _pkg_ship(dim: Dict[str, Any], weight_lbs: float|int) -> Dict[str, Any]:
+def _sanitize_ups_po_value(raw: str | None) -> str:
+    """UPS package reference Value is typically max 35 characters."""
+    s = re.sub(r"\s+", " ", str(raw or "").strip())
+    return s[:35]
+
+
+def _pkg_ship(
+    dim: Dict[str, Any],
+    weight_lbs: float | int,
+    po_number: str | None = None,
+) -> Dict[str, Any]:
     """
     Package node for Ship API v2409+ (Shipping.yaml Shipment_Package).
     Requires `Packaging` with `Code`, not `PackagingType` — otherwise 120600.
+    po_number is sent as ReferenceNumber Code PO so it prints on the label PO line.
     """
     L, W, H = str(dim["L"]), str(dim["W"]), str(dim["H"])
     WGT = f"{float(weight_lbs):.2f}"
-    return {
+    pkg: Dict[str, Any] = {
         "Packaging": {"Code": "02"},
         "Dimensions": {
             "UnitOfMeasurement": {"Code": DIM_UNIT},
@@ -291,6 +315,12 @@ def _pkg_ship(dim: Dict[str, Any], weight_lbs: float|int) -> Dict[str, Any]:
             "Weight": WGT
         }
     }
+    po = _sanitize_ups_po_value(po_number)
+    if po:
+        # US/US labels print package-level references. Code PO = Purchase Order Number.
+        pkg["ReferenceNumber"] = [{"Code": "PO", "Value": po}]
+    return pkg
+
 
 def _label_stock_size_for_request() -> Dict[str, str]:
     """
@@ -1161,6 +1191,7 @@ def get_rate(
             ship_to["addr1"], ship_to["city"], ship_to["state"], ship_to["zip"], ship_to.get("country","US"),
             ship_to.get("addr2") or None,
             ship_to.get("attention_name") or None,
+            ship_to.get("addr3") or None,
         ),
         "ShipFrom": _ship_from(),
         "PaymentDetails": {
@@ -1409,13 +1440,15 @@ def extract_ups_ship_billed_amount_usd(data: Dict[str, Any]) -> float | None:
 def create_shipment(
     ship_to: Dict[str, str],
     packages: List[Dict[str, Any]],
-    service_code: str
+    service_code: str,
+    po_number: str | None = None,
 ) -> Tuple[List[str], List[str], bool, float | None]:
     """
     Returns (label_urls, tracking_numbers, saved_to_label_printer_folder, billed_shipping_usd_or_none).
 
     billed_shipping_usd_or_none is parsed from the Ship API response (authoritative when present).
     Trimmed PDF/PNG/ZPL is written to temp for /labels/… and copied to UPS_LABEL_OUTPUT_DIR when that path exists.
+    po_number prints on the UPS label PO / purchase-order reference line.
     """
     token = get_access_token()
     url = _ups_ship_endpoint()
@@ -1446,6 +1479,7 @@ def create_shipment(
                     ship_to["addr1"], ship_to["city"], ship_to["state"], ship_to["zip"], ship_to.get("country","US"),
                     ship_to.get("addr2") or None,
                     ship_to.get("attention_name") or None,
+                    ship_to.get("addr3") or None,
                 ),
                 "Service": {"Code": service_code},
                 "PaymentInformation": {
@@ -1454,12 +1488,21 @@ def create_shipment(
                         "BillShipper": {"AccountNumber": SHIPPER_NUMBER}
                     }]
                 },
-                "Package": [_pkg_ship(p, p.get("weight", 1.0)) for p in packages],
+                "Package": [
+                    _pkg_ship(p, p.get("weight", 1.0), po_number) for p in packages
+                ],
                 "ShipmentServiceOptions": service_opts,
             },
             "LabelSpecification": _label_spec()
         }
     }
+    po_for_label = _sanitize_ups_po_value(po_number)
+    if po_for_label:
+        logging.info("UPS label PO reference: %s", po_for_label)
+    else:
+        logging.warning(
+            "UPS shipment has no customer PO — label PO line will be blank"
+        )
 
     if NEGOTIATED:
         shipment["ShipmentRequest"]["Shipment"]["ShipmentRatingOptions"] = {"NegotiatedRatesIndicator": "Y"}

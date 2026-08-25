@@ -5161,6 +5161,155 @@ def _fetch_directory_row_by_company(company_name: str):
     return None
 
 
+def _directory_cell(row: dict, *names) -> str:
+    """First non-empty Directory cell matching any header name (case-insensitive)."""
+    if not isinstance(row, dict) or not names:
+        return ""
+    by = {str(k or "").strip().lower(): v for k, v in row.items()}
+    for n in names:
+        val = by.get(str(n or "").strip().lower())
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return ""
+
+
+def _directory_is_billing_same_as_shipping(row: dict) -> bool:
+    v = _directory_cell(row, "Billing Same as Shipping").lower()
+    return v in ("yes", "y", "true", "1", "same")
+
+
+def _directory_shipping_snapshot(row: dict) -> dict:
+    """Ship-to fields for UPS / packing slips (Street Address* + Shipping*)."""
+    if not isinstance(row, dict):
+        row = {}
+    cfn = _directory_cell(row, "Contact First Name")
+    cln = _directory_cell(row, "Contact Last Name")
+    attn = " ".join(p for p in (cfn, cln) if p).strip()
+    return {
+        "company": _directory_cell(row, "Company Name"),
+        "first": cfn,
+        "last": cln,
+        "attn": attn,
+        "addr1": _directory_cell(row, "Street Address 1", "Shipping Street Address 1"),
+        "addr2": _directory_cell(row, "Street Address 2", "Shipping Street Address 2"),
+        "addr3": _directory_cell(row, "Shipping Address 3", "Street Address 3"),
+        "city": _directory_cell(row, "City", "Shipping City"),
+        "state": _directory_cell(row, "State", "Shipping State"),
+        "zip": _directory_cell(row, "Zip Code", "Shipping Zip", "Shipping Zip Code"),
+        "phone": _directory_cell(row, "Shipping Phone", "Phone Number"),
+        "email": _directory_cell(row, "Shipping Email", "Contact Email Address"),
+    }
+
+
+def _directory_unique_emails(*raw_values) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    for raw in raw_values:
+        for part in re.split(r"[;,]+", str(raw or "")):
+            e = part.strip()
+            if not e or "@" not in e:
+                continue
+            key = e.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(e)
+    return out
+
+
+def _directory_billing_snapshot(row: dict) -> dict:
+    """Bill-to fields for QuickBooks (Billing* columns; address may copy from shipping)."""
+    ship = _directory_shipping_snapshot(row)
+    emails = _directory_unique_emails(
+        _directory_cell(row, "Billing Email 1"),
+        _directory_cell(row, "Billing Email 2"),
+        _directory_cell(row, "Billing Email 3"),
+    )
+    if not emails and ship.get("email"):
+        emails = [ship["email"]]
+    same = _directory_is_billing_same_as_shipping(row)
+    bill_addr1 = _directory_cell(row, "Billing Street Address 1")
+    use_ship_addr = same or not bill_addr1
+    if use_ship_addr:
+        addr1, addr2, addr3 = ship["addr1"], ship["addr2"], ship["addr3"]
+        city, state, zipc = ship["city"], ship["state"], ship["zip"]
+    else:
+        addr1 = bill_addr1
+        addr2 = _directory_cell(row, "Billing Street Address 2")
+        addr3 = _directory_cell(row, "Billing Street Address 3")
+        city = _directory_cell(row, "Billing City")
+        state = _directory_cell(row, "Billing State")
+        zipc = _directory_cell(row, "Billing Zip", "Billing Zip Code")
+    first = _directory_cell(row, "Billing First Name") or ship["first"]
+    last = _directory_cell(row, "Billing Last Name") or ship["last"]
+    phone = _directory_cell(row, "Billing Phone") or ship["phone"]
+    return {
+        "company": ship["company"],
+        "first": first,
+        "last": last,
+        "addr1": addr1,
+        "addr2": addr2,
+        "addr3": addr3,
+        "city": city,
+        "state": state,
+        "zip": zipc,
+        "phone": phone,
+        "emails": emails,
+    }
+
+
+def _qbo_physical_addr_from_snapshot(snap: dict) -> dict | None:
+    if not isinstance(snap, dict):
+        return None
+    addr1 = str(snap.get("addr1") or "").strip()
+    if not addr1:
+        return None
+    addr = {
+        "Line1": addr1[:500],
+        "City": str(snap.get("city") or "").strip(),
+        "CountrySubDivisionCode": _state_abbr_ups(snap.get("state")),
+        "PostalCode": _zip5_ups(snap.get("zip")) or str(snap.get("zip") or "").strip(),
+        "Country": "USA",
+    }
+    addr2 = str(snap.get("addr2") or "").strip()
+    addr3 = str(snap.get("addr3") or "").strip()
+    if addr2:
+        addr["Line2"] = addr2[:500]
+    if addr3:
+        addr["Line3"] = addr3[:500]
+    return addr
+
+
+def _qbo_invoice_email_fields(emails) -> dict:
+    """Billing Email 1/2/3 → invoice To / Cc / Bcc."""
+    cleaned = _directory_unique_emails(*(emails or []))
+    out = {}
+    if len(cleaned) >= 1:
+        out["BillEmail"] = {"Address": cleaned[0][:100]}
+    if len(cleaned) >= 2:
+        out["BillEmailCc"] = {"Address": cleaned[1][:100]}
+    if len(cleaned) >= 3:
+        out["BillEmailBcc"] = {"Address": cleaned[2][:100]}
+    return out
+
+
+def _directory_qbo_invoice_overlays(company_name: str) -> dict:
+    """Bill address + billing emails (and ship address) for a QBO invoice."""
+    row = _fetch_directory_row_by_company(company_name)
+    if not row:
+        return {}
+    bill = _directory_billing_snapshot(row)
+    ship = _directory_shipping_snapshot(row)
+    out = _qbo_invoice_email_fields(bill.get("emails") or [])
+    bill_addr = _qbo_physical_addr_from_snapshot(bill)
+    if bill_addr:
+        out["BillAddr"] = bill_addr
+    ship_addr = _qbo_physical_addr_from_snapshot(ship)
+    if ship_addr:
+        out["ShipAddr"] = ship_addr
+    return out
+
+
 def _directory_company_names_from_sheet():
     """
     Unique non-empty values in the Directory sheet's Company Name column.
@@ -5248,6 +5397,16 @@ def _po_number_from_row(row: dict) -> str:
         if val:
             return val
     return ""
+
+
+def _shipment_customer_po(order_data_list) -> str:
+    """Unique customer PO numbers for this shipment (comma-separated)."""
+    seen: list[str] = []
+    for row in order_data_list or []:
+        po = _po_number_from_row(row) if isinstance(row, dict) else ""
+        if po and po not in seen:
+            seen.append(po)
+    return ", ".join(seen)
 
 
 def _ensure_po_header_index(sheets) -> int | None:
@@ -5548,35 +5707,35 @@ def _order_ship_address_from_production_row_with_pair_fallback(
 
 def _normalize_ups_ship_to_from_directory_row(row: dict) -> dict:
     """
-    Build ShipTo for UPS REST Ship/Rating. UPS does not expose your ups.com / WorldShip
-    address book over this API: every request sends a full address. Reusing the same
-    company + street + ZIP as in your address book matches that saved entry in practice.
+    Build ShipTo for UPS REST Ship/Rating from Directory shipping columns
+    (Street Address 1/2, City/State/Zip, Shipping Address 3, Shipping Email/Phone).
+    Contact first+last become AttentionName (e.g. Retail Warehouse).
     """
-    cfn = str(row.get("Contact First Name", "") or "").strip()
-    cln = str(row.get("Contact Last Name", "") or "").strip()
-    contact_line = " ".join(p for p in (cfn, cln) if p).strip()
+    ship = _directory_shipping_snapshot(row)
+    contact_line = str(ship.get("attn") or "").strip()
     attention_name = (contact_line[:35] if contact_line else None)
-    company = str(row.get("Company Name", "") or "").strip()
-    # UPS: Name = company; AttentionName = contact. If no company, use contact as Name.
+    company = str(ship.get("company") or "").strip()
     if company:
         name = company[:35]
     else:
         name = (contact_line[:35] if contact_line else "Recipient")
         attention_name = None
-    phone = re.sub(r"\D", "", str(row.get("Phone Number", "") or ""))[:15]
+    phone = re.sub(r"\D", "", str(ship.get("phone") or ""))[:15]
     if not phone:
         phone = "0000000000"
-    a2 = str(row.get("Street Address 2", "") or "").strip()
-    email = str(row.get("Contact Email Address", "") or "").strip()
+    a2 = str(ship.get("addr2") or "").strip()
+    a3 = str(ship.get("addr3") or "").strip()
+    email = str(ship.get("email") or "").strip()
     out = {
         "name": name,
         "attention_name": attention_name,
         "phone": phone,
-        "addr1": str(row.get("Street Address 1", "") or "").strip(),
+        "addr1": str(ship.get("addr1") or "").strip(),
         "addr2": a2 or None,
-        "city": str(row.get("City", "") or "").strip(),
-        "state": _state_abbr_ups(row.get("State", "")),
-        "zip": _zip5_ups(row.get("Zip Code", "")),
+        "addr3": a3 or None,
+        "city": str(ship.get("city") or "").strip(),
+        "state": _state_abbr_ups(ship.get("state")),
+        "zip": _zip5_ups(ship.get("zip")),
         "country": "US",
     }
     if email:
@@ -5990,20 +6149,30 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
         {str(o.get("Order #", "")).strip(): o for o in order_data_list if o.get("Order #")},
         get_sheets_service(),
     )
-    if order_ship.get("addr1"):
+    slip_po = _shipment_customer_po(order_data_list)
+    ship_for_slip = order_ship if order_ship.get("addr1") else {}
+    if not ship_for_slip.get("addr1"):
+        drow = _fetch_directory_row_by_company(str(cust.get("Company Name", "") or "").strip())
+        if drow:
+            ship_for_slip = _normalize_ups_ship_to_from_directory_row(drow)
+    if ship_for_slip.get("addr1"):
         ship_lines = [
-            order_ship.get("name") or "",
-            order_ship.get("attention_name") or "",
-            order_ship.get("addr1") or "",
-            order_ship.get("addr2") or "",
-            f"{order_ship.get('city', '')}, {order_ship.get('state', '')} {order_ship.get('zip', '')}".strip(", "),
-            order_ship.get("phone") or "",
+            ship_for_slip.get("name") or "",
+            ship_for_slip.get("attention_name") or "",
+            f"PO# {slip_po}" if slip_po else "",
+            ship_for_slip.get("addr1") or "",
+            ship_for_slip.get("addr2") or "",
+            ship_for_slip.get("addr3") or "",
+            f"{ship_for_slip.get('city', '')}, {ship_for_slip.get('state', '')} {ship_for_slip.get('zip', '')}".strip(", "),
+            ship_for_slip.get("phone") or "",
         ]
         ship_body = "<br/>".join(line for line in ship_lines if line)
     else:
         ship_body = (
             f"{cust.get('Company Name','')}<br/>{cust.get('Address','')}<br/>{cust.get('Phone','')}"
         )
+        if slip_po:
+            ship_body = f"{ship_body}<br/>PO# {slip_po}"
     customer_info = Paragraph(f"<b>Ship To:</b><br/>{ship_body}", normal)
 
     # shift customer info further right
@@ -6285,51 +6454,33 @@ def get_or_create_customer_ref(
             return {"value": cust["Id"], "name": cust["DisplayName"]}
 
     # ── 2) Fetch from Google Sheets “Directory” ────────────────────
-    SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-    if not SPREADSHEET_ID:
-        raise Exception("🚨 Missing SPREADSHEET_ID environment variable")
-    resp = (
-        sheet.spreadsheets()
-        .values()
-        .get(spreadsheetId=SPREADSHEET_ID, range="Directory!A1:Z")
-        .execute()
-    )
-    rows = resp.get("values", [])
-    if not rows or len(rows) < 2:
-        directory = []
-    else:
-        headers = rows[0]
-        directory = [dict(zip(headers, row)) for row in rows[1:]]
-
-    match = next(
-        (
-            row
-            for row in directory
-            if row.get("Company Name", "").strip() == company_name.strip()
-        ),
-        None,
-    )
+    match = _fetch_directory_row_by_company(company_name)
     if not match:
         raise Exception(
             f"❌ Customer '{company_name}' not found in Google Sheets Directory"
         )
 
+    ship = _directory_shipping_snapshot(match)
+    bill = _directory_billing_snapshot(match)
+    bill_addr = _qbo_physical_addr_from_snapshot(bill)
+    ship_addr = _qbo_physical_addr_from_snapshot(ship)
+    primary_email = (bill.get("emails") or [""])[0] if bill.get("emails") else ""
+    bill_phone = str(bill.get("phone") or "").strip()
+
     # ── 3) Build QuickBooks customer payload ───────────────────────
     payload = {
         "DisplayName": company_name,
         "CompanyName": company_name,
-        "PrimaryEmailAddr": {"Address": match.get("Contact Email Address", "")},
-        "PrimaryPhone": {"FreeFormNumber": match.get("Phone Number", "")},
-        "BillAddr": {
-            "Line1": match.get("Street Address 1", ""),
-            "Line2": match.get("Street Address 2", ""),
-            "City": match.get("City", ""),
-            "CountrySubDivisionCode": match.get("State", ""),
-            "PostalCode": match.get("Zip Code", ""),
-        },
-        "GivenName": match.get("Contact First Name", ""),
-        "FamilyName": match.get("Contact Last Name", ""),
+        "PrimaryEmailAddr": {"Address": primary_email} if primary_email else None,
+        "PrimaryPhone": {"FreeFormNumber": bill_phone} if bill_phone else None,
+        "GivenName": str(bill.get("first") or "").strip(),
+        "FamilyName": str(bill.get("last") or "").strip(),
     }
+    if bill_addr:
+        payload["BillAddr"] = bill_addr
+    if ship_addr:
+        payload["ShipAddr"] = ship_addr
+    payload = {k: v for k, v in payload.items() if v is not None}
 
     # ── 4) Create customer in QuickBooks ──────────────────────────
     create_url = f"{base}/v3/company/{realm_id}/customer"
@@ -8162,34 +8313,13 @@ def _qbo_invoice_record_url(realm_id, invoice_id, env_override=None):
 
 def fetch_customer_email_from_directory(sheet_service, company_name):
     """
-    Read the 'Directory' sheet and return the Contact Email Address for the company.
+    Billing Email 1 (then 2/3, then Contact Email) for QuickBooks invoices.
     """
-    SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-    if not SPREADSHEET_ID:
-        logging.warning("⚠️ Missing SPREADSHEET_ID; cannot read Directory for email.")
+    row = _fetch_directory_row_by_company(company_name)
+    if not row:
         return ""
-    resp = (
-        sheet_service.spreadsheets()
-        .values()
-        .get(spreadsheetId=SPREADSHEET_ID, range="Directory!A1:Z")
-        .execute()
-    )
-    rows = resp.get("values", []) or []
-    if len(rows) < 2:
-        return ""
-    headers = rows[0]
-    try:
-        idx_company = headers.index("Company Name")
-        idx_email = headers.index("Contact Email Address")
-    except ValueError:
-        return ""
-    for row in rows[1:]:
-        if (
-            len(row) > idx_company
-            and row[idx_company].strip() == (company_name or "").strip()
-        ):
-            return row[idx_email] if len(row) > idx_email else ""
-    return ""
+    emails = _directory_billing_snapshot(row).get("emails") or []
+    return emails[0] if emails else ""
 
 
 def _directory_header_col_index(headers, *names):
@@ -8423,6 +8553,9 @@ def create_invoice_in_quickbooks(
         invoice_payload["CustomerMemo"] = f"Ship via: {ship_via_single}"
     # Remove any None values QBO might reject (e.g., missing BillEmail)
     invoice_payload = {k: v for k, v in invoice_payload.items() if v is not None}
+    invoice_payload.update(
+        _directory_qbo_invoice_overlays(order_data.get("Company Name", ""))
+    )
 
     invoice_url = f"{base}/v3/company/{realm_id}/invoice?minorversion={QBO_MINOR_VERSION}"
     logging.info("📦 Invoice payload about to send to QuickBooks:")
@@ -8715,8 +8848,15 @@ def create_consolidated_invoice_in_quickbooks(
             )
         return out
 
+    qbo_dir_overlays = _directory_qbo_invoice_overlays(
+        first_order.get("Company Name", "")
+    )
+
     def _invoice_drop_none(inv):
-        return {k: v for k, v in inv.items() if v is not None}
+        out = {k: v for k, v in inv.items() if v is not None}
+        if qbo_dir_overlays:
+            out.update(qbo_dir_overlays)
+        return out
 
     def _fallback_invoice_payload(*, include_header_ship_amt=True):
         """Shipping as a Sales line item (used when native ShipAmt / ShipMethod metadata is unavailable).
@@ -21530,11 +21670,14 @@ def process_shipment():
                     "phone": ship_to_override.get("phone") or "0000000000",
                     "addr1": ship_to_override.get("addr1"),
                     "addr2": ship_to_override.get("addr2"),
+                    "addr3": ship_to_override.get("addr3"),
                     "city": ship_to_override.get("city"),
                     "state": str(ship_to_override.get("state") or "").strip().upper(),
                     "zip": str(ship_to_override.get("zip") or "").strip(),
                     "country": ship_to_override.get("country") or "US",
                 }
+                if ship_to_override.get("email"):
+                    ship_to["email"] = ship_to_override.get("email")
             else:
                 company = str(all_order_data[0].get("Company Name", "") or "").strip()
                 order_ship = _order_ship_address_from_production_row_with_pair_fallback(
@@ -21561,8 +21704,7 @@ def process_shipment():
                     "Incomplete ship-to address in Directory for UPS "
                     "(need street, city, 2-letter state, 5-digit ZIP)."
                 )
-            # UPS Quantum View ship/delivery emails use Directory Contact Email Address
-            # (same source as QBO BillEmail) when not already on ship_to.
+            # UPS Quantum View ship/delivery emails use Directory Shipping Email.
             if not str(ship_to.get("email") or "").strip():
                 company_for_email = str(
                     all_order_data[0].get("Company Name", "") or ""
@@ -21570,16 +21712,19 @@ def process_shipment():
                 if not company_for_email:
                     company_for_email = str(ship_to.get("name") or "").strip()
                 try:
-                    bill_email = fetch_customer_email_from_directory(
-                        service, company_for_email
+                    drow_email = _fetch_directory_row_by_company(company_for_email)
+                    ship_email = (
+                        _directory_shipping_snapshot(drow_email).get("email")
+                        if drow_email
+                        else ""
                     )
                 except Exception:
                     logging.exception(
-                        "Directory email lookup failed for UPS notifications"
+                        "Directory shipping email lookup failed for UPS notifications"
                     )
-                    bill_email = ""
-                if bill_email and str(bill_email).strip():
-                    ship_to["email"] = str(bill_email).strip()
+                    ship_email = ""
+                if ship_email and str(ship_email).strip():
+                    ship_to["email"] = str(ship_email).strip()
             ups_notify_email = str(ship_to.get("email") or "").strip()
             if ups_notify_email:
                 logging.info(
@@ -21595,12 +21740,20 @@ def process_shipment():
                 sc = sc[:2]
             elif len(sc) == 1:
                 sc = sc.zfill(2)
+            shipment_po = _shipment_customer_po(all_order_data)
+            if shipment_po:
+                logging.info("UPS shipment customer PO for label: %s", shipment_po)
+            else:
+                logging.warning(
+                    "No customer PO # on selected Production Orders — "
+                    "UPS label PO line will be blank"
+                )
             (
                 label_relative_urls,
                 tracking_list,
                 labels_local_ok,
                 ups_ship_billed_usd,
-            ) = ups_create_shipment(ship_to, packages_ups, sc)
+            ) = ups_create_shipment(ship_to, packages_ups, sc, po_number=shipment_po)
             labels_drive_ok = False
             if label_relative_urls:
                 try:
@@ -22399,6 +22552,14 @@ def _normalize_rate_ship_to(raw) -> dict:
         nested.get("AddressLine2"),
         nested.get("addressLine2"),
     )
+    addr3 = first(
+        raw.get("addr3"),
+        raw.get("addressLine3"),
+        raw.get("street3"),
+        raw.get("street_3"),
+        nested.get("AddressLine3"),
+        nested.get("addressLine3"),
+    )
     city = first(raw.get("city"), raw.get("City"), nested.get("City"), nested.get("city"))
     state = first(
         raw.get("state"),
@@ -22433,6 +22594,7 @@ def _normalize_rate_ship_to(raw) -> dict:
         "phone": phone,
         "addr1": addr1,
         "addr2": addr2 or None,
+        "addr3": addr3 or None,
         "city": city,
         "state": state,
         "zip": zipc,
