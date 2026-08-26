@@ -149,6 +149,34 @@ def _cycle_ms_between(earlier_iso: str, later_iso: str) -> int:
     return 0
 
 
+def _usable_for_average(cycle_ms: int, expected_ms: int) -> bool:
+    """Skip taps, overnight gaps, and break-length outliers (e.g. +N after 3 hours)."""
+    if cycle_ms < 2 * 60 * 1000:
+        return False
+    if cycle_ms > 4 * 60 * 60 * 1000:
+        return False
+    if expected_ms > 0:
+        limit = max(int(expected_ms * 2), int(expected_ms) + 15 * 60 * 1000)
+        if cycle_ms > limit:
+            return False
+    elif cycle_ms > 90 * 60 * 1000:
+        return False
+    return True
+
+
+def _average_cycle_ms(cycles: list) -> int:
+    if not cycles:
+        return 0
+    if len(cycles) >= 3:
+        ordered = sorted(cycles)
+        median = ordered[len(ordered) // 2]
+        if median > 0:
+            cycles = [c for c in cycles if c <= median * 2.5]
+    if not cycles:
+        return 0
+    return int(round(sum(cycles) / len(cycles)))
+
+
 def _clean_runs(raw: Any) -> list:
     if not isinstance(raw, list):
         return []
@@ -205,7 +233,7 @@ def compute_timing(
     stitch_count: Any = 0,
     head_count: Any = 6,
 ) -> dict:
-    """Average +N-to-+N cycle time, skipping tiny taps and long breaks."""
+    """Average +N-to-+N cycle time, skipping taps, breaks, and outlier gaps."""
     runs = _clean_runs((row or {}).get("runs"))
     start_at = str((row or {}).get("manualStartAt") or "")
     cycles = []
@@ -213,12 +241,12 @@ def compute_timing(
     for i, r in enumerate(runs):
         prev_at = runs[i - 1].get("at") if i > 0 else start_at
         cycle_ms = int(r.get("cycleMs") or 0) or _cycle_ms_between(prev_at, r.get("at"))
-        if cycle_ms:
-            cycles.append(cycle_ms)
         inc = int(r.get("increment") or 0)
         expected_ms = int(r.get("expectedMs") or 0) or expected_cycle_ms(
             stitch_count, inc, head_count
         )
+        if cycle_ms and _usable_for_average(cycle_ms, expected_ms):
+            cycles.append(cycle_ms)
         ahead_ms = (expected_ms - cycle_ms) if cycle_ms and expected_ms else 0
         recent.append(
             {
@@ -229,7 +257,7 @@ def compute_timing(
                 "aheadMs": ahead_ms,
             }
         )
-    avg = int(round(sum(cycles) / len(cycles))) if cycles else 0
+    avg = _average_cycle_ms(cycles)
     last = runs[-1]["at"] if runs else str((row or {}).get("updatedAt") or "")
     typical = expected_cycle_ms(stitch_count, head_count, head_count)
     return {
