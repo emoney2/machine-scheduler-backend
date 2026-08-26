@@ -248,6 +248,16 @@ def compute_timing(
         if cycle_ms and _usable_for_average(cycle_ms, expected_ms):
             cycles.append(cycle_ms)
         ahead_ms = (expected_ms - cycle_ms) if cycle_ms and expected_ms else 0
+        vs_prev_ms = None
+        if cycle_ms >= 2 * 60 * 1000:
+            if i > 0:
+                prev = recent[-1] if recent else None
+                prev_cycle = int((prev or {}).get("cycleMs") or 0)
+                prev_inc = int((prev or {}).get("increment") or 0)
+                if prev_cycle >= 2 * 60 * 1000 and prev_inc > 0 and inc > 0:
+                    vs_prev_ms = int(round((prev_cycle / prev_inc) * inc - cycle_ms))
+            if vs_prev_ms is None and expected_ms:
+                vs_prev_ms = int(expected_ms - cycle_ms)
         recent.append(
             {
                 "at": r.get("at"),
@@ -255,6 +265,7 @@ def compute_timing(
                 "cycleMs": cycle_ms,
                 "expectedMs": expected_ms,
                 "aheadMs": ahead_ms,
+                "vsPrevMs": vs_prev_ms,
             }
         )
     avg = _average_cycle_ms(cycles)
@@ -264,7 +275,7 @@ def compute_timing(
         "avgCycleMs": avg,
         "lastRunAt": last,
         "runCount": len(runs),
-        "recentRuns": recent[-3:],
+        "recentRuns": recent[-4:],
         "expectedRunMs": typical,
     }
 
