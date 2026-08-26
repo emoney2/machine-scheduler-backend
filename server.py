@@ -1743,6 +1743,7 @@ def _bump_embroidery_scheduler_signal():
     _embroidery_scheduler_rev += 1
     try:
         _json_cache.pop("changes-v1", None)
+        _json_cache.pop("combined-v6", None)
         _json_cache.pop("combined-v5", None)
         _json_cache.pop("combined-v4", None)
         _json_cache.pop("combined-v3", None)
@@ -10902,7 +10903,7 @@ def invalidate_material_inventory_status_cache():
 def _invalidate_combined_orders_cache():
     """Clear `/api/combined` caches so Fur List sees sheet updates on all clients."""
     global _json_cache
-    for key in ("combined-v5", "combined-v4", "combined-v3", "combined-v2", "combined"):
+    for key in ("combined-v6", "combined-v5", "combined-v4", "combined-v3", "combined-v2", "combined"):
         _json_cache.pop(key, None)
 
 
@@ -15591,23 +15592,36 @@ def get_combined():
         # Use acquire_sheet_lock (bounded wait) — raw sheet_lock can wait behind
         # slow batchGets and contribute to Gunicorn worker timeout + restarts.
         progress_range = f"'{emb_progress.SHEET_TAB}'!A1:Z"
+        log_range = f"'{emb_progress.LOG_TAB}'!A1:K"
         ranges_main = [ORDERS_RANGE, FUR_RANGE, CUT_RANGE, EMBROIDERY_RANGE]
+        ranges_with_prog = ranges_main + [progress_range]
+        ranges_all = ranges_with_prog + [log_range]
         with acquire_sheet_lock():
             try:
                 resp = svc.batchGet(
                     spreadsheetId=SPREADSHEET_ID,
-                    ranges=ranges_main + [progress_range],
+                    ranges=ranges_all,
                     valueRenderOption="UNFORMATTED_VALUE",
                 ).execute()
             except Exception:
                 current_app.logger.warning(
-                    "combined: Embroidery Progress tab missing or unread; retrying without it"
+                    "combined: Embroidery Run Log unread; retrying without it"
                 )
-                resp = svc.batchGet(
-                    spreadsheetId=SPREADSHEET_ID,
-                    ranges=ranges_main,
-                    valueRenderOption="UNFORMATTED_VALUE",
-                ).execute()
+                try:
+                    resp = svc.batchGet(
+                        spreadsheetId=SPREADSHEET_ID,
+                        ranges=ranges_with_prog,
+                        valueRenderOption="UNFORMATTED_VALUE",
+                    ).execute()
+                except Exception:
+                    current_app.logger.warning(
+                        "combined: Embroidery Progress tab missing or unread; retrying without it"
+                    )
+                    resp = svc.batchGet(
+                        spreadsheetId=SPREADSHEET_ID,
+                        ranges=ranges_main,
+                        valueRenderOption="UNFORMATTED_VALUE",
+                    ).execute()
 
         vrs = resp.get("valueRanges", [])
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
@@ -15615,6 +15629,7 @@ def get_combined():
         cut_rows = (vrs[2].get("values") if len(vrs) > 2 else []) or []
         emb_rows = (vrs[3].get("values") if len(vrs) > 3 else []) or []
         prog_tab_rows = (vrs[4].get("values") if len(vrs) > 4 else []) or []
+        log_tab_rows = (vrs[5].get("values") if len(vrs) > 5 else []) or []
 
         def rows_to_dicts(rows):
             if not rows:
@@ -15719,9 +15734,22 @@ def get_combined():
         except Exception:
             tab_prog = {}
         try:
-            prog = emb_progress.combine_loaded(file_prog, tab_prog if tab_prog else None)
+            log_runs = emb_progress.parse_run_log_values(log_tab_rows) if log_tab_rows else {}
+        except Exception:
+            log_runs = {}
+        try:
+            prog = emb_progress.combine_loaded(
+                file_prog,
+                tab_prog if tab_prog else None,
+                log_runs,
+            )
         except Exception:
             prog = file_prog or {}
+        try:
+            if log_runs or any((row or {}).get("runs") for row in (prog or {}).values()):
+                emb_progress.remember_rows(prog)
+        except Exception:
+            current_app.logger.warning("combined: could not remember embroidery run history")
 
         for o in orders_full:
             oid = str(o.get("Order #", "")).strip()
@@ -15752,7 +15780,7 @@ def get_combined():
     # Use caching to reduce Google Sheets API calls (stale-while-revalidate on expiry)
     TTL = int(os.environ.get("COMBINED_CACHE_TTL", "45"))
     try:
-        result = send_cached_json("combined-v5", TTL, build_payload)
+        result = send_cached_json("combined-v6", TTL, build_payload)
         if result is None:
             # If send_cached_json failed, fall through to exception handler
             raise Exception("send_cached_json returned None")
