@@ -15391,6 +15391,7 @@ def embroidery_floor_progress():
             machine=str(data.get("machine") or data.get("machineId") or "").strip(),
             stitch_count=int(payload.get("stitchCount") or 0),
             head_count=heads,
+            hoop_ended_at=str(data.get("hoopEndedAt") or data.get("lastVibrationAt") or ""),
         )
         _bump_embroidery_scheduler_signal()
         done = qty > 0 and completed >= qty

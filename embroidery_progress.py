@@ -110,6 +110,29 @@ def _parse_iso(val: Any) -> Optional[datetime]:
         return None
 
 
+def _resolve_run_at(hoop_ended_at: Any, now_iso: str, prev_at: str) -> str:
+    """Use last-vibration time for a late +N so overnight gaps are not the cycle."""
+    ended = _parse_iso(hoop_ended_at)
+    if ended is None:
+        return now_iso
+    now_dt = _parse_iso(now_iso) or datetime.now(timezone.utc)
+    if ended.tzinfo is None:
+        ended = ended.replace(tzinfo=timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    if ended > now_dt:
+        return now_iso
+    if (now_dt - ended).total_seconds() > 36 * 3600:
+        return now_iso
+    prev_dt = _parse_iso(prev_at)
+    if prev_dt is not None:
+        if prev_dt.tzinfo is None:
+            prev_dt = prev_dt.replace(tzinfo=timezone.utc)
+        if ended <= prev_dt:
+            return now_iso
+    return ended.astimezone(timezone.utc).isoformat()
+
+
 def expected_cycle_ms(stitch_count: Any, pieces: Any, head_count: Any) -> int:
     """One +N cycle: stitches/30k hours times ceil(pieces/heads)."""
     try:
@@ -994,6 +1017,7 @@ def set_qty(
     machine: str = "",
     stitch_count: int = 0,
     head_count: int = 6,
+    hoop_ended_at: str = "",
 ) -> dict:
     oid = _norm_oid(order_id)
     if not oid:
@@ -1028,11 +1052,12 @@ def set_qty(
                 prev_at = str(runs[-1].get("at") or "")
             if not prev_at:
                 prev_at = str(prev.get("manualStartAt") or "")
-            cycle_ms = _cycle_ms_between(prev_at, now)
+            run_at = _resolve_run_at(hoop_ended_at, now, prev_at)
+            cycle_ms = _cycle_ms_between(prev_at, run_at)
             expected_ms = expected_cycle_ms(stitches, inc, heads)
             runs.append(
                 {
-                    "at": now,
+                    "at": run_at,
                     "increment": inc,
                     "cycleMs": cycle_ms,
                     "expectedMs": expected_ms,
@@ -1048,7 +1073,7 @@ def set_qty(
                 "expected_ms": expected_ms,
                 "stitch_count": stitches,
                 "head_count": heads,
-                "posted_at": now,
+                "posted_at": run_at,
             }
         rows[oid] = {
             "completedQty": qty,
