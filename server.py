@@ -5806,16 +5806,47 @@ def _packing_slip_open_in_browser_fallback() -> bool:
 
 
 def _packing_slip_num_copies(boxes_summary, boxes_legacy) -> int:
-    if boxes_summary and isinstance(boxes_summary, list):
-        t = 0
-        for b in boxes_summary:
-            if isinstance(b, dict):
-                try:
-                    t += int(b.get("qty", 1) or 1)
-                except (TypeError, ValueError):
-                    t += 1
-        return max(1, t)
-    return max(1, len(boxes_legacy or []))
+    return max(1, len(_expand_boxes_for_packing_slips(boxes_summary, boxes_legacy)))
+
+
+def _expand_boxes_for_packing_slips(
+    boxes_summary, boxes_legacy, packages_ups=None
+) -> list:
+    """One dict per physical carton (qty on a summary row expands to that many)."""
+    if isinstance(packages_ups, list) and packages_ups:
+        out = []
+        for p in packages_ups:
+            if not isinstance(p, dict):
+                out.append({"label": "Box"})
+                continue
+            L, W, H = p.get("L"), p.get("W"), p.get("H")
+            label = (
+                p.get("label")
+                or (f"{L}×{W}×{H}" if L not in (None, "") else "Box")
+            )
+            out.append({**p, "label": str(label)})
+        if out:
+            return out
+    src = boxes_summary if isinstance(boxes_summary, list) and boxes_summary else boxes_legacy
+    out = []
+    for b in src or []:
+        if not isinstance(b, dict):
+            out.append({"label": "Box"})
+            continue
+        try:
+            qty = max(1, int(b.get("qty", 1) or 1))
+        except (TypeError, ValueError):
+            qty = 1
+        L, W, H = b.get("L"), b.get("W"), b.get("H")
+        label = b.get("label") or (
+            f"{L}×{W}×{H}" if L not in (None, "") else "Box"
+        )
+        for _ in range(qty):
+            row = dict(b)
+            row["label"] = str(label)
+            row["qty"] = 1
+            out.append(row)
+    return out or [{"label": "Box"}]
 
 
 def _get_packing_slip_print_drive_folder_id(drive):
@@ -6090,14 +6121,22 @@ def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers, env_override=None):
 
 
 # ─── Simulated QuickBooks Invoice Generator ─────────────────────────────────────
-def build_packing_slip_pdf(order_data_list, boxes, company_info):
+def build_packing_slip_pdf(
+    order_data_list,
+    boxes,
+    company_info,
+    box_index=None,
+    box_count=None,
+    box_label=None,
+    tracking_number=None,
+):
     """
     PDF layout:
       ┌──────────────────────────────────────────────────┐
       │ [logo]           │ Ship To: Customer Info      │
       │ Your company     │                              │
       ├──────────────────────────────────────────────────┤
-      │                 PACKING SLIP                   │
+      │          PACKING SLIP — Box 1 of 2             │
       ├──────────────────────────────────────────────────┤
       │ Product │ Design │ Qty │
       │  ...    │  ...   │ ... │
@@ -6144,7 +6183,7 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
     left_cell = [logo, Spacer(1, 0.1 * inch), your_info]
 
     # Right cell: customer info from the first order
-    cust = order_data_list[0]
+    cust = order_data_list[0] if order_data_list else {}
     order_ship = _order_ship_address_from_production_row_with_pair_fallback(
         cust,
         {str(o.get("Order #", "")).strip(): o for o in order_data_list if o.get("Order #")},
@@ -6196,7 +6235,25 @@ def build_packing_slip_pdf(order_data_list, boxes, company_info):
     elems.append(Spacer(1, 0.25 * inch))
 
     # ─── Title ──────────────────────────────────────────────
-    elems.append(Paragraph("PACKING SLIP", title_style))
+    title_txt = "PACKING SLIP"
+    if box_index and box_count:
+        title_txt = f"PACKING SLIP — Box {int(box_index)} of {int(box_count)}"
+    elems.append(Paragraph(title_txt, title_style))
+    extra_bits = []
+    if box_label:
+        extra_bits.append(str(box_label).strip())
+    if tracking_number:
+        extra_bits.append(f"Tracking: {tracking_number}")
+    if extra_bits:
+        sub = ParagraphStyle(
+            "SlipSub",
+            parent=normal,
+            alignment=1,
+            fontSize=10,
+            textColor=colors.HexColor("#37474f"),
+            spaceAfter=10,
+        )
+        elems.append(Paragraph(" · ".join(extra_bits), sub))
 
     # ─── Line Items ────────────────────────────────────────
     def _is_back_item(name: str) -> bool:
@@ -21927,62 +21984,97 @@ def process_shipment():
                 invoice_url,
             )
 
-        # 6) Build packing slip PDF (always create, even if empty)
+        # 6) Build one packing slip PDF per physical box
         try:
             company_info = (
                 default_packing_slip_company_info()
                 if skip_invoice
                 else fetch_company_info(headers, realm_id, env_override)
             )
-            pdf_bytes = build_packing_slip_pdf(all_order_data, boxes, company_info)
-            filename = f"packing_slip_{int(time.time())}.pdf"
+        except Exception:
+            company_info = default_packing_slip_company_info()
+
+        box_slips = _expand_boxes_for_packing_slips(
+            boxes_summary, boxes, packages_ups
+        )
+        n_slips = max(1, len(box_slips))
+        slip_jobs = []  # {filename, tmp_path, pdf_bytes, print_name}
+        ts = int(time.time())
+        order_ids_str = "-".join(order_ids)
+
+        def _make_slip_pdf(box_i, box_meta, order_rows):
+            tn = None
+            if tracking_list and box_i - 1 < len(tracking_list):
+                tn = tracking_list[box_i - 1]
+            return build_packing_slip_pdf(
+                order_rows,
+                boxes,
+                company_info,
+                box_index=box_i,
+                box_count=n_slips,
+                box_label=(box_meta or {}).get("label"),
+                tracking_number=tn,
+            )
+
+        for i, box_meta in enumerate(box_slips, start=1):
+            try:
+                pdf_bytes = _make_slip_pdf(i, box_meta, all_order_data)
+            except Exception as e:
+                print(f"⚠️ Error creating packing slip PDF box {i}/{n_slips}: {e}")
+                traceback.print_exc()
+                try:
+                    pdf_bytes = _make_slip_pdf(i, box_meta, [])
+                except Exception as e2:
+                    print(f"❌ Failed to create fallback packing slip box {i}: {e2}")
+                    raise
+            filename = f"packing_slip_{ts}_{i}_of_{n_slips}.pdf"
             tmp_path = os.path.join(tempfile.gettempdir(), filename)
             with open(tmp_path, "wb") as f:
                 f.write(pdf_bytes)
-            print("✅ Packing slip PDF created:", filename)
-        except Exception as e:
-            print(f"⚠️ Error creating packing slip PDF: {e}")
-            traceback.print_exc()
-            # Still create a minimal packing slip to ensure it's always created
-            try:
-                company_info = (
-                    default_packing_slip_company_info()
-                    if skip_invoice
-                    else fetch_company_info(headers, realm_id, env_override)
-                )
-                pdf_bytes = build_packing_slip_pdf([], boxes, company_info)
-                filename = f"packing_slip_{int(time.time())}.pdf"
-                tmp_path = os.path.join(tempfile.gettempdir(), filename)
-                with open(tmp_path, "wb") as f:
-                    f.write(pdf_bytes)
-                print("✅ Fallback packing slip PDF created:", filename)
-            except Exception as e2:
-                print(f"❌ Failed to create fallback packing slip: {e2}")
-                raise
+            print_name = f"{order_ids_str}_box_{i}_of_{n_slips}_packing_slip.pdf"
+            slip_jobs.append(
+                {
+                    "filename": filename,
+                    "tmp_path": tmp_path,
+                    "pdf_bytes": pdf_bytes,
+                    "print_name": print_name,
+                }
+            )
+            print("✅ Packing slip PDF created:", print_name)
 
-        _print_packing_slip_pdf(tmp_path)
+        for job in slip_jobs:
+            _print_packing_slip_pdf(job["tmp_path"])
 
-        # 7) Build a public URL for the front-end
+        # 7) Public URL for the first slip (front-end); all files go to the print folder
+        filename = slip_jobs[0]["filename"]
+        pdf_bytes = slip_jobs[0]["pdf_bytes"]
+        tmp_path = slip_jobs[0]["tmp_path"]
         slip_url = url_for("serve_slip", filename=filename, _external=True)
+        slip_urls = [
+            url_for("serve_slip", filename=j["filename"], _external=True)
+            for j in slip_jobs
+        ]
 
-        # 8) Upload packing slip to Drive for shop printer/watcher
-        order_ids_str = "-".join(order_ids)
-        num_slips = _packing_slip_num_copies(boxes_summary, boxes)
-        pdf_filename = f"{order_ids_str}_copies_{num_slips}_packing_slip.pdf"
-        media = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype="application/pdf")
+        # 8) Upload one packing-slip PDF per box to Drive print folder + local sync
         drive = get_drive_service()
         packing_slip_parent_id = _get_packing_slip_print_drive_folder_id(drive)
-        drive.files().create(
-            body={
-                "name": pdf_filename,
-                "parents": [packing_slip_parent_id],
-            },
-            media_body=media,
-        ).execute()
-        print("✅ Packing slip uploaded to watcher folder.")
-        _try_copy_packing_slip_to_local_sync_folder(tmp_path, pdf_filename)
+        for job in slip_jobs:
+            media = MediaIoBaseUpload(
+                BytesIO(job["pdf_bytes"]), mimetype="application/pdf"
+            )
+            drive.files().create(
+                body={
+                    "name": job["print_name"],
+                    "parents": [packing_slip_parent_id],
+                },
+                media_body=media,
+            ).execute()
+            _try_copy_packing_slip_to_local_sync_folder(
+                job["tmp_path"], job["print_name"]
+            )
+        print(f"✅ {n_slips} packing slip(s) uploaded to watcher folder.")
 
-        # 7b) ALSO upload the packing slip into each order's Drive folder
+        # 7b) ALSO upload each box slip into each order's Drive folder
         ORDERS_PARENT_FOLDER_ID = os.environ.get(
             "ORDERS_PARENT_FOLDER_ID", "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
         )
@@ -22008,13 +22100,17 @@ def process_shipment():
                     "parents": [ORDERS_PARENT_FOLDER_ID],
                 }
                 folder_id = drive.files().create(body=meta, fields="id").execute()["id"]
-            drive.files().create(
-                body={"name": f"{oid}_packing_slip.pdf", "parents": [folder_id]},
-                media_body=MediaIoBaseUpload(
-                    BytesIO(pdf_bytes), mimetype="application/pdf"
-                ),
-            ).execute()
-        print("✅ Packing slip copied into each order folder.")
+            for job in slip_jobs:
+                drive.files().create(
+                    body={
+                        "name": f"{oid}_{job['print_name']}",
+                        "parents": [folder_id],
+                    },
+                    media_body=MediaIoBaseUpload(
+                        BytesIO(job["pdf_bytes"]), mimetype="application/pdf"
+                    ),
+                ).execute()
+        print("✅ Packing slips copied into each order folder.")
 
         # 7c) Pre-trim (API raw) + post-trim UPS labels into each order # Drive folder
         if do_ups and tracking_list and order_ids:
@@ -22228,7 +22324,7 @@ def process_shipment():
         resp_payload = {
             "labels": full_label_urls,
             "invoice": invoice_url,
-            "slips": [slip_url],
+            "slips": slip_urls if slip_urls else [slip_url],
             "open_label_windows": open_lbl,
             "open_slip_windows": open_slip,
             "labels_copied_to_folder": bool(labels_copied_ok),
