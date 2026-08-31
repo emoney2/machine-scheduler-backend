@@ -22743,9 +22743,21 @@ def api_rate():
                 400,
             )
         options = ups_get_rate(to, packages, ask_all_services=True)
+        if not options:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "UPS returned no rates for this address and packages.",
+                        "options": [],
+                    }
+                ),
+                502,
+            )
         return jsonify({"ok": True, "options": options})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+        logging.exception("UPS /api/rate failed")
+        return jsonify({"ok": False, "error": str(e)}), 502
 
 
 @app.route("/api/list-folder-files")
