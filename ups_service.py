@@ -1,5 +1,5 @@
 # ups_service.py
-import base64, io, logging, os, re, shutil, sys, time, uuid, tempfile, json
+import base64, io, logging, math, os, re, shutil, sys, time, uuid, tempfile, json
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple
 from zoneinfo import ZoneInfo
@@ -360,15 +360,41 @@ def _ship_from() -> Dict[str, Any]:
         f.get("addr2"),
     )
 
+def _ordered_package_dims(L, W, H) -> Tuple[int, int, int]:
+    """UPS: Length is the longest side; round each side up to a whole inch (max 108)."""
+    sides: List[int] = []
+    for x in (L, W, H):
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            v = 1.0
+        if not math.isfinite(v) or v <= 0:
+            v = 1.0
+        inch = int(math.ceil(v - 1e-9))
+        sides.append(max(1, min(108, inch)))
+    sides.sort(reverse=True)
+    return sides[0], sides[1], sides[2]
+
+
+def _ordered_package_weight(weight_lbs) -> float:
+    try:
+        v = float(weight_lbs)
+    except (TypeError, ValueError):
+        v = 1.0
+    if not math.isfinite(v) or v <= 0:
+        v = 1.0
+    return max(0.1, min(150.0, round(v, 1)))
+
+
 def _pkg(dim: Dict[str, Any], weight_lbs: float|int) -> Dict[str, Any]:
     """Package node for Rating API (expects PackagingType)."""
-    L, W, H = str(dim["L"]), str(dim["W"]), str(dim["H"])
-    WGT = f"{float(weight_lbs):.2f}"
+    L, W, H = _ordered_package_dims(dim.get("L"), dim.get("W"), dim.get("H"))
+    WGT = f"{_ordered_package_weight(weight_lbs):.1f}"
     return {
         "PackagingType": {"Code": "02"},  # Customer Supplied Package
         "Dimensions": {
             "UnitOfMeasurement": {"Code": DIM_UNIT},
-            "Length": L, "Width": W, "Height": H
+            "Length": str(L), "Width": str(W), "Height": str(H)
         },
         "PackageWeight": {
             "UnitOfMeasurement": {"Code": WT_UNIT},
@@ -393,13 +419,13 @@ def _pkg_ship(
     Requires `Packaging` with `Code`, not `PackagingType` — otherwise 120600.
     po_number is sent as ReferenceNumber Code PO so it prints on the label PO line.
     """
-    L, W, H = str(dim["L"]), str(dim["W"]), str(dim["H"])
-    WGT = f"{float(weight_lbs):.2f}"
+    L, W, H = _ordered_package_dims(dim.get("L"), dim.get("W"), dim.get("H"))
+    WGT = f"{_ordered_package_weight(weight_lbs):.1f}"
     pkg: Dict[str, Any] = {
         "Packaging": {"Code": "02"},
         "Dimensions": {
             "UnitOfMeasurement": {"Code": DIM_UNIT},
-            "Length": L, "Width": W, "Height": H
+            "Length": str(L), "Width": str(W), "Height": str(H)
         },
         "PackageWeight": {
             "UnitOfMeasurement": {"Code": WT_UNIT},
@@ -1453,19 +1479,52 @@ def get_rate(
         return rows
 
     def _fail() -> None:
+        def _score(msg: str) -> int:
+            m = (msg or "").lower()
+            if any(
+                s in m
+                for s in (
+                    "dimension",
+                    "weight",
+                    "package",
+                    "girth",
+                    "size",
+                    "111030",
+                    "120602",
+                )
+            ):
+                return 0
+            if "111100" in m:
+                return 80
+            if " 400 " in m:
+                return 10
+            return 40
+
+        ranked = sorted(errors, key=_score)
         raise RuntimeError(
-            " | ".join(errors[-3:]) or "UPS Rate: no RatedShipment returned for any service."
+            " | ".join(ranked[:3]) or "UPS Rate: no RatedShipment returned for any service."
         )
 
     current_ver = _ups_rating_version()
     negotiated_tries = [True, False] if NEGOTIATED else [False]
     origin = _live_from()
     logging.info(
-        "UPS Rate origin %s %s %s acct=%s",
+        "UPS Rate origin %s %s %s acct=%s packages=%s",
         origin.get("city"),
         origin.get("state"),
         origin.get("zip"),
         (acct[:4] + "…" if len(acct) > 4 else acct),
+        [
+            {
+                "L": p.get("L"),
+                "W": p.get("W"),
+                "H": p.get("H"),
+                "weight": p.get("weight"),
+                "sent": _ordered_package_dims(p.get("L"), p.get("W"), p.get("H"))
+                + (_ordered_package_weight(p.get("weight") or p.get("Weight")),),
+            }
+            for p in packages
+        ],
     )
 
     if ask_all_services:

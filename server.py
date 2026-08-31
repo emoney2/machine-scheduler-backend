@@ -22673,35 +22673,64 @@ def _normalize_rate_packages(raw_list):
     for p in raw_list or []:
         if not isinstance(p, dict):
             continue
+        nested = p.get("Dimensions") if isinstance(p.get("Dimensions"), dict) else {}
+        nested_c = p.get("dimensions") if isinstance(p.get("dimensions"), dict) else {}
+
+        def num(*vals):
+            for v in vals:
+                if v is None or v == "":
+                    continue
+                if isinstance(v, dict):
+                    continue
+                try:
+                    n = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if n == n:  # not NaN
+                    return n
+            return None
+
         try:
-            L = float(
-                p.get("L")
-                or p.get("Length")
-                or p.get("length")
-                or p.get("Dimensions", {}).get("Length")
-                or 1
+            L = num(
+                p.get("L"),
+                p.get("Length"),
+                p.get("length"),
+                nested.get("Length"),
+                nested.get("L"),
+                nested_c.get("length"),
+                nested_c.get("L"),
             )
-            W = float(
-                p.get("W")
-                or p.get("Width")
-                or p.get("width")
-                or p.get("Dimensions", {}).get("Width")
-                or 1
+            W = num(
+                p.get("W"),
+                p.get("Width"),
+                p.get("width"),
+                nested.get("Width"),
+                nested.get("W"),
+                nested_c.get("width"),
+                nested_c.get("W"),
             )
-            H = float(
-                p.get("H")
-                or p.get("Height")
-                or p.get("height")
-                or p.get("Dimensions", {}).get("Height")
-                or 1
+            H = num(
+                p.get("H"),
+                p.get("Height"),
+                p.get("height"),
+                nested.get("Height"),
+                nested.get("H"),
+                nested_c.get("height"),
+                nested_c.get("H"),
             )
-            w = p.get("weight")
-            if w is None:
-                w = p.get("Weight")
-            wt = float(w) if w is not None else 1.0
+            wt = num(p.get("weight"), p.get("Weight"))
+            if L is None or W is None or H is None:
+                continue
+            out.append(
+                {
+                    "L": L,
+                    "W": W,
+                    "H": H,
+                    "weight": wt if wt is not None else 1.0,
+                }
+            )
         except (TypeError, ValueError):
             continue
-        out.append({"L": L, "W": W, "H": H, "weight": wt})
     return out
 
 
