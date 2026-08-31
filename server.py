@@ -22568,6 +22568,88 @@ def logout_all():
     return jsonify({"status": "ok"}), 200
 
 
+_US_STATE_NAMES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE",
+    "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
+    "new mexico": "NM", "new york": "NY", "north carolina": "NC",
+    "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
+    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+    "district of columbia": "DC", "washington dc": "DC", "dc": "DC",
+}
+
+# First-3 ZIP digits → state (catches AK vs AR and similar mix-ups).
+_ZIP3_STATE_RANGES = (
+    (5, 5, "NY"), (6, 9, "PR"), (10, 27, "MA"), (28, 29, "RI"), (30, 38, "NH"),
+    (39, 49, "ME"), (50, 54, "VT"), (55, 55, "MA"), (56, 59, "VT"), (60, 69, "CT"),
+    (70, 89, "NJ"), (100, 149, "NY"), (150, 196, "PA"), (197, 199, "DE"),
+    (200, 200, "DC"), (201, 201, "VA"), (202, 205, "DC"), (206, 219, "MD"),
+    (220, 246, "VA"), (247, 268, "WV"), (270, 289, "NC"), (290, 299, "SC"),
+    (300, 319, "GA"), (320, 349, "FL"), (350, 352, "AL"), (354, 369, "AL"),
+    (370, 385, "TN"), (386, 397, "MS"), (398, 399, "GA"), (400, 427, "KY"),
+    (430, 459, "OH"), (460, 479, "IN"), (480, 499, "MI"), (500, 528, "IA"),
+    (530, 549, "WI"), (550, 567, "MN"), (570, 577, "SD"), (580, 588, "ND"),
+    (590, 599, "MT"), (600, 629, "IL"), (630, 658, "MO"), (660, 679, "KS"),
+    (680, 693, "NE"), (700, 714, "LA"), (716, 729, "AR"), (730, 749, "OK"),
+    (750, 799, "TX"), (800, 816, "CO"), (820, 831, "WY"), (832, 838, "ID"),
+    (840, 847, "UT"), (850, 865, "AZ"), (870, 884, "NM"), (885, 885, "TX"),
+    (889, 898, "NV"), (900, 961, "CA"), (967, 968, "HI"), (970, 979, "OR"),
+    (980, 994, "WA"), (995, 999, "AK"),
+)
+
+
+def _zip5(raw) -> str:
+    if raw is None or raw == "":
+        return ""
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        digits = str(int(raw))
+        return digits[:5] if len(digits) >= 5 else ""
+    m = re.search(r"(\d{5})", str(raw))
+    return m.group(1) if m else ""
+
+
+def _state_abbr(raw) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if len(s) == 2 and s.isalpha():
+        return s.upper()
+    key = re.sub(r"\s+", " ", s.lower().replace(".", ""))
+    return _US_STATE_NAMES.get(key) or ""
+
+
+def _state_from_zip5(zipc: str) -> str:
+    z = _zip5(zipc)
+    if len(z) < 3:
+        return ""
+    try:
+        n = int(z[:3])
+    except ValueError:
+        return ""
+    for a, b, st in _ZIP3_STATE_RANGES:
+        if a <= n <= b:
+            return st
+    return ""
+
+
+def _reconcile_state_with_zip(state, zipc) -> tuple:
+    z = _zip5(zipc)
+    from_zip = _state_from_zip5(z)
+    abbr = _state_abbr(state)
+    if from_zip and abbr and from_zip != abbr:
+        logging.info("Corrected ship-to state %s → %s for ZIP %s", abbr, from_zip, z)
+        return from_zip, z
+    return (abbr or from_zip or ""), z
+
+
 def _normalize_rate_ship_to(raw) -> dict:
     """Build ship_to dict for ups_service.get_rate from mega/legacy JSON."""
     if not isinstance(raw, dict):
@@ -22637,6 +22719,7 @@ def _normalize_rate_ship_to(raw) -> dict:
         nested.get("PostalCode"),
         nested.get("postalCode"),
     )
+    state, zipc = _reconcile_state_with_zip(state, zipc)
     country = first(
         raw.get("country"),
         raw.get("countryCode"),
