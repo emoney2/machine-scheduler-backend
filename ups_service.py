@@ -16,16 +16,77 @@ _DEFAULT_UPS_LABEL_OUTPUT_DIR = r"G:\My Drive\Label Printer"
 
 # Ship-from defaults (override any field with SHIP_FROM_* in .env)
 _a2 = (os.getenv("SHIP_FROM_ADDRESS2", "Suite 300") or "").strip()
-FROM = {
-    "name":   os.getenv("SHIP_FROM_NAME", "JR & Co."),
-    "phone":  os.getenv("SHIP_FROM_PHONE", "0000000000"),
-    "addr1":  os.getenv("SHIP_FROM_ADDRESS1", "1384 Buford Business Blvd"),
-    "addr2":  _a2 or None,
-    "city":   os.getenv("SHIP_FROM_CITY", "Buford"),
-    "state":  os.getenv("SHIP_FROM_STATE", "GA"),
-    "zip":    os.getenv("SHIP_FROM_ZIP", "30518"),
-    "country":os.getenv("SHIP_FROM_COUNTRY", "US"),
+_FROM_FALLBACK = {
+    "name": "JR & Co.",
+    "phone": "678-294-5350",
+    "addr1": "1384 Buford Business Blvd",
+    "addr2": "Suite 300",
+    "city": "Buford",
+    "state": "GA",
+    "zip": "30518",
+    "country": "US",
 }
+
+FROM = {
+    "name":   os.getenv("SHIP_FROM_NAME", _FROM_FALLBACK["name"]),
+    "phone":  os.getenv("SHIP_FROM_PHONE", _FROM_FALLBACK["phone"]),
+    "addr1":  os.getenv("SHIP_FROM_ADDRESS1", _FROM_FALLBACK["addr1"]),
+    "addr2":  _a2 or None,
+    "city":   os.getenv("SHIP_FROM_CITY", _FROM_FALLBACK["city"]),
+    "state":  os.getenv("SHIP_FROM_STATE", _FROM_FALLBACK["state"]),
+    "zip":    os.getenv("SHIP_FROM_ZIP", _FROM_FALLBACK["zip"]),
+    "country":os.getenv("SHIP_FROM_COUNTRY", _FROM_FALLBACK["country"]),
+}
+
+
+def _live_shipper_number() -> str:
+    return (os.getenv("UPS_ACCOUNT_NUMBER") or SHIPPER_NUMBER or "").strip()
+
+
+def _live_from() -> Dict[str, Any]:
+    """Re-read ship-from env per request so empty Render vars don't wipe defaults."""
+    env_map = {
+        "name": "SHIP_FROM_NAME",
+        "phone": "SHIP_FROM_PHONE",
+        "addr1": "SHIP_FROM_ADDRESS1",
+        "addr2": "SHIP_FROM_ADDRESS2",
+        "city": "SHIP_FROM_CITY",
+        "state": "SHIP_FROM_STATE",
+        "zip": "SHIP_FROM_ZIP",
+        "country": "SHIP_FROM_COUNTRY",
+    }
+    out: Dict[str, Any] = {}
+    for key, envk in env_map.items():
+        raw = os.getenv(envk)
+        if raw is None or not str(raw).strip():
+            raw = FROM.get(key) or _FROM_FALLBACK.get(key) or ""
+        val = str(raw).strip()
+        out[key] = val
+    out["addr2"] = out["addr2"] or None
+    digits = re.sub(r"\D", "", out.get("zip") or "")
+    out["zip"] = (digits[:5] if len(digits) >= 5 else (_FROM_FALLBACK["zip"]))
+    st = (out.get("state") or "").strip()
+    out["state"] = st[:2].upper() if st else _FROM_FALLBACK["state"]
+    out["country"] = (out.get("country") or "US").strip().upper()[:2] or "US"
+    return out
+
+
+def _pickup_type_code() -> str:
+    raw = (os.getenv("UPS_PICKUP_TYPE") or PICKUP_TYPE or "DailyPickup").strip().lower()
+    raw = re.sub(r"[\s_-]+", "", raw)
+    mapping = {
+        "01": "01",
+        "dailypickup": "01",
+        "daily": "01",
+        "03": "03",
+        "customercounter": "03",
+        "counter": "03",
+        "06": "06",
+        "onetimepickup": "06",
+        "19": "19",
+        "20": "20",
+    }
+    return mapping.get(raw, "01")
 
 UNITS = (os.getenv("UPS_UNITS", "IN_LBS").upper())
 DIM_UNIT = "IN" if UNITS == "IN_LBS" else "CM"
@@ -269,19 +330,35 @@ def _shipment_qv_notifications(emails: List[str]) -> List[Dict[str, Any]]:
     return out
 
 def _shipper() -> Dict[str, Any]:
+    f = _live_from()
+    lines = [f["addr1"]]
+    if f.get("addr2"):
+        lines.append(f["addr2"])
     return {
-        "Name": FROM["name"][:35],
-        "ShipperNumber": SHIPPER_NUMBER,
-        "Phone": {"Number": FROM["phone"]},
+        "Name": (f["name"] or "JR & Co.")[:35],
+        "ShipperNumber": _live_shipper_number(),
+        "Phone": {"Number": f["phone"] or "0000000000"},
         "Address": {
-            "AddressLine": [FROM["addr1"]] if not FROM["addr2"] else [FROM["addr1"], FROM["addr2"]],
-            "City": FROM["city"], "StateProvinceCode": FROM["state"],
-            "PostalCode": FROM["zip"], "CountryCode": FROM["country"]
-        }
+            "AddressLine": lines,
+            "City": f["city"],
+            "StateProvinceCode": f["state"],
+            "PostalCode": f["zip"],
+            "CountryCode": f["country"] or "US",
+        },
     }
 
 def _ship_from() -> Dict[str, Any]:
-    return _addr(FROM["name"], FROM["phone"], FROM["addr1"], FROM["city"], FROM["state"], FROM["zip"], FROM["country"], FROM["addr2"])
+    f = _live_from()
+    return _addr(
+        f["name"],
+        f["phone"],
+        f["addr1"],
+        f["city"],
+        f["state"],
+        f["zip"],
+        f["country"] or "US",
+        f.get("addr2"),
+    )
 
 def _pkg(dim: Dict[str, Any], weight_lbs: float|int) -> Dict[str, Any]:
     """Package node for Rating API (expects PackagingType)."""
@@ -1076,8 +1153,12 @@ def _all_rated_shipments(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """UPS returns RatedShipment as either one object or a list of objects."""
     if not isinstance(data, dict):
         return []
-    rr = data.get("RateResponse") or {}
-    rs = rr.get("RatedShipment")
+    rr = data.get("RateResponse") or data.get("rateResponse") or {}
+    if not isinstance(rr, dict):
+        rr = {}
+    rs = rr.get("RatedShipment") or rr.get("ratedShipment")
+    if rs is None:
+        rs = data.get("RatedShipment") or data.get("ratedShipment")
     if rs is None:
         return []
     if isinstance(rs, list):
@@ -1157,16 +1238,39 @@ def _money_and_currency_from_rated(rated: Dict[str, Any]) -> Tuple[Any, str]:
     """
     if not rated:
         return None, "USD"
-    nrc = rated.get("NegotiatedRateCharges")
-    if isinstance(nrc, dict):
-        inner = nrc.get("TotalCharge") or nrc.get("TotalCharges")
+
+    def _from_block(blk: Any) -> Tuple[Any, str]:
+        if not isinstance(blk, dict):
+            return None, "USD"
+        inner = (
+            blk.get("TotalCharge")
+            or blk.get("TotalCharges")
+            or blk.get("totalCharge")
+            or blk.get("totalCharges")
+        )
         if isinstance(inner, dict) and inner.get("MonetaryValue") not in (None, ""):
-            return inner.get("MonetaryValue"), (inner.get("CurrencyCode") or "USD")
-        if nrc.get("MonetaryValue") not in (None, ""):
-            return nrc.get("MonetaryValue"), (nrc.get("CurrencyCode") or "USD")
-    tc = rated.get("TotalCharges")
-    if isinstance(tc, dict) and tc.get("MonetaryValue") not in (None, ""):
-        return tc.get("MonetaryValue"), (tc.get("CurrencyCode") or "USD")
+            return inner.get("MonetaryValue"), (inner.get("CurrencyCode") or inner.get("currencyCode") or "USD")
+        if blk.get("MonetaryValue") not in (None, "") and blk.get("MonetaryValue") is not None:
+            return blk.get("MonetaryValue"), (blk.get("CurrencyCode") or blk.get("currencyCode") or "USD")
+        if blk.get("monetaryValue") not in (None, "") and blk.get("monetaryValue") is not None:
+            return blk.get("monetaryValue"), (blk.get("currencyCode") or "USD")
+        return None, "USD"
+
+    nrc = rated.get("NegotiatedRateCharges") or rated.get("negotiatedRateCharges")
+    money, curr = _from_block(nrc)
+    if money not in (None, ""):
+        return money, curr
+    tc = (
+        rated.get("TotalCharges")
+        or rated.get("totalCharges")
+        or rated.get("TotalCharge")
+        or rated.get("totalCharge")
+    )
+    money, curr = _from_block(tc if isinstance(tc, dict) else None)
+    if money not in (None, "") :
+        return money, curr
+    if not isinstance(tc, dict) and tc not in (None, ""):
+        return tc, "USD"
     return None, "USD"
 
 
@@ -1185,7 +1289,8 @@ def _row_from_rated(
     fallback_code: str = "",
     fallback_name: str = "",
 ) -> Dict[str, Any] | None:
-    svc = rated.get("Service") if isinstance(rated.get("Service"), dict) else {}
+    svc = rated.get("Service") or rated.get("service")
+    svc = svc if isinstance(svc, dict) else {}
     code = str(svc.get("Code") or fallback_code or "").strip()
     if len(code) == 1 and code.isdigit():
         code = code.zfill(2)
@@ -1268,7 +1373,10 @@ def get_rate(
         "transactionSrc": "JRCO",
     }
 
-    # Build base shipment body
+    acct = _live_shipper_number()
+    if not acct:
+        raise RuntimeError("UPS Rate: UPS_ACCOUNT_NUMBER is not set on the server.")
+
     dti: Dict[str, Any] = {
         "PackageBillType": "03",  # DAP (shipper pays)
         "Pickup": {"Date": _pickup_date_ymd()},
@@ -1287,47 +1395,56 @@ def get_rate(
         "PaymentDetails": {
             "ShipmentCharge": [{
                 "Type": "01",
-                "BillShipper": {"AccountNumber": SHIPPER_NUMBER}
+                "BillShipper": {"AccountNumber": acct}
             }]
         },
         "Package": [_pkg(p, _package_weight_lb(p)) for p in packages],
         "DeliveryTimeInformation": dti,
     }
 
-    last_err = ""
-    saw_404 = False
+    errors: List[str] = []
+
+    def _note(msg: str) -> None:
+        if not msg:
+            return
+        if msg not in errors:
+            errors.append(msg)
+        logging.warning(msg)
 
     def _post(url: str, body: Dict[str, Any], params: Dict[str, str] | None = None):
-        nonlocal last_err, saw_404
         hdrs = {**headers, "transId": _trans_id_header()}
         resp = requests.post(url, headers=hdrs, json=body, params=params or None, timeout=25)
         if resp.status_code in (401, 403):
-            last_err = f"UPS Rate {resp.status_code} {url}: {_ups_error_snippet(resp)}"
-            logging.warning(last_err)
-            raise RuntimeError(last_err)
+            msg = f"UPS Rate {resp.status_code} {url}: {_ups_error_snippet(resp)}"
+            _note(msg)
+            raise RuntimeError(msg)
         if resp.status_code >= 400:
-            if resp.status_code == 404:
-                saw_404 = True
-            last_err = f"UPS Rate {resp.status_code} {url}: {_ups_error_snippet(resp)}"
-            logging.warning(last_err)
+            _note(f"UPS Rate {resp.status_code} {url}: {_ups_error_snippet(resp)}")
             return None
         try:
             return resp.json()
         except Exception:
-            last_err = f"UPS Rate: non-JSON response from {url}: {_ups_error_snippet(resp)}"
-            logging.warning(last_err)
+            _note(f"UPS Rate: non-JSON response from {url}: {_ups_error_snippet(resp)}")
             return None
 
-    def _rate_body(service_code: str | None, use_negotiated: bool) -> Dict[str, Any]:
+    def _rate_body(
+        service_code: str | None,
+        use_negotiated: bool,
+        include_dti: bool,
+    ) -> Dict[str, Any]:
         shipment = dict(base_shipment)
+        if not include_dti:
+            shipment.pop("DeliveryTimeInformation", None)
         if service_code:
             shipment["Service"] = {"Code": service_code}
         if use_negotiated:
             shipment["ShipmentRatingOptions"] = {"NegotiatedRatesIndicator": "Y"}
         return {
             "RateRequest": {
-                "Shipment": shipment,
                 "Request": {"SubVersion": "1707"},
+                "PickupType": {"Code": _pickup_type_code()},
+                "CustomerClassification": {"Code": "00"},
+                "Shipment": shipment,
             }
         }
 
@@ -1335,76 +1452,96 @@ def get_rate(
         rows.sort(key=lambda x: (x["rate"] is None, x["rate"] if x["rate"] is not None else 1e9))
         return rows
 
+    def _fail() -> None:
+        raise RuntimeError(
+            " | ".join(errors[-3:]) or "UPS Rate: no RatedShipment returned for any service."
+        )
+
     current_ver = _ups_rating_version()
     negotiated_tries = [True, False] if NEGOTIATED else [False]
+    origin = _live_from()
+    logging.info(
+        "UPS Rate origin %s %s %s acct=%s",
+        origin.get("city"),
+        origin.get("state"),
+        origin.get("zip"),
+        (acct[:4] + "…" if len(acct) > 4 else acct),
+    )
 
     if ask_all_services:
-        # Current Rating API: v2409 + Shop (path option max 10 chars).
-        # Transit via additionalinfo=timeintransit. v1 / Ratetimeintransit is deprecated.
-        shop_attempts: List[Tuple[str, str, Dict[str, str] | None]] = [
-            (current_ver, "Shop", {"additionalinfo": "timeintransit"}),
-            (current_ver, "Shop", None),
-            (current_ver, "Shoptimeintransit", None),
-            ("v1", "Shoptimeintransit", None),
-            ("v1", _RATING_REQ_OPT or "Ratetimeintransit", None),
+        # Shop = all services, omit Service. Rate/Ratetimeintransit without Service
+        # is UPS 111100 ("requested service is invalid from the selected origin").
+        shop_attempts: List[Tuple[str, str, Dict[str, str] | None, bool]] = [
+            (current_ver, "Shop", {"additionalinfo": "timeintransit"}, True),
+            (current_ver, "Shop", None, False),
+            ("v1", "Shop", {"additionalinfo": "timeintransit"}, True),
+            ("v1", "Shop", None, False),
+            ("v1", "Shoptimeintransit", None, True),
         ]
         seen_attempts = set()
-        for ver, opt, params in shop_attempts:
-            key = (ver, opt, tuple(sorted((params or {}).items())))
+        for ver, opt, params, include_dti in shop_attempts:
+            key = (ver, opt, tuple(sorted((params or {}).items())), include_dti)
             if key in seen_attempts:
                 continue
             seen_attempts.add(key)
             url = _ups_rate_url(opt, ver)
             for use_neg in negotiated_tries:
-                data = _post(url, _rate_body(None, use_neg), params)
+                data = _post(url, _rate_body(None, use_neg, include_dti), params)
                 if not data:
                     continue
                 rows = _rows_from_rate_payload(data)
                 if rows:
                     return _sort(rows)
+                rr = data.get("RateResponse") or data.get("rateResponse") or {}
+                rs = None
+                if isinstance(rr, dict):
+                    rs = rr.get("RatedShipment") or rr.get("ratedShipment")
+                _note(
+                    f"UPS Rate 200 {url}: no parseable rates "
+                    f"(keys={list(data.keys())[:8]} rated={type(rs).__name__})"
+                )
 
-        # Per-service Rate only if Shop URLs 404'd (retired path), not when UPS
-        # rejected the shipment (address/package) with 400.
-        if saw_404:
-            for ver, opt, params in (
-                (current_ver, "Rate", {"additionalinfo": "timeintransit"}),
-                (current_ver, "Rate", None),
-                ("v1", _RATING_REQ_OPT or "Ratetimeintransit", None),
-            ):
-                url = _ups_rate_url(opt, ver)
-                for use_neg in negotiated_tries:
-                    results: List[Dict[str, Any]] = []
-                    for code, name in UPS_SERVICES:
-                        data = _post(url, _rate_body(code, use_neg), params)
-                        if not data:
-                            continue
-                        results.extend(_rows_from_rate_payload(data, code, name))
-                    if results:
-                        return _sort(results)
+        # Per-service Rate with a real service code (Ground first). Shop 400 must
+        # not skip this — that was swallowing working Ground quotes.
+        rate_attempts: List[Tuple[str, str, Dict[str, str] | None, bool]] = [
+            (current_ver, "Rate", {"additionalinfo": "timeintransit"}, True),
+            (current_ver, "Rate", None, False),
+            ("v1", "Rate", None, False),
+            ("v1", "Ratetimeintransit", None, True),
+        ]
+        services = [("03", "Ground")] + [(c, n) for c, n in UPS_SERVICES if c != "03"]
+        for ver, opt, params, include_dti in rate_attempts:
+            url = _ups_rate_url(opt, ver)
+            for use_neg in negotiated_tries:
+                results: List[Dict[str, Any]] = []
+                for code, name in services:
+                    data = _post(url, _rate_body(code, use_neg, include_dti), params)
+                    if not data:
+                        continue
+                    results.extend(_rows_from_rate_payload(data, code, name))
+                if results:
+                    return _sort(results)
 
-        raise RuntimeError(
-            last_err or "UPS Rate: no RatedShipment returned for any service."
-        )
+        _fail()
 
     # Single service expected in ship_to["service_code"]
     code = ship_to.get("service_code", "03")
     name = next((n for c, n in UPS_SERVICES if c == code), code)
-    for ver, opt, params in (
-        (current_ver, "Rate", {"additionalinfo": "timeintransit"}),
-        (current_ver, "Rate", None),
-        ("v1", _RATING_REQ_OPT or "Ratetimeintransit", None),
+    for ver, opt, params, include_dti in (
+        (current_ver, "Rate", {"additionalinfo": "timeintransit"}, True),
+        (current_ver, "Rate", None, False),
+        ("v1", "Rate", None, False),
+        ("v1", "Ratetimeintransit", None, True),
     ):
         url = _ups_rate_url(opt, ver)
         for use_neg in negotiated_tries:
-            data = _post(url, _rate_body(code, use_neg), params)
+            data = _post(url, _rate_body(code, use_neg, include_dti), params)
             if not data:
                 continue
             rows = _rows_from_rate_payload(data, code, name)
             if rows:
                 return _sort(rows)
-    raise RuntimeError(
-        last_err or f"UPS Rate: missing RatedShipment for service {code}"
-    )
+    _fail()
 
 
 def _money_blob_to_float(obj: Any) -> float | None:
