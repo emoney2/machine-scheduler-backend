@@ -40,7 +40,7 @@ from flask import request, jsonify
 from flask import request, make_response, jsonify, Response
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest, AuthorizedSession
-from math import ceil
+from math import ceil, isfinite
 from functools import wraps
 from flask import request, session, jsonify, redirect, url_for, make_response
 from datetime import datetime, timedelta
@@ -20593,6 +20593,343 @@ def get_material_inventory_status():
 @app.route("/api/materialInventory", methods=["OPTIONS"])
 def material_inventory_preflight():
     return make_response("", 204)
+
+
+@app.route("/api/materialInventory/readjustment", methods=["OPTIONS"])
+def material_inventory_readjustment_preflight():
+    return make_response("", 204)
+
+
+def _material_readjustment_preview(material_name, physical_quantity):
+    """Return the ledger adjustment and every still-uncut job for a material."""
+    svc = get_sheets_service().spreadsheets().values()
+    response = svc.batchGet(
+        spreadsheetId=SPREADSHEET_ID,
+        ranges=[
+            "Material Inventory!A1:J",
+            "Material Log!A1:Z",
+            ORDERS_RANGE,
+            CUT_RANGE,
+            FUR_RANGE,
+        ],
+        valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
+    value_ranges = response.get("valueRanges", [])
+    sheets = [
+        (value_ranges[i].get("values") if i < len(value_ranges) else []) or []
+        for i in range(5)
+    ]
+    inventory_rows, material_log_rows, production_rows, cut_rows, fur_rows = sheets
+
+    def header_map(rows):
+        headers = rows[0] if rows else []
+        return {
+            re.sub(r"\s+", " ", str(value or "").strip().lower()): index
+            for index, value in enumerate(headers)
+        }
+
+    def column(columns, *names):
+        for name in names:
+            index = columns.get(name)
+            if index is not None:
+                return index
+        return -1
+
+    def cell(row, index):
+        return row[index] if 0 <= index < len(row) else ""
+
+    def order_key(value):
+        text = str(value or "").strip().lstrip("#").strip()
+        if re.fullmatch(r"\d+\.0+", text):
+            text = text.split(".", 1)[0]
+        return text.lower()
+
+    def material_key(value):
+        return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+    def row_map(rows, order_index):
+        result = {}
+        for row in rows[1:]:
+            key = order_key(cell(row, order_index))
+            if key:
+                result[key] = row
+        return result
+
+    target = material_key(material_name)
+    if not target:
+        raise ValueError("Material is required.")
+
+    inv_cols = header_map(inventory_rows)
+    inv_name_i = column(inv_cols, "materials", "material")
+    inv_qty_i = column(inv_cols, "inventory")
+    inv_unit_i = column(inv_cols, "unit")
+    matched_inventory = None
+    for row in inventory_rows[1:]:
+        if material_key(cell(row, inv_name_i)) == target:
+            matched_inventory = row
+            material_name = str(cell(row, inv_name_i)).strip()
+            break
+    if matched_inventory is None:
+        raise LookupError(f"Material not found: {material_name}")
+
+    unit = str(cell(matched_inventory, inv_unit_i)).strip()
+    if unit not in {"Yards", "Sqft"}:
+        raise RuntimeError(
+            f"{material_name} does not have a valid Yards or Sqft unit."
+        )
+    try:
+        current_quantity = float(cell(matched_inventory, inv_qty_i))
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"Current inventory for {material_name} is not a usable number."
+        )
+    if not isfinite(current_quantity):
+        raise RuntimeError(
+            f"Current inventory for {material_name} is not a usable number."
+        )
+
+    po_cols = header_map(production_rows)
+    po_order_i = column(po_cols, "order #", "order number", "order")
+    po_stage_i = column(po_cols, "stage")
+    po_company_i = column(po_cols, "company name", "company")
+    po_product_i = column(po_cols, "product", "product name")
+    po_due_i = column(po_cols, "due date", "due")
+    production_by_order = row_map(production_rows, po_order_i)
+
+    cut_cols = header_map(cut_rows)
+    cut_order_i = column(cut_cols, "order #", "order number", "order")
+    cut_status_i = column(cut_cols, "status")
+    cut_by_order = row_map(cut_rows, cut_order_i)
+    cut_headers = cut_rows[0] if cut_rows else []
+    cut_material_slots = [
+        (index, str(heading or "").strip().lower())
+        for index, heading in enumerate(cut_headers)
+        if "material" in str(heading or "").strip().lower()
+    ]
+
+    fur_cols = header_map(fur_rows)
+    fur_order_i = column(fur_cols, "order #", "order number", "order")
+    fur_status_i = column(fur_cols, "status")
+    fur_by_order = row_map(fur_rows, fur_order_i)
+
+    ml_cols = header_map(material_log_rows)
+    ml_order_i = column(ml_cols, "order #", "order number", "order")
+    ml_material_i = column(ml_cols, "material", "materials")
+    ml_qty_i = column(ml_cols, "qty", "quantity")
+    ml_inout_i = column(ml_cols, "in/out", "in out")
+    ml_panel_i = column(ml_cols, "panel")
+
+    jobs_by_key = {}
+    for row in material_log_rows[1:]:
+        if material_key(cell(row, ml_material_i)) != target:
+            continue
+        if str(cell(row, ml_inout_i)).strip().lower() != "out":
+            continue
+        key = order_key(cell(row, ml_order_i))
+        po_row = production_by_order.get(key)
+        if not key or po_row is None:
+            continue
+        stage = str(cell(po_row, po_stage_i)).strip()
+        if re.search(
+            r"complete|shipped|cancel|delivered|closed", stage, re.IGNORECASE
+        ):
+            continue
+        try:
+            required = float(cell(row, ml_qty_i))
+        except (TypeError, ValueError):
+            continue
+        if not isfinite(required) or required <= 0:
+            continue
+
+        panel = str(cell(row, ml_panel_i)).strip().upper() or "FRONT"
+        cut_row = cut_by_order.get(key)
+        fur_row = fur_by_order.get(key)
+        cut_status = str(cell(cut_row or [], cut_status_i)).strip()
+        fur_status = str(cell(fur_row or [], fur_status_i)).strip()
+
+        if panel == "FUR":
+            already_cut = fur_status.upper() == "COMPLETE"
+        else:
+            matching_slots = [
+                index
+                for index, heading in cut_material_slots
+                if material_key(cell(cut_row or [], index)) == target
+                and (
+                    (panel == "BACK" and "back" in heading)
+                    or (panel == "FRONT" and "back" not in heading)
+                    or panel not in {"FRONT", "BACK"}
+                )
+            ]
+            if matching_slots:
+                already_cut = all(
+                    str(cell(cut_row or [], index + 1)).strip()
+                    for index in matching_slots
+                )
+            else:
+                already_cut = cut_status.upper() == "COMPLETE"
+        if already_cut:
+            continue
+
+        dedupe_key = f"{key}|{target}|{panel}"
+        existing = jobs_by_key.get(dedupe_key)
+        if existing and existing["requiredQuantity"] >= required:
+            continue
+        due_value = cell(po_row, po_due_i)
+        if isinstance(due_value, (int, float)) and 35000 <= due_value <= 65000:
+            due_value = (
+                datetime(1899, 12, 30) + timedelta(days=float(due_value))
+            ).strftime("%m/%d/%Y")
+        jobs_by_key[dedupe_key] = {
+            "orderNumber": str(cell(row, ml_order_i)).strip(),
+            "companyName": str(cell(po_row, po_company_i)).strip(),
+            "product": str(cell(po_row, po_product_i)).strip(),
+            "panel": panel,
+            "requiredQuantity": required,
+            "unit": unit,
+            "stage": stage,
+            "cutStatus": cut_status or "NOT STARTED",
+            "furStatus": fur_status or "NOT STARTED",
+            "dueDate": str(due_value or "").strip(),
+        }
+
+    jobs = sorted(
+        jobs_by_key.values(),
+        key=lambda item: (item["dueDate"], item["orderNumber"], item["panel"]),
+    )
+    uncut_demand = sum(item["requiredQuantity"] for item in jobs)
+    target_quantity = physical_quantity - uncut_demand
+    adjustment = target_quantity - current_quantity
+    if abs(adjustment) < 0.000001:
+        adjustment = 0.0
+
+    return {
+        "materialName": material_name,
+        "unit": unit,
+        "physicalQuantity": physical_quantity,
+        "currentQuantity": current_quantity,
+        "uncutDemand": round(uncut_demand, 6),
+        "targetQuantity": round(target_quantity, 6),
+        "adjustment": round(adjustment, 6),
+        "jobs": jobs,
+    }
+
+
+@app.route("/api/materialInventory/readjustment", methods=["GET", "POST"])
+@login_required_session
+def material_inventory_readjustment():
+    """
+    Preview uncut demand or post a labeled balancing Material Log movement.
+    The resulting ledger is physical stock minus demand for jobs not yet cut.
+    """
+    try:
+        payload = (
+            request.args.to_dict()
+            if request.method == "GET"
+            else (request.get_json(silent=True) or {})
+        )
+        material_name = str(payload.get("materialName") or "").strip()
+        quantity_raw = payload.get("physicalQuantity")
+        if not material_name:
+            return jsonify({"error": "Material is required."}), 400
+        try:
+            physical_quantity = float(str(quantity_raw).strip().replace(",", ""))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Physical amount must be a number."}), 400
+        if not isfinite(physical_quantity) or physical_quantity < 0:
+            return (
+                jsonify({"error": "Physical amount must be zero or greater."}),
+                400,
+            )
+
+        with acquire_sheet_lock(timeout=60):
+            preview = _material_readjustment_preview(
+                material_name, physical_quantity
+            )
+            if request.method == "GET":
+                return jsonify(preview), 200
+
+            expected_current = payload.get("expectedCurrentQuantity")
+            expected_uncut = payload.get("expectedUncutDemand")
+            try:
+                preview_is_current = (
+                    expected_current is not None
+                    and expected_uncut is not None
+                    and abs(float(expected_current) - preview["currentQuantity"])
+                    < 0.000001
+                    and abs(float(expected_uncut) - preview["uncutDemand"])
+                    < 0.000001
+                )
+            except (TypeError, ValueError):
+                preview_is_current = False
+            if not preview_is_current:
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                "Inventory or uncut jobs changed. Review the "
+                                "updated adjustment before posting."
+                            ),
+                            "preview": preview,
+                        }
+                    ),
+                    409,
+                )
+
+            adjustment = preview["adjustment"]
+            if adjustment:
+                timestamp = datetime.now(ZoneInfo("America/New_York")).strftime(
+                    "%m/%d/%Y %H:%M:%S"
+                )
+                in_out = "IN" if adjustment > 0 else "OUT"
+                received = "Received" if adjustment > 0 else ""
+                get_sheets_service().spreadsheets().values().append(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range="Material Log!A2:I",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body={
+                        "values": [
+                            [
+                                timestamp,
+                                "READJUSTMENT",
+                                "",
+                                "",
+                                "",
+                                preview["materialName"],
+                                round(abs(adjustment), 6),
+                                in_out,
+                                received,
+                            ]
+                        ]
+                    },
+                ).execute()
+        invalidate_overview_combined_cache()
+        invalidate_materials_needed_cache()
+        invalidate_material_inventory_status_cache()
+        try:
+            socketio.emit(
+                "materialsUpdated",
+                {
+                    "status": "ok",
+                    "source": "material-readjustment",
+                    "material": preview["materialName"],
+                },
+            )
+        except Exception as emit_err:
+            app.logger.warning(
+                "material readjustment socket emit failed: %s", emit_err
+            )
+
+        return jsonify({"status": "updated", **preview}), 200
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except (ValueError, RuntimeError) as e:
+        return jsonify({"error": str(e)}), 409
+    except TimeoutError:
+        return jsonify({"error": "Inventory is busy. Please try again."}), 503
+    except Exception as e:
+        app.logger.exception("Failed to preview or post material readjustment")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/materialInventory", methods=["GET"])
