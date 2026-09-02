@@ -1165,6 +1165,8 @@ QBO_SCOPE = ["com.intuit.quickbooks.accounting"]
 QBO_AUTH_BASE_URL = "https://appcenter.intuit.com/connect/oauth2"
 # Newer minors expose metadata for entities like ShipMethod; override with QBO_MINOR_VERSION if needed.
 QBO_MINOR_VERSION = int(os.environ.get("QBO_MINOR_VERSION", "73"))
+# Never let an Intuit socket hold the only eventlet worker indefinitely.
+QBO_HTTP_TIMEOUT = (10, 45)
 
 
 def get_oauth_credentials():
@@ -2380,7 +2382,7 @@ def fetch_company_info(headers, realm_id, env_override=None):
     res = requests.get(
         url,
         headers={**headers, "Accept": "application/json"},
-        timeout=(10, 30),
+        timeout=QBO_HTTP_TIMEOUT,
     )
     res.raise_for_status()
     info = res.json().get("CompanyInfo", {})
@@ -6119,7 +6121,11 @@ def fetch_invoice_pdf_bytes(invoice_id, realm_id, headers, env_override=None):
     """
     base = get_base_qbo_url(env_override)
     url = f"{base}/v3/company/{realm_id}/invoice/{invoice_id}/pdf"
-    response = requests.get(url, headers={**headers, "Accept": "application/pdf"})
+    response = requests.get(
+        url,
+        headers={**headers, "Accept": "application/pdf"},
+        timeout=QBO_HTTP_TIMEOUT,
+    )
     response.raise_for_status()
     return response.content
 
@@ -6506,7 +6512,10 @@ def get_or_create_customer_ref(
     query_url = f"{base}/v3/company/{realm_id}/query?minorversion={QBO_MINOR_VERSION}"
     query = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
     response = requests.get(
-        query_url, headers=quickbooks_headers, params={"query": query}
+        query_url,
+        headers=quickbooks_headers,
+        params={"query": query},
+        timeout=QBO_HTTP_TIMEOUT,
     )
 
     if response.status_code == 200:
@@ -6546,7 +6555,12 @@ def get_or_create_customer_ref(
 
     # ── 4) Create customer in QuickBooks ──────────────────────────
     create_url = f"{base}/v3/company/{realm_id}/customer"
-    res = requests.post(create_url, headers=quickbooks_headers, json=payload)
+    res = requests.post(
+        create_url,
+        headers=quickbooks_headers,
+        json=payload,
+        timeout=QBO_HTTP_TIMEOUT,
+    )
     if res.status_code in (200, 201):
         data = res.json().get("Customer", {})
         return {"value": data["Id"], "name": data["DisplayName"]}
@@ -6555,7 +6569,12 @@ def get_or_create_customer_ref(
     if res.status_code == 403 and "ApplicationAuthorizationFailed" in res.text:
         print("⚠️ Sandbox blocked creation; retrying with fallback name.")
         payload["DisplayName"] = f"{company_name} Test {int(time.time())}"
-        res2 = requests.post(create_url, headers=quickbooks_headers, json=payload)
+        res2 = requests.post(
+            create_url,
+            headers=quickbooks_headers,
+            json=payload,
+            timeout=QBO_HTTP_TIMEOUT,
+        )
         if res2.status_code in (200, 201):
             data = res2.json().get("Customer", {})
             return {"value": data["Id"], "name": data["DisplayName"]}
@@ -6594,7 +6613,12 @@ def get_sales_of_product_income_account_ref(headers, realm_id, env_override=None
     q_subtype = (
         "SELECT * FROM Account WHERE AccountSubType = 'SalesOfProductIncome' MAXRESULTS 5"
     )
-    r = requests.get(query_url, headers=headers, params={"query": q_subtype})
+    r = requests.get(
+        query_url,
+        headers=headers,
+        params={"query": q_subtype},
+        timeout=QBO_HTTP_TIMEOUT,
+    )
     if r.status_code == 200:
         data = r.json().get("QueryResponse", {}).get("Account") or []
         if isinstance(data, dict):
@@ -6609,7 +6633,12 @@ def get_sales_of_product_income_account_ref(headers, realm_id, env_override=None
             return ref
 
     q_name = f"SELECT * FROM Account WHERE Name = {json.dumps('Sales of Product Income')} MAXRESULTS 5"
-    r2 = requests.get(query_url, headers=headers, params={"query": q_name})
+    r2 = requests.get(
+        query_url,
+        headers=headers,
+        params={"query": q_name},
+        timeout=QBO_HTTP_TIMEOUT,
+    )
     if r2.status_code == 200:
         data = r2.json().get("QueryResponse", {}).get("Account") or []
         if isinstance(data, dict):
@@ -6636,7 +6665,12 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
     query_url = f"{base}/v3/company/{realm_id}/query"
     escaped_name = json.dumps(product_name)  # ensures correct quoting
     query = f"SELECT * FROM Item WHERE Name = {escaped_name}"
-    response = requests.get(query_url, headers=headers, params={"query": query})
+    response = requests.get(
+        query_url,
+        headers=headers,
+        params={"query": query},
+        timeout=QBO_HTTP_TIMEOUT,
+    )
 
     items = response.json().get("QueryResponse", {}).get("Item", [])
 
@@ -6655,7 +6689,12 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
         "IncomeAccountRef": income_ref,
     }
 
-    res = requests.post(create_url, headers=headers, json=payload)
+    res = requests.post(
+        create_url,
+        headers=headers,
+        json=payload,
+        timeout=QBO_HTTP_TIMEOUT,
+    )
     if res.status_code in [200, 201]:
         item = res.json().get("Item", {})
         return {"value": item["Id"], "name": item["Name"]}
@@ -6665,7 +6704,12 @@ def get_or_create_item_ref(product_name, headers, realm_id, env_override=None):
         escaped_name = product_name.replace("'", "''")
         query = f"SELECT * FROM Item WHERE Name = '{escaped_name}'"
         print(f"🔍 Fallback item lookup query: {query}")
-        lookup_res = requests.get(query_url, headers=headers, params={"query": query})
+        lookup_res = requests.get(
+            query_url,
+            headers=headers,
+            params={"query": query},
+            timeout=QBO_HTTP_TIMEOUT,
+        )
         print("🧾 Fallback item lookup response:", lookup_res.text)
 
         existing_items = lookup_res.json().get("QueryResponse", {}).get("Item", [])
@@ -6820,7 +6864,12 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
     create_url = f"{base}/v3/company/{realm_id}/shipmethod?minorversion={QBO_MINOR_VERSION}"
 
     def _query(q):
-        r = requests.get(query_url, headers=headers, params={"query": q})
+        r = requests.get(
+            query_url,
+            headers=headers,
+            params={"query": q},
+            timeout=QBO_HTTP_TIMEOUT,
+        )
         if r.status_code != 200:
             logging.warning(
                 "QBO ShipMethod query HTTP %s (query prefix %.100r): %s",
@@ -6849,6 +6898,7 @@ def get_or_create_ship_method_ref(name, headers, realm_id, env_override=None):
             create_url,
             headers={**headers, "Content-Type": "application/json"},
             json={"Name": label},
+            timeout=QBO_HTTP_TIMEOUT,
         )
         if r2.status_code in (200, 201):
             sm = (r2.json() or {}).get("ShipMethod") or {}
@@ -6957,6 +7007,7 @@ def _qbo_native_shipping_unavailable(headers, realm_id, env_override=None):
         query_url,
         headers=headers,
         params={"query": "SELECT Id FROM ShipMethod MAXRESULTS 1"},
+        timeout=QBO_HTTP_TIMEOUT,
     )
     if r.status_code == 200:
         return False
@@ -7113,7 +7164,12 @@ def get_next_invoice_number(headers, realm_id, env_override=None, fallback_start
     query = (
         "SELECT DocNumber FROM Invoice ORDER BY MetaData.CreateTime DESC MAXRESULTS 1"
     )
-    r = requests.get(query_url, headers=headers, params={"query": query})
+    r = requests.get(
+        query_url,
+        headers=headers,
+        params={"query": query},
+        timeout=QBO_HTTP_TIMEOUT,
+    )
     if r.status_code == 200:
         resp = r.json().get("QueryResponse", {})
         invs = resp.get("Invoice", [])
@@ -7187,7 +7243,7 @@ def _ensure_qbo_invoice_ship_via(
         return
     base = get_base_qbo_url(env_override)
     get_url = f"{base}/v3/company/{realm_id}/invoice/{iid}?minorversion={QBO_MINOR_VERSION}"
-    r = requests.get(get_url, headers=headers)
+    r = requests.get(get_url, headers=headers, timeout=QBO_HTTP_TIMEOUT)
     if r.status_code != 200:
         logging.warning(
             "QBO Ship Via check: GET invoice %s failed HTTP %s: %s",
@@ -7221,6 +7277,7 @@ def _ensure_qbo_invoice_ship_via(
         post_url,
         headers={**headers, "Content-Type": "application/json"},
         json=patch,
+        timeout=QBO_HTTP_TIMEOUT,
     )
     if r2.status_code not in (200, 201):
         logging.warning(
@@ -7274,7 +7331,7 @@ def _qbo_get_invoice(headers, realm_id, invoice_id, env_override=None):
         return None, "missing_id"
     base = get_base_qbo_url(env_override)
     get_url = f"{base}/v3/company/{realm_id}/invoice/{iid}?minorversion={QBO_MINOR_VERSION}"
-    r = requests.get(get_url, headers=headers, timeout=(10, 30))
+    r = requests.get(get_url, headers=headers, timeout=QBO_HTTP_TIMEOUT)
     if r.status_code != 200:
         return None, (r.text or "")[:800]
     try:
@@ -7397,6 +7454,7 @@ def _qbo_sparse_invoice_update(headers, realm_id, invoice_id, sync_token, fields
         post_url,
         headers={**headers, "Content-Type": "application/json"},
         json=body,
+        timeout=QBO_HTTP_TIMEOUT,
     )
     if r2.status_code not in (200, 201):
         return None, (r2.text or "")[:1200]
@@ -8321,7 +8379,12 @@ def _query_invoice_id_by_doc_number(
     base = get_base_qbo_url(env_override)
     query_url = f"{base}/v3/company/{realm_id}/query?minorversion={QBO_MINOR_VERSION}"
     q = f"SELECT Id FROM Invoice WHERE DocNumber = '{dn}' MAXRESULTS 1"
-    r = requests.get(query_url, headers=headers, params={"query": q})
+    r = requests.get(
+        query_url,
+        headers=headers,
+        params={"query": q},
+        timeout=QBO_HTTP_TIMEOUT,
+    )
     if r.status_code != 200:
         logging.warning(
             "QBO Invoice Id lookup by DocNumber failed HTTP %s: %s",
@@ -8628,6 +8691,7 @@ def create_invoice_in_quickbooks(
             invoice_url,
             headers={**headers, "Content-Type": "application/json"},
             json=payload,
+            timeout=QBO_HTTP_TIMEOUT,
         )
 
     invoice_resp = _post_inv(invoice_payload)
@@ -9089,7 +9153,7 @@ def create_consolidated_invoice_in_quickbooks(
             url,
             headers={**headers, "Content-Type": "application/json"},
             json=payload,
-            timeout=(10, 45),
+            timeout=QBO_HTTP_TIMEOUT,
         )
 
     memo_fallback_parts = [f"Ship via: {ship_via_label}"]
