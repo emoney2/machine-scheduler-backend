@@ -2377,7 +2377,11 @@ def fetch_company_info(headers, realm_id, env_override=None):
     """
     base = get_base_qbo_url(env_override)
     url = f"{base}/v3/company/{realm_id}/companyinfo/{realm_id}"
-    res = requests.get(url, headers={**headers, "Accept": "application/json"})
+    res = requests.get(
+        url,
+        headers={**headers, "Accept": "application/json"},
+        timeout=(10, 30),
+    )
     res.raise_for_status()
     info = res.json().get("CompanyInfo", {})
     return {
@@ -7270,7 +7274,7 @@ def _qbo_get_invoice(headers, realm_id, invoice_id, env_override=None):
         return None, "missing_id"
     base = get_base_qbo_url(env_override)
     get_url = f"{base}/v3/company/{realm_id}/invoice/{iid}?minorversion={QBO_MINOR_VERSION}"
-    r = requests.get(get_url, headers=headers)
+    r = requests.get(get_url, headers=headers, timeout=(10, 30))
     if r.status_code != 200:
         return None, (r.text or "")[:800]
     try:
@@ -9085,6 +9089,7 @@ def create_consolidated_invoice_in_quickbooks(
             url,
             headers={**headers, "Content-Type": "application/json"},
             json=payload,
+            timeout=(10, 45),
         )
 
     memo_fallback_parts = [f"Ship via: {ship_via_label}"]
@@ -22055,77 +22060,52 @@ def process_shipment():
             for j in slip_jobs
         ]
 
-        # 8) Upload one packing-slip PDF per box to Drive print folder + local sync
-        drive = get_drive_service()
-        packing_slip_parent_id = _get_packing_slip_print_drive_folder_id(drive)
-        for job in slip_jobs:
-            media = MediaIoBaseUpload(
-                BytesIO(job["pdf_bytes"]), mimetype="application/pdf"
-            )
-            drive.files().create(
-                body={
-                    "name": job["print_name"],
-                    "parents": [packing_slip_parent_id],
-                },
-                media_body=media,
-            ).execute()
-            _try_copy_packing_slip_to_local_sync_folder(
-                job["tmp_path"], job["print_name"]
-            )
-        print(f"✅ {n_slips} packing slip(s) uploaded to watcher folder.")
-
-        # 7b) ALSO upload each box slip into each order's Drive folder
+        # 8) Upload print copies and archive files after responding. These are not needed
+        # to create the invoice, print the packing slips, or mark the order shipped.
+        # Doing N boxes × N orders synchronously can exceed Render's worker timeout
+        # after QBO and UPS have already succeeded, causing retries/duplicate invoices.
         ORDERS_PARENT_FOLDER_ID = os.environ.get(
             "ORDERS_PARENT_FOLDER_ID", "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
         )
 
-        def _find_folder_by_name(name, parent_id):
-            q = (
-                f"name = '{name}' and "
-                f"mimeType = 'application/vnd.google-apps.folder' and "
-                f"trashed = false and "
-                f"'{parent_id}' in parents"
-            )
-            res = drive.files().list(q=q, fields="files(id)").execute()
-            files = res.get("files", []) or []
-            return files[0]["id"] if files else None
+        def _archive_shipment_files_to_order_folders(archive_drive):
+            def _find_folder_by_name(name, parent_id):
+                safe_name = str(name).replace("\\", "\\\\").replace("'", "\\'")
+                q = (
+                    f"name = '{safe_name}' and "
+                    f"mimeType = 'application/vnd.google-apps.folder' and "
+                    f"trashed = false and "
+                    f"'{parent_id}' in parents"
+                )
+                res = archive_drive.files().list(q=q, fields="files(id)").execute()
+                files = res.get("files", []) or []
+                return files[0]["id"] if files else None
 
-        for oid in order_ids:
-            folder_id = _find_folder_by_name(str(oid), ORDERS_PARENT_FOLDER_ID)
-            if not folder_id:
-                # Create the folder if it's missing (no delete!)
-                meta = {
-                    "name": str(oid),
-                    "mimeType": "application/vnd.google-apps.folder",
-                    "parents": [ORDERS_PARENT_FOLDER_ID],
-                }
-                folder_id = drive.files().create(body=meta, fields="id").execute()["id"]
-            for job in slip_jobs:
-                drive.files().create(
-                    body={
-                        "name": f"{oid}_{job['print_name']}",
-                        "parents": [folder_id],
-                    },
-                    media_body=MediaIoBaseUpload(
-                        BytesIO(job["pdf_bytes"]), mimetype="application/pdf"
-                    ),
-                ).execute()
-        print("✅ Packing slips copied into each order folder.")
+            for oid in order_ids:
+                folder_id = _find_folder_by_name(str(oid), ORDERS_PARENT_FOLDER_ID)
+                if not folder_id:
+                    meta = {
+                        "name": str(oid),
+                        "mimeType": "application/vnd.google-apps.folder",
+                        "parents": [ORDERS_PARENT_FOLDER_ID],
+                    }
+                    folder_id = archive_drive.files().create(
+                        body=meta, fields="id"
+                    ).execute()["id"]
+                for job in slip_jobs:
+                    archive_drive.files().create(
+                        body={
+                            "name": f"{oid}_{job['print_name']}",
+                            "parents": [folder_id],
+                        },
+                        media_body=MediaIoBaseUpload(
+                            BytesIO(job["pdf_bytes"]),
+                            mimetype="application/pdf",
+                            resumable=False,
+                        ),
+                    ).execute()
 
-        # 7c) Pre-trim (API raw) + post-trim UPS labels into each order # Drive folder
-        if do_ups and tracking_list and order_ids:
-            try:
-                for oid in order_ids:
-                    folder_id = _find_folder_by_name(str(oid), ORDERS_PARENT_FOLDER_ID)
-                    if not folder_id:
-                        meta = {
-                            "name": str(oid),
-                            "mimeType": "application/vnd.google-apps.folder",
-                            "parents": [ORDERS_PARENT_FOLDER_ID],
-                        }
-                        folder_id = drive.files().create(body=meta, fields="id").execute()[
-                            "id"
-                        ]
+                if do_ups and tracking_list:
                     for trk in tracking_list:
                         safe = re.sub(r"[^\w.\-]+", "_", str(trk))[:120]
                         for ext in ("pdf", "png", "zpl"):
@@ -22144,38 +22124,73 @@ def process_shipment():
                             if os.path.isfile(rpath):
                                 with open(rpath, "rb") as rf:
                                     raw_body = rf.read()
-                                drive.files().create(
+                                archive_drive.files().create(
                                     body={
                                         "name": f"{oid}_label_pretrim_{safe}.{ext}",
                                         "parents": [folder_id],
                                     },
                                     media_body=MediaIoBaseUpload(
-                                        BytesIO(raw_body), mimetype=mime, resumable=False
+                                        BytesIO(raw_body),
+                                        mimetype=mime,
+                                        resumable=False,
                                     ),
                                     supportsAllDrives=True,
                                 ).execute()
                             if os.path.isfile(tpath):
                                 with open(tpath, "rb") as tf:
                                     trim_body = tf.read()
-                                drive.files().create(
+                                archive_drive.files().create(
                                     body={
                                         "name": f"{oid}_label_print_{safe}.{ext}",
                                         "parents": [folder_id],
                                     },
                                     media_body=MediaIoBaseUpload(
-                                        BytesIO(trim_body), mimetype=mime, resumable=False
+                                        BytesIO(trim_body),
+                                        mimetype=mime,
+                                        resumable=False,
                                     ),
                                     supportsAllDrives=True,
                                 ).execute()
                             if os.path.isfile(rpath) or os.path.isfile(tpath):
                                 break
-                logging.info(
-                    "UPS label pretrim/print uploaded to order folders orders=%s trackings=%s",
-                    order_ids,
-                    tracking_list,
+            logging.info(
+                "Shipment archive uploads complete orders=%s slips=%s trackings=%s",
+                order_ids,
+                len(slip_jobs),
+                tracking_list,
+            )
+
+        def _finish_shipment_file_uploads_worker():
+            try:
+                archive_drive = get_drive_service()
+                packing_slip_parent_id = _get_packing_slip_print_drive_folder_id(
+                    archive_drive
                 )
-            except Exception as ex:
-                logging.warning("UPS label copies to order Drive folders failed: %s", ex)
+                for job in slip_jobs:
+                    archive_drive.files().create(
+                        body={
+                            "name": job["print_name"],
+                            "parents": [packing_slip_parent_id],
+                        },
+                        media_body=MediaIoBaseUpload(
+                            BytesIO(job["pdf_bytes"]),
+                            mimetype="application/pdf",
+                            resumable=False,
+                        ),
+                    ).execute()
+                    _try_copy_packing_slip_to_local_sync_folder(
+                        job["tmp_path"], job["print_name"]
+                    )
+                logging.info(
+                    "%s packing slip(s) uploaded to watcher folder",
+                    len(slip_jobs),
+                )
+                _archive_shipment_files_to_order_folders(archive_drive)
+            except Exception:
+                logging.exception(
+                    "Background shipment file uploads failed orders=%s",
+                    order_ids,
+                )
 
         # 8b) Commission ledger + optional Invoice QBO Id / Invoice # on Production Orders
         if not skip_invoice and qbo_invoice_id and headers and realm_id:
@@ -22231,6 +22246,10 @@ def process_shipment():
             print("✅ Shipped quantities written to sheet.")
         else:
             print("⚠️ No updates to push—check order_ids match sheet.")
+
+        # Nonessential archival work must not hold the browser on the yellow
+        # processing overlay after the shipment itself has completed.
+        eventlet.spawn_n(_finish_shipment_file_uploads_worker)
 
         # 10) Respond with CORS headers
         full_label_urls = [
