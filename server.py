@@ -747,6 +747,18 @@ def _get_ppy_lookup():
     return out
 
 
+# Shop-floor calibration: 160 Driver pieces used 9.5 yards instead of the
+# Table calculation of 160 / 14 = 11.4286. Apply only to yard-based cuts;
+# sqft keeps its separate conversion and Driver factor.
+DRIVER_YARD_CALIBRATION = 9.5 / (160.0 / 14.0)
+
+
+def _calibrate_material_yards(product, yards):
+    if "driver" in (product or "").strip().lower():
+        return float(yards) * DRIVER_YARD_CALIBRATION
+    return yards
+
+
 def _compute_usage_units(
     material_name, unit_str, product, width_in, length_in, qty, ppy_lookup
 ):
@@ -773,7 +785,9 @@ def _compute_usage_units(
 
     if unit == "Yards":
         if product and ppy and ppy > 0:
-            return float(qty) / float(ppy)
+            return _calibrate_material_yards(
+                product, float(qty) / float(ppy)
+            )
         if area_in2:
             return (area_in2 * float(qty)) / (36.0 * 54.0)
         return 0.0
@@ -16499,13 +16513,15 @@ def write_material_log_for_order(order_number):
         def normalize_unit(unit):
             return unit.lower().replace(" ", "")
 
-        def compute_usage(mat, base):
+        def compute_usage(mat, base, calibrate_driver_yards=False):
             unit = normalize_unit(inv_map.get(mat, ""))
             if unit in {"sqft", "squarefeet", "squarefoot"}:
                 usage = base * 13.5
                 if "driver" in key:
                     usage *= 1.11
                 return usage
+            if calibrate_driver_yards:
+                return _calibrate_material_yards(product, base)
             return base
 
         # ───────────────────────────────────────────────────────────
@@ -16578,14 +16594,17 @@ def write_material_log_for_order(order_number):
             if pct <= 0 or front_yards <= 0:
                 continue
 
-            base = compute_usage(mat, front_yards)
+            base = compute_usage(mat, front_yards, calibrate_driver_yards=True)
             log(mat, base * (pct / 100))
 
         # ───────────────────────────────────────────────────────────
         # 6) Back material
         back_mat = row[h.get("Back Material")] if "Back Material" in h else ""
         if back_mat and back_yards > 0:
-            log(back_mat, compute_usage(back_mat, back_yards))
+            log(
+                back_mat,
+                compute_usage(back_mat, back_yards, calibrate_driver_yards=True),
+            )
 
         # ───────────────────────────────────────────────────────────
         # 7) Fur logic
@@ -16602,14 +16621,22 @@ def write_material_log_for_order(order_number):
             if is_long_neck and fur_qty > 0:
                 fur_qty *= 1.15
             if fur_qty > 0:
-                log(fur, compute_usage(fur, fur_qty))
+                log(
+                    fur,
+                    compute_usage(fur, fur_qty, calibrate_driver_yards=True),
+                )
 
         # ───────────────────────────────────────────────────────────
         # 8) Foam, magnets, elastic, pouch items
         for mat in ["1/2\" Foam", "3/8\" Foam", "1/4\" Foam", "1/8\" Foam"]:
             v = tbl_float(mat)
             if v > 0:
-                log(mat, compute_usage(mat, (v * qty) / ppy))
+                log(
+                    mat,
+                    compute_usage(
+                        mat, (v * qty) / ppy, calibrate_driver_yards=True
+                    ),
+                )
 
         for mat in ["N Magnets", "S Magnets"]:
             v = tbl_float(mat)
