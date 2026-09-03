@@ -13928,12 +13928,20 @@ def suggest_boxes_api():
     data = request.get_json(silent=True) or {}
     pieces = data.get("pieces") or []
     volume_map = {}
+    history = packhist.load_history()
     try:
         volume_map = packhist.load_product_volume_map(fetch_sheet, SPREADSHEET_ID)
     except Exception:
         logging.exception("suggest-boxes: volume map unavailable")
     try:
-        result = packhist.suggest_boxes(pieces, volume_map=volume_map)
+        sheet_history = packhist.load_history_from_sheet(fetch_sheet, SPREADSHEET_ID)
+        history = packhist.merge_history(sheet_history, history)
+    except Exception:
+        logging.exception("suggest-boxes: durable packing history unavailable")
+    try:
+        result = packhist.suggest_boxes(
+            pieces, history=history, volume_map=volume_map
+        )
     except Exception as e:
         logging.exception("suggest-boxes failed")
         result = {

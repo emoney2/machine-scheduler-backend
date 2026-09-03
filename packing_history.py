@@ -310,6 +310,83 @@ def load_history() -> List[Dict[str, Any]]:
             return []
 
 
+def load_history_from_sheet(
+    fetch_sheet_fn: Callable, spreadsheet_id: str
+) -> List[Dict[str, Any]]:
+    """Load the durable Packing History mirror after a server restart."""
+    try:
+        rows = fetch_sheet_fn(spreadsheet_id, f"'{SHEET_TAB}'!A1:I") or []
+    except Exception:
+        logger.exception("load_history_from_sheet failed")
+        return []
+
+    records: List[Dict[str, Any]] = []
+    for row in rows[1:]:
+        if not isinstance(row, list) or len(row) < 2:
+            continue
+
+        def _json_list(index: int) -> List[Dict[str, Any]]:
+            if len(row) <= index or not row[index]:
+                return []
+            try:
+                value = json.loads(row[index])
+                return value if isinstance(value, list) else []
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return []
+
+        pieces = normalize_pieces(_json_list(6))
+        records.append(
+            {
+                "shipped_at": str(row[0] or "").strip(),
+                "id": str(row[1] or "").strip(),
+                "company": str(row[2] or "").strip() if len(row) > 2 else "",
+                "order_ids": [
+                    x.strip()
+                    for x in str(row[3] or "").split(",")
+                    if x.strip()
+                ]
+                if len(row) > 3
+                else [],
+                "mix_signature": (
+                    str(row[4] or "").strip() if len(row) > 4 else ""
+                )
+                or mix_signature(pieces),
+                "boxes": normalize_boxes_summary(_json_list(5)),
+                "pieces": pieces,
+                "box_contents": normalize_box_contents(_json_list(7)),
+                "tracking_numbers": [
+                    x.strip()
+                    for x in str(row[8] or "").split(",")
+                    if x.strip()
+                ]
+                if len(row) > 8
+                else [],
+            }
+        )
+    return records
+
+
+def merge_history(*sources: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Combine local and durable history without counting mirrored records twice."""
+    merged: List[Dict[str, Any]] = []
+    seen: set = set()
+    for source in sources:
+        for record in source or []:
+            rid = str(record.get("id") or "").strip()
+            fallback = (
+                str(record.get("shipped_at") or ""),
+                str(record.get("mix_signature") or ""),
+                json.dumps(record.get("boxes") or [], sort_keys=True),
+            )
+            key = ("id", rid) if rid else ("record", fallback)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(record)
+    merged.sort(key=lambda r: str(r.get("shipped_at") or ""))
+    return merged[-MAX_RECORDS:]
+
+
 def _save_history_unlocked(records: List[Dict[str, Any]]) -> None:
     _ensure_data_dir()
     trimmed = records[-MAX_RECORDS:]
@@ -875,6 +952,31 @@ def _preferred_preset_order(
     return sorted(SHIP_BOX_PRESETS, key=_preset_vol, reverse=True)
 
 
+def _volume_box_presets(
+    totals: Dict[str, int], capacity: Dict[str, Dict[str, int]]
+) -> List[Dict[str, Any]]:
+    """
+    Boxes eligible for volume-only fitting.
+
+    Without physical dimensions, cube cartons are the safe defaults. Specialty
+    shapes such as 14x5x7 become eligible only after one of these products has
+    actually shipped in that carton.
+    """
+    learned_ids = {
+        pid
+        for prod in totals
+        for bkey in (capacity.get(prod) or {})
+        for pid in [_match_preset_id_for_box_key(bkey)]
+        if pid
+    }
+    return [
+        p
+        for p in SHIP_BOX_PRESETS
+        if (float(p["L"]) == float(p["W"]) == float(p["H"]))
+        or p["id"] in learned_ids
+    ]
+
+
 def _pack_by_volume(
     totals: Dict[str, int],
     volume_map: Dict[str, float],
@@ -892,8 +994,8 @@ def _pack_by_volume(
         return None
 
     items.sort(key=lambda x: x[1], reverse=True)
-    preset_order = _preferred_preset_order(totals, capacity or {})
-    largest_vol = max(_preset_vol(p) for p in SHIP_BOX_PRESETS)
+    volume_presets = _volume_box_presets(totals, capacity or {})
+    largest_vol = max(_preset_vol(p) for p in volume_presets)
     remaining = list(items)
     used: Counter = Counter()
     guard = 0
@@ -905,12 +1007,16 @@ def _pack_by_volume(
             remaining.pop(0)
             continue
 
-        chosen = None
-        for p in preset_order:
-            if _preset_vol(p) + 1e-9 >= first[1]:
-                chosen = p
-                break
-        chosen = chosen or sorted(SHIP_BOX_PRESETS, key=_preset_vol)[-1]
+        remaining_vol = sum(item[1] for item in remaining)
+        target_vol = min(largest_vol, max(first[1], remaining_vol))
+        chosen = next(
+            (
+                p
+                for p in sorted(volume_presets, key=_preset_vol)
+                if _preset_vol(p) + 1e-9 >= target_vol
+            ),
+            max(volume_presets, key=_preset_vol),
+        )
         space = _preset_vol(chosen)
         i = 0
         while i < len(remaining):
