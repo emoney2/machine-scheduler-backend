@@ -6502,27 +6502,98 @@ def get_or_create_customer_ref(
 ):
     """
     Look up a customer in QuickBooks; create if missing.
+
+    QBO name uniqueness is case-insensitive and includes inactive customers. Search
+    both active and inactive records so a returning customer is not recreated.
     """
     import requests
     import time
     import os
 
     # ── 1) Try to fetch from QuickBooks ───────────────────────────
+    company_name = str(company_name or "").strip()
+    if not company_name:
+        raise Exception("❌ Cannot look up a QuickBooks customer without a company name")
+
     base = get_base_qbo_url(env_override)
     query_url = f"{base}/v3/company/{realm_id}/query?minorversion={QBO_MINOR_VERSION}"
-    query = f"SELECT * FROM Customer WHERE DisplayName = '{company_name}'"
-    response = requests.get(
-        query_url,
-        headers=quickbooks_headers,
-        params={"query": query},
-        timeout=QBO_HTTP_TIMEOUT,
+    customer_url = (
+        f"{base}/v3/company/{realm_id}/customer?minorversion={QBO_MINOR_VERSION}"
     )
 
-    if response.status_code == 200:
-        customers = response.json().get("QueryResponse", {}).get("Customer", [])
-        if customers:
-            cust = customers[0]
-            return {"value": cust["Id"], "name": cust["DisplayName"]}
+    def _customer_rows(response):
+        if response.status_code != 200:
+            logging.warning(
+                "QBO customer lookup failed HTTP %s for %r: %s",
+                response.status_code,
+                company_name,
+                (response.text or "")[:800],
+            )
+            return []
+        rows = response.json().get("QueryResponse", {}).get("Customer", [])
+        if isinstance(rows, dict):
+            rows = [rows]
+        return rows or []
+
+    def _customer_ref(customer):
+        if customer.get("Active") is False:
+            sync_token = customer.get("SyncToken")
+            if sync_token is None:
+                raise Exception(
+                    f"❌ QuickBooks customer '{company_name}' is inactive and "
+                    "could not be reactivated because its SyncToken is missing"
+                )
+            activate = requests.post(
+                customer_url,
+                headers={**quickbooks_headers, "Content-Type": "application/json"},
+                json={
+                    "Id": str(customer["Id"]),
+                    "SyncToken": str(sync_token),
+                    "Active": True,
+                    "sparse": True,
+                },
+                timeout=QBO_HTTP_TIMEOUT,
+            )
+            if activate.status_code not in (200, 201):
+                raise Exception(
+                    f"❌ QuickBooks customer '{company_name}' already exists but is "
+                    f"inactive and could not be reactivated: {activate.text}"
+                )
+            customer = activate.json().get("Customer", customer)
+            logging.info("Reactivated returning QBO customer %r", company_name)
+        return {
+            "value": str(customer["Id"]),
+            "name": customer.get("DisplayName") or company_name,
+        }
+
+    def _find_existing_customer():
+        # QBO string literals escape apostrophes with a backslash.
+        escaped_name = company_name.replace("\\", "\\\\").replace("'", "\\'")
+        queries = [
+            (
+                "SELECT * FROM Customer "
+                f"WHERE DisplayName = '{escaped_name}' "
+                "AND Active IN (true, false)"
+            ),
+            f"SELECT * FROM Customer WHERE DisplayName = '{escaped_name}'",
+        ]
+        wanted = " ".join(company_name.split()).casefold()
+        for query in queries:
+            response = requests.get(
+                query_url,
+                headers=quickbooks_headers,
+                params={"query": query},
+                timeout=QBO_HTTP_TIMEOUT,
+            )
+            for customer in _customer_rows(response):
+                display_name = str(customer.get("DisplayName") or "")
+                if " ".join(display_name.split()).casefold() == wanted:
+                    return _customer_ref(customer)
+        return None
+
+    existing_customer = _find_existing_customer()
+    if existing_customer:
+        return existing_customer
 
     # ── 2) Fetch from Google Sheets “Directory” ────────────────────
     match = _fetch_directory_row_by_company(company_name)
@@ -6564,6 +6635,25 @@ def get_or_create_customer_ref(
     if res.status_code in (200, 201):
         data = res.json().get("Customer", {})
         return {"value": data["Id"], "name": data["DisplayName"]}
+
+    # Another request may have created the customer after our first lookup, or
+    # QBO may have omitted an inactive customer. Resolve duplicate 6240 by
+    # looking up and reusing the existing customer.
+    if res.status_code == 400 and (
+        "Duplicate Name Exists Error" in res.text or "6240" in res.text
+    ):
+        existing_customer = _find_existing_customer()
+        if existing_customer:
+            logging.info(
+                "Reusing existing QBO customer %r after duplicate response",
+                company_name,
+            )
+            return existing_customer
+        raise Exception(
+            f"❌ QuickBooks reports that '{company_name}' already exists, but no "
+            "customer with that name could be retrieved. The name may belong to "
+            "a vendor or employee in QuickBooks."
+        )
 
     # ── 5) Sandbox fallback if “ApplicationAuthorizationFailed” ────
     if res.status_code == 403 and "ApplicationAuthorizationFailed" in res.text:
