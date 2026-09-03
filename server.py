@@ -15689,6 +15689,7 @@ def save_links():
         # Keep only the most recent entries (simple truncation)
         items = list(_links_store.items())[-_links_store_max_size:]
         _links_store = dict(items)
+    _bump_embroidery_scheduler_signal()
     socketio.emit("linksUpdated", _links_store)
     return jsonify({"status": "ok"}), 200
 
@@ -16080,6 +16081,8 @@ def save_manual_state():
         global _manual_state_cache, _manual_state_ts
         _manual_state_cache = None
         _manual_state_ts = 0
+        _bump_embroidery_scheduler_signal()
+        socketio.emit("manualStateUpdated", {"source": "manualState"})
 
         return (
             jsonify(
