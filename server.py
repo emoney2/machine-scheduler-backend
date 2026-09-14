@@ -350,6 +350,11 @@ KANBAN_RECEIVED_TYPE = "RECEIVED"
 KANBAN_REQUEST_COOLDOWN_SECS = int(
     os.environ.get("KANBAN_REQUEST_COOLDOWN_SECS", "7200")
 )  # 2h
+KANBAN_SCAN_NOTIFY_EMAIL = (
+    os.environ.get("KANBAN_SCAN_NOTIFY_EMAIL") or "justin.eckard@jrcogolf.com"
+).strip()
+_kanban_scan_email_last: dict[str, float] = {}
+_KANBAN_SCAN_EMAIL_DEDUPE_SECS = 60
 
 
 import re, os
@@ -2907,6 +2912,119 @@ def kanban_upload_card():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _kanban_item_field(item, *names):
+    item = item or {}
+    for name in names:
+        val = item.get(name)
+        if val is not None and str(val).strip() != "":
+            return str(val).strip()
+    return ""
+
+
+def _send_kanban_scan_email(kanban_id, qty, item=None, already_open=False):
+    """Email Justin that a kanban QR was scanned. Uses the same SMTP as design confirmation."""
+    to_email = KANBAN_SCAN_NOTIFY_EMAIL
+    from_email = (os.environ.get("DESIGN_CONFIRMATION_FROM_EMAIL") or "info@jrco.us").strip()
+    smtp_host = (os.environ.get("SMTP_HOST") or "").strip()
+    smtp_port = int(os.environ.get("SMTP_PORT") or "587")
+    smtp_user = (os.environ.get("SMTP_USER") or "").strip()
+    smtp_password = (os.environ.get("SMTP_PASSWORD") or "").strip()
+    if not to_email:
+        logger.warning("[KanbanScan] no recipient email")
+        return False
+    if not smtp_host or not smtp_user or not smtp_password:
+        logger.info("[KanbanScan] SMTP not configured — skipping email")
+        return False
+
+    kid = str(kanban_id or "").strip()
+    dedupe_key = kid.upper() or "?"
+    now = time.time()
+    last = _kanban_scan_email_last.get(dedupe_key, 0)
+    if now - last < _KANBAN_SCAN_EMAIL_DEDUPE_SECS:
+        logger.info("[KanbanScan] skip duplicate email for %s", kid)
+        return False
+    _kanban_scan_email_last[dedupe_key] = now
+
+    item_name = _kanban_item_field(item, "Item Name", "itemName", "name") or "—"
+    sku = _kanban_item_field(item, "SKU", "sku")
+    location = _kanban_item_field(item, "Location", "location")
+    supplier = _kanban_item_field(item, "Supplier", "supplier")
+    try:
+        scanned_at = datetime.now(ZoneInfo("America/New_York")).strftime(
+            "%Y-%m-%d %I:%M %p ET"
+        )
+    except Exception:
+        scanned_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    status_line = (
+        "This card already has an open request."
+        if already_open
+        else "A new reorder request was logged."
+    )
+    subject = f"Kanban scanned — {item_name} ({kid or '?'})"
+    queue_url = "https://machineschedule.netlify.app/kanban/queue"
+    html_body = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: Arial, sans-serif; color: #111; line-height: 1.5;">
+<p><strong>Someone scanned a kanban card.</strong></p>
+<p>{_html_escape(status_line)}</p>
+<p>
+<strong>Item:</strong> {_html_escape(item_name)}<br>
+<strong>Kanban ID:</strong> {_html_escape(kid or "—")}<br>
+<strong>Quantity:</strong> {_html_escape(str(qty or "1"))}<br>
+<strong>SKU:</strong> {_html_escape(sku or "—")}<br>
+<strong>Location:</strong> {_html_escape(location or "—")}<br>
+<strong>Supplier:</strong> {_html_escape(supplier or "—")}<br>
+<strong>When:</strong> {_html_escape(scanned_at)}
+</p>
+<p><a href="{queue_url}">Open kanban queue</a></p>
+</body></html>"""
+    plain = (
+        "Someone scanned a kanban card.\n"
+        f"{status_line}\n\n"
+        f"Item: {item_name}\n"
+        f"Kanban ID: {kid or '—'}\n"
+        f"Quantity: {qty or '1'}\n"
+        f"SKU: {sku or '—'}\n"
+        f"Location: {location or '—'}\n"
+        f"Supplier: {supplier or '—'}\n"
+        f"When: {scanned_at}\n"
+        f"Queue: {queue_url}\n"
+    )
+
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.attach(MIMEText(plain, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.sendmail(from_email, [to_email], msg.as_string())
+        logger.info("[KanbanScan] emailed %s for %s", to_email, kid)
+        return True
+    except Exception as e:
+        logger.warning("[KanbanScan] failed to email %s for %s: %s", to_email, kid, e)
+        return False
+
+
+def _notify_kanban_scanned(kanban_id, qty, item=None, already_open=False):
+    """Fire-and-forget so the scan page does not wait on SMTP."""
+    try:
+        eventlet.spawn_n(
+            _send_kanban_scan_email, kanban_id, qty, item or {}, already_open
+        )
+    except Exception as e:
+        logger.warning("[KanbanScan] failed to schedule email: %s", e)
+
+
 @app.route("/kanban/scan", methods=["GET"])
 def kanban_scan():
     """Public endpoint triggered by QR scan — submits a Google Form entry once."""
@@ -2919,6 +3037,7 @@ def kanban_scan():
 
         # Check if already requested
         rows = _kanban_read_all()
+        _, item = _kanban_find_item_row(rows, kanban_id)
         if rows:
             headers = rows[0]
             hix = _kanban_headers_index(headers)
@@ -2933,6 +3052,7 @@ def kanban_scan():
                     and str(r[kanban_ix]).strip().upper() == kanban_id.strip().upper()
                     and str(r[status_ix]).strip().lower() == "open"
                 ):
+                    _notify_kanban_scanned(kanban_id, qty, item, already_open=True)
                     return """
                     <html>
                       <body style="background:#fff7ed;display:flex;align-items:center;justify-content:center;height:100vh;">
@@ -2957,6 +3077,7 @@ def kanban_scan():
         if r.status_code not in (200, 302):
             return f"<h3>⚠️ Error submitting form ({r.status_code})</h3>", 500
 
+        _notify_kanban_scanned(kanban_id, qty, item, already_open=False)
         return """
         <html>
           <body style="background:#ecfdf5;display:flex;align-items:center;justify-content:center;height:100vh;">
@@ -4381,6 +4502,7 @@ def kanban_request_public():
             body={"values": [[row.get(h, "") for h in KANBAN_HEADERS]]},
         ).execute()
 
+        _notify_kanban_scanned(kanban_id, qty, item, already_open=False)
         return jsonify({"ok": True})
     except Exception as e:
         print(f"❌ Error in kanban_request_public: {e}")
