@@ -1444,6 +1444,46 @@ def _kanban_find_item_row(rows, kanban_id):
     return None, None
 
 
+def _kanban_item_to_frontend(item_row):
+    """Map a Kanban ITEM sheet row to the frontend's editable camelCase model."""
+    item_row = item_row or {}
+
+    def field(*headers):
+        for header in headers:
+            value = item_row.get(header)
+            if value is not None and str(value).strip() != "":
+                return value
+        return ""
+
+    return {
+        "kanbanId": field("Kanban ID"),
+        "itemName": field("Item Name"),
+        "sku": field("SKU"),
+        "dept": field("Dept"),
+        "category": field("Category"),
+        "location": field("Location"),
+        "packageSize": field("Package Size"),
+        "binQtyUnits": field("Bin Qty (units)", "Bin Quantity (units)"),
+        "caseMultiple": field("Case Multiple"),
+        "reorderQtyBasis": field("Reorder Qty (basis)"),
+        "unitsBasis": field("Units Basis (units/cases)"),
+        "leadTimeDays": field("Lead Time (days)"),
+        "orderMethod": field("Order Method (Email/Online)"),
+        "orderEmail": field("Order Email"),
+        "orderUrl": field("Order URL"),
+        "supplier": field("Supplier"),
+        "supplierSku": field("Supplier SKU"),
+        "costPerPkg": field("Cost (per pkg)"),
+        "substitutes": field("Substitutes (Y/N)"),
+        "notes": field("Notes"),
+        "photoUrl": field("Photo URL"),
+        "usageDriver": field("Usage Driver"),
+        "usageCoefficient": field(
+            "Usage Coefficient (cases/100 units)"
+        ),
+    }
+
+
 def _kanban_find_request_row_by_event(event_id):
     """
     Locate a REQUEST row whose Event ID matches (used by mark-ordered / mark-received flows).
@@ -1505,14 +1545,18 @@ def _kanban_upsert_item(item_obj):
     if not kid:
         raise ValueError("Kanban ID required")
 
-    row_index, _existing = _kanban_find_item_row(rows, kid)
-    # Build row array in header order
+    row_index, existing = _kanban_find_item_row(rows, kid)
+    # Merge updates into the existing row so unknown and omitted columns survive.
     out = [""] * len(headers)
     for i, h in enumerate(headers):
         if h == "Type":
             out[i] = KANBAN_ITEM_TYPE
+        elif h in item_obj:
+            out[i] = item_obj[h]
+        elif existing is not None:
+            out[i] = existing.get(h, "")
         else:
-            out[i] = item_obj.get(h, "")
+            out[i] = ""
 
     v = _kanban_values_api()
     if row_index:
@@ -4297,7 +4341,7 @@ def kanban_upsert_item():
                 400,
             )
 
-        # Map to exact sheet headers; anything not passed stays blank
+        # Map frontend fields to the exact one-tab sheet headers.
         item_obj = {
             "Kanban ID": kid,
             "Item Name": name,
@@ -4320,6 +4364,10 @@ def kanban_upsert_item():
             "Substitutes (Y/N)": val(data.get("substitutes")),
             "Notes": val(data.get("notes")),
             "Photo URL": photo,
+            "Usage Driver": val(data.get("usageDriver")),
+            "Usage Coefficient (cases/100 units)": val(
+                data.get("usageCoefficient")
+            ),
         }
 
         result = _kanban_upsert_item(item_obj)  # uses Kanban ID to update or append
@@ -4327,6 +4375,48 @@ def kanban_upsert_item():
     except Exception as e:
         app.logger.exception("kanban_upsert_item failed")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# === KANBAN: manager item list (requires login) ===============================
+@app.route("/api/kanban/items", methods=["GET"])
+@login_required_session
+def kanban_items_manager():
+    """Return Kanban ITEM rows, optionally filtered by ID, name, SKU, or supplier."""
+    try:
+        rows = _kanban_read_all()
+        if not rows:
+            return jsonify({"items": []})
+
+        headers = rows[0]
+        hix = _kanban_headers_index(headers)
+        type_ix = hix.get("Type")
+        if type_ix is None:
+            return jsonify({"items": []})
+
+        query = (request.args.get("q") or "").strip().casefold()
+        items = []
+        for row in rows[1:]:
+            row_type = row[type_ix] if type_ix < len(row) else ""
+            if str(row_type).strip().upper() != KANBAN_ITEM_TYPE:
+                continue
+
+            padded = list(row) + [""] * max(0, len(headers) - len(row))
+            item = _kanban_item_to_frontend(dict(zip(headers, padded)))
+            if query:
+                searchable = (
+                    item["kanbanId"],
+                    item["itemName"],
+                    item["sku"],
+                    item["supplier"],
+                )
+                if not any(query in str(value).casefold() for value in searchable):
+                    continue
+            items.append(item)
+
+        return jsonify({"items": items})
+    except Exception as e:
+        app.logger.exception("kanban_items_manager failed")
+        return jsonify({"error": str(e)}), 500
 
 
 # === KANBAN: public get-item (scan page) ======================================
@@ -4407,37 +4497,7 @@ def kanban_get_item_public():
         else:
             hint = f"Last order {days_since} days ago."
 
-    item_min = {
-        "itemName": item_row.get("Item Name") or "",
-        "sku": item_row.get("SKU") or "",
-        "dept": item_row.get("Dept") or "",
-        "location": item_row.get("Location") or "",
-        "packageSize": item_row.get("Package Size") or "",
-        # ✅ add these so the card shows real numbers instead of "—"
-        "binQtyUnits": (
-            item_row.get("Bin Qty (units)")
-            or item_row.get("Bin Quantity (units)")
-            or item_row.get("binQtyUnits")
-            or item_row.get("binQty")
-            or item_row.get("binQuantity")
-            or ""
-        ),
-        "reorderQtyBasis": (
-            item_row.get("Reorder Qty (basis)")
-            or item_row.get("reorderQtyBasis")
-            or item_row.get("reorderQty")
-            or ""
-        ),
-        # NEW: expose price for the preview
-        "costPerPkg": item_row.get("Cost (per pkg)")
-        or item_row.get("costPerPkg")
-        or "",
-        "orderMethod": item_row.get("Order Method (Email/Online)") or "",
-        "orderEmail": item_row.get("Order Email") or "",
-        "orderUrl": item_row.get("Order URL") or "",
-        "supplier": item_row.get("Supplier") or "",
-        "photoUrl": item_row.get("Photo URL") or "",
-    }
+    item_min = _kanban_item_to_frontend(item_row)
 
     return jsonify(
         {
