@@ -4464,7 +4464,7 @@ def kanban_get_item_public():
         suggested_qty = int(bin_units or 1)
 
     # Minimal history hint (last order time + avg between)
-    now = datetime.utcnow()
+    now = datetime.now(ZoneInfo("UTC"))
     ordered_ts = []
     type_ix = hix.get("Type")
     id_ix = hix.get("Kanban ID")
@@ -4483,6 +4483,8 @@ def kanban_get_item_public():
             if ts:
                 try:
                     dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
                 except Exception:
                     continue
                 ordered_ts.append(dt)
