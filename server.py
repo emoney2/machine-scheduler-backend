@@ -164,6 +164,12 @@ import ship_qbo_file_log as sqlog
 import packing_history as packhist
 import sewing_priority_waiting as sew_waiting
 import embroidery_progress as emb_progress
+from magnet_kanban import (
+    INITIAL_INBOUND_EVENT_ID,
+    MAGNET_KANBAN_ID,
+    build_status as build_magnet_kanban_status,
+    fur_magnet_totals,
+)
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
@@ -355,6 +361,29 @@ KANBAN_SCAN_NOTIFY_EMAIL = (
 ).strip()
 _kanban_scan_email_last: dict[str, float] = {}
 _KANBAN_SCAN_EMAIL_DEDUPE_SECS = 60
+
+# Magnet electronic Kanban baseline. Physical counts can subsequently be reset
+# from the Overview card without changing these deployment defaults.
+MAGNET_BASE_COUNT_PAIRS = int(os.environ.get("MAGNET_BASE_COUNT_PAIRS", "3000"))
+MAGNET_BASELINE_MADE_PAIRS = int(os.environ.get("MAGNET_BASELINE_MADE_PAIRS", "6229"))
+MAGNET_BASELINE_DATE = os.environ.get("MAGNET_BASELINE_DATE", "2026-09-18")
+MAGNET_INITIAL_INBOUND_PAIRS = int(
+    os.environ.get("MAGNET_INITIAL_INBOUND_PAIRS", "5000")
+)
+MAGNET_INITIAL_INBOUND_DUE = os.environ.get(
+    "MAGNET_INITIAL_INBOUND_DUE", "2026-10-03"
+)
+MAGNET_ORDER_QUANTITY_PAIRS = int(
+    os.environ.get("MAGNET_ORDER_QUANTITY_PAIRS", "5000")
+)
+MAGNET_KANBAN_NOTIFY_EMAIL = (
+    os.environ.get("MAGNET_KANBAN_NOTIFY_EMAIL") or "info@jrco.us"
+).strip()
+_magnet_status_cache = {"ts": 0.0, "payload": None}
+_MAGNET_STATUS_TTL_SECONDS = 300
+_magnet_trigger_lock = Semaphore(1)
+_magnet_background_check_last = 0.0
+_MAGNET_BACKGROUND_CHECK_SECONDS = 6 * 60 * 60
 
 
 import re, os
@@ -4701,6 +4730,328 @@ def kanban_queue_manager():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _magnet_config_date(raw, fallback):
+    try:
+        return datetime.strptime(str(raw or "").strip(), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _magnet_rows_to_dicts(values):
+    if not values:
+        return []
+    headers = [str(value or "").strip() for value in values[0]]
+    output = []
+    for raw in values[1:]:
+        row = list(raw or []) + [""] * max(0, len(headers) - len(raw or []))
+        output.append(dict(zip(headers, row)))
+    return output
+
+
+def _magnet_load_source_rows():
+    ranges = [
+        OVERVIEW_PRODUCTION_ORDERS_RANGE,
+        FUR_RANGE,
+        f"{KANBAN_SHEET_TAB}!A1:ZZ",
+    ]
+    with acquire_sheet_lock(timeout=45):
+        response = (
+            get_sheets_service()
+            .spreadsheets()
+            .values()
+            .batchGet(
+                spreadsheetId=SPREADSHEET_ID,
+                ranges=ranges,
+                valueRenderOption="UNFORMATTED_VALUE",
+            )
+            .execute()
+        )
+    value_ranges = response.get("valueRanges", [])
+    while len(value_ranges) < 3:
+        value_ranges.append({})
+    values = [entry.get("values", []) or [] for entry in value_ranges[:3]]
+    return (
+        _magnet_rows_to_dicts(values[0]),
+        _magnet_rows_to_dicts(values[1]),
+        _magnet_rows_to_dicts(values[2]),
+        values[2],
+    )
+
+
+def _magnet_append_event(event, existing_values=None):
+    values = existing_values if existing_values is not None else _kanban_read_all()
+    headers = list(values[0]) if values else list(KANBAN_HEADERS)
+    api = _kanban_values_api()
+    if not values:
+        api.update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{KANBAN_SHEET_TAB}!A1",
+            valueInputOption="RAW",
+            body={"values": [headers]},
+        ).execute()
+    api.append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{KANBAN_SHEET_TAB}!A2",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [[event.get(header, "") for header in headers]]},
+    ).execute()
+
+
+def _magnet_active_request(kanban_rows):
+    for row in reversed(kanban_rows or []):
+        if str(row.get("Kanban ID") or "").strip().upper() != MAGNET_KANBAN_ID:
+            continue
+        if str(row.get("Type") or "").strip().upper() != KANBAN_REQUEST_TYPE:
+            continue
+        status = str(row.get("Event Status") or "").strip().lower()
+        if status in ("open", "ordered"):
+            return {
+                "eventId": str(row.get("Event ID") or "").strip(),
+                "status": status,
+                "quantity": int(float(row.get("Event Qty") or 0)),
+            }
+    return None
+
+
+def _send_magnet_reorder_email(status):
+    to_email = MAGNET_KANBAN_NOTIFY_EMAIL
+    from_email = (
+        os.environ.get("DESIGN_CONFIRMATION_FROM_EMAIL") or "info@jrco.us"
+    ).strip()
+    smtp_host = (os.environ.get("SMTP_HOST") or "").strip()
+    smtp_port = int(os.environ.get("SMTP_PORT") or "587")
+    smtp_user = (os.environ.get("SMTP_USER") or "").strip()
+    smtp_password = (os.environ.get("SMTP_PASSWORD") or "").strip()
+    if not to_email or not smtp_host or not smtp_user or not smtp_password:
+        logger.warning("[MagnetKanban] SMTP not configured; reorder email not sent")
+        return False
+
+    quantity = int(status.get("recommendedOrderPairs") or 0)
+    subject = f"ORDER MAGNETS — {quantity:,} N and {quantity:,} S"
+    queue_url = "https://machineschedule.netlify.app/kanban/queue"
+    plain = (
+        "The electronic magnet Kanban reached its reorder point.\n\n"
+        f"Order: {quantity:,} north magnets and {quantity:,} south magnets\n"
+        f"Inventory position: {int(status.get('inventoryPositionPairs') or 0):,} pairs\n"
+        f"Reorder point: {int(status.get('reorderPointPairs') or 0):,} pairs\n"
+        f"Physical on hand: {int(status.get('physicalPairs') or 0):,} of each\n"
+        f"Committed to unfinished work: {int(status.get('committedPairs') or 0):,} pairs\n"
+        f"Forecast demand: {status.get('weeklyDemandPairs') or 0} pairs/week\n"
+        f"Queue: {queue_url}\n"
+    )
+
+    import smtplib
+    from email.mime.text import MIMEText
+
+    message = MIMEText(plain, "plain")
+    message["Subject"] = subject
+    message["From"] = from_email
+    message["To"] = to_email
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.sendmail(from_email, [to_email], message.as_string())
+        logger.info("[MagnetKanban] reorder email sent to %s", to_email)
+        return True
+    except Exception as exc:
+        logger.warning("[MagnetKanban] reorder email failed: %s", exc)
+        return False
+
+
+def _magnet_create_request_if_needed(status):
+    with _magnet_trigger_lock:
+        values = _kanban_read_all()
+        rows = _magnet_rows_to_dicts(values)
+        active = _magnet_active_request(rows)
+        if active:
+            return active
+
+        event_id = f"MAG-{uuid4().hex[:12].upper()}"
+        quantity = int(status.get("recommendedOrderPairs") or MAGNET_ORDER_QUANTITY_PAIRS)
+        now_iso = _now_iso_utc()
+        event = {
+            "Type": KANBAN_REQUEST_TYPE,
+            "Kanban ID": MAGNET_KANBAN_ID,
+            "Item Name": "North + South Headcover Magnets",
+            "SKU": "MAGNET-N-S",
+            "Dept": "Purchasing",
+            "Category": "Magnets",
+            "Reorder Qty (basis)": quantity,
+            "Units Basis (units/cases)": "pairs",
+            "Lead Time (days)": 70,
+            "Order Method (Email/Online)": "Email",
+            "Order Email": MAGNET_KANBAN_NOTIFY_EMAIL,
+            "Notes": (
+                f"Electronic trigger at {status.get('inventoryPositionPairs')} pairs; "
+                f"reorder point {status.get('reorderPointPairs')} pairs."
+            ),
+            "Event ID": event_id,
+            "Event Qty": quantity,
+            "Event Status": "Open",
+            "Requested By": "Electronic Magnet Kanban",
+            "Timestamp": now_iso,
+        }
+        _magnet_append_event(event, values)
+        active = {"eventId": event_id, "status": "open", "quantity": quantity}
+        try:
+            eventlet.spawn_n(_send_magnet_reorder_email, dict(status))
+        except Exception as exc:
+            logger.warning("[MagnetKanban] could not schedule reorder email: %s", exc)
+        return active
+
+
+def _magnet_status(force=False, allow_trigger=True):
+    now = time.time()
+    cached = _magnet_status_cache.get("payload")
+    if (
+        not force
+        and cached is not None
+        and now - float(_magnet_status_cache.get("ts") or 0) < _MAGNET_STATUS_TTL_SECONDS
+    ):
+        return cached
+
+    production_rows, fur_rows, kanban_rows, _kanban_values = _magnet_load_source_rows()
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    status = build_magnet_kanban_status(
+        production_rows,
+        fur_rows,
+        kanban_rows,
+        today=today,
+        base_count_pairs=MAGNET_BASE_COUNT_PAIRS,
+        baseline_made_pairs=MAGNET_BASELINE_MADE_PAIRS,
+        baseline_date=_magnet_config_date(MAGNET_BASELINE_DATE, date(2026, 9, 18)),
+        initial_inbound_pairs=MAGNET_INITIAL_INBOUND_PAIRS,
+        initial_inbound_due=_magnet_config_date(
+            MAGNET_INITIAL_INBOUND_DUE, date(2026, 10, 3)
+        ),
+        order_quantity_pairs=MAGNET_ORDER_QUANTITY_PAIRS,
+    )
+    if allow_trigger and status.get("shouldCreateRequest"):
+        status["activeRequest"] = _magnet_create_request_if_needed(status)
+        status["shouldCreateRequest"] = False
+    _magnet_status_cache["ts"] = now
+    _magnet_status_cache["payload"] = status
+    return status
+
+
+def _invalidate_magnet_status():
+    _magnet_status_cache["ts"] = 0.0
+    _magnet_status_cache["payload"] = None
+
+
+def _magnet_background_status_check():
+    try:
+        _magnet_status(force=True, allow_trigger=True)
+    except Exception:
+        logger.exception("[MagnetKanban] scheduled status check failed")
+
+
+@app.before_request
+def schedule_magnet_kanban_check():
+    """Run the reorder check at least every six hours while the service is active."""
+    global _magnet_background_check_last
+    now = time.time()
+    if now - _magnet_background_check_last < _MAGNET_BACKGROUND_CHECK_SECONDS:
+        return None
+    _magnet_background_check_last = now
+    try:
+        eventlet.spawn_n(_magnet_background_status_check)
+    except Exception:
+        logger.exception("[MagnetKanban] could not schedule background check")
+    return None
+
+
+@app.route("/api/kanban/magnets/status", methods=["GET"])
+@login_required_session
+def magnet_kanban_status():
+    try:
+        force = str(request.args.get("fresh") or "").strip().lower() in ("1", "true", "yes")
+        return jsonify(_magnet_status(force=force, allow_trigger=True))
+    except Exception as exc:
+        logger.exception("[MagnetKanban] status failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/kanban/magnets/receive-initial", methods=["POST"])
+@login_required_session
+def magnet_kanban_receive_initial():
+    try:
+        values = _kanban_read_all()
+        rows = _magnet_rows_to_dicts(values)
+        already_received = any(
+            str(row.get("Kanban ID") or "").strip().upper() == MAGNET_KANBAN_ID
+            and str(row.get("Type") or "").strip().upper() == KANBAN_RECEIVED_TYPE
+            and str(row.get("Event ID") or "").strip() == INITIAL_INBOUND_EVENT_ID
+            for row in rows
+        )
+        if not already_received:
+            _magnet_append_event(
+                {
+                    "Type": KANBAN_RECEIVED_TYPE,
+                    "Kanban ID": MAGNET_KANBAN_ID,
+                    "Item Name": "North + South Headcover Magnets",
+                    "SKU": "MAGNET-N-S",
+                    "Units Basis (units/cases)": "pairs",
+                    "Event ID": INITIAL_INBOUND_EVENT_ID,
+                    "Event Qty": MAGNET_INITIAL_INBOUND_PAIRS,
+                    "Event Status": "Received",
+                    "Received By": (
+                        request.headers.get("X-User-Name") or "Manager"
+                    ).strip(),
+                    "Timestamp": _now_iso_utc(),
+                    "Notes": "Initial 5,000 N + 5,000 S shipment due 2026-10-03.",
+                },
+                values,
+            )
+        _invalidate_magnet_status()
+        return jsonify(_magnet_status(force=True, allow_trigger=True))
+    except Exception as exc:
+        logger.exception("[MagnetKanban] receive initial shipment failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/kanban/magnets/count", methods=["POST"])
+@login_required_session
+def magnet_kanban_record_count():
+    try:
+        data = request.get_json(silent=True) or {}
+        north = int(float(data.get("north")))
+        south = int(float(data.get("south")))
+        if north < 0 or south < 0:
+            raise ValueError("counts must be non-negative")
+        production_rows, fur_rows, _kanban_rows, kanban_values = _magnet_load_source_rows()
+        del production_rows
+        made_pairs = fur_magnet_totals(fur_rows)["madePairs"]
+        _magnet_append_event(
+            {
+                "Type": "MAGNET_COUNT",
+                "Kanban ID": MAGNET_KANBAN_ID,
+                "Item Name": "North + South Headcover Magnets",
+                "SKU": "MAGNET-N-S",
+                "Event Qty": min(north, south),
+                "Event Status": "Counted",
+                "Requested By": (
+                    request.headers.get("X-User-Name") or "Manager"
+                ).strip(),
+                "Timestamp": _now_iso_utc(),
+                "Notes": json.dumps(
+                    {"north": north, "south": south, "madePairs": made_pairs},
+                    separators=(",", ":"),
+                ),
+            },
+            kanban_values,
+        )
+        _invalidate_magnet_status()
+        return jsonify(_magnet_status(force=True, allow_trigger=True))
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        logger.exception("[MagnetKanban] count update failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/api/kanban/ordered", methods=["POST"])
 @login_required_session
 def kanban_mark_ordered_v2():
@@ -4811,6 +5162,8 @@ def kanban_mark_ordered_v2():
             body={"values": [cur[: len(headers)]]},
         ).execute()
 
+    if str(req.get("Kanban ID") or "").strip().upper() == MAGNET_KANBAN_ID:
+        _invalidate_magnet_status()
     return jsonify({"ok": True})
 
 
@@ -4917,6 +5270,8 @@ def kanban_mark_received():
             body={"values": [cur[: len(headers)]]},
         ).execute()
 
+    if str(req.get("Kanban ID") or "").strip().upper() == MAGNET_KANBAN_ID:
+        _invalidate_magnet_status()
     return jsonify({"ok": True})
 
 
