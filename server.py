@@ -9609,13 +9609,13 @@ def create_consolidated_invoice_in_quickbooks(
         _qbo_invoice_credit_card_payment_fields() if wants_cc_invoice else {}
     )
 
-    # Keep an ordinary Shipping product line and QBO's reserved shipping-box line together for
-    # now. The reserved SHIPPING_ITEM_ID line is what populates the Shipping box in QBO's UI.
-    include_shipping_sales_line = True
+    # QBO's reserved SHIPPING_ITEM_ID line populates the dedicated Shipping box. Do not also
+    # add the ordinary Shipping product line, which would duplicate the charge.
+    include_shipping_sales_line = False
     ups_ship_line_inserted = False
 
     def _lines_with_optional_ups_ship_line(base_lines):
-        """Append both the ordinary Shipping item and QBO's dedicated Shipping-box line."""
+        """Append QBO's dedicated Shipping-box line, plus the legacy product line if enabled."""
         nonlocal ups_ship_line_inserted
         out = list(base_lines)
         if not (ship_amt_r > 0):
@@ -9850,9 +9850,8 @@ def create_consolidated_invoice_in_quickbooks(
         "yes",
     )
     qbo_native_ship_off = _qbo_native_shipping_unavailable(headers, realm_id, env_override)
-    # Temporary requested behavior: keep the normal Shipping product line as well as the
-    # reserved SHIPPING_ITEM_ID line that QBO renders in its dedicated Shipping box.
-    include_shipping_sales_line = ship_amt_r > 0
+    # The reserved line renders in QBO's Shipping box; the ordinary product line is disabled.
+    include_shipping_sales_line = False
     logging.info(
         "Consolidated invoice freight mode: qbo_native_ship_off=%s "
         "include_shipping_sales_line=%s include_shipping_box_line=%s "
