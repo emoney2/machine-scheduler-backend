@@ -8002,6 +8002,8 @@ def _qbo_invoice_shipping_snapshot(inv):
     lines = inv.get("Line") or []
     n_lines = len(lines) if isinstance(lines, list) else 0
     ship_desc_lines = 0
+    shipping_box_lines = 0
+    shipping_box_amount = 0.0
     if isinstance(lines, list):
         for ln in lines:
             if not isinstance(ln, dict):
@@ -8009,6 +8011,22 @@ def _qbo_invoice_shipping_snapshot(inv):
             d = str(ln.get("Description") or "")
             if d.startswith("Shipping ("):
                 ship_desc_lines += 1
+            detail = (
+                ln.get("SalesItemLineDetail")
+                if isinstance(ln.get("SalesItemLineDetail"), dict)
+                else {}
+            )
+            item_ref = (
+                detail.get("ItemRef")
+                if isinstance(detail.get("ItemRef"), dict)
+                else {}
+            )
+            if str(item_ref.get("value") or "").strip() == "SHIPPING_ITEM_ID":
+                shipping_box_lines += 1
+                try:
+                    shipping_box_amount += float(ln.get("Amount") or 0)
+                except (TypeError, ValueError):
+                    pass
     try:
         total = round(float(inv.get("TotalAmt") or 0), 2)
     except (TypeError, ValueError):
@@ -8023,6 +8041,8 @@ def _qbo_invoice_shipping_snapshot(inv):
         "CustomerMemo_preview": memo_s or None,
         "Line_count": n_lines,
         "shipping_sales_line_count": ship_desc_lines,
+        "shipping_box_line_count": shipping_box_lines,
+        "shipping_box_amount": round(shipping_box_amount, 2),
     }
 
 
@@ -8069,13 +8089,16 @@ def _qbo_log_invoice_shipping_diagnostics(
         )
     try:
         wa = float(wanted_ship_amt or 0)
-        sa = float(snap.get("ShipAmt") or 0)
+        sa = max(
+            float(snap.get("ShipAmt") or 0),
+            float(snap.get("shipping_box_amount") or 0),
+        )
     except (TypeError, ValueError):
         wa, sa = 0.0, 0.0
     if wa > 0.01 and sa <= 0.001:
         logging.warning(
             "QBO ship-field STILL_EMPTY: stage=%s invoice_id=%s wanted_ShipAmt=%s but QBO ShipAmt=%s "
-            "(API often rejects ShipAmt when ShipMethod entity is unavailable for this company).",
+            "(neither ShipAmt nor the reserved SHIPPING_ITEM_ID line persisted).",
             stage,
             invoice_id,
             wa,
@@ -8336,7 +8359,13 @@ def _qbo_ensure_invoice_shipping_complete(
         return False
     snap = _qbo_invoice_shipping_snapshot(inv)
     try:
-        cur_amt = round(float(snap.get("ShipAmt") or 0), 2)
+        cur_amt = round(
+            max(
+                float(snap.get("ShipAmt") or 0),
+                float(snap.get("shipping_box_amount") or 0),
+            ),
+            2,
+        )
     except (TypeError, ValueError):
         cur_amt = 0.0
     has_line = int(snap.get("shipping_sales_line_count") or 0) > 0
@@ -8397,7 +8426,13 @@ def _qbo_ensure_invoice_shipping_complete(
     if inv2:
         snap2 = _qbo_invoice_shipping_snapshot(inv2)
         try:
-            cur_amt2 = round(float(snap2.get("ShipAmt") or 0), 2)
+            cur_amt2 = round(
+                max(
+                    float(snap2.get("ShipAmt") or 0),
+                    float(snap2.get("shipping_box_amount") or 0),
+                ),
+                2,
+            )
         except (TypeError, ValueError):
             cur_amt2 = 0.0
         has_line2 = int(snap2.get("shipping_sales_line_count") or 0) > 0
@@ -9054,29 +9089,20 @@ def _qbo_invoice_record_url(realm_id, invoice_id, env_override=None):
     Browser link to open the invoice editor for an existing invoice.
 
     txnId must be the QuickBooks API entity Id for the Invoice (same as in API responses),
-    not the customer-facing DocNumber. Production deeplink uses app.qbo.intuit.com.
-
-    companyId / deeplinkcompanyid (realm id) help QBO open the correct company file so the
-    link does not fall through to a blank / new-invoice screen.
+    not the customer-facing DocNumber.
     """
     iid = str(invoice_id or "").strip()
     if not iid:
         return ""
     e = str(env_override or QBO_ENV or os.getenv("QBO_ENV") or "sandbox").strip().lower()
     txn = urllib.parse.quote(iid, safe="")
-    cid = urllib.parse.quote(str(realm_id or "").strip(), safe="")
-    # Production sessions and deeplinks are most reliable on app.qbo.intuit.com (matches OAuth return).
+    # QBO's existing-transaction route expects the minimal txnId URL. Extra txnType/company
+    # parameters on app.qbo.intuit.com can fall through to the blank new-invoice editor.
     if e in ("production", "prod", "live"):
-        base = "https://app.qbo.intuit.com"
+        base = "https://qbo.intuit.com"
     else:
-        base = "https://app.sandbox.qbo.intuit.com"
-    # txnType helps QBO open the existing sales invoice instead of a blank "new invoice" editor.
-    if cid:
-        return (
-            f"{base}/app/invoice?txnId={txn}&txnType=Invoice"
-            f"&companyId={cid}&deeplinkcompanyid={cid}"
-        )
-    return f"{base}/app/invoice?txnId={txn}&txnType=Invoice"
+        base = "https://sandbox.qbo.intuit.com"
+    return f"{base}/app/invoice?txnId={txn}"
 
 
 def fetch_customer_email_from_directory(sheet_service, company_name):
@@ -9583,38 +9609,50 @@ def create_consolidated_invoice_in_quickbooks(
         _qbo_invoice_credit_card_payment_fields() if wants_cc_invoice else {}
     )
 
-    # When ShipMethod API works, use native ShipAmt + Ship Via only (matches printed invoices).
-    # Add a Shipping sales line only when native delivery fields are unavailable or ShipMethod is missing.
+    # Keep an ordinary Shipping product line and QBO's reserved shipping-box line together for
+    # now. The reserved SHIPPING_ITEM_ID line is what populates the Shipping box in QBO's UI.
     include_shipping_sales_line = True
     ups_ship_line_inserted = False
 
     def _lines_with_optional_ups_ship_line(base_lines):
-        """Append a Shipping sales line when freight > 0 and native ShipAmt is not reliable."""
+        """Append both the ordinary Shipping item and QBO's dedicated Shipping-box line."""
         nonlocal ups_ship_line_inserted
         out = list(base_lines)
-        if not include_shipping_sales_line or not (ship_amt_r > 0):
+        if not (ship_amt_r > 0):
             return out
-        try:
-            ship_item = get_or_create_item_ref(
-                "Shipping", headers, realm_id, env_override
-            )
-            out.append(
-                {
-                    "DetailType": "SalesItemLineDetail",
-                    "Amount": float(ship_amt_r),
-                    "Description": f"Shipping ({ship_via_label})",
-                    "SalesItemLineDetail": {
-                        "ItemRef": {"value": str(ship_item["value"])},
-                        "Qty": 1.0,
-                        "UnitPrice": float(ship_amt_r),
-                    },
-                }
-            )
-            ups_ship_line_inserted = True
-        except Exception as ex:
-            logging.warning(
-                "Consolidated invoice: optional Shipping sales line not added: %s", ex
-            )
+        if include_shipping_sales_line:
+            try:
+                ship_item = get_or_create_item_ref(
+                    "Shipping", headers, realm_id, env_override
+                )
+                out.append(
+                    {
+                        "DetailType": "SalesItemLineDetail",
+                        "Amount": float(ship_amt_r),
+                        "Description": f"Shipping ({ship_via_label})",
+                        "SalesItemLineDetail": {
+                            "ItemRef": {"value": str(ship_item["value"])},
+                            "Qty": 1.0,
+                            "UnitPrice": float(ship_amt_r),
+                        },
+                    }
+                )
+                ups_ship_line_inserted = True
+            except Exception as ex:
+                logging.warning(
+                    "Consolidated invoice: ordinary Shipping sales line not added: %s",
+                    ex,
+                )
+        out.append(
+            {
+                "DetailType": "SalesItemLineDetail",
+                "Amount": float(ship_amt_r),
+                "Description": "Shipping",
+                "SalesItemLineDetail": {
+                    "ItemRef": {"value": "SHIPPING_ITEM_ID"},
+                },
+            }
+        )
         return out
 
     qbo_dir_overlays = _directory_qbo_invoice_overlays(
@@ -9640,32 +9678,12 @@ def create_consolidated_invoice_in_quickbooks(
         When ShipMethodRef is unavailable, CustomerMemo is always set (ship via / tracking / freight hint)
         so the customer-facing message area is not blank — the Ship Via dropdown itself may stay empty (API).
         """
-        lines = list(line_items)
-        ship_line_appended = False
-        if ship_amt_r > 0:
-            try:
-                ship_item = get_or_create_item_ref(
-                    "Shipping", headers, realm_id, env_override
-                )
-                lines.append(
-                    {
-                        "DetailType": "SalesItemLineDetail",
-                        "Amount": float(ship_amt_r),
-                        "Description": f"Shipping ({ship_via_label})",
-                        "SalesItemLineDetail": {
-                            "ItemRef": {"value": str(ship_item["value"])},
-                            "Qty": 1.0,
-                            "UnitPrice": float(ship_amt_r),
-                        },
-                    }
-                )
-                ship_line_appended = True
-            except Exception as ex:
-                logging.warning(
-                    "Consolidated invoice: could not add Shipping line item: %s", ex
-                )
         if cc_fee_line:
-            lines.append(cc_fee_line)
+            base_lines = list(line_items) + [cc_fee_line]
+        else:
+            base_lines = list(line_items)
+        lines = _lines_with_optional_ups_ship_line(base_lines)
+        ship_line_appended = ups_ship_line_inserted
         memo_bits_fb = []
         if os.getenv("QBO_SHIPPING_CUSTOMER_MEMO_ON_CREATE", "").strip().lower() in (
             "1",
@@ -9799,6 +9817,27 @@ def create_consolidated_invoice_in_quickbooks(
             timeout=QBO_HTTP_TIMEOUT,
         )
 
+    def _without_shipping_box_line(payload):
+        """Keep invoice creation viable if this QBO company rejects SHIPPING_ITEM_ID."""
+        def _is_shipping_box_line(line):
+            if not isinstance(line, dict):
+                return False
+            detail = line.get("SalesItemLineDetail")
+            if not isinstance(detail, dict):
+                return False
+            item_ref = detail.get("ItemRef")
+            return isinstance(item_ref, dict) and str(
+                item_ref.get("value") or ""
+            ).strip() == "SHIPPING_ITEM_ID"
+
+        out = deepcopy(payload)
+        out["Line"] = [
+            ln
+            for ln in (out.get("Line") or [])
+            if not _is_shipping_box_line(ln)
+        ]
+        return out
+
     memo_fallback_parts = [f"Ship via: {ship_via_label}"]
     if ship_amt_r > 0:
         memo_fallback_parts.append(f"Shipping ${ship_amt_r:.2f}")
@@ -9811,25 +9850,23 @@ def create_consolidated_invoice_in_quickbooks(
         "yes",
     )
     qbo_native_ship_off = _qbo_native_shipping_unavailable(headers, realm_id, env_override)
-    include_shipping_sales_line = bool(
-        qbo_native_ship_off
-        or not (
-            isinstance(ship_method_ref_payload, dict)
-            and str(ship_method_ref_payload.get("value") or "").strip()
-        )
-    )
+    # Temporary requested behavior: keep the normal Shipping product line as well as the
+    # reserved SHIPPING_ITEM_ID line that QBO renders in its dedicated Shipping box.
+    include_shipping_sales_line = ship_amt_r > 0
     logging.info(
-        "Consolidated invoice freight mode: qbo_native_ship_off=%s include_shipping_sales_line=%s "
+        "Consolidated invoice freight mode: qbo_native_ship_off=%s "
+        "include_shipping_sales_line=%s include_shipping_box_line=%s "
         "ship_amt_r=%s has_ShipMethodRef=%s",
         qbo_native_ship_off,
         include_shipping_sales_line,
+        ship_amt_r > 0,
         ship_amt_r,
         bool(
             isinstance(ship_method_ref_payload, dict)
             and str(ship_method_ref_payload.get("value") or "").strip()
         ),
     )
-    if qbo_native_ship_off and (ship_amt_r > 0 or track_parts):
+    if ship_amt_r > 0 or track_parts:
         enabled_ok, enabled_detail = _qbo_try_enable_shipping_preferences(
             headers, realm_id, env_override
         )
@@ -9844,7 +9881,8 @@ def create_consolidated_invoice_in_quickbooks(
             )
         else:
             logging.warning(
-                "QBO shipping-preference enable attempt failed/skipped detail=%s; native shipping may remain unavailable",
+                "QBO shipping-preference enable attempt failed/skipped detail=%s; "
+                "the reserved Shipping-box line may be rejected",
                 enabled_detail,
             )
     if qbo_native_ship_off and (ship_amt_r > 0 or track_parts):
@@ -10194,6 +10232,15 @@ def create_consolidated_invoice_in_quickbooks(
             logging.warning("Retrying QBO invoice create without TrackingNum (explicit fault text)")
             res = _post_inv(inv2)
             invoice_payload = inv2
+    if _qbo_still_bad() and _qbo_is_2010():
+        without_box = _without_shipping_box_line(invoice_payload)
+        if len(without_box.get("Line") or []) < len(invoice_payload.get("Line") or []):
+            logging.warning(
+                "QBO rejected the reserved SHIPPING_ITEM_ID line after shipping-preference "
+                "enable attempts; retrying without the Shipping-box line so shipment can finish"
+            )
+            invoice_payload = without_box
+            res = _post_inv(invoice_payload)
     if res.status_code not in (200, 201):
         logging.error("❌ QBO invoice creation failed: %s", res.text)
         raise Exception(f"QuickBooks invoice creation failed: {res.text}")
