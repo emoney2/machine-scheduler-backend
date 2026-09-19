@@ -103,6 +103,7 @@ class ScheduleTests(unittest.TestCase):
         )
         without = build_schedule([base], thread_inventory=inventory(), now=NOW)
         self.assertTrue(any(c["type"] == "sewing_unscheduled" for c in without["conflicts"]))
+        self.assertGreater(sum(r["capacityUnits"] for r in without["sewing"] if r["orderNumber"] == "100"), 0)
         cfg = SchedulerConfig.from_dict({"approvedEmergencyDates": ["2026-09-21"]})
         with_extra = build_schedule([base], config=cfg, thread_inventory=inventory(), now=NOW)
         self.assertFalse(any(c["type"] == "sewing_unscheduled" for c in with_extra["conflicts"]))
@@ -131,11 +132,34 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(result["shippingGroups"][0]["requiredShipDate"], "2026-09-25")
         self.assertTrue(any(w["type"] == "shipping_group_date_conflict" for w in result["warnings"]))
 
-    def test_missing_shipping_address_blocks(self):
+    def test_missing_shipping_address_warns_but_still_schedules(self):
         result = build_schedule(
             [order(100, _shipping_address={})], thread_inventory=inventory(), now=NOW
         )
-        self.assertTrue(any(c["type"] == "shipping_address_required" for c in result["conflicts"]))
+        self.assertTrue(any(c["type"] == "shipping_address_required" for c in result["warnings"]))
+        self.assertTrue(any(r["orderNumber"] == "100" for r in result["sewing"]))
+        self.assertTrue(any(r["orderNumber"] == "100" for r in result["embroidery"]))
+
+    def test_past_ship_date_is_still_placed(self):
+        result = build_schedule(
+            [order(100, Quantity=40, **{"Ship Date": "09/10/2026", "Due Date": "09/10/2026"})],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
+        self.assertTrue(rows)
+        self.assertTrue(any(r["late"] for r in rows))
+        self.assertGreaterEqual(min(r["date"] for r in rows), "2026-09-21")
+
+    def test_ordered_without_stitches_stays_on_sewing_only(self):
+        result = build_schedule(
+            [order(100, Stage="ORDERED", **{"Stitch Count": 0, "Threads": ""})],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        self.assertTrue(any(r["orderNumber"] == "100" for r in result["sewing"]))
+        self.assertFalse(any(r["orderNumber"] == "100" for r in result["embroidery"]))
+        self.assertTrue(any(w["type"] == "missing_stitch_count" for w in result["warnings"]))
 
     def test_weekends_and_holidays_are_skipped(self):
         result = build_schedule(

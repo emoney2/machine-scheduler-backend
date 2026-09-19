@@ -41,7 +41,8 @@ VERSION_STATUSES = {"Draft", "Awaiting Approval", "Published", "Rejected", "Supe
 SHEET_CELL_LIMIT = 45000
 ORDER_PAYLOAD_KEYS = (
     "order_number", "customer", "product", "design", "quantity",
-    "remaining_quantity", "due_date", "in_hand_date", "required_ship_date",
+    "remaining_quantity", "embroidery_remaining", "stitch_count",
+    "due_date", "in_hand_date", "required_ship_date",
     "shipping_group_id", "stage",
 )
 
