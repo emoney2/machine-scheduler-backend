@@ -12,7 +12,13 @@ from production_scheduler import (
     normalize_orders,
     parse_date,
 )
-from schedule_store import SHEET_CELL_LIMIT, compact_order, version_summary_metadata
+from schedule_store import (
+    SHEET_CELL_LIMIT,
+    compact_order,
+    friendly_sheets_error,
+    is_sheets_rate_limit,
+    version_summary_metadata,
+)
 
 ET = ZoneInfo("America/New_York")
 NOW = datetime(2026, 9, 21, 8, 30, tzinfo=ET)  # Monday
@@ -207,6 +213,11 @@ class ScheduleTests(unittest.TestCase):
 
 
 class PersistenceSizeTests(unittest.TestCase):
+    def test_sheets_rate_limit_message_is_human(self):
+        exc = RuntimeError("HttpError 429 ... Quota exceeded for quota metric 'Read requests'")
+        self.assertTrue(is_sheets_rate_limit(exc))
+        self.assertIn("busy", friendly_sheets_error(exc).lower())
+
     def test_parse_date_accepts_sheet_serials_and_serial_strings(self):
         expected = date(1899, 12, 30) + timedelta(days=45980)
         self.assertEqual(parse_date(45980), expected)

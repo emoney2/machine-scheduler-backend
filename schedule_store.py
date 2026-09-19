@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -106,20 +107,90 @@ def safe_job_payload(row: dict) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def is_sheets_rate_limit(exc: Exception) -> bool:
+    text = str(exc)
+    return "429" in text or "RATE_LIMIT" in text or "Quota exceeded" in text
+
+
+def friendly_sheets_error(exc: Exception) -> str:
+    if is_sheets_rate_limit(exc):
+        return (
+            "Google Sheets is temporarily busy. Wait about a minute and refresh. "
+            "The published schedule was not changed."
+        )
+    return str(exc).split("\n", 1)[0][:300]
+
+
 class ScheduleSheetStore:
     def __init__(self, sheets_service, spreadsheet_id: str):
         self.service = sheets_service
         self.spreadsheet_id = spreadsheet_id
+        self._cache: Dict[str, tuple[float, List[List[Any]]]] = {}
+        self._cache_ttl = 20.0
 
     @property
     def values(self):
         return self.service.spreadsheets().values()
 
+    def _execute(self, request):
+        last_error = None
+        for attempt in range(5):
+            try:
+                return request.execute()
+            except Exception as exc:
+                last_error = exc
+                if not is_sheets_rate_limit(exc) or attempt == 4:
+                    raise
+                time.sleep(2 ** attempt)
+        raise last_error
+
+    def invalidate(self, *titles: str) -> None:
+        if not titles:
+            self._cache.clear()
+            return
+        prefixes = {f"'{title}'!" for title in titles} | {f"{title}!" for title in titles}
+        for key in list(self._cache):
+            if any(key.startswith(prefix) or key == title for prefix in prefixes for title in titles):
+                self._cache.pop(key, None)
+
+    def batch_values(self, ranges: Sequence[str]) -> List[List[List[Any]]]:
+        if not ranges:
+            return []
+        response = self._execute(
+            self.values.batchGet(
+                spreadsheetId=self.spreadsheet_id,
+                ranges=list(ranges),
+                valueRenderOption="UNFORMATTED_VALUE",
+            )
+        )
+        value_ranges = response.get("valueRanges") or []
+        out = []
+        for index, range_name in enumerate(ranges):
+            values = (value_ranges[index].get("values") if index < len(value_ranges) else None) or []
+            self._cache[str(range_name)] = (time.time(), values)
+            out.append(values)
+        return out
+
+    def _tab_range(self, title: str) -> str:
+        return f"'{title}'!A1:ZZ"
+
+    def _cached_values(self, range_name: str) -> Optional[List[List[Any]]]:
+        hit = self._cache.get(range_name)
+        if not hit:
+            return None
+        stamp, values = hit
+        if time.time() - stamp > self._cache_ttl:
+            self._cache.pop(range_name, None)
+            return None
+        return values
+
     def ensure_schema(self) -> None:
-        meta = self.service.spreadsheets().get(
-            spreadsheetId=self.spreadsheet_id,
-            fields="sheets.properties.title",
-        ).execute()
+        meta = self._execute(
+            self.service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id,
+                fields="sheets.properties.title",
+            )
+        )
         existing = {
             str((item.get("properties") or {}).get("title") or "")
             for item in (meta.get("sheets") or [])
@@ -130,19 +201,17 @@ class ScheduleSheetStore:
             if title not in existing
         ]
         if requests:
-            self.service.spreadsheets().batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body={"requests": requests},
-            ).execute()
+            self._execute(
+                self.service.spreadsheets().batchUpdate(
+                    spreadsheetId=self.spreadsheet_id,
+                    body={"requests": requests},
+                )
+            )
+        header_ranges = [f"'{title}'!1:1" for title in TAB_HEADERS]
+        current_headers = self.batch_values(header_ranges)
         updates = []
-        for title, headers in TAB_HEADERS.items():
-            current = self.values.get(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"'{title}'!1:1",
-            ).execute().get("values") or []
+        for (title, headers), current in zip(TAB_HEADERS.items(), current_headers):
             first = current[0] if current else []
-            # Safe and backward-compatible: only initialize empty tabs or extend
-            # our own known prefix. Never clear extra administrator columns.
             merged = list(first)
             if not merged:
                 merged = list(headers)
@@ -153,44 +222,41 @@ class ScheduleSheetStore:
                     elif not str(merged[index] or "").strip():
                         merged[index] = header
             if merged != first:
-                updates.append({
-                    "range": f"'{title}'!A1",
-                    "values": [merged],
-                })
+                updates.append({"range": f"'{title}'!A1", "values": [merged]})
         if updates:
-            self.values.batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body={"valueInputOption": "RAW", "data": updates},
-            ).execute()
+            self._execute(
+                self.values.batchUpdate(
+                    spreadsheetId=self.spreadsheet_id,
+                    body={"valueInputOption": "RAW", "data": updates},
+                )
+            )
 
     def read_tab(self, title: str) -> List[dict]:
+        cached = self._cached_values(self._tab_range(title))
+        if cached is not None:
+            return _rows_to_dicts(cached)
         try:
-            values = self.values.get(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"'{title}'!A1:ZZ",
-                valueRenderOption="UNFORMATTED_VALUE",
-            ).execute().get("values") or []
+            values = (self.batch_values([self._tab_range(title)]) or [[]])[0]
         except Exception:
             if title not in TAB_HEADERS:
                 raise
             self.ensure_schema()
-            values = self.values.get(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"'{title}'!A1:ZZ",
-                valueRenderOption="UNFORMATTED_VALUE",
-            ).execute().get("values") or []
+            values = (self.batch_values([self._tab_range(title)]) or [[]])[0]
         return _rows_to_dicts(values)
 
     def _append(self, title: str, rows: List[List[Any]]) -> None:
         if not rows:
             return
-        self.values.append(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"'{title}'!A:ZZ",
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values": rows},
-        ).execute()
+        self._execute(
+            self.values.append(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{title}'!A:ZZ",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": rows},
+            )
+        )
+        self.invalidate(title)
 
     def versions(self) -> List[dict]:
         return self.read_tab("Schedule Versions")
@@ -249,6 +315,10 @@ class ScheduleSheetStore:
                 failure_message,
             ]])
 
+        self.batch_values([
+            self._tab_range(title)
+            for title in ("Sewing Schedule", "Embroidery Schedule", "Schedule Orders", "Schedule Issues")
+        ])
         existing_sewing = {
             str(r.get("Record ID") or "")
             for r in self.read_tab("Sewing Schedule")
@@ -368,6 +438,11 @@ class ScheduleSheetStore:
         version = self.get_version(version_id)
         if not version:
             raise KeyError(version_id)
+        self.batch_values([
+            self._tab_range(title)
+            for title in ("Sewing Schedule", "Embroidery Schedule", "Schedule Orders", "Schedule Issues")
+            if self._cached_values(self._tab_range(title)) is None
+        ])
 
         def payloads(tab: str):
             result = []

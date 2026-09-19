@@ -24,7 +24,7 @@ from production_scheduler import (
     parse_date,
     subtract_workdays,
 )
-from schedule_store import ScheduleSheetStore
+from schedule_store import ScheduleSheetStore, friendly_sheets_error
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -213,8 +213,14 @@ class ProductionScheduleService:
             "sewingChangeoverMinutes": raw.get("sewingChangeoverMinutes", 5),
         }
 
-    def _inventory(self, thread_values: Sequence[Sequence[Any]]) -> Dict[str, dict]:
-        rows = self.fetch_sheet(self.store.spreadsheet_id, "Thread Inventory!A1:M") or []
+    def _inventory(
+        self,
+        thread_values: Sequence[Any],
+        inventory_values: Optional[Sequence[Sequence[Any]]] = None,
+    ) -> Dict[str, dict]:
+        rows = list(inventory_values or [])
+        if len(rows) < 2:
+            rows = self.fetch_sheet(self.store.spreadsheet_id, "Thread Inventory!A1:M") or []
         if len(rows) < 2:
             return {}
         received_by_code = _thread_data_received_cones(thread_values)
@@ -294,38 +300,42 @@ class ProductionScheduleService:
         return None
 
     def load_inputs(self) -> tuple[List[dict], Dict[str, dict], dict]:
-        order_values = self.fetch_sheet(
-            self.store.spreadsheet_id, self.orders_range, value_render_option="UNFORMATTED_VALUE"
-        ) or []
+        batched = self.store.batch_values([
+            self.orders_range,
+            "Directory!A1:ZZ10000",
+            "Thread Data!A1:Z",
+            "Sewing Summary!A1:Z",
+            "Cut List!A1:Z",
+            "Fur List!A1:Z",
+            "Thread Inventory!A1:M",
+        ])
+        (
+            order_values,
+            directory_values,
+            thread_values,
+            sewing_values,
+            cut_values,
+            fur_values,
+            inventory_values,
+        ) = (batched + [[] for _ in range(7)])[:7]
         orders = [r for r in _rows_to_dicts(order_values) if _active(r)]
         by_id = {normalize_order_number(r.get("Order #")): r for r in orders}
-        directory_rows = _rows_to_dicts(
-            self.fetch_sheet(
-                self.store.spreadsheet_id,
-                "Directory!A1:ZZ10000",
-                value_render_option="UNFORMATTED_VALUE",
-            ) or []
-        )
+        directory_rows = _rows_to_dicts(directory_values)
         directory_by_customer = {
             _text(r.get("Company Name")).lower(): r
             for r in directory_rows
             if _text(r.get("Company Name"))
         }
-        thread_rows = _rows_to_dicts(
-            self.fetch_sheet(self.store.spreadsheet_id, "Thread Data!A1:Z") or []
-        )
+        thread_rows = _rows_to_dicts(thread_values)
         usage = _parse_thread_usage(thread_rows)
-        sewing_values = self.fetch_sheet(
-            self.store.spreadsheet_id, "Sewing Summary!A1:Z", value_render_option="UNFORMATTED_VALUE"
-        ) or []
         sewing_done = _parse_sewing_completion(sewing_values)
         cut_rows = {
             normalize_order_number(r.get("Order #")): r
-            for r in _rows_to_dicts(self.fetch_sheet(self.store.spreadsheet_id, "Cut List!A1:Z") or [])
+            for r in _rows_to_dicts(cut_values)
         }
         fur_rows = {
             normalize_order_number(r.get("Order #")): r
-            for r in _rows_to_dicts(self.fetch_sheet(self.store.spreadsheet_id, "Fur List!A1:Z") or [])
+            for r in _rows_to_dicts(fur_values)
         }
         published = self.store.published_version()
         explicit_groups: Dict[str, str] = {}
@@ -375,7 +385,7 @@ class ProductionScheduleService:
         # The production workbook records finished pieces in Sewing Summary.Top.
         # It has no dated Sewing Log, so recent averages remain "Not enough data"
         # until a timestamped finished-output source is introduced.
-        return orders, self._inventory(thread_rows), sewing_output_metrics(sewing_values)
+        return orders, self._inventory(thread_rows, inventory_values), sewing_output_metrics(sewing_values)
 
     @staticmethod
     def _version_id(fingerprint: str) -> str:
@@ -464,7 +474,7 @@ class ProductionScheduleService:
             logger.exception("Production schedule rebuild failed; published schedule preserved")
             return {
                 "ok": False,
-                "error": f"Schedule rebuild failed: {exc}",
+                "error": f"Schedule rebuild failed: {friendly_sheets_error(exc)}",
                 "publishedVersion": published,
             }
 

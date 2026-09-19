@@ -8,6 +8,8 @@ from uuid import uuid4
 
 from flask import Blueprint, jsonify, request
 
+from schedule_store import friendly_sheets_error
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,14 +36,9 @@ def create_schedule_blueprint(
             try:
                 service.store.ensure_schema()
                 schema_ready = True
-            except Exception:
+            except Exception as exc:
                 logger.exception("Scheduling Sheets schema initialization failed")
-                return jsonify({
-                    "error": (
-                        "Scheduling storage could not be initialized. "
-                        "The current published schedule was not changed."
-                    )
-                }), 503
+                return jsonify({"error": friendly_sheets_error(exc)}), 503
         return None
 
     def actor() -> str:
@@ -57,32 +54,40 @@ def create_schedule_blueprint(
     @bp.get("/published")
     @login_required
     def published():
-        version = service.store.published_version()
-        if not version:
-            return jsonify({"version": None, "schedule": None}), 200
-        loaded = service.store.load_schedule(str(version.get("Version ID") or ""))
-        return jsonify({"version": version, "schedule": loaded}), 200
+        try:
+            version = service.store.published_version()
+            if not version:
+                return jsonify({"version": None, "schedule": None}), 200
+            loaded = service.store.load_schedule(str(version.get("Version ID") or ""))
+            return jsonify({"version": version, "schedule": loaded}), 200
+        except Exception as exc:
+            logger.exception("Could not load published schedule")
+            return jsonify({"error": friendly_sheets_error(exc)}), 503
 
     @bp.get("/proposal")
     @login_required
     def proposal():
-        version = service.store.active_proposal()
-        if not version:
-            return jsonify({"version": None, "schedule": None}), 200
-        loaded = service.store.load_schedule(str(version.get("Version ID") or ""))
-        published_version = service.store.published_version()
-        comparison = service._comparison(
-            published_version,
-            {
-                "orders": [
-                    {"order_number": row.get("order_number")}
-                    for row in (loaded.get("orders") or [])
-                ],
-                "sewing": loaded.get("sewing") or [],
-                "embroidery": loaded.get("embroidery") or [],
-            },
-        )
-        return jsonify({"version": version, "schedule": loaded, "comparison": comparison}), 200
+        try:
+            version = service.store.active_proposal()
+            if not version:
+                return jsonify({"version": None, "schedule": None}), 200
+            loaded = service.store.load_schedule(str(version.get("Version ID") or ""))
+            published_version = service.store.published_version()
+            comparison = service._comparison(
+                published_version,
+                {
+                    "orders": [
+                        {"order_number": row.get("order_number")}
+                        for row in (loaded.get("orders") or [])
+                    ],
+                    "sewing": loaded.get("sewing") or [],
+                    "embroidery": loaded.get("embroidery") or [],
+                },
+            )
+            return jsonify({"version": version, "schedule": loaded, "comparison": comparison}), 200
+        except Exception as exc:
+            logger.exception("Could not load schedule proposal")
+            return jsonify({"error": friendly_sheets_error(exc)}), 503
 
     @bp.get("/versions")
     @login_required
