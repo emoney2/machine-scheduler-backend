@@ -216,8 +216,37 @@ class ScheduleTests(unittest.TestCase):
         )
         hard = [r for r in result["sewing"] if r["orderNumber"] == "100"]
         soft = [r for r in result["sewing"] if r["orderNumber"] == "200"]
-        self.assertEqual(min(r["date"] for r in hard), "2026-09-28")
+        self.assertTrue(hard and soft)
         self.assertEqual(min(r["date"] for r in soft), "2026-09-21")
+        self.assertLessEqual(min(r["date"] for r in hard), "2026-09-28")
+        self.assertFalse(any(r["late"] for r in hard))
+        self.assertIn("2026-09-21", {r["date"] for r in result["sewing"]})
+
+    def test_later_job_fills_an_empty_weekday(self):
+        locks = [
+            {"lockId": "L1", "orderNumber": "1", "date": "2026-09-21", "capacityUnits": 95},
+            {"lockId": "L2", "orderNumber": "2", "date": "2026-09-22", "capacityUnits": 95},
+            {"lockId": "L3", "orderNumber": "3", "date": "2026-09-23", "capacityUnits": 95},
+        ]
+        result = build_schedule(
+            [
+                order(1, Quantity=95, **{"Ship Date": "09/21/2026", "Due Date": "09/21/2026", "Stitch Count": 1000}),
+                order(2, Quantity=95, **{"Ship Date": "09/22/2026", "Due Date": "09/22/2026", "Stitch Count": 1000, "Company Name": "B"}),
+                order(3, Quantity=95, **{"Ship Date": "09/23/2026", "Due Date": "09/23/2026", "Stitch Count": 1000, "Company Name": "C"}),
+                order(200, Quantity=100, **{
+                    "Hard Date/Soft Date": "Soft Date",
+                    "Ship Date": "09/25/2026",
+                    "Due Date": "09/28/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Soft Customer",
+                }),
+            ],
+            thread_inventory=inventory(),
+            locks=locks,
+            now=NOW,
+        )
+        soft = [r["date"] for r in result["sewing"] if r["orderNumber"] == "200"]
+        self.assertIn("2026-09-24", soft)
 
     def test_soft_job_moves_up_when_the_gap_is_too_small(self):
         lock = {"lockId": "L1", "orderNumber": "100", "date": "2026-09-21", "capacityUnits": 60}
