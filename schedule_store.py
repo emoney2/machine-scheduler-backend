@@ -44,7 +44,7 @@ ORDER_PAYLOAD_KEYS = (
     "order_number", "customer", "product", "design", "quantity",
     "remaining_quantity", "embroidery_remaining", "stitch_count",
     "due_date", "in_hand_date", "required_ship_date",
-    "shipping_group_id", "stage",
+    "shipping_group_id", "stage", "image",
 )
 
 
@@ -100,10 +100,18 @@ def version_summary_metadata(schedule: dict) -> dict:
     }
 
 
+def compact_image(value: Any) -> str:
+    text = str(value or "").strip()
+    return text[:500]
+
+
 def safe_job_payload(row: dict) -> dict:
     payload = _jsonable(row)
     if isinstance(payload, dict):
-        payload.pop("image", None)
+        image = payload.get("image") or payload.get("Image") or payload.get("Preview")
+        payload["image"] = compact_image(image)
+        payload.pop("Image", None)
+        payload.pop("Preview", None)
     return payload if isinstance(payload, dict) else {}
 
 

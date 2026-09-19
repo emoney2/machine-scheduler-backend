@@ -246,7 +246,19 @@ class PersistenceSizeTests(unittest.TestCase):
         self.assertLess(len(encoded), SHEET_CELL_LIMIT)
         sample = compact_order(result["orders"][0])
         self.assertIn("order_number", sample)
+        self.assertIn("image", sample)
         self.assertLess(len(__import__("json").dumps(sample, default=str)), 2000)
+
+    def test_sewing_jobs_keep_artwork_link(self):
+        result = build_schedule(
+            [order(100, Image="https://drive.google.com/file/d/ABCDEFGHIJKLMNOPQRSTUVWXYZ0123/view")],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        job = next(r for r in result["sewing"] if r["orderNumber"] == "100")
+        self.assertIn("drive.google.com", job["image"])
+        from schedule_store import safe_job_payload
+        self.assertIn("drive.google.com", safe_job_payload(job)["image"])
 
 
 if __name__ == "__main__":
