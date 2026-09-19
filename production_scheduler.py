@@ -712,13 +712,19 @@ def _schedule_sewing(
         remaining_units: float,
         allow_emergency: bool = False,
         existing_entries: Optional[List[dict]] = None,
+        force: bool = False,
     ):
         regular, emergency, total, already, setup, free = _sewing_capacity(
             cursor, config, reserved, day_job_count, setup_units, allow_emergency
         )
         if free <= 1e-9:
-            return remaining_units, None
-        used = min(free, remaining_units)
+            if not force:
+                return remaining_units, None
+            used = remaining_units
+            emergency = max(emergency, config.emergency_sewing_capacity)
+            total = max(total, already + setup + used)
+        else:
+            used = min(free, remaining_units)
         same_day = next(
             (row for row in (existing_entries or []) if row.get("date") == iso_day(cursor)),
             None,
@@ -745,141 +751,200 @@ def _schedule_sewing(
         return remaining_units - used, entry
 
     for group in groups:
-        group_ship = _resolve_group_ship(group, planning_start, config.holidays)
-        group_entries: List[dict] = []
-        for order in sorted(group["orders"], key=_priority):
-            fixed = locks_by_order.get(order["order_number"]) or []
-            if fixed:
-                fixed.sort(key=lambda e: e["start"])
-                for entry in fixed:
-                    entry.update({
-                        "customer": order["customer"],
-                        "product": order["product"],
-                        "design": order["design"],
-                        "shippingGroupId": group["id"],
-                        "requiredShipDate": iso_day(group_ship),
-                        "quantity": order["quantity"],
-                        "remainingQuantity": order["remaining_quantity"],
-                        "materialsReady": order["materials_ready"],
-                        "materialsWarnings": order["material_warnings"],
-                        "readinessOverride": order["readiness_override"],
-                        "frenchSeam": order["french_seam"],
-                        "unusualShape": order["unusual_shape"],
-                        "rush": order["rush"],
-                        "hardDate": "HARD" in order["due_type"].upper(),
-                        "conflict": False,
-                    })
-                _annotate_day_quantities(fixed, order)
-                group_entries.extend(fixed)
-                embroidery_deadlines[order["order_number"]] = datetime.fromisoformat(fixed[0]["start"])
-                continue
-            remaining_units = order["sewing_units"]
-            if remaining_units <= 1e-9:
-                embroidery_deadlines[order["order_number"]] = _at(group_ship, SEWING_DAY_START)
-                continue
+        _resolve_group_ship(group, planning_start, config.holidays)
+
+    def place_order(order: dict, group: dict) -> None:
+        group_ship = group.get("required_ship_date") or order.get("required_ship_date")
+        hard = is_hard_date(order)
+        fixed = locks_by_order.get(order["order_number"]) or []
+        if fixed:
+            fixed.sort(key=lambda e: e["start"])
+            for entry in fixed:
+                entry.update({
+                    "customer": order["customer"],
+                    "product": order["product"],
+                    "design": order["design"],
+                    "shippingGroupId": group["id"],
+                    "requiredShipDate": iso_day(group_ship),
+                    "quantity": order["quantity"],
+                    "remainingQuantity": order["remaining_quantity"],
+                    "materialsReady": order["materials_ready"],
+                    "materialsWarnings": order["material_warnings"],
+                    "readinessOverride": order["readiness_override"],
+                    "frenchSeam": order["french_seam"],
+                    "unusualShape": order["unusual_shape"],
+                    "rush": order["rush"],
+                    "hardDate": hard,
+                    "conflict": False,
+                })
+            _annotate_day_quantities(fixed, order)
+            embroidery_deadlines[order["order_number"]] = datetime.fromisoformat(fixed[0]["start"])
+            return
+        remaining_units = order["sewing_units"]
+        if remaining_units <= 1e-9:
+            embroidery_deadlines[order["order_number"]] = _at(group_ship, SEWING_DAY_START)
+            return
+        cursor = previous_workday(group_ship, config.holidays, include=True)
+        order_entries: List[dict] = []
+        guard = 0
+        while remaining_units > 1e-9 and guard < 5000:
+            guard += 1
+            if cursor < planning_start:
+                break
+            remaining_units, entry = take_day(cursor, order, group, group_ship, remaining_units)
+            if entry and entry not in order_entries:
+                order_entries.append(entry)
+            cursor = previous_workday(cursor, config.holidays)
+        if remaining_units > 1e-9 and config.emergency_sewing_capacity > 0:
             cursor = previous_workday(group_ship, config.holidays, include=True)
-            order_entries: List[dict] = []
-            guard = 0
             while remaining_units > 1e-9 and guard < 5000:
                 guard += 1
                 if cursor < planning_start:
                     break
-                remaining_units, entry = take_day(cursor, order, group, group_ship, remaining_units)
+                remaining_units, entry = take_day(
+                    cursor, order, group, group_ship, remaining_units,
+                    allow_emergency=True, existing_entries=order_entries,
+                )
                 if entry and entry not in order_entries:
                     order_entries.append(entry)
                 cursor = previous_workday(cursor, config.holidays)
-            if remaining_units > 1e-9 and config.emergency_sewing_capacity > 0:
-                cursor = previous_workday(group_ship, config.holidays, include=True)
-                while remaining_units > 1e-9 and guard < 5000:
-                    guard += 1
-                    if cursor < planning_start:
-                        break
-                    remaining_units, entry = take_day(
-                        cursor, order, group, group_ship, remaining_units,
-                        allow_emergency=True, existing_entries=order_entries,
-                    )
-                    if entry and entry not in order_entries:
-                        order_entries.append(entry)
-                    cursor = previous_workday(cursor, config.holidays)
-            overflow = remaining_units
-            late = overflow > 1e-9
-            if remaining_units > 1e-9:
-                cursor = next_workday(planning_start, config.holidays, include=True)
-                while remaining_units > 1e-9 and guard < 5000:
-                    guard += 1
-                    remaining_units, entry = take_day(
-                        cursor, order, group, group_ship, remaining_units,
-                        allow_emergency=True, existing_entries=order_entries,
-                    )
-                    if entry and entry not in order_entries:
-                        order_entries.append(entry)
-                    cursor = next_workday(cursor, config.holidays)
-            if not order_entries:
-                conflicts.append({
-                    "type": "sewing_unscheduled",
-                    "severity": "blocking",
-                    "orderNumber": order["order_number"],
-                    "missingSewingUnits": round(remaining_units, 2),
-                    "message": "Sewing work could not be placed on any workday",
-                })
-                continue
-            order_entries.sort(key=lambda e: e["start"])
-            _annotate_day_quantities(order_entries, order)
-            emergency_dates = sorted({
-                row["date"]
-                for row in order_entries
-                if row.get("emergencyUsed") or _number(row.get("emergencyCapacity")) > 0
-            })
-            if emergency_dates:
-                conflicts.append({
-                    "type": "emergency_sewing",
-                    "severity": "warning",
-                    "orderNumber": order["order_number"],
-                    "dates": emergency_dates,
-                    "message": (
-                        "Emergency sewing (third sewer +50) added because regular "
-                        "capacity would miss the ship date"
-                    ),
-                })
-            if late:
-                finish = order_entries[-1]["finish"]
-                emergency_days_needed = int(
-                    math.ceil(overflow / max(config.emergency_sewing_capacity, 1.0))
+        overflow = remaining_units
+        ship_in_horizon = bool(group_ship and group_ship >= planning_start)
+        if remaining_units > 1e-9 and hard and ship_in_horizon:
+            cursor = previous_workday(group_ship, config.holidays, include=True)
+            while remaining_units > 1e-9 and guard < 5000:
+                guard += 1
+                if cursor < planning_start:
+                    break
+                remaining_units, entry = take_day(
+                    cursor, order, group, group_ship, remaining_units,
+                    allow_emergency=True, existing_entries=order_entries, force=True,
                 )
-                for entry in order_entries:
-                    entry["conflict"] = True
-                    entry["late"] = True
-                conflicts.append({
-                    "type": "sewing_unscheduled",
-                    "severity": "blocking",
-                    "orderNumber": order["order_number"],
-                    "missingSewingUnits": 0,
-                    "expectedCompletion": finish,
-                    "requiredShipDate": iso_day(group_ship),
-                    "thirdSewerWouldHelp": config.emergency_sewing_capacity > 0,
-                    "thirdSewerDaysNeeded": emergency_days_needed,
-                    "message": (
-                        f"Sewing is scheduled but finishes {fmt_conflict_day(finish)} after "
-                        f"required ship date {iso_day(group_ship)}"
-                    ),
-                })
-            entries.extend(order_entries)
-            group_entries.extend(order_entries)
-            embroidery_deadlines[order["order_number"]] = datetime.fromisoformat(order_entries[0]["start"])
+                if entry and entry not in order_entries:
+                    order_entries.append(entry)
+                cursor = previous_workday(cursor, config.holidays)
+            overflow = 0.0
+        elif remaining_units > 1e-9 and not hard:
+            cursor = next_workday(planning_start, config.holidays, include=True)
+            while remaining_units > 1e-9 and guard < 5000:
+                guard += 1
+                remaining_units, entry = take_day(
+                    cursor, order, group, group_ship, remaining_units,
+                    allow_emergency=True, existing_entries=order_entries,
+                )
+                if entry and entry not in order_entries:
+                    order_entries.append(entry)
+                cursor = next_workday(cursor, config.holidays)
+        elif remaining_units > 1e-9 and hard:
+            cursor = next_workday(planning_start, config.holidays, include=True)
+            while remaining_units > 1e-9 and guard < 5000:
+                guard += 1
+                remaining_units, entry = take_day(
+                    cursor, order, group, group_ship, remaining_units,
+                    allow_emergency=True, existing_entries=order_entries, force=True,
+                )
+                if entry and entry not in order_entries:
+                    order_entries.append(entry)
+                cursor = next_workday(cursor, config.holidays)
+        late = (not hard) and overflow > 1e-9
+        if not order_entries:
+            conflicts.append({
+                "type": "sewing_unscheduled",
+                "severity": "blocking",
+                "orderNumber": order["order_number"],
+                "missingSewingUnits": round(remaining_units, 2),
+                "message": "Sewing work could not be placed on any workday",
+            })
+            return
+        order_entries.sort(key=lambda e: e["start"])
+        _annotate_day_quantities(order_entries, order)
+        emergency_dates = sorted({
+            row["date"]
+            for row in order_entries
+            if row.get("emergencyUsed") or _number(row.get("emergencyCapacity")) > 0
+        })
+        if emergency_dates:
+            conflicts.append({
+                "type": "emergency_sewing",
+                "severity": "warning",
+                "orderNumber": order["order_number"],
+                "dates": emergency_dates,
+                "message": (
+                    "Emergency sewing (third sewer +50) added because regular "
+                    "capacity would miss the ship date"
+                ),
+            })
+        finish = datetime.fromisoformat(order_entries[-1]["finish"])
+        ship_end = _at(group_ship, SEWING_DAY_END) if group_ship else finish
+        if hard and not ship_in_horizon:
+            for entry in order_entries:
+                entry["conflict"] = True
+            conflicts.append({
+                "type": "hard_date_missed",
+                "severity": "blocking",
+                "orderNumber": order["order_number"],
+                "requiredShipDate": iso_day(group_ship),
+                "expectedCompletion": finish.isoformat(),
+                "message": (
+                    f"Hard date {iso_day(group_ship)} is already past; "
+                    "work is placed on the first open days and is not marked late"
+                ),
+            })
+        elif hard and finish > ship_end:
+            for entry in order_entries:
+                entry["conflict"] = True
+            conflicts.append({
+                "type": "hard_date_capacity",
+                "severity": "blocking",
+                "orderNumber": order["order_number"],
+                "requiredShipDate": iso_day(group_ship),
+                "expectedCompletion": finish.isoformat(),
+                "message": "Hard date kept on the calendar; sewing capacity is overloaded to finish on time",
+            })
+        elif late:
+            for entry in order_entries:
+                entry["conflict"] = True
+                entry["late"] = True
+            conflicts.append({
+                "type": "sewing_unscheduled",
+                "severity": "blocking",
+                "orderNumber": order["order_number"],
+                "missingSewingUnits": 0,
+                "expectedCompletion": finish.isoformat(),
+                "requiredShipDate": iso_day(group_ship),
+                "thirdSewerWouldHelp": config.emergency_sewing_capacity > 0,
+                "thirdSewerDaysNeeded": int(
+                    math.ceil(overflow / max(config.emergency_sewing_capacity, 1.0))
+                ),
+                "message": (
+                    f"Sewing is scheduled but finishes {fmt_conflict_day(finish.isoformat())} after "
+                    f"required ship date {iso_day(group_ship)}"
+                ),
+            })
+        entries.extend(order_entries)
+        embroidery_deadlines[order["order_number"]] = datetime.fromisoformat(order_entries[0]["start"])
 
-        if group_entries:
-            finish = max(datetime.fromisoformat(e["finish"]) for e in group_entries)
-            ship_end = _at(group_ship, SEWING_DAY_END)
-            if finish > ship_end:
-                conflicts.append({
-                    "type": "sewing_deadline",
-                    "severity": "blocking",
-                    "groupId": group["id"],
-                    "orderNumbers": [o["order_number"] for o in group["orders"]],
-                    "expectedCompletion": finish.isoformat(),
-                    "requiredShipDate": iso_day(group_ship),
-                    "message": "Shipping group cannot finish sewing by its required ship date",
-                })
+    queued = [(order, group) for group in groups for order in group["orders"]]
+    for order, group in sorted(queued, key=lambda item: (0 if is_hard_date(item[0]) else 1, _priority(item[0]))):
+        place_order(order, group)
+
+    for group in groups:
+        group_ship = group.get("required_ship_date")
+        hard_numbers = {o["order_number"] for o in group["orders"] if is_hard_date(o)}
+        hard_entries = [e for e in entries if e.get("orderNumber") in hard_numbers]
+        if not hard_entries or not group_ship:
+            continue
+        finish = max(datetime.fromisoformat(e["finish"]) for e in hard_entries)
+        if finish > _at(group_ship, SEWING_DAY_END):
+            conflicts.append({
+                "type": "sewing_deadline",
+                "severity": "blocking",
+                "groupId": group["id"],
+                "orderNumbers": sorted(hard_numbers),
+                "expectedCompletion": finish.isoformat(),
+                "requiredShipDate": iso_day(group_ship),
+                "message": "Hard-date shipping group cannot finish sewing by its required ship date",
+            })
 
     order_lookup = {o["order_number"]: o for g in groups for o in g["orders"]}
     group_lookup = {o["order_number"]: g for g in groups for o in g["orders"]}

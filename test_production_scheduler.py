@@ -282,7 +282,11 @@ class ScheduleTests(unittest.TestCase):
 
     def test_past_ship_date_is_still_placed(self):
         result = build_schedule(
-            [order(100, Quantity=40, **{"Ship Date": "09/10/2026", "Due Date": "09/10/2026"})],
+            [order(100, Quantity=40, **{
+                "Hard Date/Soft Date": "Soft Date",
+                "Ship Date": "09/10/2026",
+                "Due Date": "09/10/2026",
+            })],
             thread_inventory=inventory(),
             now=NOW,
         )
@@ -290,6 +294,34 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(rows)
         self.assertTrue(any(r["late"] for r in rows))
         self.assertGreaterEqual(min(r["date"] for r in rows), "2026-09-21")
+
+    def test_hard_date_is_never_late(self):
+        result = build_schedule(
+            [order(100, Quantity=400, **{
+                "Hard Date/Soft Date": "Hard Date",
+                "Ship Date": "09/21/2026",
+                "Due Date": "09/21/2026",
+                "Stitch Count": 1000,
+            })],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
+        self.assertTrue(rows)
+        self.assertFalse(any(r["late"] for r in rows))
+        self.assertTrue(all(r["date"] <= "2026-09-21" for r in rows))
+        self.assertAlmostEqual(sum(r["capacityUnits"] for r in rows), 400)
+
+    def test_past_hard_date_is_not_marked_late(self):
+        result = build_schedule(
+            [order(100, Quantity=40, **{"Ship Date": "09/10/2026", "Due Date": "09/10/2026"})],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
+        self.assertTrue(rows)
+        self.assertFalse(any(r["late"] for r in rows))
+        self.assertTrue(any(c["type"] == "hard_date_missed" for c in result["conflicts"]))
 
     def test_ordered_without_stitches_stays_on_sewing_only(self):
         result = build_schedule(
