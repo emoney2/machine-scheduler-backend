@@ -18,7 +18,13 @@ from zoneinfo import ZoneInfo
 
 BUSINESS_TZ = ZoneInfo("America/New_York")
 EMBROIDERY_HEADS = 6
-EMBROIDERY_MACHINES = ("Machine 1", "Machine 2", "Machine 3")
+EMBROIDERY_MACHINE_HEADS = {
+    "Single Head Machine": 1,
+    "Machine 2": 6,
+    "Machine 3": 6,
+    "Machine 4": 6,
+}
+EMBROIDERY_MACHINES = tuple(EMBROIDERY_MACHINE_HEADS)
 EMBROIDERY_SPEED = 30_000.0
 EMBROIDERY_SETUP_HOURS = 0.5
 SEWING_DAY_START = time(8, 30)
@@ -115,6 +121,13 @@ def subtract_workdays(value: date, days: int, holidays: Iterable[date]) -> date:
     for _ in range(max(0, int(days))):
         cursor = previous_workday(cursor, holidays)
     return cursor
+
+
+def embroidery_heads(machine: Any) -> int:
+    name = _text(machine)
+    if name in {"Machine 1", "Single Head", "Single Head Machine"}:
+        return int(EMBROIDERY_MACHINE_HEADS.get("Single Head Machine", 1))
+    return int(EMBROIDERY_MACHINE_HEADS.get(name, EMBROIDERY_HEADS))
 
 
 def embroidery_runs(quantity: Any, heads: int = EMBROIDERY_HEADS) -> int:
@@ -774,8 +787,10 @@ def _thread_slot_allowed(
     finish: datetime,
     placed: Sequence[dict],
     inventory: Dict[str, dict],
+    machine: str,
 ) -> Tuple[bool, List[dict]]:
     problems: List[dict] = []
+    heads = embroidery_heads(machine)
     for color in order["thread_colors"]:
         inv = inventory.get(color) or {}
         available = int(_number(inv.get("cones"), 0))
@@ -784,7 +799,7 @@ def _thread_slot_allowed(
             if color in p.get("threadColors", [])
             and _overlap(start, finish, p["_start"], p["_finish"])
         ]
-        required = EMBROIDERY_HEADS * (1 + len({p["machine"] for p in simultaneous}))
+        required = heads + sum(embroidery_heads(p.get("machine")) for p in simultaneous)
         if required > available:
             problems.append({
                 "type": "thread_cone_conflict",
@@ -814,36 +829,40 @@ def _schedule_embroidery(
     for order in sorted(orders, key=_priority):
         if order["embroidery_remaining"] <= 0 or "SEW" in order["stage"].upper():
             continue
+        if order["stitch_count"] <= 0:
+            continue
         deadline = deadlines.get(order["order_number"])
         if not deadline:
-            continue
-        hours = embroidery_hours(order["embroidery_remaining"], order["stitch_count"])
-        if hours <= 0:
             continue
         candidates: List[tuple] = []
         rejected_thread: List[dict] = []
         for machine in EMBROIDERY_MACHINES:
+            heads = embroidery_heads(machine)
+            hours = embroidery_hours(order["embroidery_remaining"], order["stitch_count"], heads)
+            if hours <= 0:
+                continue
             effective_deadline = min(deadline, machine_deadlines[machine])
             start, finish, segments = _split_work_backward(
                 effective_deadline, hours, config.holidays
             )
             allowed, problems = _thread_slot_allowed(
-                order, start, finish, placed, thread_inventory
+                order, start, finish, placed, thread_inventory, machine
             )
             if allowed:
-                candidates.append((start, machine, finish, segments))
+                candidates.append((start, machine, finish, segments, hours, heads))
             else:
                 rejected_thread.extend(problems)
         if not candidates:
-            # Keep work visible on the least-late machine and surface exact conflict.
             machine = max(EMBROIDERY_MACHINES, key=lambda m: machine_deadlines[m])
+            heads = embroidery_heads(machine)
+            hours = embroidery_hours(order["embroidery_remaining"], order["stitch_count"], heads)
             start, finish, segments = _split_work_backward(
                 min(deadline, machine_deadlines[machine]), hours, config.holidays
             )
             conflicts.extend(_dedupe_conflicts(rejected_thread))
             conflict = True
         else:
-            start, machine, finish, segments = max(candidates, key=lambda c: c[0])
+            start, machine, finish, segments, hours, heads = max(candidates, key=lambda c: c[0])
             conflict = False
         if start < planning_start:
             start, finish, segments = _split_work_forward(planning_start, hours, config.holidays)
@@ -855,12 +874,13 @@ def _schedule_embroidery(
         )
         entry = {
             "machine": machine,
+            "heads": heads,
             "orderNumber": order["order_number"],
             "customer": order["customer"],
             "product": order["product"],
             "design": order["design"],
             "quantity": order["embroidery_remaining"],
-            "runs": embroidery_runs(order["embroidery_remaining"]),
+            "runs": embroidery_runs(order["embroidery_remaining"], heads),
             "stitchCount": order["stitch_count"],
             "durationHours": round(hours, 4),
             "start": start.isoformat(),
@@ -891,7 +911,7 @@ def _schedule_embroidery(
                 ),
                 "requiredStart": start.isoformat(),
                 "earliestAvailable": planning_start.isoformat(),
-                "message": "Three-machine embroidery capacity cannot meet the sewing-ready deadline",
+                "message": "Embroidery capacity cannot meet the sewing-ready deadline",
             })
         if finish > deadline:
             conflicts.append({

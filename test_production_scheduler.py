@@ -57,6 +57,10 @@ class EmbroideryMathTests(unittest.TestCase):
         self.assertEqual(embroidery_runs(12), 2)
         self.assertAlmostEqual(embroidery_hours(12, 30000), 2.5)
 
+    def test_single_head_runs_one_piece_at_a_time(self):
+        self.assertEqual(embroidery_runs(7, 1), 7)
+        self.assertAlmostEqual(embroidery_hours(6, 30000, 1), 6.5)
+
     def test_remainder_requires_full_run(self):
         self.assertEqual(embroidery_runs(7), 2)
         self.assertAlmostEqual(embroidery_hours(7, 30000), 2.5)
@@ -79,8 +83,19 @@ class ScheduleTests(unittest.TestCase):
         rows = [order(i, Quantity=30) for i in (100, 200, 300)]
         result = build_schedule(rows, thread_inventory=inventory(), now=NOW)
         machines = {j["machine"] for j in result["embroidery"]}
-        self.assertEqual(machines, {"Machine 1", "Machine 2", "Machine 3"})
+        self.assertEqual(machines, {"Machine 2", "Machine 3", "Machine 4"})
+        self.assertTrue(all(j["heads"] == 6 for j in result["embroidery"]))
         self.assertTrue(all(isinstance(j["machine"], str) for j in result["embroidery"]))
+
+    def test_single_head_machine_is_available(self):
+        rows = [order(i, Quantity=30) for i in (100, 200, 300)] + [order(400, Quantity=1)]
+        result = build_schedule(rows, thread_inventory=inventory(30), now=NOW)
+        machines = {j["machine"] for j in result["embroidery"]}
+        self.assertIn("Single Head Machine", machines)
+        single = next(j for j in result["embroidery"] if j["machine"] == "Single Head Machine")
+        self.assertEqual(single["orderNumber"], "400")
+        self.assertEqual(single["heads"], 1)
+        self.assertEqual(single["runs"], 1)
 
     def test_thread_cone_conflict_prevents_silent_overlap(self):
         rows = [order(100, Quantity=30), order(200, Quantity=30)]
