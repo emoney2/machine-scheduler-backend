@@ -164,6 +164,8 @@ import ship_qbo_file_log as sqlog
 import packing_history as packhist
 import sewing_priority_waiting as sew_waiting
 import embroidery_progress as emb_progress
+from wilcom_dispatch import MACHINE_IDS as WILCOM_MACHINE_IDS
+from wilcom_dispatch import dispatch as wilcom_dispatch
 from magnet_kanban import (
     INITIAL_INBOUND_EVENT_ID,
     MAGNET_KANBAN_ID,
@@ -16333,6 +16335,105 @@ def embroidery_floor_recut():
     except Exception:
         logger.exception("embroidery recut email failed")
         return jsonify({"ok": False, "error": "Failed to send recut email"}), 500
+
+
+def _wilcom_agent_token():
+    return str(os.environ.get("WILCOM_AGENT_TOKEN") or "").strip()
+
+
+def _wilcom_agent_authorized():
+    expected = _wilcom_agent_token()
+    supplied = str(request.headers.get("X-Wilcom-Agent-Token") or "").strip()
+    return bool(expected and supplied and hmac.compare_digest(expected, supplied))
+
+
+def _wilcom_public_command(command):
+    if not command:
+        return None
+    return {
+        key: command.get(key)
+        for key in ("id", "orderId", "machineId", "status", "message")
+    }
+
+
+@app.route("/api/embroidery/send-file/status", methods=["GET", "OPTIONS"])
+@login_required_session
+def embroidery_send_file_status():
+    """Report whether the warehouse helper can accept an immediate request."""
+    if request.method == "OPTIONS":
+        return make_response("", 204)
+    status = wilcom_dispatch.agent_status()
+    status["configured"] = bool(_wilcom_agent_token())
+    status["machineIds"] = list(WILCOM_MACHINE_IDS)
+    return jsonify(status), 200
+
+
+@app.route("/api/embroidery/send-file", methods=["POST", "OPTIONS"])
+@login_required_session
+def embroidery_send_file():
+    """Queue one exact <order>.EMB file for the designated tablet machine."""
+    if request.method == "OPTIONS":
+        return make_response("", 204)
+    if not _wilcom_agent_token():
+        return jsonify({"error": "Warehouse helper is not configured"}), 503
+
+    data = request.get_json(silent=True) or {}
+    order_id = str(data.get("orderId") or "").strip()
+    machine_id = str(data.get("machineId") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", order_id):
+        return jsonify({"error": "Invalid order number"}), 400
+    try:
+        command = wilcom_dispatch.create(order_id, machine_id)
+        return jsonify(_wilcom_public_command(command)), 202
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+
+
+@app.route(
+    "/api/embroidery/send-file/<command_id>",
+    methods=["GET", "OPTIONS"],
+)
+@login_required_session
+def embroidery_send_file_result(command_id):
+    """Return the current warehouse result for a tablet send request."""
+    if request.method == "OPTIONS":
+        return make_response("", 204)
+    command = wilcom_dispatch.get(command_id)
+    if not command:
+        return jsonify({"error": "Send request not found"}), 404
+    return jsonify(_wilcom_public_command(command)), 200
+
+
+@app.route("/api/wilcom-agent/next", methods=["POST"])
+def wilcom_agent_next():
+    """Heartbeat and lease the next command to the warehouse Windows helper."""
+    if not _wilcom_agent_authorized():
+        return jsonify({"error": "Invalid warehouse helper token"}), 401
+    data = request.get_json(silent=True) or {}
+    wilcom_dispatch.heartbeat(
+        data.get("configuredMachines") or [],
+        str(data.get("agentVersion") or ""),
+    )
+    command = wilcom_dispatch.lease_next()
+    return jsonify({"command": _wilcom_public_command(command)}), 200
+
+
+@app.route("/api/wilcom-agent/result/<command_id>", methods=["POST"])
+def wilcom_agent_result(command_id):
+    """Accept a final machine-send result from the warehouse helper."""
+    if not _wilcom_agent_authorized():
+        return jsonify({"error": "Invalid warehouse helper token"}), 401
+    data = request.get_json(silent=True) or {}
+    command = wilcom_dispatch.finish(
+        command_id,
+        ok=data.get("ok") is True,
+        message=str(data.get("message") or ""),
+    )
+    if not command:
+        return jsonify({"error": "Send request not found"}), 404
+    return jsonify(_wilcom_public_command(command)), 200
 
 
 # ─── GET A SINGLE ORDER ───────────────────────────────────────────

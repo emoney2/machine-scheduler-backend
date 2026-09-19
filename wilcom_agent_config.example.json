@@ -1,0 +1,13 @@
+{
+  "serverUrl": "https://machine-scheduler-backend.onrender.com/api",
+  "agentToken": "REPLACE_WITH_THE_RENDER_WILCOM_AGENT_TOKEN",
+  "ordersRoot": "G:\\My Drive\\Orders",
+  "pollSeconds": 2,
+  "openTimeoutSeconds": 30,
+  "machineDevices": {
+    "machine1": "REPLACE_WITH_WILCOM_DEVICE_NAME_1",
+    "machine2": "REPLACE_WITH_WILCOM_DEVICE_NAME_2",
+    "machine3": "REPLACE_WITH_WILCOM_DEVICE_NAME_3",
+    "machine4": "REPLACE_WITH_WILCOM_DEVICE_NAME_4"
+  }
+}

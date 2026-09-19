@@ -16,6 +16,7 @@ credentials.json
 # OS/editor
 .DS_Store
 Thumbs.db
+__pycache__/
 new.json
 token.json
 token.b64.txt
@@ -23,3 +24,8 @@ token.b64.txt
 # Local packing history (also mirrored to Google Sheet tab Packing History)
 data/packing_history.json
 data/packing_history.tmp
+
+# Warehouse Wilcom helper secrets and local delivery history
+wilcom_agent_config.json
+wilcom_agent_history.json
+wilcom-agent-venv/
