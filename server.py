@@ -26353,6 +26353,35 @@ def api_fur_files():
         return {"error": str(e)}, 500
 
 
+# ─── Versioned production scheduler ───────────────────────────────────────────
+# Registered after the existing Sheets, UPS, auth, address, SMTP, and Socket.IO
+# helpers are defined so the new workflow reuses those live application systems.
+from production_schedule_service import ProductionScheduleService
+from schedule_api import create_schedule_blueprint
+from schedule_store import ScheduleSheetStore
+
+_production_schedule_store = ScheduleSheetStore(get_sheets_service(), SPREADSHEET_ID)
+_production_schedule_service = ProductionScheduleService(
+    store=_production_schedule_store,
+    fetch_sheet=fetch_sheet,
+    orders_range=JOBS_FOR_COMPANY_RANGE,
+    resolve_order_address=_order_ship_address_from_production_row_with_pair_fallback,
+    fetch_directory_row=_fetch_directory_row_by_company,
+    normalize_directory_address=_normalize_ups_ship_to_from_directory_row,
+    ups_get_rate=ups_get_rate,
+    frontend_url=FRONTEND_URL,
+)
+app.register_blueprint(
+    create_schedule_blueprint(
+        _production_schedule_service,
+        login_required=login_required_session,
+        values_service=get_sheets_service().spreadsheets().values(),
+        spreadsheet_id=SPREADSHEET_ID,
+        socketio=socketio,
+    )
+)
+
+
 # ─── Run ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     # --- Startup banner ---

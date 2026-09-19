@@ -23,7 +23,7 @@ _FROM_FALLBACK = {
     "addr2": "Suite 300",
     "city": "Buford",
     "state": "GA",
-    "zip": "30518",
+    "zip": "30519",
     "country": "US",
 }
 
