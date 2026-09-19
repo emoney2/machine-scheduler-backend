@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from threading import Lock
 from datetime import datetime
 from uuid import uuid4
 
@@ -19,6 +20,29 @@ def create_schedule_blueprint(
     socketio=None,
 ):
     bp = Blueprint("production_schedule", __name__, url_prefix="/api/schedule")
+    schema_lock = Lock()
+    schema_ready = False
+
+    @bp.before_request
+    def ensure_schedule_schema():
+        nonlocal schema_ready
+        if schema_ready:
+            return None
+        with schema_lock:
+            if schema_ready:
+                return None
+            try:
+                service.store.ensure_schema()
+                schema_ready = True
+            except Exception:
+                logger.exception("Scheduling Sheets schema initialization failed")
+                return jsonify({
+                    "error": (
+                        "Scheduling storage could not be initialized. "
+                        "The current published schedule was not changed."
+                    )
+                }), 503
+        return None
 
     def actor() -> str:
         return "admin"
