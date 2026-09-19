@@ -194,6 +194,61 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(any(r.get("emergencyUsed") for r in rows))
         self.assertEqual(result["summary"]["thirdSewerDates"], [])
 
+    def test_soft_jobs_fill_early_sewing_gaps(self):
+        result = build_schedule(
+            [
+                order(100, Quantity=6, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "09/28/2026",
+                    "Due Date": "09/28/2026",
+                    "Stitch Count": 1000,
+                }),
+                order(200, Quantity=6, **{
+                    "Hard Date/Soft Date": "Soft Date",
+                    "Ship Date": "09/28/2026",
+                    "Due Date": "09/30/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Soft Customer",
+                }),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        hard = [r for r in result["sewing"] if r["orderNumber"] == "100"]
+        soft = [r for r in result["sewing"] if r["orderNumber"] == "200"]
+        self.assertEqual(min(r["date"] for r in hard), "2026-09-28")
+        self.assertEqual(min(r["date"] for r in soft), "2026-09-21")
+
+    def test_soft_job_moves_up_when_the_gap_is_too_small(self):
+        lock = {"lockId": "L1", "orderNumber": "100", "date": "2026-09-21", "capacityUnits": 60}
+        result = build_schedule(
+            [
+                order(100, Quantity=60, **{
+                    "Ship Date": "09/21/2026",
+                    "Due Date": "09/21/2026",
+                    "Stitch Count": 1000,
+                }),
+                order(200, Quantity=100, **{
+                    "Hard Date/Soft Date": "Soft Date",
+                    "Ship Date": "09/28/2026",
+                    "Due Date": "09/30/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Soft Customer",
+                }),
+            ],
+            thread_inventory=inventory(),
+            locks=[lock],
+            now=NOW,
+        )
+        soft = sorted(
+            [r for r in result["sewing"] if r["orderNumber"] == "200"],
+            key=lambda r: r["date"],
+        )
+        self.assertGreaterEqual(len(soft), 2)
+        self.assertEqual(soft[0]["date"], "2026-09-21")
+        self.assertLess(soft[0]["dayQuantity"], 100)
+        self.assertEqual(sum(r["dayQuantity"] for r in soft), 100)
+
     def test_consecutive_exact_customer_orders_group(self):
         normalized, _ = normalize_orders([order(100), order(101)], SchedulerConfig())
         groups, _ = detect_shipping_groups(normalized)

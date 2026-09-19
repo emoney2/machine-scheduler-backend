@@ -313,6 +313,10 @@ def is_back_product(product: Any) -> bool:
     return bool(re.search(r"(?:^|\s)backs?$", name, flags=re.I))
 
 
+def is_hard_date(order: dict) -> bool:
+    return "HARD" in _text(order.get("due_type") or order.get("dueType")).upper()
+
+
 def _priority(order: dict) -> tuple:
     hard = 0 if "HARD" in order["due_type"].upper() else 1
     rush = 0 if order["rush"] else 1
@@ -877,8 +881,135 @@ def _schedule_sewing(
                     "message": "Shipping group cannot finish sewing by its required ship date",
                 })
 
+    order_lookup = {o["order_number"]: o for g in groups for o in g["orders"]}
+    group_lookup = {o["order_number"]: g for g in groups for o in g["orders"]}
+    _fill_soft_sewing_gaps(
+        entries,
+        order_lookup,
+        group_lookup,
+        config,
+        planning_start,
+        locks_by_order,
+        reserved,
+        day_job_count,
+        setup_units,
+        take_day,
+        embroidery_deadlines,
+    )
     entries.sort(key=lambda e: (e.get("date", ""), e.get("start", ""), e.get("orderNumber", "")))
     return entries, conflicts, embroidery_deadlines
+
+
+def _fill_soft_sewing_gaps(
+    entries: List[dict],
+    order_lookup: Dict[str, dict],
+    group_lookup: Dict[str, dict],
+    config: SchedulerConfig,
+    planning_start: date,
+    locks_by_order: Dict[str, List[dict]],
+    reserved: Dict[date, float],
+    day_job_count: Dict[date, int],
+    setup_units: float,
+    take_day,
+    embroidery_deadlines: Dict[str, datetime],
+) -> None:
+    """Pull soft-date sewing into empty days. Hard-date jobs stay against their ship date."""
+    soft_ids: List[str] = []
+    seen: set[str] = set()
+    for row in entries:
+        oid = _text(row.get("orderNumber"))
+        order = order_lookup.get(oid)
+        if not oid or not order or oid in seen:
+            continue
+        if oid in locks_by_order or row.get("locked") or row.get("late"):
+            continue
+        if is_hard_date(order):
+            continue
+        seen.add(oid)
+        soft_ids.append(oid)
+    if not soft_ids:
+        return
+
+    def day_free(day: date) -> float:
+        _regular, _emergency, _total, _already, _setup, free = _sewing_capacity(
+            day, config, reserved, day_job_count, setup_units, False
+        )
+        return free
+
+    def cumulative_free(start: date, finish: date) -> float:
+        total = 0.0
+        cursor = start
+        guard = 0
+        while cursor <= finish and guard < 400:
+            total += day_free(cursor)
+            cursor = next_workday(cursor, config.holidays)
+            guard += 1
+        return total
+
+    for oid in soft_ids:
+        order = order_lookup[oid]
+        group = group_lookup[oid]
+        group_ship = group.get("required_ship_date") or order.get("required_ship_date")
+        units = max(0.0, _number(order.get("sewing_units")))
+        old = [row for row in entries if _text(row.get("orderNumber")) == oid]
+        for row in old:
+            day = parse_date(row.get("date"))
+            if day:
+                reserved[day] = max(
+                    0.0,
+                    reserved[day] - _number(row.get("capacityUnits")) - _number(row.get("setupUnits")),
+                )
+                day_job_count[day] = max(0, day_job_count[day] - 1)
+            entries.remove(row)
+        first = next_workday(planning_start, config.holidays, include=True)
+        last = previous_workday(group_ship, config.holidays, include=True) if group_ship else first
+        if last < first:
+            last = first
+        whole_day = None
+        cursor = first
+        guard = 0
+        while cursor <= last and guard < 400:
+            if day_free(cursor) + 1e-9 >= units:
+                whole_day = cursor
+                break
+            cursor = next_workday(cursor, config.holidays)
+            guard += 1
+        start_day = whole_day
+        if start_day is None:
+            cursor = first
+            guard = 0
+            while cursor <= last and guard < 400:
+                if day_free(cursor) > 1e-6 and cumulative_free(cursor, last) + 1e-9 >= units:
+                    start_day = cursor
+                    break
+                cursor = next_workday(cursor, config.holidays)
+                guard += 1
+        if start_day is None:
+            start_day = first
+        remaining = units
+        new_entries: List[dict] = []
+        place = start_day
+        guard = 0
+        while remaining > 1e-9 and guard < 5000:
+            remaining, entry = take_day(
+                place, order, group, group_ship, remaining, False, new_entries
+            )
+            if entry and entry not in new_entries:
+                new_entries.append(entry)
+            place = next_workday(place, config.holidays)
+            guard += 1
+        if not new_entries:
+            continue
+        new_entries.sort(key=lambda e: e["start"])
+        _annotate_day_quantities(new_entries, order)
+        finish = datetime.fromisoformat(new_entries[-1]["finish"])
+        ship_end = _at(group_ship, SEWING_DAY_END) if group_ship else finish
+        if finish > ship_end:
+            for row in new_entries:
+                row["late"] = True
+                row["conflict"] = True
+        entries.extend(new_entries)
+        embroidery_deadlines[oid] = datetime.fromisoformat(new_entries[0]["start"])
 
 
 def fmt_conflict_day(value: str) -> str:
@@ -1061,6 +1192,7 @@ def _schedule_embroidery(
             "threadConflict": conflict,
             "sewingReadyDeadline": deadline.isoformat(),
             "sameDaySewing": finish.date() == deadline.date() and finish <= deadline,
+            "hardDate": is_hard_date(order),
             "splitPermitted": split_allowed,
             "splitReason": split_reason,
             "image": order["image"],
@@ -1090,11 +1222,85 @@ def _schedule_embroidery(
                 "requiredCompletion": deadline.isoformat(),
                 "message": "Embroidery cannot finish before sewing must begin",
             })
+    _fill_soft_embroidery_gaps(placed, orders, config, planning_start, thread_inventory)
     for row in placed:
         row.pop("_start", None)
         row.pop("_finish", None)
     placed.sort(key=lambda e: (e["start"], e["machine"], e["orderNumber"]))
     return placed, _dedupe_conflicts(conflicts)
+
+
+def _fill_soft_embroidery_gaps(
+    placed: List[dict],
+    orders: Sequence[dict],
+    config: SchedulerConfig,
+    planning_start: datetime,
+    thread_inventory: Dict[str, dict],
+) -> None:
+    """Move soft embroidery into idle machine time. Hard jobs stay just-in-time."""
+    by_oid = {order["order_number"]: order for order in orders}
+    soft = [
+        job for job in placed
+        if not job.get("hardDate")
+        and not job.get("threadConflict")
+        and not is_hard_date(by_oid.get(job.get("orderNumber"), {}))
+    ]
+    if not soft:
+        return
+    soft.sort(key=lambda job: (job.get("sewingReadyDeadline") or "", job.get("start") or "", job.get("orderNumber") or ""))
+    for job in soft:
+        order = by_oid.get(job.get("orderNumber"))
+        if not order:
+            continue
+        deadline = datetime.fromisoformat(job["sewingReadyDeadline"])
+        others = [row for row in placed if row.get("orderNumber") != job.get("orderNumber")]
+        best = None
+        for machine in EMBROIDERY_MACHINES:
+            heads = embroidery_heads(machine)
+            hours = embroidery_hours(order["embroidery_remaining"], order["stitch_count"], heads)
+            if hours <= 0:
+                continue
+            starts = [planning_start]
+            starts.extend(
+                row["_finish"]
+                for row in sorted(others, key=lambda r: r["_start"])
+                if row.get("machine") == machine
+            )
+            for start_at in starts:
+                start, finish, segments = _split_work_forward(start_at, hours, config.holidays)
+                if finish > deadline:
+                    continue
+                if any(
+                    row.get("machine") == machine
+                    and _overlap(start, finish, row["_start"], row["_finish"])
+                    for row in others
+                ):
+                    continue
+                allowed, _ = _thread_slot_allowed(
+                    order, start, finish, others, thread_inventory, machine
+                )
+                if not allowed:
+                    continue
+                if best is None or start < best[0]:
+                    best = (start, machine, finish, segments, hours, heads)
+        if not best or best[0] >= job["_start"]:
+            continue
+        start, machine, finish, segments, hours, heads = best
+        job.update({
+            "machine": machine,
+            "heads": heads,
+            "runs": embroidery_runs(order["embroidery_remaining"], heads),
+            "durationHours": round(hours, 4),
+            "start": start.isoformat(),
+            "finish": finish.isoformat(),
+            "segments": [
+                {**s, "start": s["start"].isoformat(), "finish": s["finish"].isoformat(), "hours": round(s["hours"], 4)}
+                for s in segments
+            ],
+            "sameDaySewing": finish.date() == deadline.date() and finish <= deadline,
+            "_start": start,
+            "_finish": finish,
+        })
 
 
 def _dedupe_conflicts(conflicts: Sequence[dict]) -> List[dict]:
