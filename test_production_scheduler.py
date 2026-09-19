@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from production_scheduler import (
@@ -10,7 +10,9 @@ from production_scheduler import (
     embroidery_hours,
     embroidery_runs,
     normalize_orders,
+    parse_date,
 )
+from schedule_store import SHEET_CELL_LIMIT, compact_order, version_summary_metadata
 
 ET = ZoneInfo("America/New_York")
 NOW = datetime(2026, 9, 21, 8, 30, tzinfo=ET)  # Monday
@@ -178,6 +180,23 @@ class ScheduleTests(unittest.TestCase):
             sum(r["capacityUnits"] for r in first["sewing"]),
             sum(r["capacityUnits"] for r in second["sewing"]),
         )
+
+
+class PersistenceSizeTests(unittest.TestCase):
+    def test_parse_date_accepts_sheet_serials_and_serial_strings(self):
+        expected = date(1899, 12, 30) + timedelta(days=45980)
+        self.assertEqual(parse_date(45980), expected)
+        self.assertEqual(parse_date("45980.0"), expected)
+        self.assertEqual(str(parse_date("09/30/2026")), "2026-09-30")
+
+    def test_version_summary_stays_under_sheet_cell_limit(self):
+        rows = [order(1000 + i, Quantity=12) for i in range(250)]
+        result = build_schedule(rows, thread_inventory=inventory(120), now=NOW)
+        encoded = __import__("json").dumps(version_summary_metadata(result), default=str)
+        self.assertLess(len(encoded), SHEET_CELL_LIMIT)
+        sample = compact_order(result["orders"][0])
+        self.assertIn("order_number", sample)
+        self.assertLess(len(__import__("json").dumps(sample, default=str)), 2000)
 
 
 if __name__ == "__main__":

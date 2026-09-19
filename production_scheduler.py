@@ -72,7 +72,12 @@ def parse_date(value: Any) -> Optional[date]:
             return date(1899, 12, 30) + timedelta(days=float(value))
         except (TypeError, ValueError, OverflowError):
             return None
-    raw = _text(value).split("T", 1)[0].split(" ", 1)[0]
+    raw = _text(value).split("T", 1)[0].split(" ", 1)[0].replace(",", "")
+    if raw and raw[0].isdigit() and "/" not in raw and raw.count("-") == 0:
+        try:
+            return date(1899, 12, 30) + timedelta(days=float(raw))
+        except (TypeError, ValueError, OverflowError):
+            return None
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
         try:
             return datetime.strptime(raw, fmt).date()
@@ -630,7 +635,9 @@ def _split_work_backward(
     cursor = finish
     remaining = max(0.0, hours)
     segments: List[dict] = []
-    while remaining > 1e-9:
+    guard = 0
+    while remaining > 1e-9 and guard < 5000:
+        guard += 1
         day_start = _at(cursor.date(), EMBROIDERY_DAY_START)
         available = max(0.0, (cursor - day_start).total_seconds() / 3600.0)
         if available <= 1e-9:

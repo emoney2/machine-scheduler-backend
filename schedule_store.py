@@ -31,9 +31,19 @@ TAB_HEADERS = {
         "Previous Published Version", "Payload JSON",
     ],
     "Scheduling Settings": ["Key", "Value JSON", "Updated At", "Updated By"],
+    "Schedule Orders": ["Version ID", "Order #", "Payload JSON"],
+    "Schedule Issues": [
+        "Version ID", "Record ID", "Severity", "Type", "Order #", "Payload JSON",
+    ],
 }
 
 VERSION_STATUSES = {"Draft", "Awaiting Approval", "Published", "Rejected", "Superseded"}
+SHEET_CELL_LIMIT = 45000
+ORDER_PAYLOAD_KEYS = (
+    "order_number", "customer", "product", "design", "quantity",
+    "remaining_quantity", "due_date", "in_hand_date", "required_ship_date",
+    "shipping_group_id", "stage",
+)
 
 
 def _rows_to_dicts(values: List[List[Any]]) -> List[dict]:
@@ -49,6 +59,50 @@ def _rows_to_dicts(values: List[List[Any]]) -> List[dict]:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _jsonable(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def compact_order(row: dict) -> dict:
+    out = {}
+    for key in ORDER_PAYLOAD_KEYS:
+        out[key] = _jsonable(row.get(key))
+    return out
+
+
+def version_summary_metadata(schedule: dict) -> dict:
+    """Keep the Versions tab cell well under Google Sheets' 50k character limit."""
+    return {
+        "summary": schedule.get("summary") or {},
+        "settings": schedule.get("settings") or {},
+        "runReason": schedule.get("runReason") or "",
+        "timezone": schedule.get("timezone") or "America/New_York",
+        "shippingGroups": [
+            {
+                "id": row.get("id"),
+                "source": row.get("source"),
+                "requiredShipDate": _jsonable(row.get("requiredShipDate")),
+                "orderNumbers": row.get("orderNumbers") or [],
+                "customer": row.get("customer") or "",
+            }
+            for row in (schedule.get("shippingGroups") or [])
+        ],
+    }
+
+
+def safe_job_payload(row: dict) -> dict:
+    payload = _jsonable(row)
+    if isinstance(payload, dict):
+        payload.pop("image", None)
+    return payload if isinstance(payload, dict) else {}
 
 
 class ScheduleSheetStore:
@@ -171,34 +225,22 @@ class ScheduleSheetStore:
         existing = self.get_version(version_id)
         if not existing:
             summary = schedule.get("summary") or {}
-            metadata = {
-                "summary": summary,
-                "conflicts": schedule.get("conflicts") or [],
-                "warnings": schedule.get("warnings") or [],
-                "shippingGroups": schedule.get("shippingGroups") or [],
-                "orders": [
-                    {
-                        key: row.get(key)
-                        for key in (
-                            "order_number", "customer", "product", "design", "quantity",
-                            "remaining_quantity", "due_date", "in_hand_date",
-                            "required_ship_date", "shipping_group_id", "stage",
-                        )
-                    }
-                    for row in (schedule.get("orders") or [])
-                ],
-                "settings": schedule.get("settings") or {},
-                "runReason": schedule.get("runReason") or "",
-                "timezone": schedule.get("timezone") or "America/New_York",
-            }
+            metadata = version_summary_metadata(schedule)
+            encoded_meta = _json(metadata)
+            if len(encoded_meta) > SHEET_CELL_LIMIT:
+                metadata.pop("shippingGroups", None)
+                encoded_meta = _json(metadata)
+            baseline_json = _json(sorted(set(str(v) for v in baseline_order_ids)))
+            if len(baseline_json) > SHEET_CELL_LIMIT:
+                baseline_json = _json(sorted(set(str(v) for v in baseline_order_ids))[:400])
             self._append("Schedule Versions", [[
                 version_id,
                 status,
                 schedule.get("createdAt") or datetime.utcnow().isoformat(),
                 schedule.get("runReason") or "",
                 schedule.get("inputFingerprint") or "",
-                _json(sorted(set(str(v) for v in baseline_order_ids))),
-                _json(metadata),
+                baseline_json,
+                encoded_meta,
                 int(summary.get("blockingConflictCount") or 0),
                 int(summary.get("warningCount") or 0),
                 "",
@@ -219,7 +261,7 @@ class ScheduleSheetStore:
             sewing_rows.append([
                 version_id, rid, row.get("orderNumber", ""), row.get("shippingGroupId", ""),
                 row.get("date", ""), row.get("start", ""), row.get("finish", ""),
-                row.get("capacityUnits", 0), bool(row.get("locked")), _json(row),
+                row.get("capacityUnits", 0), bool(row.get("locked")), _json(safe_job_payload(row)),
             ])
         self._append("Sewing Schedule", sewing_rows)
 
@@ -236,9 +278,39 @@ class ScheduleSheetStore:
             emb_rows.append([
                 version_id, rid, row.get("machine", ""), row.get("orderNumber", ""),
                 row.get("start", ""), row.get("finish", ""), row.get("durationHours", 0),
-                _json(row),
+                _json(safe_job_payload(row)),
             ])
         self._append("Embroidery Schedule", emb_rows)
+
+        existing_orders = {
+            str(r.get("Order #") or "")
+            for r in self.read_tab("Schedule Orders")
+            if str(r.get("Version ID") or "") == version_id
+        }
+        order_rows = []
+        for row in schedule.get("orders") or []:
+            oid = str(row.get("order_number") or "")
+            if not oid or oid in existing_orders:
+                continue
+            order_rows.append([version_id, oid, _json(compact_order(row))])
+        self._append("Schedule Orders", order_rows)
+
+        existing_issues = {
+            str(r.get("Record ID") or "")
+            for r in self.read_tab("Schedule Issues")
+            if str(r.get("Version ID") or "") == version_id
+        }
+        issue_rows = []
+        for index, row in enumerate((schedule.get("conflicts") or []) + (schedule.get("warnings") or [])):
+            rid = f"{version_id}-I-{index:05d}"
+            if rid in existing_issues:
+                continue
+            issue_rows.append([
+                version_id, rid, row.get("severity", ""), row.get("type", ""),
+                row.get("orderNumber") or row.get("groupId") or "",
+                _json(_jsonable(row)),
+            ])
+        self._append("Schedule Issues", issue_rows)
         return self.get_version(version_id) or {}
 
     def _update_version_fields(self, version_id: str, fields: Dict[str, Any]) -> None:
@@ -312,13 +384,22 @@ class ScheduleSheetStore:
         except (TypeError, ValueError, json.JSONDecodeError):
             metadata = {}
         summary = metadata.get("summary", metadata) if isinstance(metadata, dict) else {}
+        orders = payloads("Schedule Orders")
+        if not orders and isinstance(metadata, dict):
+            orders = metadata.get("orders") or []
+        issues = payloads("Schedule Issues")
+        conflicts = [row for row in issues if str(row.get("severity") or "").lower() == "blocking"]
+        warnings = [row for row in issues if str(row.get("severity") or "").lower() != "blocking"]
+        if not issues and isinstance(metadata, dict):
+            conflicts = metadata.get("conflicts") or []
+            warnings = metadata.get("warnings") or []
         return {
             "version": version,
             "summary": summary,
-            "conflicts": metadata.get("conflicts", []) if isinstance(metadata, dict) else [],
-            "warnings": metadata.get("warnings", []) if isinstance(metadata, dict) else [],
+            "conflicts": conflicts,
+            "warnings": warnings,
             "shippingGroups": metadata.get("shippingGroups", []) if isinstance(metadata, dict) else [],
-            "orders": metadata.get("orders", []) if isinstance(metadata, dict) else [],
+            "orders": orders,
             "settings": metadata.get("settings", {}) if isinstance(metadata, dict) else {},
             "runReason": metadata.get("runReason", "") if isinstance(metadata, dict) else "",
             "timezone": metadata.get("timezone", "America/New_York") if isinstance(metadata, dict) else "America/New_York",

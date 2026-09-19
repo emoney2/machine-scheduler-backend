@@ -88,10 +88,11 @@ def _parse_thread_usage(thread_rows: Sequence[dict]) -> Dict[str, Dict[str, floa
     return out
 
 
-def _thread_data_received_cones(values: Sequence[Sequence[Any]]) -> Dict[str, int]:
+def _thread_data_received_cones(values: Sequence[Any]) -> Dict[str, int]:
     """Mirror the existing thread-inventory endpoint's received-cone calculation."""
+    rows = values if values and isinstance(values[0], dict) else _rows_to_dicts(values)
     result: Dict[str, int] = {}
-    for row in _rows_to_dicts(values):
+    for row in rows:
         if _text(row.get("IN/OUT")).upper() != "IN":
             continue
         if _text(row.get("O/R")).upper() == "ORDERED":
@@ -454,7 +455,10 @@ class ProductionScheduleService:
                 "sewingMetrics": metrics,
             }
             if notify and not initial_baseline:
-                self.send_approval_email(version_id, result)
+                try:
+                    self.send_approval_email(version_id, result)
+                except Exception:
+                    logger.exception("Schedule approval email failed; proposal was still saved")
             return result
         except Exception as exc:
             logger.exception("Production schedule rebuild failed; published schedule preserved")
