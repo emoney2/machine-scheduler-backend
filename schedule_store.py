@@ -44,7 +44,7 @@ ORDER_PAYLOAD_KEYS = (
     "order_number", "customer", "product", "design", "quantity",
     "remaining_quantity", "embroidery_remaining", "stitch_count",
     "due_date", "in_hand_date", "required_ship_date",
-    "shipping_group_id", "stage", "image",
+    "shipping_group_id", "stage", "image", "needs_sewing",
 )
 
 

@@ -9,6 +9,7 @@ from production_scheduler import (
     detect_shipping_groups,
     embroidery_hours,
     embroidery_runs,
+    is_back_product,
     normalize_orders,
     parse_date,
 )
@@ -115,6 +116,26 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertAlmostEqual(sum(r["capacityUnits"] for r in rows), 190)
         self.assertTrue(all(r["regularCapacity"] == 95 for r in rows))
+        self.assertEqual([r["dayQuantity"] for r in rows], [95, 95])
+        self.assertTrue(all(r["split"] for r in rows))
+        self.assertEqual(sum(r["dayQuantity"] for r in rows), 190)
+
+    def test_back_products_are_not_sewn(self):
+        self.assertTrue(is_back_product("Driver Back"))
+        self.assertFalse(is_back_product("Driver Front"))
+        result = build_schedule(
+            [
+                order(100, Product="Driver Front", Quantity=6),
+                order(101, Product="Driver Back", Quantity=6),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        self.assertTrue(all(r["product"] != "Driver Back" for r in result["sewing"]))
+        self.assertTrue(any(r["orderNumber"] == "100" for r in result["sewing"]))
+        self.assertTrue(any(r["orderNumber"] == "101" for r in result["embroidery"]))
+        back = next(o for o in result["orders"] if o["order_number"] == "101")
+        self.assertFalse(back["needs_sewing"])
 
     def test_optional_third_sewer_capacity(self):
         base = order(

@@ -253,6 +253,12 @@ def _stage_priority(stage: str) -> int:
     return 2
 
 
+def is_back_product(product: Any) -> bool:
+    """Back panels are embroidered, not sewn as their own sewing job."""
+    name = re.sub(r"\s+", " ", _text(product)).strip()
+    return bool(re.search(r"(?:^|\s)backs?$", name, flags=re.I))
+
+
 def _priority(order: dict) -> tuple:
     hard = 0 if "HARD" in order["due_type"].upper() else 1
     rush = 0 if order["rush"] else 1
@@ -315,6 +321,8 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
         ship = parse_date(raw.get("_required_ship_date") or raw.get("Ship Date"))
         address = raw.get("_shipping_address") if isinstance(raw.get("_shipping_address"), dict) else {}
         factor = _capacity_factor(raw, config, warnings)
+        product = _text(raw.get("Product"))
+        back = is_back_product(product)
         emb_done = max(0, int(_number(raw.get("Embroidery Completed Qty"))))
         sewing_done = max(0, int(_number(raw.get("_sewing_completed_qty"))))
         if not due:
@@ -348,11 +356,12 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
             "order_number": oid,
             "customer": _text(raw.get("Company Name")),
             "customer_key": normalize_customer(raw.get("Company Name")),
-            "product": _text(raw.get("Product")),
+            "product": product,
             "design": _text(raw.get("Design")),
             "quantity": qty,
             "remaining_quantity": max(0, remaining - sewing_done),
             "embroidery_remaining": max(0, remaining - emb_done),
+            "needs_sewing": not back,
             "stitch_count": stitches,
             "thread_colors": thread_codes,
             "thread_usage_cones": {
@@ -370,7 +379,7 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
             "rush": _flag(raw, "Rush", "Rush Order") or "RUSH" in _text(raw.get("Notes")).upper(),
             "order_date": parse_date(raw.get("Date")),
             "sewing_factor": factor,
-            "sewing_units": max(0.0, (max(0, remaining - sewing_done) * factor)),
+            "sewing_units": 0.0 if back else max(0.0, (max(0, remaining - sewing_done) * factor)),
             "french_seam": _flag(raw, "French Seam", "French Seams", "French-seam"),
             "unusual_shape": _flag(raw, "Unusual Shape", "Custom Shape", "Unusual/Custom Shape"),
             "materials_ready": not material_warnings,
@@ -551,7 +560,37 @@ def _sewing_entry(
         "conflict": False,
         "late": False,
         "image": order["image"],
+        "dayQuantity": 0,
+        "split": False,
+        "splitPart": 1,
+        "splitParts": 1,
     }
+
+
+def _annotate_day_quantities(entries: List[dict], order: dict) -> None:
+    """Put the pieces for this calendar day on each sewing card."""
+    pieces = max(0, int(_number(order.get("remaining_quantity"))))
+    factor = max(_number(order.get("sewing_factor"), 1.0), 1e-9)
+    if not entries:
+        return
+    split = len(entries) > 1
+    total_units = sum(max(0.0, _number(row.get("capacityUnits"))) for row in entries)
+    allocated = 0
+    for index, entry in enumerate(entries):
+        units = max(0.0, _number(entry.get("capacityUnits")))
+        if index == len(entries) - 1:
+            qty = max(0, pieces - allocated)
+        elif total_units <= 1e-9:
+            qty = 0
+        else:
+            qty = int(round(pieces * units / total_units))
+            allocated += qty
+        if qty <= 0 and units > 0:
+            qty = max(1, int(round(units / factor)))
+        entry["dayQuantity"] = qty
+        entry["split"] = split
+        entry["splitPart"] = index + 1
+        entry["splitParts"] = len(entries)
 
 
 def _resolve_group_ship(group: dict, planning_start: date, holidays: set[date]) -> date:
@@ -630,6 +669,7 @@ def _schedule_sewing(
                         "hardDate": "HARD" in order["due_type"].upper(),
                         "conflict": False,
                     })
+                _annotate_day_quantities(fixed, order)
                 group_entries.extend(fixed)
                 embroidery_deadlines[order["order_number"]] = datetime.fromisoformat(fixed[0]["start"])
                 continue
@@ -670,6 +710,7 @@ def _schedule_sewing(
                 })
                 continue
             order_entries.sort(key=lambda e: e["start"])
+            _annotate_day_quantities(order_entries, order)
             if late:
                 finish = order_entries[-1]["finish"]
                 emergency_days_needed = int(
