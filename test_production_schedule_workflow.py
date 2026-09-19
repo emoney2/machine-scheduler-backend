@@ -2,7 +2,12 @@ import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from production_schedule_service import ProductionScheduleService
+from production_schedule_service import (
+    ProductionScheduleService,
+    _physical_cones_on_hand,
+    _thread_data_received_cones,
+    sewing_output_metrics,
+)
 
 ET = ZoneInfo("America/New_York")
 
@@ -108,6 +113,24 @@ class FakeService(ProductionScheduleService):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_thread_inventory_reuses_received_cone_math(self):
+        values = [
+            ["Color", "Length (ft)", "IN/OUT", "O/R"],
+            ["1800 Black", 99000, "IN", "Received"],
+            ["1800 Black", 99000, "IN", "Ordered"],
+        ]
+        self.assertEqual(_thread_data_received_cones(values), {"1800": 6})
+        self.assertEqual(_physical_cones_on_hand(5.5, 6), 6)
+        self.assertEqual(_physical_cones_on_hand(0, 6), 0)
+
+    def test_sewing_summary_without_timestamps_does_not_invent_averages(self):
+        metrics = sewing_output_metrics([
+            ["Order #", "Elastic", "Fur", "Flat", "Round", "Top"],
+            [100, 2, 2, 2, 2, 12],
+        ], now=datetime(2026, 9, 19, tzinfo=ET))
+        self.assertFalse(metrics["7"]["enoughData"])
+        self.assertEqual(metrics["7"]["finishedPieces"], 0)
+
     def test_initial_deployment_is_published_without_email(self):
         service = FakeService(FakeStore())
         result = service.rebuild("initial")

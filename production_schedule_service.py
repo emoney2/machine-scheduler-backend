@@ -88,6 +88,38 @@ def _parse_thread_usage(thread_rows: Sequence[dict]) -> Dict[str, Dict[str, floa
     return out
 
 
+def _thread_data_received_cones(values: Sequence[Sequence[Any]]) -> Dict[str, int]:
+    """Mirror the existing thread-inventory endpoint's received-cone calculation."""
+    result: Dict[str, int] = {}
+    for row in _rows_to_dicts(values):
+        if _text(row.get("IN/OUT")).upper() != "IN":
+            continue
+        if _text(row.get("O/R")).upper() == "ORDERED":
+            continue
+        color_match = re.search(r"\b(\d{4})\b", _text(row.get("Color")))
+        if not color_match:
+            continue
+        feet = max(0.0, _number(row.get("Length (ft)")))
+        cones = int(round(feet / 16500.0)) if feet else 0
+        if cones > 0:
+            code = color_match.group(1)
+            result[code] = result.get(code, 0) + cones
+    return result
+
+
+def _physical_cones_on_hand(remaining_eq: float, cones_received: int) -> int:
+    """Mirror the app's six-head loadable-cone calculation."""
+    remaining = max(0.0, _number(remaining_eq))
+    if remaining <= 0:
+        return 0
+    received = max(0, int(_number(cones_received)))
+    if received <= 0:
+        return int(((remaining + 5.999999) // 6) * 6)
+    used = max(0.0, received - remaining)
+    emptied = int(used // 6) * 6
+    return max(0, received - emptied)
+
+
 def _parse_sewing_completion(values: Sequence[Sequence[Any]]) -> Dict[str, float]:
     rows = _rows_to_dicts(values)
     result = {}
@@ -180,10 +212,11 @@ class ProductionScheduleService:
             "sewingChangeoverMinutes": raw.get("sewingChangeoverMinutes", 5),
         }
 
-    def _inventory(self) -> Dict[str, dict]:
+    def _inventory(self, thread_values: Sequence[Sequence[Any]]) -> Dict[str, dict]:
         rows = self.fetch_sheet(self.store.spreadsheet_id, "Thread Inventory!A1:M") or []
         if len(rows) < 2:
             return {}
+        received_by_code = _thread_data_received_cones(thread_values)
         headers = [_text(v) for v in rows[0]]
         lower = [h.lower() for h in headers]
         color_i = next((i for i, h in enumerate(lower) if h in {"thread colors", "thread color"}), None)
@@ -199,7 +232,7 @@ class ProductionScheduleService:
             code = match.group(1)
             remaining = _number(row[inv_i] if inv_i is not None and inv_i < len(row) else 0)
             # Same six-cone loading rule used by /api/thread-inventory-status.
-            loadable = int(((remaining + 5.999999) // 6) * 6) if remaining > 0 else 0
+            loadable = _physical_cones_on_hand(remaining, received_by_code.get(code, 0))
             result[code] = {
                 "inventory": remaining,
                 "onOrder": _number(row[order_i] if order_i is not None and order_i < len(row) else 0),
@@ -338,8 +371,10 @@ class ProductionScheduleService:
             row["_sewing_completed_qty"] = sewing_done.get(oid, 0)
             row["_material_warnings"] = warnings
             row["_shipping_group_id"] = explicit_groups.get(oid, "")
-        sewing_log = self.fetch_sheet(self.store.spreadsheet_id, "Sewing Log!A1:Z") or []
-        return orders, self._inventory(), sewing_output_metrics(sewing_log)
+        # The production workbook records finished pieces in Sewing Summary.Top.
+        # It has no dated Sewing Log, so recent averages remain "Not enough data"
+        # until a timestamped finished-output source is introduced.
+        return orders, self._inventory(thread_rows), sewing_output_metrics(sewing_values)
 
     @staticmethod
     def _version_id(fingerprint: str) -> str:
