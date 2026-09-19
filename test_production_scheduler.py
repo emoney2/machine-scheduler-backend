@@ -174,13 +174,25 @@ class ScheduleTests(unittest.TestCase):
             Quantity=140,
             **{"Ship Date": "09/21/2026", "Due Date": "09/21/2026", "Stitch Count": 1000},
         )
-        without = build_schedule([base], thread_inventory=inventory(), now=NOW)
-        self.assertTrue(any(c["type"] == "sewing_unscheduled" for c in without["conflicts"]))
-        self.assertGreater(sum(r["capacityUnits"] for r in without["sewing"] if r["orderNumber"] == "100"), 0)
-        cfg = SchedulerConfig.from_dict({"approvedEmergencyDates": ["2026-09-21"]})
-        with_extra = build_schedule([base], config=cfg, thread_inventory=inventory(), now=NOW)
-        self.assertFalse(any(c["type"] == "sewing_unscheduled" for c in with_extra["conflicts"]))
-        self.assertEqual(with_extra["summary"]["thirdSewerDates"], ["2026-09-21"])
+        result = build_schedule([base], thread_inventory=inventory(), now=NOW)
+        rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
+        self.assertFalse(any(c["type"] == "sewing_unscheduled" for c in result["conflicts"]))
+        self.assertAlmostEqual(sum(r["capacityUnits"] for r in rows), 140)
+        self.assertTrue(any(r.get("emergencyUsed") for r in rows))
+        self.assertEqual(result["summary"]["thirdSewerDates"], ["2026-09-21"])
+        self.assertFalse(any(r["late"] for r in rows))
+        self.assertTrue(any(w["type"] == "emergency_sewing" for w in result["warnings"]))
+
+    def test_on_time_jobs_do_not_use_emergency_sewing(self):
+        result = build_schedule(
+            [order(100, Quantity=6)],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
+        self.assertTrue(rows)
+        self.assertFalse(any(r.get("emergencyUsed") for r in rows))
+        self.assertEqual(result["summary"]["thirdSewerDates"], [])
 
     def test_consecutive_exact_customer_orders_group(self):
         normalized, _ = normalize_orders([order(100), order(101)], SchedulerConfig())
