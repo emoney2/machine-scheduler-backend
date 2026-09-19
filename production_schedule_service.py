@@ -22,7 +22,8 @@ from production_scheduler import (
     build_schedule,
     normalize_order_number,
     parse_date,
-    subtract_workdays,
+    resolve_required_ship_date,
+    transit_days_for_service,
 )
 from schedule_store import ScheduleSheetStore, friendly_sheets_error
 
@@ -278,7 +279,7 @@ class ProductionScheduleService:
         return address if all(_text(address.get(k)) for k in required) else {}
 
     def _transit_days(self, address: dict, service_code: str) -> Optional[int]:
-        if not address.get("addr1"):
+        if not address.get("zip") and not address.get("addr1"):
             return None
         key = f"{address.get('zip')}|{service_code}"
         if key in self._transit_cache:
@@ -291,13 +292,22 @@ class ProductionScheduleService:
                 ask_all_services=False,
             )
             match = next((r for r in rows if _text(r.get("code")).zfill(2) == service_code), None)
-            days = int((match or {}).get("business_days"))
-            if days >= 0:
+            raw_days = (match or {}).get("business_days")
+            if raw_days in (None, ""):
+                return None
+            days = int(raw_days)
+            if 1 <= days <= 6:
                 self._transit_cache[key] = days
                 return days
         except Exception:
             logger.exception("UPS transit lookup failed for %s", key)
         return None
+
+    def _planning_transit(self, row: dict, address: dict, service_code: str) -> int:
+        live = self._transit_days(address, service_code) if address else None
+        if live is not None:
+            return live
+        return transit_days_for_service(service_code, address.get("zip"), address.get("state"))
 
     def load_inputs(self) -> tuple[List[dict], Dict[str, dict], dict]:
         batched = self.store.batch_values([
@@ -352,16 +362,10 @@ class ProductionScheduleService:
             oid = normalize_order_number(row.get("Order #"))
             address = self._address(row, by_id, directory_by_customer)
             service_code = self._service_code(row)
-            transit = None
-            ship_date = parse_date(row.get("Ship Date"))
             due = parse_date(row.get("Due Date"))
-            if not ship_date and address:
-                transit = self._transit_days(address, service_code)
-                if due and transit is not None:
-                    ship_date = subtract_workdays(due, transit, cfg.holidays)
-            elif ship_date and due:
-                # The existing Production Orders Ship Date remains authoritative.
-                transit = max(0, (due - ship_date).days)
+            transit = self._planning_transit(row, address, service_code)
+            # Sheet Ship Date is WORKDAY(due, -5) — a blanket week, not real transit.
+            ship_date = resolve_required_ship_date(due, transit, cfg.holidays)
             warnings = []
             cut = cut_rows.get(oid) or {}
             cut_status = _text(cut.get("Status") or row.get("Cut Status")).upper()

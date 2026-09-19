@@ -9,9 +9,11 @@ from production_scheduler import (
     detect_shipping_groups,
     embroidery_hours,
     embroidery_runs,
+    estimate_ground_transit_days,
     is_back_product,
     normalize_orders,
     parse_date,
+    resolve_required_ship_date,
 )
 from schedule_store import (
     SHEET_CELL_LIMIT,
@@ -119,6 +121,35 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual([r["dayQuantity"] for r in rows], [95, 95])
         self.assertTrue(all(r["split"] for r in rows))
         self.assertEqual(sum(r["dayQuantity"] for r in rows), 190)
+
+    def test_nearby_ground_transit_is_not_a_week(self):
+        self.assertEqual(estimate_ground_transit_days("30519", "GA"), 1)
+        self.assertEqual(estimate_ground_transit_days("30305", "GA"), 1)
+        self.assertEqual(estimate_ground_transit_days("28202", "NC"), 2)
+        self.assertEqual(estimate_ground_transit_days("10001", "NY"), 3)
+        self.assertEqual(estimate_ground_transit_days("90210", "CA"), 5)
+        due = date(2026, 9, 30)
+        nearby = resolve_required_ship_date(due, 2)
+        week = resolve_required_ship_date(due, 5)
+        self.assertEqual(str(nearby), "2026-09-28")
+        self.assertEqual(str(week), "2026-09-23")
+        self.assertGreater(nearby, week)
+
+    def test_actual_transit_overrides_conservative_sheet_ship_date(self):
+        result = build_schedule(
+            [order(100, Quantity=6, **{
+                "Ship Date": "09/23/2026",
+                "Due Date": "09/30/2026",
+                "_transit_business_days": 2,
+            })],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["requiredShipDate"], "2026-09-28")
+        self.assertEqual(rows[0]["transitBusinessDays"], 2)
+        self.assertFalse(any(r["late"] for r in rows))
 
     def test_back_products_are_not_sewn(self):
         self.assertTrue(is_back_product("Driver Back"))

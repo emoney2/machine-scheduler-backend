@@ -123,6 +123,60 @@ def subtract_workdays(value: date, days: int, holidays: Iterable[date]) -> date:
     return cursor
 
 
+DEFAULT_GROUND_TRANSIT_DAYS = 3
+
+
+def estimate_ground_transit_days(zip_code: Any = "", state: Any = "") -> int:
+    """Typical UPS Ground business days from Buford, GA (30519).
+
+    Used when live UPS transit is missing. Nearby Southeast jobs are 1–2 days,
+    not a blanket week.
+    """
+    digits = re.sub(r"\D", "", _text(zip_code))
+    prefix = digits[:3]
+    lead = prefix[:1]
+    st = _text(state).upper()
+    if st == "GA" or prefix.startswith("30") or prefix.startswith("31"):
+        return 1
+    if st in {"SC", "AL", "TN", "FL", "NC"} or lead == "3":
+        return 2
+    if st in {
+        "VA", "WV", "KY", "MS", "LA", "MD", "DC", "DE", "PA", "NJ", "NY",
+        "CT", "RI", "MA", "NH", "VT", "ME", "OH", "IN", "MI", "IL", "WI",
+        "MO", "AR",
+    } or lead in {"1", "2", "4"}:
+        return 3
+    if lead in {"5", "6", "7"}:
+        return 4
+    if lead in {"8", "9"}:
+        return 5
+    return DEFAULT_GROUND_TRANSIT_DAYS
+
+
+def transit_days_for_service(service_code: Any, zip_code: Any = "", state: Any = "") -> int:
+    code = _text(service_code).zfill(2)
+    if code in {"01", "13", "14"}:
+        return 1
+    if code == "02":
+        return 2
+    if code == "12":
+        return 3
+    return estimate_ground_transit_days(zip_code, state)
+
+
+def resolve_required_ship_date(
+    due: Optional[date],
+    transit_days: Any,
+    holidays: Iterable[date] = (),
+    fallback_ship: Optional[date] = None,
+) -> Optional[date]:
+    """Ship date = due minus actual transit. Ignore a conservative sheet ship date."""
+    days = int(_number(transit_days, -1))
+    if due and days >= 0:
+        return subtract_workdays(due, days, holidays)
+    return fallback_ship or due
+
+
 def embroidery_heads(machine: Any) -> int:
     name = _text(machine)
     if name in {"Machine 1", "Single Head", "Single Head Machine"}:
@@ -318,7 +372,13 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
             continue
         stitches = max(0, int(round(_number(raw.get("Stitch Count")))))
         due = parse_date(raw.get("Due Date"))
-        ship = parse_date(raw.get("_required_ship_date") or raw.get("Ship Date"))
+        transit_raw = raw.get("_transit_business_days")
+        transit = int(_number(transit_raw, -1)) if transit_raw not in (None, "") else -1
+        provided_ship = parse_date(raw.get("_required_ship_date") or raw.get("Ship Date"))
+        if due and transit >= 0:
+            ship = resolve_required_ship_date(due, transit, config.holidays, provided_ship)
+        else:
+            ship = provided_ship
         address = raw.get("_shipping_address") if isinstance(raw.get("_shipping_address"), dict) else {}
         factor = _capacity_factor(raw, config, warnings)
         product = _text(raw.get("Product"))
@@ -371,7 +431,7 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
             "due_date": due,
             "in_hand_date": parse_date(raw.get("In-Hand Date")) or due,
             "required_ship_date": ship,
-            "transit_business_days": int(_number(raw.get("_transit_business_days"), 0)),
+            "transit_business_days": max(0, transit) if transit >= 0 else 0,
             "shipping_method": _text(raw.get("_shipping_method") or raw.get("Shipping Method") or "UPS Ground"),
             "shipping_address": address,
             "stage": stage,
@@ -548,6 +608,8 @@ def _sewing_entry(
         "dueDate": iso_day(order["due_date"]),
         "inHandDate": iso_day(order["in_hand_date"]),
         "requiredShipDate": iso_day(group_ship),
+        "transitBusinessDays": order["transit_business_days"],
+        "shippingMethod": order["shipping_method"],
         "embroideryReady": False,
         "materialsReady": order["materials_ready"],
         "materialsWarnings": order["material_warnings"],
