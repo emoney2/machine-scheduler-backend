@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from production_scheduler import (
+    LOCAL_DELIVERY_TRANSIT_DAYS,
     SchedulerConfig,
     build_schedule,
     can_split_embroidery_job,
@@ -11,6 +12,7 @@ from production_scheduler import (
     embroidery_runs,
     estimate_ground_transit_days,
     is_back_product,
+    is_local_delivery,
     normalize_orders,
     parse_date,
     resolve_required_ship_date,
@@ -149,6 +151,29 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(rows)
         self.assertEqual(rows[0]["requiredShipDate"], "2026-09-28")
         self.assertEqual(rows[0]["transitBusinessDays"], 2)
+        self.assertFalse(any(r["late"] for r in rows))
+
+    def test_local_delivery_uses_one_day_buffer(self):
+        self.assertTrue(is_local_delivery("Local Delivery"))
+        self.assertTrue(is_local_delivery("local"))
+        self.assertFalse(is_local_delivery("UPS"))
+        self.assertEqual(LOCAL_DELIVERY_TRANSIT_DAYS, 1)
+        due = date(2026, 9, 30)
+        self.assertEqual(str(resolve_required_ship_date(due, 1)), "2026-09-29")
+        result = build_schedule(
+            [order(100, Quantity=6, **{
+                "Ship Date": "09/23/2026",
+                "Due Date": "09/30/2026",
+                "Shipping Method": "Local Delivery",
+            })],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["shippingMethod"], "Local Delivery")
+        self.assertEqual(rows[0]["transitBusinessDays"], 1)
+        self.assertEqual(rows[0]["requiredShipDate"], "2026-09-29")
         self.assertFalse(any(r["late"] for r in rows))
 
     def test_back_products_are_not_sewn(self):

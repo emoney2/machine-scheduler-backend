@@ -5932,6 +5932,15 @@ ORDER_SHIP_ADDRESS_HEADERS = (
 PO_NUMBER_HEADER = "PO #"
 PO_NUMBER_HEADER_CANDIDATES = ("PO #", "PO#", "PO Number", "Customer PO", "PO")
 
+# Planning shipping type from Order Submission (UPS vs Local delivery).
+# Do not write over Ship Via — that column is used later for QBO / UPS labels.
+SHIPPING_METHOD_HEADER = "Shipping Method"
+SHIPPING_METHOD_HEADER_CANDIDATES = (
+    "Shipping Method",
+    "Shipping Type",
+    "Shipping Service",
+)
+
 
 def _normalize_po_header_key(name) -> str:
     return re.sub(r"\s+", "", str(name or "").strip().lower())
@@ -6016,6 +6025,86 @@ def _write_po_number(sheets, row_num: int, po_number: str) -> None:
         logger.info("[submit] Wrote PO # %s to Production Orders row %s", po, row_num)
     except Exception as e:
         logger.warning("[submit] Failed to write PO # for row %s: %s", row_num, e)
+
+
+def _shipping_method_from_submit(data) -> str:
+    raw = (
+        (data.get("shippingType") if data is not None else None)
+        or (data.get("shippingMethod") if data is not None else None)
+        or (data.get("Shipping Method") if data is not None else None)
+        or ""
+    )
+    if "local" in str(raw).casefold():
+        return "Local Delivery"
+    return "UPS"
+
+
+def _shipping_method_header_index(header_row) -> int | None:
+    by_key = {}
+    for i, h in enumerate(header_row or []):
+        key = _normalize_po_header_key(h)
+        if key and key not in by_key:
+            by_key[key] = i
+    for cand in SHIPPING_METHOD_HEADER_CANDIDATES:
+        idx = by_key.get(_normalize_po_header_key(cand))
+        if idx is not None:
+            return idx
+    return None
+
+
+def _ensure_shipping_method_header_index(sheets) -> int | None:
+    header_row = list(_production_orders_header_row(sheets) or [])
+    idx = _shipping_method_header_index(header_row)
+    if idx is not None:
+        return idx
+    last = -1
+    for i, h in enumerate(header_row):
+        if str(h).strip():
+            last = i
+    col_idx = last + 1
+    try:
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!{_col_letter_local(col_idx)}1",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[SHIPPING_METHOD_HEADER]]},
+        ).execute()
+        logger.info(
+            "[submit] Created %s header on Production Orders column %s",
+            SHIPPING_METHOD_HEADER,
+            _col_letter_local(col_idx),
+        )
+        return col_idx
+    except Exception as e:
+        logger.warning(
+            "Failed to create Production Orders %s header: %s",
+            SHIPPING_METHOD_HEADER,
+            e,
+        )
+        return None
+
+
+def _write_shipping_method(sheets, row_num: int, shipping_method: str) -> None:
+    value = str(shipping_method or "").strip() or "UPS"
+    if row_num < 2:
+        return
+    try:
+        col_idx = _ensure_shipping_method_header_index(sheets)
+        if col_idx is None:
+            return
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!{_col_letter_local(col_idx)}{row_num}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[value]]},
+        ).execute()
+        logger.info(
+            "[submit] Wrote Shipping Method %s to Production Orders row %s",
+            value,
+            row_num,
+        )
+    except Exception as e:
+        logger.warning("[submit] Failed to write Shipping Method for row %s: %s", row_num, e)
 
 
 def _order_ship_address_from_production_row(row: dict) -> dict:
@@ -17765,6 +17854,8 @@ def submit_order():
             data.get("poNumber") or data.get("po") or data.get("PO #") or ""
         ).strip()
         _write_po_number(sheets, next_row, po_number)
+        shipping_method = _shipping_method_from_submit(data)
+        _write_shipping_method(sheets, next_row, shipping_method)
 
         # ─── ORDER-SPECIFIC SHIP ADDRESS (Order Ship * columns) ──────────────
         order_ship_field_map = None
@@ -17887,6 +17978,7 @@ def submit_order():
             ).execute()
 
             _write_po_number(sheets, back_next_row, po_number)
+            _write_shipping_method(sheets, back_next_row, shipping_method)
 
             # Copy front ship address onto the back row (in-memory first, then sheet).
             if order_ship_field_map and order_ship_field_map.get("Order Ship Street 1"):

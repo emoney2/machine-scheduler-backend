@@ -113,6 +113,17 @@ class FakeService(ProductionScheduleService):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_local_delivery_planning_transit_is_one_day(self):
+        service = FakeService(FakeStore())
+        self.assertEqual(
+            service._planning_transit(
+                {"Shipping Method": "Local Delivery"},
+                {"zip": "90210", "state": "CA"},
+                "03",
+            ),
+            1,
+        )
+
     def test_thread_inventory_reuses_received_cone_math(self):
         values = [
             ["Color", "Length (ft)", "IN/OUT", "O/R"],

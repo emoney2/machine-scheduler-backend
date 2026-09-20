@@ -18,8 +18,10 @@ import requests
 
 from production_scheduler import (
     BUSINESS_TZ,
+    LOCAL_DELIVERY_TRANSIT_DAYS,
     SchedulerConfig,
     build_schedule,
+    is_local_delivery,
     normalize_order_number,
     parse_date,
     resolve_required_ship_date,
@@ -248,14 +250,21 @@ class ProductionScheduleService:
             }
         return result
 
-    def _service_code(self, row: dict) -> str:
-        raw = _text(
-            row.get("Shipping Service")
+    def _shipping_method_raw(self, row: dict) -> str:
+        return _text(
+            row.get("Shipping Type")
             or row.get("Shipping Method")
+            or row.get("Shipping Service")
             or row.get("Ship Via")
             or row.get("UPS Service")
-        ).upper()
-        if not raw:
+        )
+
+    def _is_local_delivery(self, row: dict) -> bool:
+        return is_local_delivery(self._shipping_method_raw(row))
+
+    def _service_code(self, row: dict) -> str:
+        raw = self._shipping_method_raw(row).upper()
+        if not raw or self._is_local_delivery(row):
             return GROUND_CODE
         for label, code in SERVICE_CODES.items():
             if label in raw:
@@ -304,6 +313,8 @@ class ProductionScheduleService:
         return None
 
     def _planning_transit(self, row: dict, address: dict, service_code: str) -> int:
+        if self._is_local_delivery(row):
+            return LOCAL_DELIVERY_TRANSIT_DAYS
         live = self._transit_days(address, service_code) if address else None
         if live is not None:
             return live
@@ -376,9 +387,13 @@ class ProductionScheduleService:
                 if fur_status and fur_status not in {"COMPLETE", "COMPLETED", "DONE", "READY"}:
                     warnings.append(f"Fur: {fur_status}")
             row["_shipping_address"] = address
-            row["_shipping_method"] = next(
-                (label.title() for label, code in SERVICE_CODES.items() if code == service_code),
-                "UPS Ground",
+            row["_shipping_method"] = (
+                "Local Delivery"
+                if self._is_local_delivery(row)
+                else next(
+                    (label.title() for label, code in SERVICE_CODES.items() if code == service_code),
+                    "UPS Ground",
+                )
             )
             row["_required_ship_date"] = ship_date.isoformat() if ship_date else ""
             row["_transit_business_days"] = transit if transit is not None else ""

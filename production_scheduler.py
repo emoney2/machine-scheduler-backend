@@ -153,6 +153,14 @@ def estimate_ground_transit_days(zip_code: Any = "", state: Any = "") -> int:
     return DEFAULT_GROUND_TRANSIT_DAYS
 
 
+LOCAL_DELIVERY_TRANSIT_DAYS = 1
+
+
+def is_local_delivery(value: Any) -> bool:
+    """True for Local delivery / will-call style shipping (no UPS transit)."""
+    return "local" in _text(value).casefold()
+
+
 def transit_days_for_service(service_code: Any, zip_code: Any = "", state: Any = "") -> int:
     code = _text(service_code).zfill(2)
     if code in {"01", "13", "14"}:
@@ -378,6 +386,15 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
         due = parse_date(raw.get("Due Date"))
         transit_raw = raw.get("_transit_business_days")
         transit = int(_number(transit_raw, -1)) if transit_raw not in (None, "") else -1
+        shipping_method = _text(
+            raw.get("_shipping_method") or raw.get("Shipping Method") or raw.get("Ship Via")
+        )
+        if is_local_delivery(shipping_method):
+            shipping_method = "Local Delivery"
+            if transit < 0:
+                transit = LOCAL_DELIVERY_TRANSIT_DAYS
+        elif not shipping_method:
+            shipping_method = "UPS Ground"
         provided_ship = parse_date(raw.get("_required_ship_date") or raw.get("Ship Date"))
         if due and transit >= 0:
             ship = resolve_required_ship_date(due, transit, config.holidays, provided_ship)
@@ -436,7 +453,7 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
             "in_hand_date": parse_date(raw.get("In-Hand Date")) or due,
             "required_ship_date": ship,
             "transit_business_days": max(0, transit) if transit >= 0 else 0,
-            "shipping_method": _text(raw.get("_shipping_method") or raw.get("Shipping Method") or "UPS Ground"),
+            "shipping_method": shipping_method,
             "shipping_address": address,
             "stage": stage,
             "due_type": _text(raw.get("Hard Date/Soft Date")),
