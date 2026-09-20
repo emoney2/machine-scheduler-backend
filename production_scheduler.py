@@ -1026,65 +1026,66 @@ def _schedule_sewing(
         cursor = previous_workday(group_ship, off, include=True)
         order_entries: List[dict] = []
         guard = 0
-        while remaining_units > 1e-9 and guard < 5000:
-            guard += 1
-            if cursor < planning_start:
-                break
-            remaining_units, entry = take_day(cursor, order, group, group_ship, remaining_units)
-            if entry and entry not in order_entries:
-                order_entries.append(entry)
-            cursor = previous_workday(cursor, off)
-        if remaining_units > 1e-9 and config.emergency_sewing_capacity > 0:
-            cursor = previous_workday(group_ship, off, include=True)
+
+        def walk_back(allow_emergency: bool, force: bool, only_existing: bool) -> None:
+            nonlocal remaining_units, guard
+            started = False
+            place = previous_workday(group_ship, off, include=True)
+            existing_days = {
+                parse_date(row.get("date"))
+                for row in order_entries
+                if parse_date(row.get("date"))
+            }
             while remaining_units > 1e-9 and guard < 5000:
                 guard += 1
-                if cursor < planning_start:
+                if place < planning_start:
                     break
+                if only_existing and existing_days and place not in existing_days:
+                    if started:
+                        break
+                    place = previous_workday(place, off)
+                    continue
                 remaining_units, entry = take_day(
-                    cursor, order, group, group_ship, remaining_units,
-                    allow_emergency=True, existing_entries=order_entries,
+                    place, order, group, group_ship, remaining_units,
+                    allow_emergency=allow_emergency, existing_entries=order_entries, force=force,
                 )
-                if entry and entry not in order_entries:
-                    order_entries.append(entry)
-                cursor = previous_workday(cursor, off)
+                if entry:
+                    started = True
+                    if entry not in order_entries:
+                        order_entries.append(entry)
+                elif started:
+                    break
+                place = previous_workday(place, off)
+
+        walk_back(False, False, False)
+        if remaining_units > 1e-9 and config.emergency_sewing_capacity > 0:
+            walk_back(True, False, False)
         overflow = remaining_units
         ship_in_horizon = bool(group_ship and group_ship >= planning_start)
         if remaining_units > 1e-9 and hard and ship_in_horizon:
-            cursor = previous_workday(group_ship, off, include=True)
-            while remaining_units > 1e-9 and guard < 5000:
-                guard += 1
-                if cursor < planning_start:
-                    break
-                remaining_units, entry = take_day(
-                    cursor, order, group, group_ship, remaining_units,
-                    allow_emergency=True, existing_entries=order_entries, force=True,
-                )
-                if entry and entry not in order_entries:
-                    order_entries.append(entry)
-                cursor = previous_workday(cursor, off)
+            walk_back(True, True, True)
+            if remaining_units > 1e-9:
+                walk_back(True, True, False)
             overflow = 0.0
-        elif remaining_units > 1e-9 and not hard:
-            cursor = next_workday(planning_start, off, include=True)
+        elif remaining_units > 1e-9:
+            last = max(_sewing_entry_dates(order_entries), default=None)
+            place = next_workday(last or planning_start, off, include=last is None)
+            started = bool(order_entries)
             while remaining_units > 1e-9 and guard < 5000:
                 guard += 1
                 remaining_units, entry = take_day(
-                    cursor, order, group, group_ship, remaining_units,
-                    allow_emergency=True, existing_entries=order_entries,
+                    place, order, group, group_ship, remaining_units,
+                    allow_emergency=True, existing_entries=order_entries, force=hard,
                 )
-                if entry and entry not in order_entries:
-                    order_entries.append(entry)
-                cursor = next_workday(cursor, off)
-        elif remaining_units > 1e-9 and hard:
-            cursor = next_workday(planning_start, off, include=True)
-            while remaining_units > 1e-9 and guard < 5000:
-                guard += 1
-                remaining_units, entry = take_day(
-                    cursor, order, group, group_ship, remaining_units,
-                    allow_emergency=True, existing_entries=order_entries, force=True,
-                )
-                if entry and entry not in order_entries:
-                    order_entries.append(entry)
-                cursor = next_workday(cursor, off)
+                if entry:
+                    started = True
+                    if entry not in order_entries:
+                        order_entries.append(entry)
+                    place = next_workday(place, off)
+                elif started:
+                    break
+                else:
+                    place = next_workday(place, off)
         late = (not hard) and overflow > 1e-9
         if not order_entries:
             conflicts.append({
@@ -1188,19 +1189,6 @@ def _schedule_sewing(
     order_lookup = {o["order_number"]: o for g in groups for o in g["orders"]}
     group_lookup = {o["order_number"]: g for g in groups for o in g["orders"]}
     _fill_soft_sewing_gaps(
-        entries,
-        order_lookup,
-        group_lookup,
-        config,
-        planning_start,
-        locks_by_order,
-        reserved,
-        day_job_count,
-        setup_units,
-        take_day,
-        embroidery_deadlines,
-    )
-    _yield_early_scraps_to_adjacent_jobs(
         entries,
         order_lookup,
         group_lookup,
@@ -1646,6 +1634,15 @@ def _fill_soft_sewing_gaps(
         last = previous_workday(group_ship, off, include=True) if group_ship else first
         if last < first:
             last = first
+        daily = max(config.regular_sewing_capacity, 1.0)
+        if units > daily + 1e-9:
+            earliest = last
+            for _ in range(int(math.ceil(units / daily))):
+                prev = previous_workday(earliest, off)
+                if prev < first:
+                    break
+                earliest = prev
+            first = max(first, earliest)
         placed = False
         cursor = first
         guard = 0

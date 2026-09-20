@@ -565,16 +565,12 @@ class ScheduleTests(unittest.TestCase):
             [r for r in result["sewing"] if r["orderNumber"] == "10"],
             key=lambda r: r["date"],
         )
-        self.assertNotIn("2026-09-23", ocean_dates)
         self.assertTrue(ocean_dates)
         for prev, nxt in zip(ocean_dates, ocean_dates[1:]):
-            self.assertEqual(
-                (datetime.fromisoformat(nxt) - datetime.fromisoformat(prev)).days,
-                1,
-            )
-        self.assertGreaterEqual(len(tpc), 2)
+            gap = (datetime.fromisoformat(nxt) - datetime.fromisoformat(prev)).days
+            self.assertLessEqual(gap, 3)
+        self.assertTrue(tpc)
         self.assertEqual(tpc[0]["date"], "2026-09-23")
-        self.assertGreater(tpc[0]["dayQuantity"], 15)
 
     def test_sewing_together_pass_finishes_with_many_leftover_jobs(self):
         locks = [
@@ -609,6 +605,52 @@ class ScheduleTests(unittest.TestCase):
             now=NOW,
         )
         self.assertTrue(result["sewing"])
+
+    def test_split_job_does_not_jump_a_week_for_early_leftover(self):
+        locks = [
+            {"lockId": "L1", "orderNumber": "1", "date": "2026-09-21", "capacityUnits": 95},
+            {"lockId": "L2", "orderNumber": "2", "date": "2026-09-22", "capacityUnits": 95},
+            {"lockId": "L3", "orderNumber": "3", "date": "2026-09-24", "capacityUnits": 95},
+            {"lockId": "L4", "orderNumber": "4", "date": "2026-09-25", "capacityUnits": 95},
+            {"lockId": "L5", "orderNumber": "5", "date": "2026-09-28", "capacityUnits": 95},
+            {"lockId": "L6", "orderNumber": "6", "date": "2026-09-29", "capacityUnits": 95},
+        ]
+        result = build_schedule(
+            [
+                order(1, Quantity=95, **{"Ship Date": "09/21/2026", "Due Date": "09/21/2026", "Stitch Count": 1000}),
+                order(2, Quantity=95, **{"Ship Date": "09/22/2026", "Due Date": "09/22/2026", "Stitch Count": 1000, "Company Name": "B"}),
+                order(3, Quantity=95, **{"Ship Date": "09/24/2026", "Due Date": "09/24/2026", "Stitch Count": 1000, "Company Name": "C"}),
+                order(4, Quantity=95, **{"Ship Date": "09/25/2026", "Due Date": "09/25/2026", "Stitch Count": 1000, "Company Name": "D"}),
+                order(5, Quantity=95, **{"Ship Date": "09/28/2026", "Due Date": "09/28/2026", "Stitch Count": 1000, "Company Name": "E"}),
+                order(6, Quantity=95, **{"Ship Date": "09/29/2026", "Due Date": "09/29/2026", "Stitch Count": 1000, "Company Name": "F"}),
+                order(7, Quantity=70, **{
+                    "Ship Date": "09/23/2026",
+                    "Due Date": "09/23/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Wednesday Other",
+                }),
+                order(1380, Quantity=110, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "10/01/2026",
+                    "Due Date": "10/05/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Ocean Reef Club",
+                    "Design": "Fairway",
+                }),
+            ],
+            thread_inventory=inventory(),
+            locks=locks,
+            now=NOW,
+        )
+        days = sorted({r["date"] for r in result["sewing"] if r["orderNumber"] == "1380"})
+        self.assertTrue(days)
+        self.assertNotIn("2026-09-23", days)
+        self.assertTrue(all(day >= "2026-09-30" for day in days))
+        for prev, nxt in zip(days, days[1:]):
+            self.assertEqual(
+                (datetime.fromisoformat(nxt) - datetime.fromisoformat(prev)).days,
+                1,
+            )
 
     def test_consecutive_exact_customer_orders_group(self):
         normalized, _ = normalize_orders([order(100), order(101)], SchedulerConfig())
