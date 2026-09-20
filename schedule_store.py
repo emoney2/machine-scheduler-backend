@@ -32,7 +32,7 @@ TAB_HEADERS = {
         "Previous Published Version", "Payload JSON",
     ],
     "Scheduling Settings": ["Key", "Value JSON", "Updated At", "Updated By"],
-    "Sewers": ["Name", "Role", "Capacity"],
+    "Sewers": ["Name"],
     "Schedule Orders": ["Version ID", "Order #", "Payload JSON"],
     "Schedule Issues": [
         "Version ID", "Record ID", "Severity", "Type", "Order #", "Payload JSON",

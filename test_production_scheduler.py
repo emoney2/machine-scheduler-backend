@@ -242,7 +242,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_named_sewer_out_reduces_that_days_capacity(self):
         self.assertEqual(
-            [s["role"] for s in parse_sewers([["Name", "Role"], ["Maria", "Regular"], ["Jose", "Regular"], ["Ana", "Emergency"]])],
+            [s["role"] for s in parse_sewers([["Name"], ["Maria"], ["Jose"], ["Ana"]])],
             ["regular", "regular", "emergency"],
         )
         cfg = SchedulerConfig.from_dict({

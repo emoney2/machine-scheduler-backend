@@ -355,19 +355,11 @@ def is_hard_date(order: dict) -> bool:
 
 
 _SEWER_NAME_HEADERS = {"name", "sewer", "sewers", "employee", "staff", "sewer name"}
-_SEWER_ROLE_HEADERS = {"role", "type", "kind"}
 _SEWER_CAPACITY_HEADERS = {"capacity", "pcs", "pieces", "daily capacity"}
 
 
-def _sewer_role(value: Any, name: str = "") -> str:
-    raw = f"{value} {name}".casefold()
-    if any(token in raw for token in ("emergency", "third", "3rd", "extra")):
-        return "emergency"
-    return "regular"
-
-
 def parse_sewers(raw: Any) -> List[dict]:
-    """Read sewer names from a Sewers sheet, settings list, or name rows."""
+    """Read sewer names. The last listed person is always the emergency sewer."""
     rows: List[dict] = []
     if isinstance(raw, dict):
         raw = raw.get("sewers") or raw.get("values") or []
@@ -378,18 +370,16 @@ def parse_sewers(raw: Any) -> List[dict]:
         has_header = any(h in _SEWER_NAME_HEADERS for h in headers)
         start = 1 if has_header else 0
         name_i = next((i for i, h in enumerate(headers) if h in _SEWER_NAME_HEADERS), 0)
-        role_i = next((i for i, h in enumerate(headers) if h in _SEWER_ROLE_HEADERS), None)
         cap_i = next((i for i, h in enumerate(headers) if h in _SEWER_CAPACITY_HEADERS), None)
         for row in raw[start:]:
             cells = list(row or [])
             name = _text(cells[name_i] if name_i < len(cells) else "")
             if not name or name.casefold() in _SEWER_NAME_HEADERS:
                 continue
-            role_raw = cells[role_i] if role_i is not None and role_i < len(cells) else ""
             cap_raw = cells[cap_i] if cap_i is not None and cap_i < len(cells) else ""
             rows.append({
                 "name": name,
-                "role": _sewer_role(role_raw, name),
+                "role": "regular",
                 "capacity": _number(cap_raw) if cap_raw not in (None, "") else 0.0,
             })
         return _dedupe_sewers(rows)
@@ -400,13 +390,13 @@ def parse_sewers(raw: Any) -> List[dict]:
                 continue
             rows.append({
                 "name": name,
-                "role": _sewer_role(item.get("role") or item.get("Role"), name),
+                "role": "regular",
                 "capacity": _number(item.get("capacity") or item.get("Capacity")),
             })
         else:
             name = _text(item)
             if name:
-                rows.append({"name": name, "role": _sewer_role("", name), "capacity": 0.0})
+                rows.append({"name": name, "role": "regular", "capacity": 0.0})
     return _dedupe_sewers(rows)
 
 
@@ -419,9 +409,8 @@ def _dedupe_sewers(rows: Sequence[dict]) -> List[dict]:
             continue
         seen.add(key)
         out.append(dict(row))
-    unnamed_emergency = all(row["role"] != "emergency" for row in out)
-    if unnamed_emergency and len(out) >= 3:
-        out[-1]["role"] = "emergency"
+    for index, row in enumerate(out):
+        row["role"] = "emergency" if len(out) >= 2 and index == len(out) - 1 else "regular"
     return out
 
 
