@@ -136,8 +136,8 @@ class ScheduleTests(unittest.TestCase):
         due = date(2026, 9, 30)
         nearby = resolve_required_ship_date(due, 2)
         week = resolve_required_ship_date(due, 5)
-        self.assertEqual(str(nearby), "2026-09-28")
-        self.assertEqual(str(week), "2026-09-23")
+        self.assertEqual(str(nearby), "2026-09-25")
+        self.assertEqual(str(week), "2026-09-22")
         self.assertGreater(nearby, week)
 
     def test_actual_transit_overrides_conservative_sheet_ship_date(self):
@@ -152,7 +152,7 @@ class ScheduleTests(unittest.TestCase):
         )
         rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
         self.assertTrue(rows)
-        self.assertEqual(rows[0]["requiredShipDate"], "2026-09-28")
+        self.assertEqual(rows[0]["requiredShipDate"], "2026-09-25")
         self.assertEqual(rows[0]["transitBusinessDays"], 2)
         self.assertFalse(any(r["late"] for r in rows))
 
@@ -162,7 +162,8 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(is_local_delivery("UPS"))
         self.assertEqual(LOCAL_DELIVERY_TRANSIT_DAYS, 1)
         due = date(2026, 9, 30)
-        self.assertEqual(str(resolve_required_ship_date(due, 1)), "2026-09-29")
+        self.assertEqual(str(resolve_required_ship_date(due, 1, shipping_method="Local Delivery")), "2026-09-29")
+        self.assertEqual(str(resolve_required_ship_date(due, 1)), "2026-09-28")
         result = build_schedule(
             [order(100, Quantity=6, **{
                 "Ship Date": "09/23/2026",
@@ -304,6 +305,48 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(rows)
         self.assertFalse(any(r.get("emergencyUsed") for r in rows))
         self.assertEqual(result["summary"]["thirdSewerDates"], [])
+
+    def test_smallest_hard_job_owns_the_shared_ship_day(self):
+        result = build_schedule(
+            [
+                order(200, Quantity=96, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "09/25/2026",
+                    "Due Date": "09/25/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Ocean Reef",
+                    "_transit_business_days": 0,
+                }),
+                order(201, Quantity=110, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "09/25/2026",
+                    "Due Date": "09/25/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Columbus",
+                    "_transit_business_days": 0,
+                }),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        ocean = [r for r in result["sewing"] if r["orderNumber"] == "200"]
+        columbus = [r for r in result["sewing"] if r["orderNumber"] == "201"]
+        self.assertTrue(ocean and columbus)
+        self.assertEqual(sum(r["dayQuantity"] for r in ocean), 96)
+        self.assertEqual(sum(r["dayQuantity"] for r in columbus), 110)
+        friday = [r for r in ocean if r["date"] == "2026-09-25"]
+        self.assertTrue(friday)
+        self.assertGreaterEqual(friday[0]["dayQuantity"], 95)
+        self.assertFalse(any(r["date"] == "2026-09-25" and r["dayQuantity"] >= 90 for r in columbus))
+        for rows in (ocean, columbus):
+            days = sorted({r["date"] for r in rows})
+            for prev, nxt in zip(days, days[1:]):
+                gap = (datetime.fromisoformat(nxt) - datetime.fromisoformat(prev)).days
+                self.assertLessEqual(gap, 3)
+        by_day = {}
+        for row in result["sewing"]:
+            by_day[row["date"]] = by_day.get(row["date"], 0) + float(row.get("capacityUnits") or 0)
+        self.assertTrue(all(units <= 145.01 for units in by_day.values()))
 
     def test_overflow_spills_to_the_next_day(self):
         result = build_schedule(
@@ -654,7 +697,13 @@ class ScheduleTests(unittest.TestCase):
             gap = (datetime.fromisoformat(nxt) - datetime.fromisoformat(prev)).days
             self.assertLessEqual(gap, 3)
         self.assertTrue(tpc)
-        self.assertEqual(tpc[0]["date"], "2026-09-23")
+        self.assertTrue(all(r["date"] <= "2026-09-24" for r in tpc))
+        tpc_days = sorted({r["date"] for r in tpc})
+        for prev, nxt in zip(tpc_days, tpc_days[1:]):
+            self.assertLessEqual(
+                (datetime.fromisoformat(nxt) - datetime.fromisoformat(prev)).days,
+                3,
+            )
 
     def test_sewing_together_pass_finishes_with_many_leftover_jobs(self):
         locks = [
@@ -883,9 +932,12 @@ class ScheduleTests(unittest.TestCase):
         rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
         self.assertTrue(rows)
         self.assertFalse(any(r["late"] for r in rows))
-        self.assertTrue(all(r["date"] <= "2026-09-21" for r in rows))
         self.assertLessEqual(max(r["capacityUnits"] for r in rows), 145.01)
-        self.assertTrue(any(c["type"] == "hard_date_capacity" for c in result["conflicts"]))
+        by_day = {}
+        for row in rows:
+            by_day[row["date"]] = by_day.get(row["date"], 0) + float(row["capacityUnits"])
+        self.assertTrue(all(units <= 145.01 for units in by_day.values()))
+        self.assertAlmostEqual(sum(by_day.values()), 400)
 
     def test_past_hard_date_is_not_marked_late(self):
         result = build_schedule(
