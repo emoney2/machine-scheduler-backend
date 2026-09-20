@@ -326,6 +326,50 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(result["shippingGroups"][0]["requiredShipDate"], "2026-09-25")
         self.assertTrue(any(w["type"] == "shipping_group_date_conflict" for w in result["warnings"]))
 
+    def test_different_due_dates_are_separate_shipments(self):
+        result = build_schedule(
+            [
+                order(100, **{"Due Date": "10/01/2026", "Ship Date": "09/28/2026"}),
+                order(101, **{"Due Date": "11/01/2026", "Ship Date": "10/28/2026"}),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        groups = result["shippingGroups"]
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(all(len(g["orderNumbers"]) == 1 for g in groups))
+        sew = {r["orderNumber"]: r for r in result["sewing"]}
+        self.assertEqual(sew["100"]["requiredShipDate"], "2026-09-28")
+        self.assertEqual(sew["101"]["requiredShipDate"], "2026-10-28")
+        self.assertFalse(any(w["type"] == "shipping_group_date_conflict" for w in result["warnings"]))
+
+    def test_explicit_group_splits_when_due_dates_differ(self):
+        normalized, _ = normalize_orders(
+            [
+                order(100, **{
+                    "Due Date": "10/01/2026",
+                    "Ship Date": "09/28/2026",
+                    "_shipping_group_id": "REPEAT-A",
+                }),
+                order(101, **{
+                    "Due Date": "11/01/2026",
+                    "Ship Date": "10/28/2026",
+                    "_shipping_group_id": "REPEAT-A",
+                }),
+            ],
+            SchedulerConfig(),
+        )
+        groups, warnings = detect_shipping_groups(normalized)
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(all(len(g["orders"]) == 1 for g in groups))
+        by_order = {
+            g["orders"][0]["order_number"]: g["orders"][0]["required_ship_date"]
+            for g in groups
+        }
+        self.assertEqual(str(by_order["100"]), "2026-09-28")
+        self.assertEqual(str(by_order["101"]), "2026-10-28")
+        self.assertFalse(any(w["type"] == "shipping_group_date_conflict" for w in warnings))
+
     def test_missing_shipping_address_warns_but_still_schedules(self):
         result = build_schedule(
             [order(100, _shipping_address={})], thread_inventory=inventory(), now=NOW

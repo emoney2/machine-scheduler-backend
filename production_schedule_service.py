@@ -363,7 +363,10 @@ class ProductionScheduleService:
         if published:
             try:
                 for row in self.store.load_schedule(_text(published.get("Version ID"))).get("sewing", []):
-                    if row.get("shippingGroupSource") in {"explicit", "inferred"}:
+                    # Only honor user/sheet Shipping Group IDs. Inferred
+                    # consecutive-order groups must be recomputed so later
+                    # deliveries of the same design stay on their own due date.
+                    if row.get("shippingGroupSource") == "explicit":
                         explicit_groups[_text(row.get("orderNumber"))] = _text(row.get("shippingGroupId"))
             except Exception:
                 logger.exception("Could not load approved shipping groups")

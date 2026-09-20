@@ -473,8 +473,22 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
     return orders, warnings
 
 
+def _shipment_due_key(order: dict) -> Optional[date]:
+    """Customer delivery date that decides whether jobs may share a shipment."""
+    return order.get("due_date") or order.get("in_hand_date") or order.get("required_ship_date")
+
+
+def _same_shipment_due(left: dict, right: dict) -> bool:
+    a, b = _shipment_due_key(left), _shipment_due_key(right)
+    return a is not None and a == b
+
+
 def detect_shipping_groups(orders: Sequence[dict]) -> Tuple[List[dict], List[dict]]:
-    """Group exact normalized customers with consecutive integer order numbers."""
+    """Group same-customer consecutive jobs only when they share a due date.
+
+    Repeat orders of the same design for later deliveries stay separate
+    shipments even if the order numbers are consecutive.
+    """
     warnings: List[dict] = []
     explicit: Dict[str, List[dict]] = defaultdict(list)
     ungrouped: List[dict] = []
@@ -485,7 +499,7 @@ def detect_shipping_groups(orders: Sequence[dict]) -> Tuple[List[dict], List[dic
             ungrouped.append(order)
     groups: List[dict] = []
     for gid, members in explicit.items():
-        groups.append({"id": gid, "source": "explicit", "orders": members})
+        _append_groups_split_by_due(groups, members, gid, "explicit")
 
     by_customer: Dict[str, List[dict]] = defaultdict(list)
     for order in ungrouped:
@@ -498,7 +512,12 @@ def detect_shipping_groups(orders: Sequence[dict]) -> Tuple[List[dict], List[dic
                 chunk = [order]
                 continue
             prev, current = chunk[-1]["order_number"], order["order_number"]
-            if prev.isdigit() and current.isdigit() and int(current) == int(prev) + 1:
+            consecutive = (
+                prev.isdigit()
+                and current.isdigit()
+                and int(current) == int(prev) + 1
+            )
+            if consecutive and _same_shipment_due(chunk[-1], order):
                 chunk.append(order)
             else:
                 _append_inferred_group(groups, chunk, customer_key)
@@ -535,6 +554,26 @@ def _append_inferred_group(groups: List[dict], chunk: List[dict], customer_key: 
     else:
         order = chunk[0]
         groups.append({"id": f"ORDER-{order['order_number']}", "source": "single", "orders": [order]})
+
+
+def _append_groups_split_by_due(
+    groups: List[dict],
+    members: Sequence[dict],
+    group_id: str,
+    source: str,
+) -> None:
+    """Keep an explicit group only when every job shares the same due date."""
+    if not members:
+        return
+    buckets: Dict[Optional[date], List[dict]] = defaultdict(list)
+    for order in members:
+        buckets[_shipment_due_key(order)].append(order)
+    if len(buckets) == 1:
+        groups.append({"id": group_id, "source": source, "orders": list(members)})
+        return
+    for chunk in buckets.values():
+        customer_key = chunk[0].get("customer_key") or ""
+        _append_inferred_group(groups, chunk, customer_key)
 
 
 def _at(day: date, value: time) -> datetime:
