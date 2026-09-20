@@ -309,7 +309,7 @@ class ProductionScheduleService:
 
     def _address(self, row: dict, by_id: dict, directory_by_customer: Optional[dict] = None) -> dict:
         specific = self.resolve_order_address(row, by_id, None) or {}
-        if specific.get("addr1"):
+        if self._usable_ship_address(specific):
             return specific
         company = _text(row.get("Company Name"))
         directory = None
@@ -322,6 +322,13 @@ class ProductionScheduleService:
         address = self.normalize_directory_address(directory) or {}
         required = ("addr1", "city", "state", "zip")
         return address if all(_text(address.get(k)) for k in required) else {}
+
+    def _usable_ship_address(self, addr: Any) -> bool:
+        if not isinstance(addr, dict):
+            return False
+        zip5 = self._zip5(addr)
+        state = _text(addr.get("state"))
+        return bool(_text(addr.get("addr1")) or len(zip5) == 5 or len(state) == 2)
 
     def _zip5(self, address: Optional[dict]) -> str:
         digits = re.sub(r"\D", "", _text((address or {}).get("zip")))
@@ -361,9 +368,8 @@ class ProductionScheduleService:
         return transit_days_for_service(service_code, address.get("zip"), address.get("state"))
 
     def _unify_destination_transit(self, planned: Sequence[dict]) -> None:
-        """Same destination + same UPS service must share one transit time."""
+        """Same destination ZIP + same UPS service share one transit time."""
         by_dest: Dict[str, List[dict]] = {}
-        by_customer: Dict[str, List[dict]] = {}
         for item in planned:
             row = item.get("row") or {}
             if self._is_local_delivery(row):
@@ -372,9 +378,6 @@ class ProductionScheduleService:
             service = _text(item.get("service_code")).zfill(2)
             if zip5:
                 by_dest.setdefault(f"{zip5}|{service}", []).append(item)
-            customer = _text(row.get("Company Name")).casefold()
-            if customer:
-                by_customer.setdefault(f"{customer}|{service}", []).append(item)
 
         def apply_shared(group: Sequence[dict]) -> None:
             live_days = [int(item["live"]) for item in group if item.get("live") not in (None, "")]
@@ -389,9 +392,6 @@ class ProductionScheduleService:
                 item["transit"] = chosen
 
         for group in by_dest.values():
-            if len(group) > 1:
-                apply_shared(group)
-        for group in by_customer.values():
             if len(group) > 1:
                 apply_shared(group)
 
@@ -471,7 +471,12 @@ class ProductionScheduleService:
             transit = item["transit"]
             due = parse_date(row.get("Due Date"))
             # Sheet Ship Date is WORKDAY(due, -5) — a blanket week, not real transit.
-            ship_date = resolve_required_ship_date(due, transit, cfg.holidays)
+            ship_date = resolve_required_ship_date(
+                due,
+                transit,
+                cfg.holidays,
+                shipping_method=self._shipping_method_raw(row),
+            )
             warnings = []
             cut = cut_rows.get(oid) or {}
             cut_status = _text(cut.get("Status") or row.get("Cut Status")).upper()

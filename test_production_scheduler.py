@@ -131,6 +131,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(estimate_ground_transit_days("30519", "GA"), 1)
         self.assertEqual(estimate_ground_transit_days("30305", "GA"), 1)
         self.assertEqual(estimate_ground_transit_days("28202", "NC"), 2)
+        self.assertEqual(estimate_ground_transit_days("37203", "TN"), 2)
         self.assertEqual(estimate_ground_transit_days("10001", "NY"), 3)
         self.assertEqual(estimate_ground_transit_days("90210", "CA"), 5)
         due = date(2026, 9, 30)

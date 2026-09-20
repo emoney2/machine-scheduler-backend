@@ -6107,29 +6107,59 @@ def _write_shipping_method(sheets, row_num: int, shipping_method: str) -> None:
         logger.warning("[submit] Failed to write Shipping Method for row %s: %s", row_num, e)
 
 
+def _order_row_cell(row: dict, *names) -> str:
+    if not isinstance(row, dict) or not names:
+        return ""
+    by = {str(k or "").strip().lower(): v for k, v in row.items()}
+    for name in names:
+        val = by.get(str(name or "").strip().lower())
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return ""
+
+
 def _order_ship_address_from_production_row(row: dict) -> dict:
-    """Order-specific ship address saved on Production Orders at submit time."""
+    """Job ship-to on Production Orders. Zip/state is enough for transit."""
     if not isinstance(row, dict):
         return {}
-    street1 = str(row.get("Order Ship Street 1", "") or "").strip()
-    if not street1:
+    street1 = _order_row_cell(
+        row,
+        "Order Ship Street 1",
+        "Shipping Street Address 1",
+        "Ship To Street 1",
+        "Shipping Address 1",
+        "Ship Street 1",
+    )
+    city = _order_row_cell(row, "Order Ship City", "Shipping City", "Ship To City")
+    state = _state_abbr_ups(
+        _order_row_cell(row, "Order Ship State", "Shipping State", "Ship To State")
+    )
+    zipc = _zip5_ups(
+        _order_row_cell(
+            row,
+            "Order Ship ZIP",
+            "Order Ship Zip",
+            "Shipping Zip",
+            "Shipping Zip Code",
+            "Ship To Zip",
+            "Ship To ZIP",
+        )
+    )
+    if len(zipc) != 5 and (not street1 or not city or len(state) != 2):
         return {}
-    city = str(row.get("Order Ship City", "") or "").strip()
-    state = _state_abbr_ups(row.get("Order Ship State", ""))
-    zipc = _zip5_ups(row.get("Order Ship ZIP", ""))
-    if not city or len(state) != 2 or len(zipc) != 5:
+    if len(state) != 2 and len(zipc) != 5:
         return {}
-    company = str(row.get("Order Ship Company", "") or "").strip()
-    contact = str(row.get("Order Ship Contact", "") or "").strip()
-    phone = re.sub(r"\D", "", str(row.get("Order Ship Phone", "") or ""))[:15]
+    company = _order_row_cell(row, "Order Ship Company", "Ship To Company")
+    contact = _order_row_cell(row, "Order Ship Contact", "Ship To Contact")
+    phone = re.sub(r"\D", "", _order_row_cell(row, "Order Ship Phone", "Shipping Phone"))[:15]
     if not phone:
         phone = "0000000000"
-    a2 = str(row.get("Order Ship Street 2", "") or "").strip()
+    a2 = _order_row_cell(row, "Order Ship Street 2", "Shipping Street Address 2", "Ship To Street 2")
     return {
         "name": (company or contact or "Recipient")[:200],
         "attention_name": (contact[:35] if contact else None),
         "phone": phone,
-        "addr1": street1,
+        "addr1": street1 or (f"{city}, {state}" if city and state else zipc),
         "addr2": a2 or None,
         "city": city,
         "state": state,
@@ -6338,7 +6368,7 @@ def _order_ship_address_from_production_row_with_pair_fallback(
 ) -> dict:
     """Order ship address from row, or from paired front order when this is a back product."""
     addr = _order_ship_address_from_production_row(row)
-    if addr.get("addr1"):
+    if addr.get("addr1") or addr.get("zip") or addr.get("state"):
         return addr
     product = str(row.get("Product", "") or "")
     if not _is_back_product_name(product):

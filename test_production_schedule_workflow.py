@@ -146,6 +146,93 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(planned[0]["transit"], 3)
         self.assertEqual(planned[1]["transit"], 3)
 
+    def test_same_customer_different_zips_keep_their_own_transit(self):
+        service = FakeService(FakeStore())
+        planned = [
+            {
+                "row": {"Company Name": "Acme Golf", "Shipping Method": "UPS"},
+                "address": {"zip": "37203", "state": "TN", "city": "Nashville"},
+                "service_code": "03",
+                "transit": 2,
+                "live": 2,
+            },
+            {
+                "row": {"Company Name": "Acme Golf", "Shipping Method": "UPS"},
+                "address": {"zip": "80202", "state": "CO", "city": "Denver"},
+                "service_code": "03",
+                "transit": 4,
+                "live": 4,
+            },
+        ]
+        service._unify_destination_transit(planned)
+        self.assertEqual(planned[0]["transit"], 2)
+        self.assertEqual(planned[1]["transit"], 4)
+
+    def test_job_ship_address_beats_company_directory(self):
+        def resolve(row, _by_id, _sheets):
+            zipc = str(row.get("Order Ship ZIP") or "").strip()
+            if not zipc:
+                return {}
+            return {
+                "addr1": str(row.get("Order Ship Street 1") or ""),
+                "city": str(row.get("Order Ship City") or ""),
+                "state": str(row.get("Order Ship State") or ""),
+                "zip": zipc,
+            }
+
+        service = ProductionScheduleService(
+            store=FakeStore(),
+            fetch_sheet=lambda *a, **k: [],
+            orders_range="Production Orders!A1:BZ",
+            resolve_order_address=resolve,
+            fetch_directory_row=lambda _name: {
+                "Street Address 1": "1 HQ Blvd",
+                "City": "Denver",
+                "State": "CO",
+                "Zip Code": "80202",
+            },
+            normalize_directory_address=lambda _row: {
+                "addr1": "1 HQ Blvd",
+                "city": "Denver",
+                "state": "CO",
+                "zip": "80202",
+            },
+            ups_get_rate=lambda *a, **k: [],
+            frontend_url="https://example.test",
+        )
+        job_addr = service._address(
+            {
+                "Company Name": "Acme Golf",
+                "Order Ship Street 1": "100 Broadway",
+                "Order Ship City": "Nashville",
+                "Order Ship State": "TN",
+                "Order Ship ZIP": "37203",
+            },
+            {},
+            {
+                "acme golf": {
+                    "Street Address 1": "1 HQ Blvd",
+                    "City": "Denver",
+                    "State": "CO",
+                    "Zip Code": "80202",
+                }
+            },
+        )
+        self.assertEqual(job_addr.get("zip"), "37203")
+        self.assertEqual(job_addr.get("city"), "Nashville")
+        self.assertEqual(service._planning_transit({}, job_addr, "03"), 2)
+
+        company_only = service._address({"Company Name": "Acme Golf"}, {}, None)
+        self.assertEqual(company_only.get("zip"), "80202")
+
+        zip_only = service._address(
+            {"Company Name": "Acme Golf", "Order Ship ZIP": "37203", "Order Ship State": "TN"},
+            {},
+            None,
+        )
+        self.assertEqual(zip_only.get("zip"), "37203")
+        self.assertEqual(service._planning_transit({}, zip_only, "03"), 2)
+
     def test_thread_inventory_reuses_received_cone_math(self):
         values = [
             ["Color", "Length (ft)", "IN/OUT", "O/R"],
