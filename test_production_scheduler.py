@@ -575,6 +575,40 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(tpc[0]["date"], "2026-09-23")
         self.assertGreater(tpc[0]["dayQuantity"], 15)
 
+    def test_sewing_together_pass_finishes_with_many_leftover_jobs(self):
+        locks = [
+            {"lockId": "L1", "orderNumber": "1", "date": "2026-09-21", "capacityUnits": 95},
+            {"lockId": "L2", "orderNumber": "2", "date": "2026-09-22", "capacityUnits": 95},
+        ]
+        oceans = [
+            order(200 + i, Quantity=12, **{
+                "Hard Date/Soft Date": "Hard Date" if i % 2 == 0 else "Soft Date",
+                "Ship Date": "09/25/2026",
+                "Due Date": "09/30/2026",
+                "Stitch Count": 1000,
+                "Company Name": "Ocean Reef Club",
+                "Design": f"Cover {i}",
+            })
+            for i in range(8)
+        ]
+        result = build_schedule(
+            [
+                order(1, Quantity=95, **{"Ship Date": "09/21/2026", "Due Date": "09/21/2026", "Stitch Count": 1000}),
+                order(2, Quantity=95, **{"Ship Date": "09/22/2026", "Due Date": "09/22/2026", "Stitch Count": 1000, "Company Name": "B"}),
+                order(10, Quantity=110, **{
+                    "Ship Date": "09/24/2026",
+                    "Due Date": "09/24/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "TPC Potomac",
+                }),
+                *oceans,
+            ],
+            thread_inventory=inventory(),
+            locks=locks,
+            now=NOW,
+        )
+        self.assertTrue(result["sewing"])
+
     def test_consecutive_exact_customer_orders_group(self):
         normalized, _ = normalize_orders([order(100), order(101)], SchedulerConfig())
         groups, _ = detect_shipping_groups(normalized)

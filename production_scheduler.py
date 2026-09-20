@@ -1415,14 +1415,20 @@ def _commit_sewing_move(
     embroidery_deadlines: Dict[str, datetime],
     other_customer_dates: Sequence[date],
     latest_ok: Optional[date] = None,
+    ignore_deadline: bool = False,
 ) -> bool:
     if remaining > 1e-9 or not new_entries:
         return False
     new_entries.sort(key=lambda row: row["start"])
     finish = datetime.fromisoformat(new_entries[-1]["finish"])
     ship_end = _at(group_ship, SEWING_DAY_END) if group_ship else finish
-    horizon = _at(latest_ok, SEWING_DAY_END) if latest_ok else ship_end
-    if is_hard_date(order) and finish > max(ship_end, horizon):
+    horizon = ship_end
+    if latest_ok is not None:
+        try:
+            horizon = _at(latest_ok, SEWING_DAY_END)
+        except (OverflowError, ValueError, OSError):
+            horizon = ship_end
+    if is_hard_date(order) and not ignore_deadline and finish > max(ship_end, horizon):
         return False
     combined = _sewing_entry_dates(new_entries) + list(other_customer_dates)
     if _interior_sewing_hole(combined, off):
@@ -1466,13 +1472,23 @@ def _yield_early_scraps_to_adjacent_jobs(
         order = order_lookup.get(oid) or {}
         return normalize_customer(order.get("customer") or (rows[0].get("customer") if rows else ""))
 
-    def place_from(oid: str, start: date, last: Optional[date], other_dates: Sequence[date], latest_ok: Optional[date]) -> bool:
+    def place_from(
+        oid: str,
+        start: date,
+        last: Optional[date],
+        other_dates: Sequence[date],
+        latest_ok: Optional[date],
+        ignore_deadline: bool = False,
+    ) -> bool:
         order = order_lookup.get(oid)
         group = group_lookup.get(oid)
         if not order or not group:
             return False
         group_ship = group.get("required_ship_date") or order.get("required_ship_date")
         units = max(0.0, _number(order.get("sewing_units")))
+        bound = start + timedelta(days=180)
+        if last is None or last > bound:
+            last = bound
         if not _can_place_contiguous(start, units, last, day_free, off):
             return False
         new_entries, remaining = _place_sewing_forward(
@@ -1480,7 +1496,8 @@ def _yield_early_scraps_to_adjacent_jobs(
         )
         if _commit_sewing_move(
             new_entries, remaining, order, group_ship, off,
-            entries, embroidery_deadlines, other_dates, latest_ok=latest_ok,
+            entries, embroidery_deadlines, other_dates,
+            latest_ok=latest_ok, ignore_deadline=ignore_deadline,
         ):
             return True
         _release_sewing_rows(new_entries, entries, reserved, day_job_count)
@@ -1496,7 +1513,8 @@ def _yield_early_scraps_to_adjacent_jobs(
             return
         cursor = min(dates)
         last_busy = max(dates)
-        while cursor < last_busy:
+        inner = 0
+        while cursor < last_busy and inner < 40:
             nxt = next_workday(cursor, off)
             by_order: Dict[str, List[dict]] = defaultdict(list)
             customer_days: Dict[str, set] = defaultdict(set)
@@ -1561,20 +1579,20 @@ def _yield_early_scraps_to_adjacent_jobs(
                     break
             distant_ok = adjacent_ok
             if distant_ok:
-                far = date.max
                 for oid in distant:
                     other = later_dates.get(oid) or []
-                    if not place_from(oid, nxt, None, other, far):
+                    if not place_from(oid, nxt, None, other, latest_ok, ignore_deadline=True):
                         distant_ok = False
                         break
-            if distant_ok:
+            if not distant_ok:
+                for oid in list({_text(row.get("orderNumber")) for row in entries}):
+                    if oid in distant_snaps or oid in adjacent_snaps:
+                        _release_sewing_rows(rows_for(oid), entries, reserved, day_job_count)
+                for snap in list(adjacent_snaps.values()) + list(distant_snaps.values()):
+                    _restore_sewing_rows(snap, entries, reserved, day_job_count)
+            else:
                 changed = True
-                continue
-            for oid in list({_text(row.get("orderNumber")) for row in entries}):
-                if oid in distant_snaps or oid in adjacent_snaps:
-                    _release_sewing_rows(rows_for(oid), entries, reserved, day_job_count)
-            for snap in list(adjacent_snaps.values()) + list(distant_snaps.values()):
-                _restore_sewing_rows(snap, entries, reserved, day_job_count)
+            inner += 1
             cursor = nxt
 
 
