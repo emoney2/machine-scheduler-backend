@@ -305,6 +305,35 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(any(r.get("emergencyUsed") for r in rows))
         self.assertEqual(result["summary"]["thirdSewerDates"], [])
 
+    def test_hard_job_never_dumps_more_than_a_days_capacity(self):
+        result = build_schedule(
+            [
+                order(100, Quantity=95, **{
+                    "Ship Date": "09/22/2026",
+                    "Due Date": "09/22/2026",
+                    "Stitch Count": 1000,
+                }),
+                order(200, Quantity=200, **{
+                    "Ship Date": "09/22/2026",
+                    "Due Date": "09/22/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "TaylorMade",
+                }),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        by_day = {}
+        for row in result["sewing"]:
+            if row.get("locked"):
+                continue
+            by_day[row["date"]] = by_day.get(row["date"], 0) + float(row.get("capacityUnits") or 0)
+        self.assertTrue(by_day)
+        self.assertTrue(all(units <= 145.01 for units in by_day.values()))
+        taylor = [r for r in result["sewing"] if r["orderNumber"] == "200"]
+        self.assertTrue(taylor)
+        self.assertLessEqual(max(r["capacityUnits"] for r in taylor), 145.01)
+
     def test_on_time_jobs_do_not_use_emergency_sewing(self):
         result = build_schedule(
             [order(100, Quantity=6)],
@@ -315,6 +344,38 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(rows)
         self.assertFalse(any(r.get("emergencyUsed") for r in rows))
         self.assertEqual(result["summary"]["thirdSewerDates"], [])
+
+    def test_two_large_soft_customers_get_separate_days(self):
+        result = build_schedule(
+            [
+                order(200, Quantity=100, **{
+                    "Hard Date/Soft Date": "Soft Date",
+                    "Ship Date": "09/28/2026",
+                    "Due Date": "09/30/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Ocean Reef",
+                }),
+                order(201, Quantity=100, **{
+                    "Hard Date/Soft Date": "Soft Date",
+                    "Ship Date": "09/28/2026",
+                    "Due Date": "09/30/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Columbus",
+                }),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        ocean = [r for r in result["sewing"] if r["orderNumber"] == "200"]
+        columbus = [r for r in result["sewing"] if r["orderNumber"] == "201"]
+        self.assertTrue(ocean and columbus)
+        self.assertEqual(sum(r["dayQuantity"] for r in ocean), 100)
+        self.assertEqual(sum(r["dayQuantity"] for r in columbus), 100)
+        self.assertEqual(len({r["date"] for r in ocean}), 1)
+        self.assertEqual(len({r["date"] for r in columbus}), 1)
+        self.assertNotEqual(ocean[0]["date"], columbus[0]["date"])
+        self.assertEqual(min(r["date"] for r in ocean + columbus), "2026-09-21")
+        self.assertFalse(any(r.get("late") for r in ocean + columbus))
 
     def test_soft_jobs_fill_early_sewing_gaps(self):
         result = build_schedule(
@@ -395,10 +456,10 @@ class ScheduleTests(unittest.TestCase):
             [r for r in result["sewing"] if r["orderNumber"] == "200"],
             key=lambda r: r["date"],
         )
-        self.assertGreaterEqual(len(soft), 2)
-        self.assertEqual(soft[0]["date"], "2026-09-21")
-        self.assertLess(soft[0]["dayQuantity"], 100)
         self.assertEqual(sum(r["dayQuantity"] for r in soft), 100)
+        self.assertEqual(len({r["date"] for r in soft}), 1)
+        self.assertEqual(soft[0]["date"], "2026-09-22")
+        self.assertFalse(any(r["date"] == "2026-09-21" for r in soft))
 
     def test_soft_job_does_not_skip_a_full_weekday(self):
         locks = [
@@ -484,7 +545,8 @@ class ScheduleTests(unittest.TestCase):
             if r["orderNumber"] in {"200", "201"}
         )
         self.assertEqual(len(ocean), 2)
-        self.assertTrue(all(day == "2026-09-25" for day in ocean))
+        self.assertEqual(len(set(ocean)), 1)
+        self.assertNotIn("2026-09-24", ocean)
 
     def test_split_job_packs_onto_the_earlier_day(self):
         result = build_schedule(
@@ -509,10 +571,10 @@ class ScheduleTests(unittest.TestCase):
             [r for r in result["sewing"] if r["orderNumber"] == "200"],
             key=lambda r: r["date"],
         )
-        self.assertGreaterEqual(len(soft), 2)
-        self.assertEqual(soft[0]["date"], "2026-09-21")
-        self.assertGreater(soft[0]["dayQuantity"], soft[-1]["dayQuantity"])
         self.assertEqual(sum(r["dayQuantity"] for r in soft), 80)
+        self.assertEqual(len({r["date"] for r in soft}), 1)
+        self.assertEqual(soft[0]["date"], "2026-09-22")
+        self.assertFalse(any(r["date"] == "2026-09-21" for r in soft))
 
     def test_later_customer_yields_wednesday_to_the_thursday_split(self):
         locks = [
@@ -757,7 +819,8 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(rows)
         self.assertFalse(any(r["late"] for r in rows))
         self.assertTrue(all(r["date"] <= "2026-09-21" for r in rows))
-        self.assertAlmostEqual(sum(r["capacityUnits"] for r in rows), 400)
+        self.assertLessEqual(max(r["capacityUnits"] for r in rows), 145.01)
+        self.assertTrue(any(c["type"] == "hard_date_capacity" for c in result["conflicts"]))
 
     def test_past_hard_date_is_not_marked_late(self):
         result = build_schedule(
