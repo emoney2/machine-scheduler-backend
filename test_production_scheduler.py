@@ -399,6 +399,120 @@ class ScheduleTests(unittest.TestCase):
         self.assertLess(soft[0]["dayQuantity"], 100)
         self.assertEqual(sum(r["dayQuantity"] for r in soft), 100)
 
+    def test_soft_job_does_not_skip_a_full_weekday(self):
+        locks = [
+            {"lockId": "L1", "orderNumber": "1", "date": "2026-09-21", "capacityUnits": 95},
+            {"lockId": "L2", "orderNumber": "2", "date": "2026-09-22", "capacityUnits": 95},
+            {"lockId": "L3", "orderNumber": "3", "date": "2026-09-24", "capacityUnits": 95},
+        ]
+        result = build_schedule(
+            [
+                order(1, Quantity=95, **{"Ship Date": "09/21/2026", "Due Date": "09/21/2026", "Stitch Count": 1000}),
+                order(2, Quantity=95, **{"Ship Date": "09/22/2026", "Due Date": "09/22/2026", "Stitch Count": 1000, "Company Name": "B"}),
+                order(3, Quantity=95, **{"Ship Date": "09/24/2026", "Due Date": "09/24/2026", "Stitch Count": 1000, "Company Name": "C"}),
+                order(4, Quantity=75, **{
+                    "Ship Date": "09/23/2026",
+                    "Due Date": "09/23/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Wednesday Fill",
+                }),
+                order(200, Quantity=40, **{
+                    "Hard Date/Soft Date": "Soft Date",
+                    "Ship Date": "09/28/2026",
+                    "Due Date": "09/30/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Ocean Reef",
+                }),
+            ],
+            thread_inventory=inventory(),
+            locks=locks,
+            now=NOW,
+        )
+        ocean = sorted(r["date"] for r in result["sewing"] if r["orderNumber"] == "200")
+        self.assertTrue(ocean)
+        self.assertNotIn("2026-09-23", ocean)
+        self.assertIn("2026-09-25", ocean)
+        days = sorted(set(ocean))
+        for prev, nxt in zip(days, days[1:]):
+            self.assertEqual(
+                (datetime.fromisoformat(nxt) - datetime.fromisoformat(prev)).days,
+                1,
+            )
+
+    def test_same_customer_does_not_skip_a_weekday(self):
+        locks = [
+            {"lockId": "L1", "orderNumber": "1", "date": "2026-09-21", "capacityUnits": 95},
+            {"lockId": "L2", "orderNumber": "2", "date": "2026-09-22", "capacityUnits": 95},
+            {"lockId": "L3", "orderNumber": "3", "date": "2026-09-24", "capacityUnits": 95},
+        ]
+        result = build_schedule(
+            [
+                order(1, Quantity=95, **{"Ship Date": "09/21/2026", "Due Date": "09/21/2026", "Stitch Count": 1000}),
+                order(2, Quantity=95, **{"Ship Date": "09/22/2026", "Due Date": "09/22/2026", "Stitch Count": 1000, "Company Name": "B"}),
+                order(3, Quantity=95, **{"Ship Date": "09/24/2026", "Due Date": "09/24/2026", "Stitch Count": 1000, "Company Name": "C"}),
+                order(4, Quantity=75, **{
+                    "Ship Date": "09/23/2026",
+                    "Due Date": "09/23/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Wednesday Fill",
+                }),
+                order(200, Quantity=12, **{
+                    "Hard Date/Soft Date": "Soft Date",
+                    "Ship Date": "09/28/2026",
+                    "Due Date": "09/30/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Ocean Reef",
+                    "Design": "Fairway",
+                }),
+                order(201, Quantity=12, **{
+                    "Hard Date/Soft Date": "Soft Date",
+                    "Ship Date": "09/28/2026",
+                    "Due Date": "09/30/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Ocean Reef",
+                    "Design": "Driver",
+                }),
+            ],
+            thread_inventory=inventory(),
+            locks=locks,
+            now=NOW,
+        )
+        ocean = sorted(
+            r["date"]
+            for r in result["sewing"]
+            if r["orderNumber"] in {"200", "201"}
+        )
+        self.assertEqual(len(ocean), 2)
+        self.assertTrue(all(day == "2026-09-25" for day in ocean))
+
+    def test_split_job_packs_onto_the_earlier_day(self):
+        result = build_schedule(
+            [
+                order(100, Quantity=50, **{
+                    "Ship Date": "09/21/2026",
+                    "Due Date": "09/21/2026",
+                    "Stitch Count": 1000,
+                }),
+                order(200, Quantity=80, **{
+                    "Hard Date/Soft Date": "Soft Date",
+                    "Ship Date": "09/22/2026",
+                    "Due Date": "09/23/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Hershey",
+                }),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        soft = sorted(
+            [r for r in result["sewing"] if r["orderNumber"] == "200"],
+            key=lambda r: r["date"],
+        )
+        self.assertGreaterEqual(len(soft), 2)
+        self.assertEqual(soft[0]["date"], "2026-09-21")
+        self.assertGreater(soft[0]["dayQuantity"], soft[-1]["dayQuantity"])
+        self.assertEqual(sum(r["dayQuantity"] for r in soft), 80)
+
     def test_consecutive_exact_customer_orders_group(self):
         normalized, _ = normalize_orders([order(100), order(101)], SchedulerConfig())
         groups, _ = detect_shipping_groups(normalized)
