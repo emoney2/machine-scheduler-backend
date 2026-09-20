@@ -13,6 +13,7 @@ from production_scheduler import (
     estimate_ground_transit_days,
     is_back_product,
     is_local_delivery,
+    is_towel_or_needlepoint,
     normalize_orders,
     parse_date,
     resolve_required_ship_date,
@@ -192,6 +193,36 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(any(r["orderNumber"] == "101" for r in result["embroidery"]))
         back = next(o for o in result["orders"] if o["order_number"] == "101")
         self.assertFalse(back["needs_sewing"])
+
+    def test_towels_and_needlepoint_are_not_scheduled(self):
+        self.assertTrue(is_towel_or_needlepoint("Golf Towel"))
+        self.assertTrue(is_towel_or_needlepoint("Printed Towels"))
+        self.assertTrue(is_towel_or_needlepoint("Needlepoint"))
+        self.assertTrue(is_towel_or_needlepoint("Needle Point Wallet"))
+        self.assertFalse(is_towel_or_needlepoint("Driver"))
+        result = build_schedule(
+            [
+                order(100, Product="Driver", Quantity=6),
+                order(101, Product="Golf Towel", Quantity=12),
+                order(102, Product="Needle Point Wallet", Quantity=6),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        sew = {r["product"] for r in result["sewing"]}
+        emb = {r["product"] for r in result["embroidery"]}
+        self.assertIn("Driver", sew)
+        self.assertIn("Driver", emb)
+        self.assertNotIn("Golf Towel", sew)
+        self.assertNotIn("Golf Towel", emb)
+        self.assertNotIn("Needle Point Wallet", sew)
+        self.assertNotIn("Needle Point Wallet", emb)
+        towel = next(o for o in result["orders"] if o["order_number"] == "101")
+        needle = next(o for o in result["orders"] if o["order_number"] == "102")
+        self.assertFalse(towel["needs_sewing"])
+        self.assertFalse(needle["needs_sewing"])
+        self.assertEqual(towel["embroidery_remaining"], 0)
+        self.assertEqual(needle["embroidery_remaining"], 0)
 
     def test_optional_third_sewer_capacity(self):
         base = order(

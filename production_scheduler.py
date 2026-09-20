@@ -321,6 +321,14 @@ def is_back_product(product: Any) -> bool:
     return bool(re.search(r"(?:^|\s)backs?$", name, flags=re.I))
 
 
+def is_towel_or_needlepoint(product: Any) -> bool:
+    """Towels and needlepoint are not run on the embroidery or sewing calendars."""
+    name = re.sub(r"[\s\-_]+", " ", _text(product)).casefold()
+    if "towel" in name:
+        return True
+    return "needlepoint" in name.replace(" ", "")
+
+
 def is_hard_date(order: dict) -> bool:
     return "HARD" in _text(order.get("due_type") or order.get("dueType")).upper()
 
@@ -404,6 +412,7 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
         factor = _capacity_factor(raw, config, warnings)
         product = _text(raw.get("Product"))
         back = is_back_product(product)
+        outsourced = is_towel_or_needlepoint(product)
         emb_done = max(0, int(_number(raw.get("Embroidery Completed Qty"))))
         sewing_done = max(0, int(_number(raw.get("_sewing_completed_qty"))))
         if not due:
@@ -421,13 +430,13 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
                 "type": "shipping_address_required", "severity": "warning", "orderNumber": oid,
                 "message": "Shipping address required",
             })
-        if stitches <= 0 and "SEW" not in stage_token:
+        if stitches <= 0 and "SEW" not in stage_token and not outsourced:
             warnings.append({
                 "type": "missing_stitch_count", "severity": "warning", "orderNumber": oid,
                 "message": "Stitch count is missing; embroidery will stay unscheduled until it is available",
             })
         thread_codes = _thread_codes(raw.get("Threads"))
-        if not thread_codes and "SEW" not in stage_token:
+        if not thread_codes and "SEW" not in stage_token and not outsourced:
             warnings.append({
                 "type": "missing_thread_data", "severity": "warning", "orderNumber": oid,
                 "message": "Thread colors are missing; embroidery will stay unscheduled until they are available",
@@ -441,8 +450,8 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
             "design": _text(raw.get("Design")),
             "quantity": qty,
             "remaining_quantity": max(0, remaining - sewing_done),
-            "embroidery_remaining": max(0, remaining - emb_done),
-            "needs_sewing": not back,
+            "embroidery_remaining": 0 if outsourced else max(0, remaining - emb_done),
+            "needs_sewing": not back and not outsourced,
             "stitch_count": stitches,
             "thread_colors": thread_codes,
             "thread_usage_cones": {
@@ -460,7 +469,7 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
             "rush": _flag(raw, "Rush", "Rush Order") or "RUSH" in _text(raw.get("Notes")).upper(),
             "order_date": parse_date(raw.get("Date")),
             "sewing_factor": factor,
-            "sewing_units": 0.0 if back else max(0.0, (max(0, remaining - sewing_done) * factor)),
+            "sewing_units": 0.0 if back or outsourced else max(0.0, (max(0, remaining - sewing_done) * factor)),
             "french_seam": _flag(raw, "French Seam", "French Seams", "French-seam"),
             "unusual_shape": _flag(raw, "Unusual Shape", "Custom Shape", "Unusual/Custom Shape"),
             "materials_ready": not material_warnings,
@@ -1379,6 +1388,8 @@ def _schedule_embroidery(
     }
     for order in sorted(orders, key=_priority):
         if order["embroidery_remaining"] <= 0 or "SEW" in order["stage"].upper():
+            continue
+        if is_towel_or_needlepoint(order.get("product")):
             continue
         if order["stitch_count"] <= 0:
             continue
