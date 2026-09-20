@@ -223,10 +223,17 @@ class ProductionScheduleService:
         }
 
     def load_sewer_roster(self, regular_total: Any = 95, emergency_total: Any = 50) -> List[dict]:
+        title = ""
         try:
-            values = (self.store.batch_values(["Sewing!A1:Z"]) or [[]])[0]
+            title = self.store.find_sheet_title("Sewing")
         except Exception:
-            logger.exception("Could not read Sewing sheet for sewer names")
+            logger.exception("Could not list spreadsheet tabs for sewer names")
+        if not title:
+            title = "Sewing"
+        try:
+            values = (self.store.batch_values([f"'{title}'!A1:CZ40"]) or [[]])[0]
+        except Exception:
+            logger.exception("Could not read %s sheet for sewer names", title)
             return []
         return assign_sewer_capacities(parse_sewers(values), _number(regular_total, 95), _number(emergency_total, 50))
 

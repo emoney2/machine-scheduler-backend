@@ -249,6 +249,14 @@ class ScheduleTests(unittest.TestCase):
             [s["role"] for s in parse_sewers([["Date", "Maria", "Jose", "Ana", "Justin"]])],
             ["regular", "regular", "emergency"],
         )
+        self.assertEqual(
+            [s["name"] for s in parse_sewers([
+                ["Sewing"],
+                [],
+                ["", "Luz", "Yessenia", "Karla", "Justin"],
+            ])],
+            ["Luz", "Yessenia", "Karla"],
+        )
         cfg = SchedulerConfig.from_dict({
             "sewers": [
                 {"name": "Maria", "role": "regular", "capacity": 47.5},

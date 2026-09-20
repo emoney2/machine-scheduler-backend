@@ -378,6 +378,39 @@ def _is_sewer_name(value: Any) -> bool:
     return bool(re.search(r"[A-Za-z]", name))
 
 
+def _sewer_name_list_score(names: Sequence[str]) -> int:
+    n = len(names)
+    if n < 2:
+        return n
+    if n <= 8:
+        return 10 + n
+    return max(0, 18 - (n - 8))
+
+
+def extract_sewer_names(values: Sequence[Sequence[Any]]) -> List[str]:
+    """Find the densest name row or column on the Sewing tab."""
+    grid = [list(row or []) for row in (values or [])]
+    if not grid:
+        return []
+    best: List[str] = []
+    best_score = -1
+    for row in grid[:25]:
+        names = [_text(cell) for cell in row if _is_sewer_name(cell)]
+        score = _sewer_name_list_score(names)
+        if score > best_score:
+            best, best_score = names, score
+    width = max((len(row) for row in grid[:40]), default=0)
+    for col in range(min(width, 50)):
+        names = []
+        for row in grid[:40]:
+            if col < len(row) and _is_sewer_name(row[col]):
+                names.append(_text(row[col]))
+        score = _sewer_name_list_score(names)
+        if score > best_score:
+            best, best_score = names, score
+    return best
+
+
 def parse_sewers(raw: Any) -> List[dict]:
     """Read sewer names from the Sewing tab. Last remaining name is emergency. Skip Justin."""
     rows: List[dict] = []
@@ -386,22 +419,7 @@ def parse_sewers(raw: Any) -> List[dict]:
     if not isinstance(raw, (list, tuple)):
         return []
     if raw and not isinstance(raw[0], dict) and isinstance(raw[0], (list, tuple)):
-        first = [_text(v) for v in (raw[0] or [])]
-        headers = [v.casefold() for v in first]
-        has_name_header = any(h in _SEWER_NAME_HEADERS for h in headers)
-        header_names = [v for v in first if _is_sewer_name(v)]
-        column_names = []
-        start = 1 if has_name_header or header_names else 0
-        name_i = next((i for i, h in enumerate(headers) if h in _SEWER_NAME_HEADERS), 0)
-        for row in raw[start:]:
-            cells = list(row or [])
-            name = _text(cells[name_i] if name_i < len(cells) else "")
-            if _is_sewer_name(name):
-                column_names.append(name)
-        chosen = column_names if len(column_names) >= 2 else header_names
-        if not chosen and header_names:
-            chosen = header_names
-        for name in chosen:
+        for name in extract_sewer_names(raw):
             rows.append({"name": name, "role": "regular", "capacity": 0.0})
         return _dedupe_sewers(rows)
     for item in raw:

@@ -182,6 +182,34 @@ class ScheduleSheetStore:
     def _tab_range(self, title: str) -> str:
         return f"'{title}'!A1:ZZ"
 
+    def sheet_titles(self) -> List[str]:
+        meta = self._execute(
+            self.service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id,
+                fields="sheets.properties.title",
+            )
+        )
+        return [
+            str((item.get("properties") or {}).get("title") or "").strip()
+            for item in (meta.get("sheets") or [])
+            if str((item.get("properties") or {}).get("title") or "").strip()
+        ]
+
+    def find_sheet_title(self, *needles: str) -> str:
+        titles = self.sheet_titles()
+        wanted = [str(n or "").strip().casefold() for n in needles if str(n or "").strip()]
+        for needle in wanted:
+            for title in titles:
+                if title.casefold() == needle:
+                    return title
+        skip = ("summary", "schedule", "waiting", "log", "priority")
+        for needle in wanted:
+            for title in titles:
+                low = title.casefold()
+                if needle in low and not any(part in low for part in skip):
+                    return title
+        return ""
+
     def _cached_values(self, range_name: str) -> Optional[List[List[Any]]]:
         hit = self._cache.get(range_name)
         if not hit:
