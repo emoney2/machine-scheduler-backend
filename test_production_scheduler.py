@@ -791,6 +791,8 @@ class PersistenceSizeTests(unittest.TestCase):
         glitch = RuntimeError("reentrant call inside <_io.BufferedReader name=28>")
         self.assertTrue(is_transient_sheets_error(glitch))
         self.assertIn("busy", friendly_sheets_error(glitch).lower())
+        closed = AttributeError("'NoneType' object has no attribute 'close'")
+        self.assertTrue(is_transient_sheets_error(closed))
 
     def test_parse_date_accepts_sheet_serials_and_serial_strings(self):
         expected = date(1899, 12, 30) + timedelta(days=45980)

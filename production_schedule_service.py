@@ -204,6 +204,14 @@ class ProductionScheduleService:
         self.ups_get_rate = ups_get_rate
         self.frontend_url = frontend_url.rstrip("/")
         self._transit_cache: Dict[str, int] = {}
+        self._published_cache: Optional[dict] = None
+
+    def remember_published(self, version: Optional[dict], schedule: Optional[dict]) -> None:
+        if version and schedule:
+            self._published_cache = {"version": version, "schedule": schedule}
+
+    def cached_published(self) -> Optional[dict]:
+        return self._published_cache
 
     def _settings(self, sewer_values: Optional[Sequence[Sequence[Any]]] = None) -> dict:
         raw = self.store.settings()
@@ -551,6 +559,8 @@ class ProductionScheduleService:
             existing = self.store.get_version(version_id)
             if existing:
                 loaded = self.store.load_schedule(version_id)
+                if _text(existing.get("Status")) == "Published":
+                    self.remember_published(existing, loaded)
                 return {
                     "ok": True, "deduplicated": True, "version": existing,
                     "schedule": loaded, "comparison": self._comparison(published, schedule),
@@ -561,6 +571,8 @@ class ProductionScheduleService:
             initial_baseline = published is None and not self.store.versions()
             status = "Published" if initial_baseline else "Awaiting Approval"
             version = self.store.write_version(version_id, status, schedule, order_ids)
+            if status == "Published":
+                self.remember_published(version, {**schedule, "version": version})
             comparison = self._comparison(published, schedule)
             result = {
                 "ok": True,

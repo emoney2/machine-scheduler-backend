@@ -122,12 +122,17 @@ def is_sheets_rate_limit(exc: Exception) -> bool:
 
 def is_transient_sheets_error(exc: Exception) -> bool:
     text = str(exc)
+    if isinstance(exc, AttributeError) and "close" in text:
+        return True
     return is_sheets_rate_limit(exc) or any(
         token in text
         for token in (
             "BadStatusLine",
             "00000001",
             "reentrant call",
+            "has no attribute 'close'",
+            "attribute 'close'",
+            "NoneType",
             "Connection reset",
             "Connection aborted",
             "RemoteDisconnected",

@@ -38,6 +38,10 @@ def create_schedule_blueprint(
                 schema_ready = True
             except Exception as exc:
                 logger.exception("Scheduling Sheets schema initialization failed")
+                cached = getattr(service, "cached_published", lambda: None)()
+                if cached and request.method == "GET":
+                    schema_ready = True
+                    return None
                 return jsonify({"error": friendly_sheets_error(exc)}), 503
         return None
 
@@ -57,11 +61,23 @@ def create_schedule_blueprint(
         try:
             version = service.store.published_version()
             if not version:
+                cached = getattr(service, "cached_published", lambda: None)()
+                if cached:
+                    return jsonify({**cached, "stale": True}), 200
                 return jsonify({"version": None, "schedule": None}), 200
             loaded = service.store.load_schedule(str(version.get("Version ID") or ""))
+            if hasattr(service, "remember_published"):
+                service.remember_published(version, loaded)
             return jsonify({"version": version, "schedule": loaded}), 200
         except Exception as exc:
             logger.exception("Could not load published schedule")
+            cached = getattr(service, "cached_published", lambda: None)()
+            if cached:
+                return jsonify({
+                    **cached,
+                    "stale": True,
+                    "warning": friendly_sheets_error(exc),
+                }), 200
             return jsonify({"error": friendly_sheets_error(exc)}), 503
 
     @bp.get("/proposal")
