@@ -120,8 +120,30 @@ def is_sheets_rate_limit(exc: Exception) -> bool:
     return "429" in text or "RATE_LIMIT" in text or "Quota exceeded" in text
 
 
+def is_transient_sheets_error(exc: Exception) -> bool:
+    text = str(exc)
+    return is_sheets_rate_limit(exc) or any(
+        token in text
+        for token in (
+            "BadStatusLine",
+            "00000001",
+            "reentrant call",
+            "Connection reset",
+            "Connection aborted",
+            "RemoteDisconnected",
+            "timed out",
+            "Timeout",
+            "SSLError",
+            "Broken pipe",
+            "503",
+            "502",
+            "500",
+        )
+    )
+
+
 def friendly_sheets_error(exc: Exception) -> str:
-    if is_sheets_rate_limit(exc):
+    if is_sheets_rate_limit(exc) or is_transient_sheets_error(exc):
         return (
             "Google Sheets is temporarily busy. Wait about a minute and refresh. "
             "The published schedule was not changed."
@@ -147,7 +169,7 @@ class ScheduleSheetStore:
                 return request.execute()
             except Exception as exc:
                 last_error = exc
-                if not is_sheets_rate_limit(exc) or attempt == 4:
+                if not is_transient_sheets_error(exc) or attempt == 4:
                     raise
                 time.sleep(2 ** attempt)
         raise last_error

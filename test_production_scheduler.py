@@ -24,6 +24,7 @@ from schedule_store import (
     compact_order,
     friendly_sheets_error,
     is_sheets_rate_limit,
+    is_transient_sheets_error,
     version_summary_metadata,
 )
 
@@ -787,6 +788,9 @@ class PersistenceSizeTests(unittest.TestCase):
         exc = RuntimeError("HttpError 429 ... Quota exceeded for quota metric 'Read requests'")
         self.assertTrue(is_sheets_rate_limit(exc))
         self.assertIn("busy", friendly_sheets_error(exc).lower())
+        glitch = RuntimeError("reentrant call inside <_io.BufferedReader name=28>")
+        self.assertTrue(is_transient_sheets_error(glitch))
+        self.assertIn("busy", friendly_sheets_error(glitch).lower())
 
     def test_parse_date_accepts_sheet_serials_and_serial_strings(self):
         expected = date(1899, 12, 30) + timedelta(days=45980)

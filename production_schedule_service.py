@@ -205,7 +205,7 @@ class ProductionScheduleService:
         self.frontend_url = frontend_url.rstrip("/")
         self._transit_cache: Dict[str, int] = {}
 
-    def _settings(self) -> dict:
+    def _settings(self, sewer_values: Optional[Sequence[Sequence[Any]]] = None) -> dict:
         raw = self.store.settings()
         regular = raw.get("regularSewingCapacity", 95)
         emergency = raw.get("emergencySewingCapacity", 50)
@@ -218,24 +218,31 @@ class ProductionScheduleService:
             "frenchSeamFactor": raw.get("frenchSeamFactor"),
             "unusualShapeFactor": raw.get("unusualShapeFactor"),
             "sewingChangeoverMinutes": raw.get("sewingChangeoverMinutes", 5),
-            "sewers": self.load_sewer_roster(regular, emergency),
+            "sewers": self.load_sewer_roster(regular, emergency, sewer_values),
             "sewerAbsences": raw.get("sewerAbsences") or {},
         }
 
-    def load_sewer_roster(self, regular_total: Any = 95, emergency_total: Any = 50) -> List[dict]:
-        title = ""
-        try:
-            title = self.store.find_sheet_title("Sewing")
-        except Exception:
-            logger.exception("Could not list spreadsheet tabs for sewer names")
-        if not title:
-            title = "Sewing"
-        try:
-            values = (self.store.batch_values([f"'{title}'!A1:CZ40"]) or [[]])[0]
-        except Exception:
-            logger.exception("Could not read %s sheet for sewer names", title)
-            return []
-        return assign_sewer_capacities(parse_sewers(values), _number(regular_total, 95), _number(emergency_total, 50))
+    def load_sewer_roster(
+        self,
+        regular_total: Any = 95,
+        emergency_total: Any = 50,
+        values: Optional[Sequence[Sequence[Any]]] = None,
+    ) -> List[dict]:
+        grid = list(values or [])
+        if not grid:
+            title = ""
+            try:
+                title = self.store.find_sheet_title("Sewing")
+            except Exception:
+                logger.exception("Could not list spreadsheet tabs for sewer names")
+            if not title:
+                title = "Sewing"
+            try:
+                grid = (self.store.batch_values([f"'{title}'!A1:CZ40"]) or [[]])[0]
+            except Exception:
+                logger.exception("Could not read %s sheet for sewer names", title)
+                return []
+        return assign_sewer_capacities(parse_sewers(grid), _number(regular_total, 95), _number(emergency_total, 50))
 
     def _inventory(
         self,
@@ -308,10 +315,14 @@ class ProductionScheduleService:
         required = ("addr1", "city", "state", "zip")
         return address if all(_text(address.get(k)) for k in required) else {}
 
+    def _zip5(self, address: Optional[dict]) -> str:
+        digits = re.sub(r"\D", "", _text((address or {}).get("zip")))
+        return digits[:5]
+
     def _transit_days(self, address: dict, service_code: str) -> Optional[int]:
         if not address.get("zip") and not address.get("addr1"):
             return None
-        key = f"{address.get('zip')}|{service_code}"
+        key = f"{self._zip5(address) or _text(address.get('zip'))}|{service_code}"
         if key in self._transit_cache:
             return self._transit_cache[key]
         ship_to = {**address, "service_code": service_code}
@@ -340,6 +351,41 @@ class ProductionScheduleService:
         if live is not None:
             return live
         return transit_days_for_service(service_code, address.get("zip"), address.get("state"))
+
+    def _unify_destination_transit(self, planned: Sequence[dict]) -> None:
+        """Same destination + same UPS service must share one transit time."""
+        by_dest: Dict[str, List[dict]] = {}
+        by_customer: Dict[str, List[dict]] = {}
+        for item in planned:
+            row = item.get("row") or {}
+            if self._is_local_delivery(row):
+                continue
+            zip5 = self._zip5(item.get("address"))
+            service = _text(item.get("service_code")).zfill(2)
+            if zip5:
+                by_dest.setdefault(f"{zip5}|{service}", []).append(item)
+            customer = _text(row.get("Company Name")).casefold()
+            if customer:
+                by_customer.setdefault(f"{customer}|{service}", []).append(item)
+
+        def apply_shared(group: Sequence[dict]) -> None:
+            live_days = [int(item["live"]) for item in group if item.get("live") not in (None, "")]
+            if live_days:
+                chosen = max(live_days)
+            else:
+                values = [int(item["transit"]) for item in group if item.get("transit") not in (None, "")]
+                if not values:
+                    return
+                chosen = max(values)
+            for item in group:
+                item["transit"] = chosen
+
+        for group in by_dest.values():
+            if len(group) > 1:
+                apply_shared(group)
+        for group in by_customer.values():
+            if len(group) > 1:
+                apply_shared(group)
 
     def load_inputs(self) -> tuple[List[dict], Dict[str, dict], dict]:
         batched = self.store.batch_values([
@@ -393,12 +439,29 @@ class ProductionScheduleService:
                 logger.exception("Could not load approved shipping groups")
 
         cfg = SchedulerConfig.from_dict(self._settings())
+        planned: List[dict] = []
         for row in orders:
-            oid = normalize_order_number(row.get("Order #"))
             address = self._address(row, by_id, directory_by_customer)
             service_code = self._service_code(row)
-            due = parse_date(row.get("Due Date"))
+            live = None
+            if not self._is_local_delivery(row) and address:
+                live = self._transit_days(address, service_code)
             transit = self._planning_transit(row, address, service_code)
+            planned.append({
+                "row": row,
+                "address": address,
+                "service_code": service_code,
+                "transit": transit,
+                "live": live,
+            })
+        self._unify_destination_transit(planned)
+        for item in planned:
+            row = item["row"]
+            oid = normalize_order_number(row.get("Order #"))
+            address = item["address"]
+            service_code = item["service_code"]
+            transit = item["transit"]
+            due = parse_date(row.get("Due Date"))
             # Sheet Ship Date is WORKDAY(due, -5) — a blanket week, not real transit.
             ship_date = resolve_required_ship_date(due, transit, cfg.holidays)
             warnings = []

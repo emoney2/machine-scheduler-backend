@@ -124,6 +124,28 @@ class WorkflowTests(unittest.TestCase):
             1,
         )
 
+    def test_same_destination_shares_live_ups_transit(self):
+        service = FakeService(FakeStore())
+        planned = [
+            {
+                "row": {"Company Name": "Ocean Reef Club", "Shipping Method": "UPS"},
+                "address": {"zip": "33050-1234", "state": "FL"},
+                "service_code": "03",
+                "transit": 2,
+                "live": None,
+            },
+            {
+                "row": {"Company Name": "Ocean Reef Club", "Shipping Method": "UPS"},
+                "address": {"zip": "33050", "state": "FL"},
+                "service_code": "03",
+                "transit": 3,
+                "live": 3,
+            },
+        ]
+        service._unify_destination_transit(planned)
+        self.assertEqual(planned[0]["transit"], 3)
+        self.assertEqual(planned[1]["transit"], 3)
+
     def test_thread_inventory_reuses_received_cone_math(self):
         values = [
             ["Color", "Length (ft)", "IN/OUT", "O/R"],
