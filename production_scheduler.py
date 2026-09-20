@@ -356,37 +356,58 @@ def is_hard_date(order: dict) -> bool:
 
 _SEWER_NAME_HEADERS = {"name", "sewer", "sewers", "employee", "staff", "sewer name"}
 _SEWER_CAPACITY_HEADERS = {"capacity", "pcs", "pieces", "daily capacity"}
+_SEWER_IGNORE_NAMES = {"justin", "justin eckard"}
+_SEWER_HEADER_WORDS = _SEWER_NAME_HEADERS | {
+    "date", "day", "order", "order #", "order#", "qty", "quantity", "total",
+    "notes", "product", "design", "stage", "top", "elastic", "fur", "flat",
+    "round", "pcs", "pieces", "capacity",
+}
+
+
+def _is_sewer_name(value: Any) -> bool:
+    name = _text(value)
+    if not name:
+        return False
+    key = name.casefold()
+    if key in _SEWER_IGNORE_NAMES or key.startswith("justin"):
+        return False
+    if key in _SEWER_HEADER_WORDS:
+        return False
+    if re.fullmatch(r"[\d./\-]+", name):
+        return False
+    return bool(re.search(r"[A-Za-z]", name))
 
 
 def parse_sewers(raw: Any) -> List[dict]:
-    """Read sewer names. The last listed person is always the emergency sewer."""
+    """Read sewer names from the Sewing tab. Last remaining name is emergency. Skip Justin."""
     rows: List[dict] = []
     if isinstance(raw, dict):
         raw = raw.get("sewers") or raw.get("values") or []
     if not isinstance(raw, (list, tuple)):
         return []
     if raw and not isinstance(raw[0], dict) and isinstance(raw[0], (list, tuple)):
-        headers = [_text(h).casefold() for h in (raw[0] or [])]
-        has_header = any(h in _SEWER_NAME_HEADERS for h in headers)
-        start = 1 if has_header else 0
+        first = [_text(v) for v in (raw[0] or [])]
+        headers = [v.casefold() for v in first]
+        has_name_header = any(h in _SEWER_NAME_HEADERS for h in headers)
+        header_names = [v for v in first if _is_sewer_name(v)]
+        column_names = []
+        start = 1 if has_name_header or header_names else 0
         name_i = next((i for i, h in enumerate(headers) if h in _SEWER_NAME_HEADERS), 0)
-        cap_i = next((i for i, h in enumerate(headers) if h in _SEWER_CAPACITY_HEADERS), None)
         for row in raw[start:]:
             cells = list(row or [])
             name = _text(cells[name_i] if name_i < len(cells) else "")
-            if not name or name.casefold() in _SEWER_NAME_HEADERS:
-                continue
-            cap_raw = cells[cap_i] if cap_i is not None and cap_i < len(cells) else ""
-            rows.append({
-                "name": name,
-                "role": "regular",
-                "capacity": _number(cap_raw) if cap_raw not in (None, "") else 0.0,
-            })
+            if _is_sewer_name(name):
+                column_names.append(name)
+        chosen = column_names if len(column_names) >= 2 else header_names
+        if not chosen and header_names:
+            chosen = header_names
+        for name in chosen:
+            rows.append({"name": name, "role": "regular", "capacity": 0.0})
         return _dedupe_sewers(rows)
     for item in raw:
         if isinstance(item, dict):
             name = _text(item.get("name") or item.get("Name") or item.get("Sewer"))
-            if not name:
+            if not _is_sewer_name(name):
                 continue
             rows.append({
                 "name": name,
@@ -395,7 +416,7 @@ def parse_sewers(raw: Any) -> List[dict]:
             })
         else:
             name = _text(item)
-            if name:
+            if _is_sewer_name(name):
                 rows.append({"name": name, "role": "regular", "capacity": 0.0})
     return _dedupe_sewers(rows)
 

@@ -224,14 +224,10 @@ class ProductionScheduleService:
 
     def load_sewer_roster(self, regular_total: Any = 95, emergency_total: Any = 50) -> List[dict]:
         try:
-            values = (self.store.batch_values(["Sewers!A1:Z"]) or [[]])[0]
+            values = (self.store.batch_values(["Sewing!A1:Z"]) or [[]])[0]
         except Exception:
-            logger.exception("Could not read Sewers sheet")
-            try:
-                self.store.ensure_schema()
-                values = (self.store.batch_values(["Sewers!A1:Z"]) or [[]])[0]
-            except Exception:
-                return []
+            logger.exception("Could not read Sewing sheet for sewer names")
+            return []
         return assign_sewer_capacities(parse_sewers(values), _number(regular_total, 95), _number(emergency_total, 50))
 
     def _inventory(
