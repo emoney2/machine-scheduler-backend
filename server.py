@@ -5741,23 +5741,33 @@ def _directory_is_billing_same_as_shipping(row: dict) -> bool:
 
 
 def _directory_shipping_snapshot(row: dict) -> dict:
-    """Ship-to fields for UPS / packing slips (Street Address* + Shipping*)."""
+    """Ship-to fields for UPS / packing slips. Prefer Shipping* over Street/City."""
     if not isinstance(row, dict):
         row = {}
     cfn = _directory_cell(row, "Contact First Name")
     cln = _directory_cell(row, "Contact Last Name")
     attn = " ".join(p for p in (cfn, cln) if p).strip()
+    ship_street = _directory_cell(row, "Shipping Street Address 1")
+    ship_city = _directory_cell(row, "Shipping City")
+    ship_state = _directory_cell(row, "Shipping State")
+    ship_zip = _directory_cell(row, "Shipping Zip", "Shipping Zip Code")
+    has_ship = bool(ship_street or ship_city or ship_zip)
     return {
         "company": _directory_cell(row, "Company Name"),
         "first": cfn,
         "last": cln,
         "attn": attn,
-        "addr1": _directory_cell(row, "Street Address 1", "Shipping Street Address 1"),
-        "addr2": _directory_cell(row, "Street Address 2", "Shipping Street Address 2"),
+        "addr1": ship_street or _directory_cell(row, "Street Address 1"),
+        "addr2": (
+            _directory_cell(row, "Shipping Street Address 2")
+            or _directory_cell(row, "Street Address 2")
+        ),
         "addr3": _directory_cell(row, "Shipping Address 3", "Street Address 3"),
-        "city": _directory_cell(row, "City", "Shipping City"),
-        "state": _directory_cell(row, "State", "Shipping State"),
-        "zip": _directory_cell(row, "Zip Code", "Shipping Zip", "Shipping Zip Code"),
+        "city": (ship_city if has_ship else "") or _directory_cell(row, "City", "Shipping City"),
+        "state": (ship_state if has_ship else "") or _directory_cell(row, "State", "Shipping State"),
+        "zip": (ship_zip if has_ship else "") or _directory_cell(
+            row, "Zip Code", "Shipping Zip", "Shipping Zip Code"
+        ),
         "phone": _directory_cell(row, "Shipping Phone", "Phone Number"),
         "email": _directory_cell(row, "Shipping Email", "Contact Email Address"),
     }

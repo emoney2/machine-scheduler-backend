@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 from production_schedule_service import (
     ProductionScheduleService,
+    _parse_embroidery_progress,
     _physical_cones_on_hand,
     _thread_data_received_cones,
     sewing_output_metrics,
@@ -232,6 +233,17 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(zip_only.get("zip"), "37203")
         self.assertEqual(service._planning_transit({}, zip_only, "03"), 2)
+
+    def test_embroidery_list_quantity_made_is_used(self):
+        parsed = _parse_embroidery_progress([
+            ["Order #", "Status", "Quantity Made"],
+            ["100", "In Progress", 0],
+            ["101", "COMPLETE", 12],
+        ])
+        self.assertEqual(parsed["100"]["status"], "In Progress")
+        self.assertEqual(parsed["100"]["qty"], 0)
+        self.assertEqual(parsed["101"]["status"], "COMPLETE")
+        self.assertEqual(parsed["101"]["qty"], 12)
 
     def test_thread_inventory_reuses_received_cone_math(self):
         values = [

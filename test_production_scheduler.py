@@ -835,6 +835,47 @@ class ScheduleTests(unittest.TestCase):
         auto = next(g for g in groups if g["source"] == "inferred")
         self.assertEqual([o["order_number"] for o in auto["orders"]], ["100", "101"])
 
+    def test_same_customer_same_due_groups_across_order_gaps(self):
+        normalized, _ = normalize_orders([order(100), order(140)], SchedulerConfig())
+        groups, _ = detect_shipping_groups(normalized)
+        auto = next(g for g in groups if g["source"] == "inferred")
+        self.assertEqual([o["order_number"] for o in auto["orders"]], ["100", "140"])
+
+    def test_same_customer_same_due_has_no_gap_days(self):
+        result = build_schedule(
+            [
+                order(100, Quantity=95, **{"Company Name": "Nashville CC"}),
+                order(140, Quantity=95, **{"Company Name": "Nashville CC"}),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        days = sorted({
+            datetime.fromisoformat(row["date"]).date()
+            for row in result["sewing"]
+            if row["orderNumber"] in {"100", "140"}
+        })
+        self.assertGreaterEqual(len(days), 2)
+        for prev, nxt in zip(days, days[1:]):
+            gap = (nxt - prev).days
+            self.assertTrue(
+                gap == 1 or (prev.weekday() == 4 and nxt.weekday() == 0 and gap <= 3),
+                f"grouped jobs skipped {prev} to {nxt}",
+            )
+
+    def test_completed_embroidery_list_status_is_ready(self):
+        result = build_schedule(
+            [order(100, Quantity=6, **{
+                "Embroidery Completed Qty": 6,
+                "_embroidery_list_status": "COMPLETE",
+            })],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        sew = next(row for row in result["sewing"] if row["orderNumber"] == "100")
+        self.assertTrue(sew["embroideryReady"])
+        self.assertFalse(any(row["orderNumber"] == "100" for row in result["embroidery"]))
+
     def test_similar_customer_names_do_not_group(self):
         normalized, _ = normalize_orders(
             [order(100), order(101, **{"Company Name": "Exact Customer LLC"})],
@@ -960,6 +1001,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(any(r["orderNumber"] == "100" for r in result["sewing"]))
         self.assertFalse(any(r["orderNumber"] == "100" for r in result["embroidery"]))
         self.assertTrue(any(w["type"] == "missing_stitch_count" for w in result["warnings"]))
+        self.assertFalse(next(r for r in result["sewing"] if r["orderNumber"] == "100")["embroideryReady"])
 
     def test_weekends_and_holidays_are_skipped(self):
         result = build_schedule(

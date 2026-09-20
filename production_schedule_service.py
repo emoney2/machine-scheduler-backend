@@ -126,6 +126,29 @@ def _physical_cones_on_hand(remaining_eq: float, cones_received: int) -> int:
     return max(0, received - emptied)
 
 
+def _parse_embroidery_progress(values: Sequence[Sequence[Any]]) -> Dict[str, dict]:
+    """Embroidery List Status + Quantity Made, keyed by order number."""
+    rows = _rows_to_dicts(values)
+    result: Dict[str, dict] = {}
+    for row in rows:
+        oid = normalize_order_number(
+            row.get("Order #") or row.get("Order#") or row.get("Order")
+        )
+        if not oid:
+            continue
+        status = _text(row.get("Status") or row.get("Embroidery Status"))
+        qty = 0.0
+        for key in ("Quantity Made", "Qty Made", "Completed Qty", "Qty"):
+            if row.get(key) not in (None, ""):
+                qty = max(0.0, _number(row.get(key)))
+                break
+        prev = result.get(oid)
+        if prev and qty <= prev.get("qty", 0) and status.upper() != "COMPLETE":
+            continue
+        result[oid] = {"qty": qty, "status": status}
+    return result
+
+
 def _parse_sewing_completion(values: Sequence[Sequence[Any]]) -> Dict[str, float]:
     rows = _rows_to_dicts(values)
     result = {}
@@ -328,7 +351,8 @@ class ProductionScheduleService:
             return False
         zip5 = self._zip5(addr)
         state = _text(addr.get("state"))
-        return bool(_text(addr.get("addr1")) or len(zip5) == 5 or len(state) == 2)
+        city = _text(addr.get("city"))
+        return bool(_text(addr.get("addr1")) or len(zip5) == 5 or (len(state) == 2 and city))
 
     def _zip5(self, address: Optional[dict]) -> str:
         digits = re.sub(r"\D", "", _text((address or {}).get("zip")))
@@ -404,6 +428,7 @@ class ProductionScheduleService:
             "Cut List!A1:Z",
             "Fur List!A1:Z",
             "Thread Inventory!A1:M",
+            "Embroidery List!A1:ZZ",
         ])
         (
             order_values,
@@ -413,7 +438,8 @@ class ProductionScheduleService:
             cut_values,
             fur_values,
             inventory_values,
-        ) = (batched + [[] for _ in range(7)])[:7]
+            embroidery_values,
+        ) = (batched + [[] for _ in range(8)])[:8]
         orders = [r for r in _rows_to_dicts(order_values) if _active(r)]
         by_id = {normalize_order_number(r.get("Order #")): r for r in orders}
         directory_rows = _rows_to_dicts(directory_values)
@@ -425,6 +451,7 @@ class ProductionScheduleService:
         thread_rows = _rows_to_dicts(thread_values)
         usage = _parse_thread_usage(thread_rows)
         sewing_done = _parse_sewing_completion(sewing_values)
+        embroidery_done = _parse_embroidery_progress(embroidery_values)
         cut_rows = {
             normalize_order_number(r.get("Order #")): r
             for r in _rows_to_dicts(cut_values)
@@ -499,6 +526,17 @@ class ProductionScheduleService:
             row["_transit_business_days"] = transit if transit is not None else ""
             row["_thread_usage_cones"] = usage.get(oid, {})
             row["_sewing_completed_qty"] = sewing_done.get(oid, 0)
+            emb_info = embroidery_done.get(oid) or {}
+            row["_embroidery_list_status"] = _text(emb_info.get("status"))
+            row["Embroidery Completed Qty"] = max(
+                0,
+                int(_number(emb_info.get("qty"))),
+            )
+            if _text(emb_info.get("status")).upper() == "COMPLETE":
+                row["Embroidery Completed Qty"] = max(
+                    int(_number(row.get("Embroidery Completed Qty"))),
+                    int(_number(row.get("Quantity"))),
+                )
             row["_material_warnings"] = warnings
             row["_shipping_group_id"] = explicit_groups.get(oid, "")
         # The production workbook records finished pieces in Sewing Summary.Top.

@@ -585,7 +585,10 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
         back = is_back_product(product)
         outsourced = is_towel_or_needlepoint(product)
         emb_done = max(0, int(_number(raw.get("Embroidery Completed Qty"))))
+        emb_status = _text(raw.get("_embroidery_list_status") or raw.get("Embroidery List Status"))
         sewing_done = max(0, int(_number(raw.get("_sewing_completed_qty"))))
+        if emb_status.upper() == "COMPLETE":
+            emb_done = max(emb_done, remaining)
         if not due:
             warnings.append({
                 "type": "missing_due_date", "severity": "warning", "orderNumber": oid,
@@ -622,6 +625,7 @@ def normalize_orders(rows: Sequence[dict], config: SchedulerConfig) -> Tuple[Lis
             "quantity": qty,
             "remaining_quantity": max(0, remaining - sewing_done),
             "embroidery_remaining": 0 if outsourced else max(0, remaining - emb_done),
+            "embroidery_status": emb_status,
             "needs_sewing": not back and not outsourced,
             "stitch_count": stitches,
             "thread_colors": thread_codes,
@@ -664,10 +668,10 @@ def _same_shipment_due(left: dict, right: dict) -> bool:
 
 
 def detect_shipping_groups(orders: Sequence[dict]) -> Tuple[List[dict], List[dict]]:
-    """Group same-customer consecutive jobs only when they share a due date.
+    """Group every same-customer job that shares a due date into one shipment.
 
-    Repeat orders of the same design for later deliveries stay separate
-    shipments even if the order numbers are consecutive.
+    Different due dates stay separate shipments even when order numbers are
+    consecutive. Order-number gaps do not split a same-day shipment.
     """
     warnings: List[dict] = []
     explicit: Dict[str, List[dict]] = defaultdict(list)
@@ -685,24 +689,12 @@ def detect_shipping_groups(orders: Sequence[dict]) -> Tuple[List[dict], List[dic
     for order in ungrouped:
         by_customer[order["customer_key"]].append(order)
     for customer_key, members in by_customer.items():
-        members.sort(key=lambda o: int(o["order_number"]) if o["order_number"].isdigit() else 10**15)
-        chunk: List[dict] = []
+        by_due: Dict[Optional[date], List[dict]] = defaultdict(list)
         for order in members:
-            if not chunk:
-                chunk = [order]
-                continue
-            prev, current = chunk[-1]["order_number"], order["order_number"]
-            consecutive = (
-                prev.isdigit()
-                and current.isdigit()
-                and int(current) == int(prev) + 1
-            )
-            if consecutive and _same_shipment_due(chunk[-1], order):
-                chunk.append(order)
-            else:
-                _append_inferred_group(groups, chunk, customer_key)
-                chunk = [order]
-        _append_inferred_group(groups, chunk, customer_key)
+            by_due[_shipment_due_key(order)].append(order)
+        for chunk in by_due.values():
+            chunk.sort(key=lambda o: int(o["order_number"]) if o["order_number"].isdigit() else 10**15)
+            _append_inferred_group(groups, chunk, customer_key)
 
     for group in groups:
         dates = [o["required_ship_date"] for o in group["orders"] if o["required_ship_date"]]
@@ -869,6 +861,9 @@ def _sewing_entry(
         "requiredShipDate": iso_day(group_ship),
         "transitBusinessDays": order["transit_business_days"],
         "shippingMethod": order["shipping_method"],
+        "shipCity": _text((order.get("shipping_address") or {}).get("city")),
+        "shipState": _text((order.get("shipping_address") or {}).get("state")),
+        "shipZip": _text((order.get("shipping_address") or {}).get("zip")),
         "embroideryReady": False,
         "materialsReady": order["materials_ready"],
         "materialsWarnings": order["material_warnings"],
@@ -1279,24 +1274,22 @@ def _schedule_sewing(
         entries.extend(order_entries)
         embroidery_deadlines[order["order_number"]] = datetime.fromisoformat(order_entries[0]["start"])
 
-    queued = [(order, group) for group in groups for order in group["orders"]]
+    def _group_place_key(group: dict) -> tuple:
+        ship = group.get("required_ship_date") or date.max
+        hard = 0 if any(is_hard_date(order) for order in group["orders"]) else 1
+        units = sum(_number(order.get("sewing_units")) for order in group["orders"])
+        return (hard, ship, units, group.get("id") or "")
 
-    def _place_key(item):
-        order, group = item
-        ship = group.get("required_ship_date") or order.get("required_ship_date") or date.max
+    def _member_place_key(order: dict) -> tuple:
         try:
             oid = int(order["order_number"])
         except (TypeError, ValueError):
             oid = 10**15
-        return (
-            0 if is_hard_date(order) else 1,
-            ship,
-            _number(order.get("sewing_units")),
-            oid,
-        )
+        return (_number(order.get("sewing_units")), oid)
 
-    for order, group in sorted(queued, key=_place_key):
-        place_order(order, group)
+    for group in sorted(groups, key=_group_place_key):
+        for order in sorted(group["orders"], key=_member_place_key):
+            place_order(order, group)
 
     for group in groups:
         group_ship = group.get("required_ship_date")
@@ -1367,6 +1360,22 @@ def _customer_sewing_dates(entries: Sequence[dict], customer_key: str, skip: str
         if skip and _text(row.get("orderNumber")) == skip:
             continue
         if normalize_customer(row.get("customer")) != customer_key:
+            continue
+        day = parse_date(row.get("date"))
+        if day:
+            dates.append(day)
+    return sorted(set(dates))
+
+
+def _group_sewing_dates(entries: Sequence[dict], group_id: Any, skip: str = "") -> List[date]:
+    gid = _text(group_id)
+    dates = []
+    if not gid:
+        return dates
+    for row in entries:
+        if skip and _text(row.get("orderNumber")) == skip:
+            continue
+        if _text(row.get("shippingGroupId")) != gid:
             continue
         day = parse_date(row.get("date"))
         if day:
@@ -1712,7 +1721,7 @@ def _fill_soft_sewing_gaps(
         units = max(0.0, _number(order.get("sewing_units")))
         old = [row for row in entries if _text(row.get("orderNumber")) == oid]
         customer_key = normalize_customer(order.get("customer") or (old[0].get("customer") if old else ""))
-        other_dates = _customer_sewing_dates(entries, customer_key, oid)
+        other_dates = _group_sewing_dates(entries, group.get("id"), oid)
         _release_sewing_rows(old, entries, reserved, day_job_count)
         first = next_workday(planning_start, off, include=True)
         last = previous_workday(group_ship, off, include=True) if group_ship else first
@@ -2026,8 +2035,7 @@ def _keep_sewing_together(
             return False
         group_ship = group.get("required_ship_date") or order.get("required_ship_date")
         units = max(0.0, _number(order.get("sewing_units")))
-        customer_key = normalize_customer(order.get("customer") or old[0].get("customer"))
-        other_dates = [day for day in _customer_sewing_dates(entries, customer_key, oid) if day >= start]
+        other_dates = [day for day in _group_sewing_dates(entries, group.get("id"), oid) if day >= start]
         _release_sewing_rows(old, entries, reserved, day_job_count)
         last = previous_workday(group_ship, off, include=True) if group_ship else start
         if last < start:
@@ -2055,7 +2063,7 @@ def _keep_sewing_together(
         changed = False
         guard += 1
         by_order: Dict[str, List[dict]] = defaultdict(list)
-        by_customer: Dict[str, List[str]] = defaultdict(list)
+        by_group: Dict[str, List[str]] = defaultdict(list)
         for row in entries:
             oid = _text(row.get("orderNumber"))
             if not oid:
@@ -2063,11 +2071,9 @@ def _keep_sewing_together(
             by_order[oid].append(row)
         for oid, rows in by_order.items():
             order = order_lookup.get(oid)
-            customer_key = normalize_customer(
-                (order or {}).get("customer") or rows[0].get("customer")
-            )
-            if customer_key and oid not in by_customer[customer_key]:
-                by_customer[customer_key].append(oid)
+            gid = _text((order_lookup.get(oid) or {}).get("shipping_group_id") or rows[0].get("shippingGroupId"))
+            if gid and oid not in by_group[gid]:
+                by_group[gid].append(oid)
             hole = _interior_sewing_hole(_sewing_entry_dates(rows), off)
             if not hole:
                 continue
@@ -2078,8 +2084,8 @@ def _keep_sewing_together(
                 changed = True
         if changed:
             continue
-        for customer_key, oids in by_customer.items():
-            dates = _customer_sewing_dates(entries, customer_key)
+        for gid, oids in by_group.items():
+            dates = _group_sewing_dates(entries, gid)
             hole = _interior_sewing_hole(dates, off)
             if not hole:
                 continue
@@ -2213,7 +2219,7 @@ def _schedule_embroidery(
         m: datetime.max.replace(tzinfo=BUSINESS_TZ) for m in EMBROIDERY_MACHINES
     }
     for order in sorted(orders, key=_priority):
-        if order["embroidery_remaining"] <= 0 or "SEW" in order["stage"].upper():
+        if order["embroidery_remaining"] <= 0:
             continue
         if is_towel_or_needlepoint(order.get("product")):
             continue
@@ -2405,16 +2411,31 @@ def _dedupe_conflicts(conflicts: Sequence[dict]) -> List[dict]:
     return out
 
 
-def _mark_readiness(sewing: List[dict], embroidery: Sequence[dict]) -> None:
+def _mark_readiness(
+    sewing: List[dict],
+    embroidery: Sequence[dict],
+    orders: Sequence[dict] | None = None,
+) -> None:
     finish_by_order = {
         row["orderNumber"]: datetime.fromisoformat(row["finish"]) for row in embroidery
     }
+    by_order = {order["order_number"]: order for order in (orders or [])}
     for row in sewing:
         if row.get("locked") and not row.get("orderNumber"):
             continue
+        order = by_order.get(row.get("orderNumber")) or {}
+        remaining = max(0, int(_number(order.get("embroidery_remaining"))))
+        status = _text(order.get("embroidery_status")).upper()
+        if remaining <= 0 or status == "COMPLETE":
+            row["embroideryReady"] = True
+            continue
         start = datetime.fromisoformat(row["start"]) if row.get("start") else None
         finish = finish_by_order.get(row.get("orderNumber"))
-        row["embroideryReady"] = finish is None or (start is not None and finish <= start)
+        if finish is None:
+            row["embroideryReady"] = False
+            row["conflict"] = True
+            continue
+        row["embroideryReady"] = start is not None and finish <= start
         if not row["embroideryReady"]:
             row["conflict"] = True
 
@@ -2442,7 +2463,7 @@ def build_schedule(
     embroidery, embroidery_conflicts = _schedule_embroidery(
         orders, cfg, deadlines, thread_inventory or {}, planning_start_dt
     )
-    _mark_readiness(sewing, embroidery)
+    _mark_readiness(sewing, embroidery, orders)
     all_issues = warnings + grouping_warnings + sewing_conflicts + embroidery_conflicts
     conflicts = _dedupe_conflicts([w for w in all_issues if w.get("severity") == "blocking"])
     non_blocking = _dedupe_conflicts([w for w in all_issues if w.get("severity") != "blocking"])
