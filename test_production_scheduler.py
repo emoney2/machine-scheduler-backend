@@ -305,6 +305,28 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(any(r.get("emergencyUsed") for r in rows))
         self.assertEqual(result["summary"]["thirdSewerDates"], [])
 
+    def test_overflow_spills_to_the_next_day(self):
+        result = build_schedule(
+            [order(100, Quantity=200, **{
+                "Hard Date/Soft Date": "Soft Date",
+                "Ship Date": "09/28/2026",
+                "Due Date": "09/30/2026",
+                "Stitch Count": 1000,
+            })],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
+        by_day = {}
+        for row in rows:
+            by_day[row["date"]] = by_day.get(row["date"], 0) + float(row.get("capacityUnits") or 0)
+        self.assertTrue(by_day)
+        self.assertTrue(all(units <= 145.01 for units in by_day.values()))
+        self.assertAlmostEqual(sum(by_day.values()), 200)
+        self.assertGreaterEqual(len(by_day), 2)
+        self.assertEqual(sum(r["dayQuantity"] for r in rows), 200)
+        self.assertTrue(all(r["dayQuantity"] <= 145 for r in rows))
+
     def test_hard_job_never_dumps_more_than_a_days_capacity(self):
         result = build_schedule(
             [

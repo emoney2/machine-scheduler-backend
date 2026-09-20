@@ -783,6 +783,18 @@ def _reserve_locked_sewing(
     return reserved, normalized
 
 
+def _day_sewing_cap(cursor: date, config: SchedulerConfig) -> Tuple[float, float, float]:
+    """Regular, emergency, and hard daily max (regular + emergency)."""
+    if config.sewers:
+        present = sewers_present(config, cursor)
+        regular = sum(_number(row.get("capacity")) for row in present if row.get("role") != "emergency")
+        emergency = sum(_number(row.get("capacity")) for row in present if row.get("role") == "emergency")
+    else:
+        regular = config.regular_sewing_capacity
+        emergency = config.emergency_sewing_capacity
+    return regular, emergency, regular + emergency
+
+
 def _sewing_capacity(
     cursor: date,
     config: SchedulerConfig,
@@ -791,23 +803,13 @@ def _sewing_capacity(
     setup_units: float,
     allow_emergency: bool = False,
 ):
-    if config.sewers:
-        present = sewers_present(config, cursor)
-        regular = sum(_number(row.get("capacity")) for row in present if row.get("role") != "emergency")
-        emergency_pool = sum(_number(row.get("capacity")) for row in present if row.get("role") == "emergency")
-        emergency = (
-            emergency_pool
-            if allow_emergency or cursor in config.approved_emergency_dates
-            else 0.0
-        )
-    else:
-        regular = config.regular_sewing_capacity
-        emergency = (
-            config.emergency_sewing_capacity
-            if allow_emergency or cursor in config.approved_emergency_dates
-            else 0.0
-        )
-    total = regular + emergency
+    regular, emergency_max, physical = _day_sewing_cap(cursor, config)
+    emergency = (
+        emergency_max
+        if allow_emergency or cursor in config.approved_emergency_dates
+        else 0.0
+    )
+    total = min(regular + emergency, physical)
     already = reserved[cursor]
     setup = setup_units if day_job_count[cursor] > 0 else 0.0
     free = max(0.0, total - already - setup)
@@ -878,10 +880,13 @@ def _annotate_day_quantities(entries: List[dict], order: dict) -> None:
     """Put the pieces for this calendar day on each sewing card."""
     pieces = max(0, int(_number(order.get("remaining_quantity"))))
     factor = max(_number(order.get("sewing_factor"), 1.0), 1e-9)
+    sewing_units = max(0.0, _number(order.get("sewing_units")))
     if not entries:
         return
     split = len(entries) > 1
     total_units = sum(max(0.0, _number(row.get("capacityUnits"))) for row in entries)
+    if sewing_units > 1e-9 and total_units + 1e-6 < sewing_units:
+        pieces = min(pieces, max(0, int(round(total_units / factor))))
     allocated = 0
     for index, entry in enumerate(entries):
         units = max(0.0, _number(entry.get("capacityUnits")))
@@ -952,24 +957,17 @@ def _schedule_sewing(
         regular, emergency, total, already, setup, free = _sewing_capacity(
             cursor, config, reserved, day_job_count, setup_units, allow_emergency
         )
-        if free <= 1e-9:
+        _reg, emergency_max, physical = _day_sewing_cap(cursor, config)
+        room = max(0.0, min(total, physical) - already - setup)
+        if room <= 1e-9:
             if not force:
                 return remaining_units, None
-            emergency_available = (
-                not config.sewers
-                or any(row.get("role") == "emergency" for row in sewers_present(config, cursor))
-            )
-            if emergency_available:
-                emergency = max(emergency, config.emergency_sewing_capacity)
-            total = regular + emergency
-            if total <= 1e-9:
-                return remaining_units, None
+            emergency = max(emergency, emergency_max)
+            total = min(regular + emergency, physical)
             room = max(0.0, total - already - setup)
             if room <= 1e-9:
                 return remaining_units, None
-            used = min(room, remaining_units)
-        else:
-            used = min(free, remaining_units)
+        used = min(room, remaining_units)
         same_day = next(
             (row for row in (existing_entries or []) if row.get("date") == iso_day(cursor)),
             None,
@@ -1167,6 +1165,15 @@ def _schedule_sewing(
                         break
                     else:
                         place = next_workday(place, off)
+        if remaining_units > 1e-9 and not hard:
+            last = max(_sewing_entry_dates(order_entries), default=None)
+            last_ok = planning_start + timedelta(days=400)
+            take_until_done(
+                next_workday(last or planning_start, off, include=last is None),
+                True,
+                False,
+            )
+            overflow = remaining_units
         late = (not hard) and overflow > 1e-9
         if not order_entries:
             conflicts.append({
@@ -1304,6 +1311,7 @@ def _schedule_sewing(
     _keep_sewing_together(*pass_args)
     _close_interior_sewing_gaps(*pass_args)
     _front_load_sewing(*pass_args)
+    _spill_sewing_over_capacity(*pass_args)
     entries.sort(key=lambda e: (e.get("date", ""), e.get("start", ""), e.get("orderNumber", "")))
     return entries, conflicts, embroidery_deadlines
 
@@ -1882,6 +1890,85 @@ def _front_load_sewing(
             continue
         _release_sewing_rows(new_entries, entries, reserved, day_job_count)
         _restore_sewing_rows(old, entries, reserved, day_job_count)
+
+
+def _spill_sewing_over_capacity(
+    entries: List[dict],
+    order_lookup: Dict[str, dict],
+    group_lookup: Dict[str, dict],
+    config: SchedulerConfig,
+    planning_start: date,
+    locks_by_order: Dict[str, List[dict]],
+    reserved: Dict[date, float],
+    day_job_count: Dict[date, int],
+    setup_units: float,
+    take_day,
+    embroidery_deadlines: Dict[str, datetime],
+) -> None:
+    """If a day is over regular+emergency, move the extra pieces to the next workday."""
+    off = config.sewing_off_days()
+    guard = 0
+    changed = True
+    while changed and guard < 80:
+        changed = False
+        guard += 1
+        days = sorted({
+            day for day in (parse_date(row.get("date")) for row in entries) if day
+        })
+        for day in days:
+            _regular, _emergency, cap = _day_sewing_cap(day, config)
+            extra = reserved[day] - cap
+            if extra <= 1e-6:
+                continue
+            rows = [
+                row for row in entries
+                if parse_date(row.get("date")) == day
+                and not row.get("locked")
+                and _text(row.get("orderNumber")) not in locks_by_order
+            ]
+            rows.sort(key=lambda row: (
+                1 if is_hard_date(order_lookup.get(_text(row.get("orderNumber"))) or {}) else 0,
+                -_number(row.get("capacityUnits")),
+            ))
+            nxt = next_workday(day, off)
+            for row in rows:
+                if extra <= 1e-6:
+                    break
+                oid = _text(row.get("orderNumber"))
+                order = order_lookup.get(oid)
+                group = group_lookup.get(oid)
+                if not order or not group:
+                    continue
+                take = min(extra, _number(row.get("capacityUnits")))
+                if take <= 1e-9:
+                    continue
+                row["capacityUnits"] = round(_number(row.get("capacityUnits")) - take, 4)
+                reserved[day] -= take
+                extra -= take
+                group_ship = group.get("required_ship_date") or order.get("required_ship_date")
+                same_order = [item for item in entries if _text(item.get("orderNumber")) == oid]
+                leftover = take
+                place = nxt
+                inner = 0
+                while leftover > 1e-9 and inner < 40:
+                    leftover, entry = take_day(
+                        place, order, group, group_ship, leftover,
+                        allow_emergency=True, existing_entries=same_order,
+                    )
+                    if entry and entry not in entries:
+                        entries.append(entry)
+                    place = next_workday(place, off)
+                    inner += 1
+                if _number(row.get("capacityUnits")) <= 1e-9:
+                    reserved[day] = max(0.0, reserved[day] - _number(row.get("setupUnits")))
+                    day_job_count[day] = max(0, day_job_count[day] - 1)
+                    if row in entries:
+                        entries.remove(row)
+                _annotate_day_quantities(
+                    [item for item in entries if _text(item.get("orderNumber")) == oid],
+                    order,
+                )
+                changed = True
 
 
 def _keep_sewing_together(
