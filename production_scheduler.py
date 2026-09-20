@@ -243,13 +243,24 @@ class SchedulerConfig:
     unusual_shape_factor: Optional[float] = None
     sewing_changeover_minutes: float = 5.0
     timezone: str = "America/New_York"
+    sewers: List[dict] = field(default_factory=list)
+    sewer_absences: Dict[date, List[str]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: Optional[dict]) -> "SchedulerConfig":
         raw = raw or {}
+        regular = max(1.0, _number(raw.get("regularSewingCapacity"), 95.0))
+        emergency = max(0.0, _number(raw.get("emergencySewingCapacity"), 50.0))
+        sewers = assign_sewer_capacities(parse_sewers(raw.get("sewers")), regular, emergency)
+        absences: Dict[date, List[str]] = {}
+        for key, names in (raw.get("sewerAbsences") or {}).items():
+            day = parse_date(key)
+            if not day:
+                continue
+            absences[day] = [_text(n) for n in (names or []) if _text(n)]
         return cls(
-            regular_sewing_capacity=max(1.0, _number(raw.get("regularSewingCapacity"), 95.0)),
-            emergency_sewing_capacity=max(0.0, _number(raw.get("emergencySewingCapacity"), 50.0)),
+            regular_sewing_capacity=regular,
+            emergency_sewing_capacity=emergency,
             approved_emergency_dates={
                 d for d in (parse_date(v) for v in raw.get("approvedEmergencyDates", [])) if d
             },
@@ -270,6 +281,8 @@ class SchedulerConfig:
                 else None
             ),
             sewing_changeover_minutes=max(0.0, _number(raw.get("sewingChangeoverMinutes"), 5.0)),
+            sewers=sewers,
+            sewer_absences=absences,
         )
 
     def as_dict(self) -> dict:
@@ -283,7 +296,15 @@ class SchedulerConfig:
             "unusualShapeFactor": self.unusual_shape_factor,
             "sewingChangeoverMinutes": self.sewing_changeover_minutes,
             "timezone": self.timezone,
+            "sewers": list(self.sewers),
+            "sewerAbsences": {
+                iso_day(day): list(names)
+                for day, names in sorted(self.sewer_absences.items(), key=lambda item: item[0])
+            },
         }
+
+    def sewing_off_days(self) -> set[date]:
+        return set(self.holidays) | closed_sewing_dates(self)
 
 
 def _flag(row: dict, *names: str) -> bool:
@@ -331,6 +352,115 @@ def is_towel_or_needlepoint(product: Any) -> bool:
 
 def is_hard_date(order: dict) -> bool:
     return "HARD" in _text(order.get("due_type") or order.get("dueType")).upper()
+
+
+_SEWER_NAME_HEADERS = {"name", "sewer", "sewers", "employee", "staff", "sewer name"}
+_SEWER_ROLE_HEADERS = {"role", "type", "kind"}
+_SEWER_CAPACITY_HEADERS = {"capacity", "pcs", "pieces", "daily capacity"}
+
+
+def _sewer_role(value: Any, name: str = "") -> str:
+    raw = f"{value} {name}".casefold()
+    if any(token in raw for token in ("emergency", "third", "3rd", "extra")):
+        return "emergency"
+    return "regular"
+
+
+def parse_sewers(raw: Any) -> List[dict]:
+    """Read sewer names from a Sewers sheet, settings list, or name rows."""
+    rows: List[dict] = []
+    if isinstance(raw, dict):
+        raw = raw.get("sewers") or raw.get("values") or []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    if raw and not isinstance(raw[0], dict) and isinstance(raw[0], (list, tuple)):
+        headers = [_text(h).casefold() for h in (raw[0] or [])]
+        has_header = any(h in _SEWER_NAME_HEADERS for h in headers)
+        start = 1 if has_header else 0
+        name_i = next((i for i, h in enumerate(headers) if h in _SEWER_NAME_HEADERS), 0)
+        role_i = next((i for i, h in enumerate(headers) if h in _SEWER_ROLE_HEADERS), None)
+        cap_i = next((i for i, h in enumerate(headers) if h in _SEWER_CAPACITY_HEADERS), None)
+        for row in raw[start:]:
+            cells = list(row or [])
+            name = _text(cells[name_i] if name_i < len(cells) else "")
+            if not name or name.casefold() in _SEWER_NAME_HEADERS:
+                continue
+            role_raw = cells[role_i] if role_i is not None and role_i < len(cells) else ""
+            cap_raw = cells[cap_i] if cap_i is not None and cap_i < len(cells) else ""
+            rows.append({
+                "name": name,
+                "role": _sewer_role(role_raw, name),
+                "capacity": _number(cap_raw) if cap_raw not in (None, "") else 0.0,
+            })
+        return _dedupe_sewers(rows)
+    for item in raw:
+        if isinstance(item, dict):
+            name = _text(item.get("name") or item.get("Name") or item.get("Sewer"))
+            if not name:
+                continue
+            rows.append({
+                "name": name,
+                "role": _sewer_role(item.get("role") or item.get("Role"), name),
+                "capacity": _number(item.get("capacity") or item.get("Capacity")),
+            })
+        else:
+            name = _text(item)
+            if name:
+                rows.append({"name": name, "role": _sewer_role("", name), "capacity": 0.0})
+    return _dedupe_sewers(rows)
+
+
+def _dedupe_sewers(rows: Sequence[dict]) -> List[dict]:
+    seen = set()
+    out = []
+    for row in rows:
+        key = _text(row.get("name")).casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(row))
+    unnamed_emergency = all(row["role"] != "emergency" for row in out)
+    if unnamed_emergency and len(out) >= 3:
+        out[-1]["role"] = "emergency"
+    return out
+
+
+def assign_sewer_capacities(
+    sewers: Sequence[dict],
+    regular_total: float,
+    emergency_total: float,
+) -> List[dict]:
+    regular = [dict(s) for s in sewers if s.get("role") != "emergency"]
+    extra = [dict(s) for s in sewers if s.get("role") == "emergency"]
+    if regular:
+        missing = [s for s in regular if _number(s.get("capacity")) <= 0]
+        if missing:
+            share = max(0.0, regular_total) / len(regular)
+            for row in missing:
+                row["capacity"] = share
+    for row in extra:
+        if _number(row.get("capacity")) <= 0:
+            row["capacity"] = max(0.0, emergency_total)
+    return regular + extra
+
+
+def _absence_names(config: "SchedulerConfig", cursor: date) -> set[str]:
+    return {_text(name).casefold() for name in (config.sewer_absences.get(cursor) or []) if _text(name)}
+
+
+def sewers_present(config: "SchedulerConfig", cursor: date) -> List[dict]:
+    absent = _absence_names(config, cursor)
+    return [row for row in config.sewers if _text(row.get("name")).casefold() not in absent]
+
+
+def closed_sewing_dates(config: "SchedulerConfig") -> set[date]:
+    if not config.sewers:
+        return set()
+    return {
+        day
+        for day in config.sewer_absences
+        if not sewers_present(config, day)
+    }
 
 
 def _priority(order: dict) -> tuple:
@@ -633,12 +763,22 @@ def _sewing_capacity(
     setup_units: float,
     allow_emergency: bool = False,
 ):
-    regular = config.regular_sewing_capacity
-    emergency = (
-        config.emergency_sewing_capacity
-        if allow_emergency or cursor in config.approved_emergency_dates
-        else 0.0
-    )
+    if config.sewers:
+        present = sewers_present(config, cursor)
+        regular = sum(_number(row.get("capacity")) for row in present if row.get("role") != "emergency")
+        emergency_pool = sum(_number(row.get("capacity")) for row in present if row.get("role") == "emergency")
+        emergency = (
+            emergency_pool
+            if allow_emergency or cursor in config.approved_emergency_dates
+            else 0.0
+        )
+    else:
+        regular = config.regular_sewing_capacity
+        emergency = (
+            config.emergency_sewing_capacity
+            if allow_emergency or cursor in config.approved_emergency_dates
+            else 0.0
+        )
     total = regular + emergency
     already = reserved[cursor]
     setup = setup_units if day_job_count[cursor] > 0 else 0.0
@@ -768,6 +908,7 @@ def _schedule_sewing(
             day_job_count[day] += 1
     embroidery_deadlines: Dict[str, datetime] = {}
     setup_units = _setup_units(config)
+    off = config.sewing_off_days()
 
     def take_day(
         cursor: date,
@@ -786,7 +927,12 @@ def _schedule_sewing(
             if not force:
                 return remaining_units, None
             used = remaining_units
-            emergency = max(emergency, config.emergency_sewing_capacity)
+            emergency_available = (
+                not config.sewers
+                or any(row.get("role") == "emergency" for row in sewers_present(config, cursor))
+            )
+            if emergency_available:
+                emergency = max(emergency, config.emergency_sewing_capacity)
             total = max(total, already + setup + used)
         else:
             used = min(free, remaining_units)
@@ -849,7 +995,7 @@ def _schedule_sewing(
         if remaining_units <= 1e-9:
             embroidery_deadlines[order["order_number"]] = _at(group_ship, SEWING_DAY_START)
             return
-        cursor = previous_workday(group_ship, config.holidays, include=True)
+        cursor = previous_workday(group_ship, off, include=True)
         order_entries: List[dict] = []
         guard = 0
         while remaining_units > 1e-9 and guard < 5000:
@@ -859,9 +1005,9 @@ def _schedule_sewing(
             remaining_units, entry = take_day(cursor, order, group, group_ship, remaining_units)
             if entry and entry not in order_entries:
                 order_entries.append(entry)
-            cursor = previous_workday(cursor, config.holidays)
+            cursor = previous_workday(cursor, off)
         if remaining_units > 1e-9 and config.emergency_sewing_capacity > 0:
-            cursor = previous_workday(group_ship, config.holidays, include=True)
+            cursor = previous_workday(group_ship, off, include=True)
             while remaining_units > 1e-9 and guard < 5000:
                 guard += 1
                 if cursor < planning_start:
@@ -872,11 +1018,11 @@ def _schedule_sewing(
                 )
                 if entry and entry not in order_entries:
                     order_entries.append(entry)
-                cursor = previous_workday(cursor, config.holidays)
+                cursor = previous_workday(cursor, off)
         overflow = remaining_units
         ship_in_horizon = bool(group_ship and group_ship >= planning_start)
         if remaining_units > 1e-9 and hard and ship_in_horizon:
-            cursor = previous_workday(group_ship, config.holidays, include=True)
+            cursor = previous_workday(group_ship, off, include=True)
             while remaining_units > 1e-9 and guard < 5000:
                 guard += 1
                 if cursor < planning_start:
@@ -887,10 +1033,10 @@ def _schedule_sewing(
                 )
                 if entry and entry not in order_entries:
                     order_entries.append(entry)
-                cursor = previous_workday(cursor, config.holidays)
+                cursor = previous_workday(cursor, off)
             overflow = 0.0
         elif remaining_units > 1e-9 and not hard:
-            cursor = next_workday(planning_start, config.holidays, include=True)
+            cursor = next_workday(planning_start, off, include=True)
             while remaining_units > 1e-9 and guard < 5000:
                 guard += 1
                 remaining_units, entry = take_day(
@@ -899,9 +1045,9 @@ def _schedule_sewing(
                 )
                 if entry and entry not in order_entries:
                     order_entries.append(entry)
-                cursor = next_workday(cursor, config.holidays)
+                cursor = next_workday(cursor, off)
         elif remaining_units > 1e-9 and hard:
-            cursor = next_workday(planning_start, config.holidays, include=True)
+            cursor = next_workday(planning_start, off, include=True)
             while remaining_units > 1e-9 and guard < 5000:
                 guard += 1
                 remaining_units, entry = take_day(
@@ -910,7 +1056,7 @@ def _schedule_sewing(
                 )
                 if entry and entry not in order_entries:
                     order_entries.append(entry)
-                cursor = next_workday(cursor, config.holidays)
+                cursor = next_workday(cursor, off)
         late = (not hard) and overflow > 1e-9
         if not order_entries:
             conflicts.append({
@@ -1057,6 +1203,7 @@ def _fill_soft_sewing_gaps(
     embroidery_deadlines: Dict[str, datetime],
 ) -> None:
     """Pull soft-date sewing into empty early days. Hard jobs are moved only to close holes."""
+    off = config.sewing_off_days()
     soft_ids: List[str] = []
     seen: set[str] = set()
     for row in entries:
@@ -1085,7 +1232,7 @@ def _fill_soft_sewing_gaps(
         guard = 0
         while cursor <= finish and guard < 400:
             total += day_free(cursor)
-            cursor = next_workday(cursor, config.holidays)
+            cursor = next_workday(cursor, off)
             guard += 1
         return total
 
@@ -1104,8 +1251,8 @@ def _fill_soft_sewing_gaps(
                 )
                 day_job_count[day] = max(0, day_job_count[day] - 1)
             entries.remove(row)
-        first = next_workday(planning_start, config.holidays, include=True)
-        last = previous_workday(group_ship, config.holidays, include=True) if group_ship else first
+        first = next_workday(planning_start, off, include=True)
+        last = previous_workday(group_ship, off, include=True) if group_ship else first
         if last < first:
             last = first
         whole_day = None
@@ -1115,7 +1262,7 @@ def _fill_soft_sewing_gaps(
             if day_free(cursor) + 1e-9 >= units:
                 whole_day = cursor
                 break
-            cursor = next_workday(cursor, config.holidays)
+            cursor = next_workday(cursor, off)
             guard += 1
         start_day = whole_day
         if start_day is None:
@@ -1125,7 +1272,7 @@ def _fill_soft_sewing_gaps(
                 if day_free(cursor) > 1e-6 and cumulative_free(cursor, last) + 1e-9 >= units:
                     start_day = cursor
                     break
-                cursor = next_workday(cursor, config.holidays)
+                cursor = next_workday(cursor, off)
                 guard += 1
         if start_day is None:
             start_day = first
@@ -1139,7 +1286,7 @@ def _fill_soft_sewing_gaps(
             )
             if entry and entry not in new_entries:
                 new_entries.append(entry)
-            place = next_workday(place, config.holidays)
+            place = next_workday(place, off)
             guard += 1
         if not new_entries:
             continue
@@ -1169,6 +1316,7 @@ def _close_interior_sewing_gaps(
     embroidery_deadlines: Dict[str, datetime],
 ) -> None:
     """If a weekday is open and a later day has work, move that later job up."""
+    off = config.sewing_off_days()
 
     def day_free(day: date) -> float:
         _regular, _emergency, _total, _already, _setup, free = _sewing_capacity(
@@ -1199,10 +1347,10 @@ def _close_interior_sewing_gaps(
             return
         first_busy = min(dates)
         last = max(dates)
-        cursor = next_workday(first_busy, config.holidays)
+        cursor = next_workday(first_busy, off)
         while cursor < last:
             if day_free(cursor) <= 1e-6:
-                cursor = next_workday(cursor, config.holidays)
+                cursor = next_workday(cursor, off)
                 continue
             starts: Dict[str, date] = {}
             for row in entries:
@@ -1213,7 +1361,7 @@ def _close_interior_sewing_gaps(
                 starts[oid] = min(starts[oid], day) if oid in starts else day
             later = [oid for oid, start in starts.items() if start > cursor]
             if not later:
-                cursor = next_workday(cursor, config.holidays)
+                cursor = next_workday(cursor, off)
                 continue
             later.sort(key=lambda oid: (starts[oid], oid))
             moved = False
@@ -1243,7 +1391,7 @@ def _close_interior_sewing_gaps(
                     )
                     if entry and entry not in new_entries:
                         new_entries.append(entry)
-                    place = next_workday(place, config.holidays)
+                    place = next_workday(place, off)
                     inner += 1
                 finish = (
                     datetime.fromisoformat(new_entries[-1]["finish"])
@@ -1271,7 +1419,7 @@ def _close_interior_sewing_gaps(
                 changed = True
                 break
             if not moved:
-                cursor = next_workday(cursor, config.holidays)
+                cursor = next_workday(cursor, off)
 
 
 def fmt_conflict_day(value: str) -> str:

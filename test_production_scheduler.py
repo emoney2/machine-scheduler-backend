@@ -16,6 +16,7 @@ from production_scheduler import (
     is_towel_or_needlepoint,
     normalize_orders,
     parse_date,
+    parse_sewers,
     resolve_required_ship_date,
 )
 from schedule_store import (
@@ -238,6 +239,58 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(result["summary"]["thirdSewerDates"], ["2026-09-21"])
         self.assertFalse(any(r["late"] for r in rows))
         self.assertTrue(any(w["type"] == "emergency_sewing" for w in result["warnings"]))
+
+    def test_named_sewer_out_reduces_that_days_capacity(self):
+        self.assertEqual(
+            [s["role"] for s in parse_sewers([["Name", "Role"], ["Maria", "Regular"], ["Jose", "Regular"], ["Ana", "Emergency"]])],
+            ["regular", "regular", "emergency"],
+        )
+        cfg = SchedulerConfig.from_dict({
+            "sewers": [
+                {"name": "Maria", "role": "regular", "capacity": 47.5},
+                {"name": "Jose", "role": "regular", "capacity": 47.5},
+                {"name": "Ana", "role": "emergency", "capacity": 50},
+            ],
+            "sewerAbsences": {"2026-09-21": ["Maria"]},
+        })
+        result = build_schedule(
+            [order(100, Quantity=40, **{
+                "Ship Date": "09/21/2026",
+                "Due Date": "09/21/2026",
+                "Stitch Count": 1000,
+            })],
+            config=cfg,
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
+        self.assertTrue(rows)
+        self.assertAlmostEqual(max(r["regularCapacity"] for r in rows), 47.5)
+        self.assertFalse(any(r.get("emergencyUsed") for r in rows))
+
+    def test_emergency_sewer_out_blocks_overtime(self):
+        cfg = SchedulerConfig.from_dict({
+            "sewers": [
+                {"name": "Maria", "role": "regular", "capacity": 47.5},
+                {"name": "Jose", "role": "regular", "capacity": 47.5},
+                {"name": "Ana", "role": "emergency", "capacity": 50},
+            ],
+            "sewerAbsences": {"2026-09-21": ["Ana"]},
+        })
+        result = build_schedule(
+            [order(100, Quantity=140, **{
+                "Ship Date": "09/21/2026",
+                "Due Date": "09/21/2026",
+                "Stitch Count": 1000,
+            })],
+            config=cfg,
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
+        self.assertTrue(rows)
+        self.assertFalse(any(r.get("emergencyUsed") for r in rows))
+        self.assertEqual(result["summary"]["thirdSewerDates"], [])
 
     def test_on_time_jobs_do_not_use_emergency_sewing(self):
         result = build_schedule(

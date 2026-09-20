@@ -179,11 +179,55 @@ def create_schedule_blueprint(
             "regularSewingCapacity", "emergencySewingCapacity",
             "approvedEmergencyDates", "holidays", "productFactors",
             "frenchSeamFactor", "unusualShapeFactor", "sewingChangeoverMinutes",
+            "sewerAbsences",
         }
         clean = {key: value for key, value in settings.items() if key in allowed}
         service.store.save_settings(clean, actor())
         emit("scheduleSettingsUpdated", {"keys": sorted(clean)})
         return jsonify({"ok": True, "settings": service._settings()}), 200
+
+    @bp.get("/staff")
+    @login_required
+    def get_staff():
+        settings = service._settings()
+        return jsonify({
+            "sewers": settings.get("sewers") or [],
+            "absences": settings.get("sewerAbsences") or {},
+        }), 200
+
+    @bp.put("/staff")
+    @login_required
+    def save_staff():
+        from production_scheduler import parse_date as parse_staff_date
+        data = request.get_json(silent=True) or {}
+        day = parse_staff_date(data.get("date"))
+        if not day:
+            return jsonify({"error": "date is required"}), 400
+        names = [
+            str(name or "").strip()
+            for name in (data.get("out") or [])
+            if str(name or "").strip()
+        ]
+        current = dict(service.store.settings().get("sewerAbsences") or {})
+        key = day.isoformat()
+        if names:
+            current[key] = names
+        else:
+            current.pop(key, None)
+        service.store.save_settings({"sewerAbsences": current}, actor())
+        result = service.rebuild(reason=f"staff out {key}", notify=True)
+        if result.get("ok"):
+            emit("scheduleProposalUpdated", {
+                "versionId": (result.get("version") or {}).get("Version ID"),
+                "staffDate": key,
+            })
+        status = 200 if result.get("ok") else 500
+        return jsonify({
+            "ok": result.get("ok"),
+            "absences": current,
+            "rebuild": result,
+            "error": result.get("error"),
+        }), status
 
     @bp.get("/locks")
     @login_required

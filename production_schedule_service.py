@@ -20,10 +20,12 @@ from production_scheduler import (
     BUSINESS_TZ,
     LOCAL_DELIVERY_TRANSIT_DAYS,
     SchedulerConfig,
+    assign_sewer_capacities,
     build_schedule,
     is_local_delivery,
     normalize_order_number,
     parse_date,
+    parse_sewers,
     resolve_required_ship_date,
     transit_days_for_service,
 )
@@ -205,16 +207,32 @@ class ProductionScheduleService:
 
     def _settings(self) -> dict:
         raw = self.store.settings()
+        regular = raw.get("regularSewingCapacity", 95)
+        emergency = raw.get("emergencySewingCapacity", 50)
         return {
-            "regularSewingCapacity": raw.get("regularSewingCapacity", 95),
-            "emergencySewingCapacity": raw.get("emergencySewingCapacity", 50),
+            "regularSewingCapacity": regular,
+            "emergencySewingCapacity": emergency,
             "approvedEmergencyDates": raw.get("approvedEmergencyDates", []),
             "holidays": raw.get("holidays", []),
             "productFactors": raw.get("productFactors", {}),
             "frenchSeamFactor": raw.get("frenchSeamFactor"),
             "unusualShapeFactor": raw.get("unusualShapeFactor"),
             "sewingChangeoverMinutes": raw.get("sewingChangeoverMinutes", 5),
+            "sewers": self.load_sewer_roster(regular, emergency),
+            "sewerAbsences": raw.get("sewerAbsences") or {},
         }
+
+    def load_sewer_roster(self, regular_total: Any = 95, emergency_total: Any = 50) -> List[dict]:
+        try:
+            values = (self.store.batch_values(["Sewers!A1:Z"]) or [[]])[0]
+        except Exception:
+            logger.exception("Could not read Sewers sheet")
+            try:
+                self.store.ensure_schema()
+                values = (self.store.batch_values(["Sewers!A1:Z"]) or [[]])[0]
+            except Exception:
+                return []
+        return assign_sewer_capacities(parse_sewers(values), _number(regular_total, 95), _number(emergency_total, 50))
 
     def _inventory(
         self,
