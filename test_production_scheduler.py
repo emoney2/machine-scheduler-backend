@@ -668,6 +668,49 @@ class ScheduleTests(unittest.TestCase):
         )
         self.assertTrue(result["sewing"])
 
+    def test_hard_job_stays_on_late_days_when_midweek_is_full(self):
+        locks = [
+            {"lockId": "L1", "orderNumber": "1", "date": "2026-09-21", "capacityUnits": 95},
+            {"lockId": "L2", "orderNumber": "2", "date": "2026-09-22", "capacityUnits": 95},
+            {"lockId": "L3", "orderNumber": "7", "date": "2026-09-23", "capacityUnits": 69},
+            {"lockId": "L4", "orderNumber": "3", "date": "2026-09-24", "capacityUnits": 95},
+            {"lockId": "L5", "orderNumber": "4", "date": "2026-09-25", "capacityUnits": 95},
+            {"lockId": "L6", "orderNumber": "5", "date": "2026-09-28", "capacityUnits": 95},
+            {"lockId": "L7", "orderNumber": "6", "date": "2026-09-29", "capacityUnits": 95},
+            {"lockId": "L8", "orderNumber": "8", "date": "2026-09-30", "capacityUnits": 50},
+            {"lockId": "L9", "orderNumber": "9", "date": "2026-10-01", "capacityUnits": 50},
+        ]
+        result = build_schedule(
+            [
+                order(1, Quantity=95, **{"Ship Date": "09/21/2026", "Due Date": "09/21/2026", "Stitch Count": 1000}),
+                order(2, Quantity=95, **{"Ship Date": "09/22/2026", "Due Date": "09/22/2026", "Stitch Count": 1000, "Company Name": "B"}),
+                order(7, Quantity=69, **{"Ship Date": "09/23/2026", "Due Date": "09/23/2026", "Stitch Count": 1000, "Company Name": "Wednesday Other"}),
+                order(3, Quantity=95, **{"Ship Date": "09/24/2026", "Due Date": "09/24/2026", "Stitch Count": 1000, "Company Name": "C"}),
+                order(4, Quantity=95, **{"Ship Date": "09/25/2026", "Due Date": "09/25/2026", "Stitch Count": 1000, "Company Name": "D"}),
+                order(5, Quantity=95, **{"Ship Date": "09/28/2026", "Due Date": "09/28/2026", "Stitch Count": 1000, "Company Name": "E"}),
+                order(6, Quantity=95, **{"Ship Date": "09/29/2026", "Due Date": "09/29/2026", "Stitch Count": 1000, "Company Name": "F"}),
+                order(8, Quantity=50, **{"Ship Date": "09/30/2026", "Due Date": "09/30/2026", "Stitch Count": 1000, "Company Name": "G"}),
+                order(9, Quantity=50, **{"Ship Date": "10/01/2026", "Due Date": "10/01/2026", "Stitch Count": 1000, "Company Name": "H"}),
+                order(1360, Quantity=110, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "10/01/2026",
+                    "Due Date": "10/01/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Ocean Reef Club",
+                    "Design": "Driver",
+                    "_transit_business_days": 0,
+                }),
+            ],
+            thread_inventory=inventory(),
+            locks=locks,
+            now=NOW,
+        )
+        days = sorted({r["date"] for r in result["sewing"] if r["orderNumber"] == "1360"})
+        self.assertTrue(days)
+        self.assertNotIn("2026-09-23", days)
+        self.assertTrue(all(day >= "2026-09-30" for day in days))
+        self.assertEqual(sum(r["dayQuantity"] for r in result["sewing"] if r["orderNumber"] == "1360"), 110)
+
     def test_split_job_does_not_jump_a_week_for_early_leftover(self):
         locks = [
             {"lockId": "L1", "orderNumber": "1", "date": "2026-09-21", "capacityUnits": 95},

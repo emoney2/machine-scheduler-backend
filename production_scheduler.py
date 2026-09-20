@@ -1099,6 +1099,17 @@ def _schedule_sewing(
             overflow = remaining_units
             ship_in_horizon = bool(group_ship and group_ship >= planning_start)
         else:
+            window_days = max(
+                1,
+                math.ceil(order["sewing_units"] / max(config.regular_sewing_capacity, 1.0)),
+            )
+            earliest_hard = previous_workday(group_ship, off, include=True) if group_ship else planning_start
+            for _ in range(window_days - 1):
+                prev = previous_workday(earliest_hard, off)
+                if prev < planning_start:
+                    break
+                earliest_hard = prev
+
             def walk_back(allow_emergency: bool, force: bool, only_existing: bool) -> None:
                 nonlocal remaining_units, guard
                 started = False
@@ -1110,7 +1121,7 @@ def _schedule_sewing(
                 }
                 while remaining_units > 1e-9 and guard < 5000:
                     guard += 1
-                    if place < planning_start:
+                    if place < planning_start or place < earliest_hard:
                         break
                     if only_existing and existing_days and place not in existing_days:
                         if started:
@@ -1136,8 +1147,6 @@ def _schedule_sewing(
             ship_in_horizon = bool(group_ship and group_ship >= planning_start)
             if remaining_units > 1e-9 and ship_in_horizon:
                 walk_back(True, True, True)
-                if remaining_units > 1e-9:
-                    walk_back(True, True, False)
                 overflow = remaining_units
             elif remaining_units > 1e-9:
                 last = max(_sewing_entry_dates(order_entries), default=None)
@@ -1275,7 +1284,7 @@ def _schedule_sewing(
 
     order_lookup = {o["order_number"]: o for g in groups for o in g["orders"]}
     group_lookup = {o["order_number"]: g for g in groups for o in g["orders"]}
-    _fill_soft_sewing_gaps(
+    pass_args = (
         entries,
         order_lookup,
         group_lookup,
@@ -1288,71 +1297,13 @@ def _schedule_sewing(
         take_day,
         embroidery_deadlines,
     )
-    _close_interior_sewing_gaps(
-        entries,
-        order_lookup,
-        group_lookup,
-        config,
-        planning_start,
-        locks_by_order,
-        reserved,
-        day_job_count,
-        setup_units,
-        take_day,
-        embroidery_deadlines,
-    )
-    _front_load_sewing(
-        entries,
-        order_lookup,
-        group_lookup,
-        config,
-        planning_start,
-        locks_by_order,
-        reserved,
-        day_job_count,
-        setup_units,
-        take_day,
-        embroidery_deadlines,
-    )
-    _keep_sewing_together(
-        entries,
-        order_lookup,
-        group_lookup,
-        config,
-        planning_start,
-        locks_by_order,
-        reserved,
-        day_job_count,
-        setup_units,
-        take_day,
-        embroidery_deadlines,
-    )
-    _close_interior_sewing_gaps(
-        entries,
-        order_lookup,
-        group_lookup,
-        config,
-        planning_start,
-        locks_by_order,
-        reserved,
-        day_job_count,
-        setup_units,
-        take_day,
-        embroidery_deadlines,
-    )
-    _front_load_sewing(
-        entries,
-        order_lookup,
-        group_lookup,
-        config,
-        planning_start,
-        locks_by_order,
-        reserved,
-        day_job_count,
-        setup_units,
-        take_day,
-        embroidery_deadlines,
-    )
+    _keep_sewing_together(*pass_args)
+    _fill_soft_sewing_gaps(*pass_args)
+    _close_interior_sewing_gaps(*pass_args)
+    _front_load_sewing(*pass_args)
+    _keep_sewing_together(*pass_args)
+    _close_interior_sewing_gaps(*pass_args)
+    _front_load_sewing(*pass_args)
     entries.sort(key=lambda e: (e.get("date", ""), e.get("start", ""), e.get("orderNumber", "")))
     return entries, conflicts, embroidery_deadlines
 
@@ -1836,7 +1787,7 @@ def _close_interior_sewing_gaps(
             for oid in later:
                 order = order_lookup.get(oid)
                 group = group_lookup.get(oid)
-                if not order or not group:
+                if not order or not group or is_hard_date(order):
                     continue
                 group_ship = group.get("required_ship_date") or order.get("required_ship_date")
                 units = max(0.0, _number(order.get("sewing_units")))
@@ -1908,7 +1859,7 @@ def _front_load_sewing(
     for oid in order_ids:
         order = order_lookup.get(oid)
         group = group_lookup.get(oid)
-        if not order or not group:
+        if not order or not group or is_hard_date(order):
             continue
         old = [row for row in entries if _text(row.get("orderNumber")) == oid]
         dates = _sewing_entry_dates(old)
@@ -2013,7 +1964,7 @@ def _keep_sewing_together(
             late_start = next((day for day in _sewing_entry_dates(rows) if day > hole), None)
             if late_start and try_start(oid, late_start):
                 changed = True
-            elif try_start(oid, hole):
+            elif order and not is_hard_date(order) and try_start(oid, hole):
                 changed = True
         if changed:
             continue
@@ -2030,9 +1981,10 @@ def _keep_sewing_together(
                 if last and last < hole:
                     early.append(oid)
             for oid in early:
+                order = order_lookup.get(oid)
                 if late_start and try_start(oid, late_start):
                     changed = True
-                elif try_start(oid, hole):
+                elif order and not is_hard_date(order) and try_start(oid, hole):
                     changed = True
             if changed:
                 break
