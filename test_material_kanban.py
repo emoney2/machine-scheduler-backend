@@ -16,6 +16,34 @@ class MaterialKanbanTests(unittest.TestCase):
         self.assertEqual(material_from_name("light gray")["id"], "LIGHT-GREY-FUR")
         self.assertIsNone(material_from_name("Navy Fur"))
 
+    def test_long_neck_missing_sibling_ppy_does_not_crash(self):
+        today = date(2026, 9, 21)
+        production = [
+            {
+                "Order #": "99",
+                "Date": today,
+                "Company Name": "Club",
+                "Product": "Long Neck Blade",
+                "Quantity": 2,
+                "Fur Color": "Black Fur",
+            }
+        ]
+        result = build_status(
+            production,
+            [],
+            [{"Product": "Long Neck Blade", "PPY": 18}, {"Product": "Blade", "PPY": None}],
+            [],
+            today=today,
+        )
+        self.assertTrue(result["ok"])
+        raw_table = [
+            ["Product", "SKU", "Width", "Length", "Unit", "PPY"],
+            ["Long Neck Blade", "", "", "", "Yards", 18],
+            ["Blade", "", "", "", "Yards", None],
+        ]
+        raw_result = build_status(production, [], raw_table, [], today=today)
+        self.assertTrue(raw_result["ok"])
+
     def test_fur_usage_rules(self):
         self.assertAlmostEqual(fur_yards_for_product("Mallet", 20, 20), 1.0)
         self.assertAlmostEqual(fur_yards_for_product("Blade", 40, 20), 2.0)

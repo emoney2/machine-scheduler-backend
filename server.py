@@ -5211,7 +5211,7 @@ def _material_load_source_rows():
     return (
         _magnet_rows_to_dicts(values[0]),
         _magnet_rows_to_dicts(values[1]),
-        _magnet_rows_to_dicts(values[2]),
+        values[2],
         _magnet_rows_to_dicts(values[3]),
         values[3],
     )

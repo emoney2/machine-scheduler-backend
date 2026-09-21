@@ -108,13 +108,43 @@ def tracked_kanban_ids():
     return {item["kanbanId"] for item in TRACKED_MATERIALS}
 
 
+def ppy_lookup_from_values(values) -> dict:
+    """Read Table sheet values using the same PPY column fallback as material logging."""
+    if not values or len(values) < 2:
+        return {}
+    headers = [str(header or "").strip() for header in (values[0] or [])]
+    lower = [header.casefold() for header in headers]
+    product_col = lower.index("product") if "product" in lower else 0
+    ppy_col = lower.index("ppy") if "ppy" in lower else (5 if len(headers) > 5 else 1)
+    lookup = {}
+    for raw in values[1:]:
+        row = list(raw or [])
+        product = str(row[product_col] if product_col < len(row) else "").strip()
+        ppy = _number(row[ppy_col] if ppy_col < len(row) else 0)
+        if product and ppy > 0:
+            lookup[product.casefold()] = ppy
+    return lookup
+
+
 def ppy_lookup(table_rows) -> dict:
+    if table_rows and not isinstance(table_rows[0], dict):
+        return ppy_lookup_from_values(table_rows)
     lookup = {}
     for row in table_rows or []:
-        product = str(row.get("Product") or row.get("product") or "").strip()
+        product = str(
+            row.get("Product")
+            or row.get("product")
+            or row.get("PRODUCT")
+            or ""
+        ).strip()
         if not product:
             continue
-        ppy = _number(row.get("PPY") or row.get("Ppy") or row.get("ppy"))
+        ppy = _number(
+            row.get("PPY")
+            or row.get("Ppy")
+            or row.get("ppy")
+            or row.get("Pieces Per Yard")
+        )
         if ppy > 0:
             lookup[product.casefold()] = ppy
     return lookup
@@ -122,12 +152,12 @@ def ppy_lookup(table_rows) -> dict:
 
 def _resolve_ppy(product: str, lookup: dict) -> float:
     key = (product or "").strip().casefold()
-    ppy = lookup.get(key) or 0.0
+    ppy = _number(lookup.get(key))
     if "long neck" in key:
         sibling = " ".join(product.replace("Long Neck", " ").replace("long neck", " ").split())
-        sib = lookup.get(sibling.casefold()) if sibling else 0.0
+        sib = _number(lookup.get(sibling.casefold())) if sibling else 0.0
         if sib <= 0 and "blade" in key:
-            sib = lookup.get("blade") or 0.0
+            sib = _number(lookup.get("blade"))
         if sib > 0:
             ppy = min(ppy, sib) if ppy > 0 else sib
     return ppy
@@ -202,7 +232,7 @@ def usage_by_material(production_rows, cut_rows, table_rows) -> dict:
         if not material:
             continue
         ppy = _resolve_ppy(product, lookup)
-        yards = fur_yards_for_product(product, row.get("Quantity") or row.get("Qty"), ppy)
+        yards = _number(fur_yards_for_product(product, row.get("Quantity") or row.get("Qty"), ppy))
         if yards <= 0:
             continue
         dedupe = (order_id.casefold(), product.casefold(), material["id"])
@@ -239,6 +269,7 @@ def demand_forecast(history, today: date) -> dict:
     history_yards = 0.0
     first_date = None
     for ordered_on, yards in history or []:
+        yards = _number(yards)
         if not ordered_on or ordered_on > today or yards <= 0:
             continue
         history_yards += yards
@@ -298,6 +329,9 @@ def demand_forecast(history, today: date) -> dict:
 
 
 def _project_date(start: date, weekly_rate: float, weekly_growth: float, yards: float):
+    yards = _number(yards)
+    weekly_rate = _number(weekly_rate)
+    weekly_growth = _number(weekly_growth)
     if yards <= 0:
         return start
     if weekly_rate <= 0:
@@ -385,10 +419,10 @@ def inventory_state(item, kanban_rows, consumed_yards: float, today: date) -> di
 def _build_material_status(item, usage, kanban_rows, today: date) -> dict:
     inventory = inventory_state(item, kanban_rows, usage["consumedYards"], today)
     forecast = demand_forecast(usage["history"], today)
-    committed = usage["committedYards"]
-    uncommitted = max(0.0, inventory["physicalYards"] - committed)
-    position = max(0.0, uncommitted + inventory["inboundYards"])
-    reorder_point = forecast["reorderPointYards"]
+    committed = _number(usage.get("committedYards"))
+    uncommitted = max(0.0, _number(inventory.get("physicalYards")) - committed)
+    position = max(0.0, uncommitted + _number(inventory.get("inboundYards")))
+    reorder_point = _number(forecast.get("reorderPointYards"))
     trigger = position <= reorder_point
     weekly_rate = forecast["weeklyRate"]
     growth = forecast["weeklyGrowthRate"]
