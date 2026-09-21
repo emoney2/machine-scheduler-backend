@@ -945,6 +945,40 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(any(r["orderNumber"] == "100" for r in result["sewing"]))
         self.assertTrue(any(r["orderNumber"] == "100" for r in result["embroidery"]))
 
+    def test_hard_job_does_not_ship_the_week_after_it_is_due(self):
+        later = datetime(2026, 9, 28, 8, 30, tzinfo=ET)
+        result = build_schedule(
+            [
+                order(623, Quantity=110, **{
+                    "Ship Date": "09/30/2026",
+                    "Due Date": "09/30/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "TPC Potomac",
+                    "_transit_business_days": 0,
+                }),
+                order(1360, Quantity=110, **{
+                    "Ship Date": "10/01/2026",
+                    "Due Date": "10/02/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Country Club of Columbus",
+                    "_transit_business_days": 0,
+                }),
+                order(1375, Quantity=24, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "09/25/2026",
+                    "Due Date": "09/30/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Big Cedar Lodge",
+                    "_transit_business_days": 2,
+                }),
+            ],
+            thread_inventory=inventory(),
+            now=later,
+        )
+        days = [row["date"] for row in result["sewing"] if row["orderNumber"] == "1375"]
+        self.assertTrue(days)
+        self.assertTrue(all(day <= "2026-09-30" for day in days), days)
+
     def test_past_ship_date_is_still_placed(self):
         result = build_schedule(
             [order(100, Quantity=40, **{

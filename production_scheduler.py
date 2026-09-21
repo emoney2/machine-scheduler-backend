@@ -1055,9 +1055,13 @@ def _schedule_sewing(
         guard = 0
         customer_key = normalize_customer(order.get("customer"))
         ship_in_horizon = bool(group_ship and group_ship >= planning_start)
+        due = order.get("due_date")
+        latest_allowed = due or group_ship
         last_ok = previous_workday(group_ship, off, include=True) if group_ship else planning_start
-        if group_ship and last_ok < planning_start:
-            last_ok = planning_start + timedelta(days=400)
+        if latest_allowed and latest_allowed >= planning_start:
+            last_ok = previous_workday(latest_allowed, off, include=True)
+        elif last_ok < planning_start:
+            last_ok = next_workday(planning_start, off, include=True)
         full_units = remaining_units
 
         def other_customer_owns(place: date) -> bool:
@@ -1167,15 +1171,26 @@ def _schedule_sewing(
                         break
                     cursor = previous_workday(cursor, off)
             if not placed:
-                clear_order_entries()
-                walk_back_from(end, True)
-                if remaining_units > 1e-9:
-                    last = max(_sewing_entry_dates(order_entries), default=end)
+                due_end = last_ok
+                if end < planning_start:
+                    clear_order_entries()
                     take_until_done(
-                        next_workday(last, off),
+                        next_workday(planning_start, off, include=True),
                         True,
                         False,
-                        last + timedelta(days=40),
+                        due_end,
+                    )
+                elif not order_entries:
+                    walk_back_from(end, True)
+                if remaining_units > 1e-9:
+                    last = max(_sewing_entry_dates(order_entries), default=due_end)
+                    extra_days = int(math.ceil(remaining_units / max(config.regular_sewing_capacity, 1.0)))
+                    start = next_workday(last, off) if last >= planning_start else next_workday(planning_start, off, include=True)
+                    take_until_done(
+                        start,
+                        True,
+                        False,
+                        last + timedelta(days=max(7, extra_days * 3)),
                     )
             overflow = remaining_units
         late = (not hard) and overflow > 1e-9
@@ -2034,10 +2049,14 @@ def _keep_sewing_together(
         if not old or any(row.get("locked") for row in old) or oid in locks_by_order:
             return False
         group_ship = group.get("required_ship_date") or order.get("required_ship_date")
+        due = order.get("due_date")
+        deadline = due or group_ship
+        if deadline and start > deadline:
+            return False
         units = max(0.0, _number(order.get("sewing_units")))
         other_dates = [day for day in _group_sewing_dates(entries, group.get("id"), oid) if day >= start]
         _release_sewing_rows(old, entries, reserved, day_job_count)
-        last = previous_workday(group_ship, off, include=True) if group_ship else start
+        last = previous_workday(deadline or group_ship, off, include=True) if (deadline or group_ship) else start
         if last < start:
             last = start
         if not _can_place_contiguous(start, units, last, day_free, off):
@@ -2046,11 +2065,15 @@ def _keep_sewing_together(
         new_entries, remaining = _place_sewing_forward(
             take_day, order, group, group_ship, start, units, off, last
         )
-        customer_last = max(other_dates, default=start)
+        latest = last
+        if other_dates:
+            latest = max(latest, max(other_dates))
+        if deadline:
+            latest = min(latest, deadline)
         if _commit_sewing_move(
             new_entries, remaining, order, group_ship, off,
             entries, embroidery_deadlines, other_dates,
-            latest_ok=max(customer_last, last),
+            latest_ok=latest,
         ):
             return True
         _release_sewing_rows(new_entries, entries, reserved, day_job_count)
