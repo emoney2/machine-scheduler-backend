@@ -349,41 +349,6 @@ class ScheduleTests(unittest.TestCase):
             by_day[row["date"]] = by_day.get(row["date"], 0) + float(row.get("capacityUnits") or 0)
         self.assertTrue(all(units <= 145.01 for units in by_day.values()))
 
-    def test_later_ship_job_stays_compact_and_earlier_job_goes_in_front(self):
-        result = build_schedule(
-            [
-                order(623, Quantity=110, **{
-                    "Hard Date/Soft Date": "Hard Date",
-                    "Ship Date": "09/30/2026",
-                    "Due Date": "09/30/2026",
-                    "Stitch Count": 1000,
-                    "Company Name": "TPC Potomac",
-                    "_transit_business_days": 0,
-                }),
-                order(1360, Quantity=110, **{
-                    "Hard Date/Soft Date": "Hard Date",
-                    "Ship Date": "10/01/2026",
-                    "Due Date": "10/01/2026",
-                    "Stitch Count": 1000,
-                    "Company Name": "Country Club of Columbus",
-                    "_transit_business_days": 0,
-                }),
-            ],
-            thread_inventory=inventory(),
-            now=NOW,
-        )
-        potomac = sorted(
-            r["date"] for r in result["sewing"] if r["orderNumber"] == "623"
-        )
-        columbus = sorted(
-            r["date"] for r in result["sewing"] if r["orderNumber"] == "1360"
-        )
-        self.assertTrue(potomac and columbus)
-        self.assertLessEqual(len(set(columbus)), 2)
-        self.assertEqual(max(columbus), "2026-10-01")
-        self.assertLess(min(potomac), min(columbus))
-        self.assertNotIn("2026-09-29", columbus)
-
     def test_overflow_spills_to_the_next_day(self):
         result = build_schedule(
             [order(100, Quantity=200, **{
