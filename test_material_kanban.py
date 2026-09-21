@@ -136,6 +136,61 @@ class MaterialKanbanTests(unittest.TestCase):
             round(black_before["physicalYards"] - 2.0, 1),
         )
 
+    def test_far_future_uncut_is_deferred_not_committed(self):
+        today = date(2026, 9, 21)
+        table = [{"Product": "Mallet", "PPY": 20}]
+        production = [
+            {
+                "Order #": "200",
+                "Date": today,
+                "Due Date": today + timedelta(days=120),
+                "Ship Date": today + timedelta(days=115),
+                "Company Name": "Club",
+                "Product": "Mallet",
+                "Quantity": 80,
+                "Fur Color": "Light Grey Fur",
+            },
+            {
+                "Order #": "201",
+                "Date": today,
+                "Due Date": today + timedelta(days=30),
+                "Company Name": "Club",
+                "Product": "Mallet",
+                "Quantity": 20,
+                "Fur Color": "Light Grey Fur",
+            },
+        ]
+        result = build_status(production, [], table, [], today=today)
+        grey = next(row for row in result["materials"] if row["id"] == "LIGHT-GREY-FUR")
+        self.assertAlmostEqual(grey["committedYards"], 1.0)
+        self.assertAlmostEqual(grey["deferredYards"], 4.0)
+        self.assertAlmostEqual(grey["uncommittedYards"], round(yards_from_rolls(6) - 1.0, 1))
+        self.assertGreater(grey["inventoryPositionYards"], grey["reorderPointYards"])
+
+    def test_started_far_future_cut_still_commits_remaining(self):
+        today = date(2026, 9, 21)
+        table = [{"Product": "Mallet", "PPY": 20}]
+        production = [
+            {
+                "Order #": "300",
+                "Date": today,
+                "Due Date": today + timedelta(days=120),
+                "Company Name": "Club",
+                "Product": "Mallet",
+                "Quantity": 40,
+                "Fur Color": "Black Fur",
+            }
+        ]
+        usage = usage_by_material(
+            production,
+            [{"Order #": "300", "Quantity": 40, "Quantity Made": 20}],
+            table,
+            today=today,
+        )
+        self.assertAlmostEqual(usage["BLACK-FUR"]["consumedYards"], 1.0)
+        self.assertAlmostEqual(usage["BLACK-FUR"]["committedYards"], 1.0)
+        self.assertAlmostEqual(usage["BLACK-FUR"]["deferredYards"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

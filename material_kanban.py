@@ -13,6 +13,7 @@ METERS_PER_ROLL = 77.5
 YARDS_PER_METER = 1.0 / 0.9144
 LEAD_TIME_DAYS = 90
 DELAY_BUFFER_DAYS = 21
+COMMIT_HORIZON_DAYS = LEAD_TIME_DAYS
 PROTECTED_WEEKS = 16
 LONG_NECK_FACTOR = 1.15
 DRIVER_YARD_CALIBRATION = 9.5 / (160.0 / 14.0)
@@ -181,6 +182,23 @@ def fur_yards_for_product(product, quantity, ppy) -> float:
     return yards
 
 
+def _need_date(row) -> date | None:
+    return _date(
+        row.get("Ship Date")
+        or row.get("Ship")
+        or row.get("Due Date")
+        or row.get("Due")
+    )
+
+
+def is_deferred_demand(row, today: date) -> bool:
+    """Uncut work due after the Turkey lead time does not reserve today's fur."""
+    need = _need_date(row)
+    if need is None:
+        return False
+    return need > today + timedelta(days=COMMIT_HORIZON_DAYS)
+
+
 def _cut_progress(cut_row) -> tuple[str, float, float]:
     quantity = max(0.0, _number(cut_row.get("Quantity") or cut_row.get("Qty")))
     made = min(quantity, max(0.0, _number(cut_row.get("Quantity Made") or cut_row.get("Qty Made"))))
@@ -198,8 +216,9 @@ def _best_cut_row(existing, incoming):
     return incoming if made_new >= made_old else existing
 
 
-def usage_by_material(production_rows, cut_rows, table_rows) -> dict:
+def usage_by_material(production_rows, cut_rows, table_rows, today=None) -> dict:
     """Return consumed/committed yards for each tracked fur from live orders + Cut List."""
+    today = today or date.today()
     lookup = ppy_lookup(table_rows)
     cuts = {}
     for row in cut_rows or []:
@@ -216,6 +235,7 @@ def usage_by_material(production_rows, cut_rows, table_rows) -> dict:
             "name": item["name"],
             "consumedYards": 0.0,
             "committedYards": 0.0,
+            "deferredYards": 0.0,
             "history": [],
         }
         for item in TRACKED_MATERIALS
@@ -242,24 +262,30 @@ def usage_by_material(production_rows, cut_rows, table_rows) -> dict:
 
         cut = cuts.get(order_id.casefold())
         status, quantity, made = _cut_progress(cut or {})
+        deferred = is_deferred_demand(row, today) and made <= 0 and status != "complete"
         if quantity > 0 and made > 0:
             consumed = yards * (made / quantity)
             committed = max(0.0, yards - consumed)
+            deferred_yards = 0.0
         elif status == "complete":
-            consumed, committed = yards, 0.0
+            consumed, committed, deferred_yards = yards, 0.0, 0.0
+        elif deferred:
+            consumed, committed, deferred_yards = 0.0, 0.0, yards
         else:
-            consumed, committed = 0.0, yards
+            consumed, committed, deferred_yards = 0.0, yards, 0.0
 
         bucket = by_id[material["id"]]
         bucket["consumedYards"] += consumed
         bucket["committedYards"] += committed
+        bucket["deferredYards"] += deferred_yards
         ordered_on = _date(row.get("Date") or row.get("Order Date"))
-        if ordered_on:
+        if ordered_on and not deferred:
             bucket["history"].append((ordered_on, yards))
 
     for bucket in by_id.values():
         bucket["consumedYards"] = round(bucket["consumedYards"], 2)
         bucket["committedYards"] = round(bucket["committedYards"], 2)
+        bucket["deferredYards"] = round(bucket["deferredYards"], 2)
     return by_id
 
 
@@ -420,6 +446,7 @@ def _build_material_status(item, usage, kanban_rows, today: date) -> dict:
     inventory = inventory_state(item, kanban_rows, usage["consumedYards"], today)
     forecast = demand_forecast(usage["history"], today)
     committed = _number(usage.get("committedYards"))
+    deferred = _number(usage.get("deferredYards"))
     uncommitted = max(0.0, _number(inventory.get("physicalYards")) - committed)
     position = max(0.0, uncommitted + _number(inventory.get("inboundYards")))
     reorder_point = _number(forecast.get("reorderPointYards"))
@@ -442,6 +469,7 @@ def _build_material_status(item, usage, kanban_rows, today: date) -> dict:
         "physicalYards": inventory["physicalYards"],
         "physicalRolls": round(rolls_from_yards(inventory["physicalYards"]), 1),
         "committedYards": round(committed, 1),
+        "deferredYards": round(deferred, 1),
         "uncommittedYards": round(uncommitted, 1),
         "inboundYards": inventory["inboundYards"],
         "inventoryPositionYards": round(position, 1),
@@ -462,7 +490,7 @@ def _build_material_status(item, usage, kanban_rows, today: date) -> dict:
 
 
 def build_status(production_rows, cut_rows, table_rows, kanban_rows, *, today: date) -> dict:
-    usage = usage_by_material(production_rows, cut_rows, table_rows)
+    usage = usage_by_material(production_rows, cut_rows, table_rows, today=today)
     materials = [
         _build_material_status(item, usage[item["id"]], kanban_rows, today)
         for item in TRACKED_MATERIALS
@@ -478,6 +506,7 @@ def build_status(production_rows, cut_rows, table_rows, kanban_rows, *, today: d
         "model": {
             "leadTimeDays": LEAD_TIME_DAYS,
             "delayBufferDays": DELAY_BUFFER_DAYS,
+            "commitHorizonDays": COMMIT_HORIZON_DAYS,
             "serviceLevelPct": 99,
             "metersPerRoll": METERS_PER_ROLL,
             "orderYards": DEFAULT_ORDER_YARDS,
