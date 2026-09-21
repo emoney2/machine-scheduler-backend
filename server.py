@@ -3100,71 +3100,174 @@ def _notify_kanban_scanned(kanban_id, qty, item=None, already_open=False):
         logger.warning("[KanbanScan] failed to schedule email: %s", e)
 
 
-@app.route("/kanban/scan", methods=["GET"])
-def kanban_scan():
-    """Public endpoint triggered by QR scan — submits a Google Form entry once."""
+_KANBAN_SCAN_BOT_UA = re.compile(
+    r"bot|crawler|spider|slurp|preview|facebookexternalhit|facebot|twitterbot|"
+    r"linkedinbot|slackbot|discordbot|whatsapp|telegrambot|googlebot|bingbot|"
+    r"yandex|duckduck|baidu|semrush|ahrefs|mj12|dotbot|petalbot|bytespider|"
+    r"gptbot|claudebot|anthropic|safelink|proofpoint|urlscan|virustotal|"
+    r"python-requests|go-http-client|wget|curl/|httpclient|axios/|"
+    r"scanner|uptime|pingdom|statuscake|headlesschrome|prefetch",
+    re.I,
+)
+
+
+def _kanban_scan_is_bot():
+    ua = request.headers.get("User-Agent") or ""
+    purpose = " ".join(
+        [
+            request.headers.get("Purpose") or "",
+            request.headers.get("Sec-Purpose") or "",
+            request.headers.get("X-Purpose") or "",
+        ]
+    ).lower()
+    if "prefetch" in purpose or "preview" in purpose:
+        return True
+    if not ua.strip():
+        return True
+    return bool(_KANBAN_SCAN_BOT_UA.search(ua))
+
+
+def _kanban_has_open_request(rows, kanban_id):
+    if not rows:
+        return False
+    headers = rows[0]
+    hix = _kanban_headers_index(headers)
+    type_ix = hix.get("Type")
+    kanban_ix = hix.get("Kanban ID")
+    status_ix = hix.get("Event Status")
+    if None in (type_ix, kanban_ix, status_ix):
+        return False
+    needle = str(kanban_id or "").strip().upper()
+    for r in rows[1:]:
+        if not r or len(r) <= max(type_ix, kanban_ix, status_ix):
+            continue
+        if (
+            str(r[type_ix]).strip().upper() == "REQUEST"
+            and str(r[kanban_ix]).strip().upper() == needle
+            and str(r[status_ix]).strip().lower() == "open"
+        ):
+            return True
+    return False
+
+
+def _kanban_scan_confirm_token(kanban_id, qty, ts=None):
+    ts = str(ts or int(time.time()))
+    raw = f"{kanban_id}|{qty}|{ts}".encode("utf-8")
+    sig = hmac.new(
+        str(app.secret_key or "kanban-scan").encode("utf-8"),
+        raw,
+        hashlib.sha256,
+    ).hexdigest()[:24]
+    return f"{ts}.{sig}"
+
+
+def _kanban_scan_confirm_ok(kanban_id, qty, token):
+    token = str(token or "").strip()
+    if "." not in token:
+        return False
+    ts, _sig = token.split(".", 1)
     try:
-        kanban_id = request.args.get("id") or request.args.get("kanbanId", "")
-        qty = request.args.get("qty", "1")
+        if abs(time.time() - int(ts)) > 30 * 60:
+            return False
+    except Exception:
+        return False
+    expected = _kanban_scan_confirm_token(kanban_id, qty, ts)
+    return hmac.compare_digest(token, expected)
+
+
+def _kanban_scan_page(body_html, status=200, bg="#f3f4f6"):
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kanban scan</title>
+</head>
+<body style="margin:0;background:{bg};display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif;">
+  <div style="text-align:center;max-width:28rem;padding:24px;">{body_html}</div>
+</body>
+</html>"""
+    resp = make_response(html, status)
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/kanban/scan", methods=["GET", "POST"])
+def kanban_scan():
+    """QR codes open this URL. GET only shows a confirm button so crawlers
+    and link-previews cannot log a scan or send a notification email."""
+    try:
+        kanban_id = (
+            request.values.get("id") or request.values.get("kanbanId") or ""
+        ).strip()
+        qty = str(request.values.get("qty") or "1").strip() or "1"
 
         if not kanban_id:
-            return "<h3>❌ Missing Kanban ID</h3>", 400
+            return _kanban_scan_page("<h1>Missing Kanban ID</h1>", 400, "#fef2f2")
 
-        # Check if already requested
+        if _kanban_scan_is_bot():
+            ua = (request.headers.get("User-Agent") or "")[:160]
+            logger.info("[KanbanScan] ignoring bot %s %s ua=%s", request.method, kanban_id, ua)
+            return _kanban_scan_page("<h1>Kanban</h1><p>Open this link on a phone to request a reorder.</p>")
+
         rows = _kanban_read_all()
         _, item = _kanban_find_item_row(rows, kanban_id)
-        if rows:
-            headers = rows[0]
-            hix = _kanban_headers_index(headers)
-            type_ix = hix.get("Type")
-            kanban_ix = hix.get("Kanban ID")
-            status_ix = hix.get("Event Status")
-            for r in rows[1:]:
-                if not r or len(r) <= max(type_ix, kanban_ix, status_ix):
-                    continue
-                if (
-                    str(r[type_ix]).strip().upper() == "REQUEST"
-                    and str(r[kanban_ix]).strip().upper() == kanban_id.strip().upper()
-                    and str(r[status_ix]).strip().lower() == "open"
-                ):
-                    _notify_kanban_scanned(kanban_id, qty, item, already_open=True)
-                    return """
-                    <html>
-                      <body style="background:#fff7ed;display:flex;align-items:center;justify-content:center;height:100vh;">
-                        <div style="text-align:center;font-family:sans-serif;">
-                          <h1>⚠️ Already Scanned</h1>
-                          <p>This Kanban request is already open.</p>
-                        </div>
-                      </body>
-                    </html>
-                    """
+        item_name = _kanban_item_field(item, "Item Name", "itemName", "name") or kanban_id
+        already_open = _kanban_has_open_request(rows, kanban_id)
 
-        # --- Submit directly to Google Form (single request only)
+        if already_open:
+            return _kanban_scan_page(
+                "<h1>Already scanned</h1><p>This Kanban request is already open.</p>",
+                bg="#fff7ed",
+            )
+
+        if request.method != "POST":
+            token = _kanban_scan_confirm_token(kanban_id, qty)
+            return _kanban_scan_page(
+                f"""
+                <h1 style="margin:0 0 8px;">Request reorder?</h1>
+                <p style="margin:0 0 20px;color:#374151;">{_html_escape(item_name)}</p>
+                <p style="margin:0 0 20px;color:#6b7280;">Qty {_html_escape(qty)}</p>
+                <form method="POST" action="/kanban/scan">
+                  <input type="hidden" name="id" value="{_html_escape(kanban_id)}">
+                  <input type="hidden" name="qty" value="{_html_escape(qty)}">
+                  <input type="hidden" name="t" value="{_html_escape(token)}">
+                  <button type="submit" style="font-size:22px;font-weight:800;padding:16px 28px;border:0;border-radius:12px;background:#059669;color:white;width:100%;">
+                    Confirm scan
+                  </button>
+                </form>
+                """,
+            )
+
+        token = request.values.get("t") or ""
+        if not _kanban_scan_confirm_ok(kanban_id, qty, token):
+            return _kanban_scan_page(
+                "<h1>Scan expired</h1><p>Close this page and scan the card again.</p>",
+                400,
+                "#fff7ed",
+            )
+
         GOOGLE_FORM_ID = "1FAIpQLScsQeFaR22LNHcSZWbqwtNSBQU-j5MJdbxK1AA3cF-yBBxutA"
         ENTRY_KANBAN = "entry.1189949378"
         ENTRY_QTY = "entry.312175649"
         form_url = f"https://docs.google.com/forms/d/e/{GOOGLE_FORM_ID}/formResponse"
         payload = {ENTRY_KANBAN: kanban_id, ENTRY_QTY: qty, "submit": "Submit"}
 
-        import requests
-
         r = requests.post(form_url, data=payload)
         if r.status_code not in (200, 302):
-            return f"<h3>⚠️ Error submitting form ({r.status_code})</h3>", 500
+            return _kanban_scan_page(
+                f"<h1>Error submitting form ({r.status_code})</h1>", 500, "#fef2f2"
+            )
 
         _notify_kanban_scanned(kanban_id, qty, item, already_open=False)
-        return """
-        <html>
-          <body style="background:#ecfdf5;display:flex;align-items:center;justify-content:center;height:100vh;">
-            <div style="text-align:center;font-family:sans-serif;">
-              <h1>✅ Request Logged</h1>
-              <p>You can close this window.</p>
-            </div>
-          </body>
-        </html>
-        """
+        return _kanban_scan_page(
+            "<h1>Request logged</h1><p>You can close this window.</p>",
+            bg="#ecfdf5",
+        )
     except Exception as e:
-        return f"<h3>❌ Server error: {e}</h3>", 500
+        return _kanban_scan_page(f"<h1>Server error</h1><p>{_html_escape(e)}</p>", 500, "#fef2f2")
 
 
 @app.route("/kanban/receive", methods=["GET"])
@@ -4554,6 +4657,11 @@ def kanban_request_public():
         if not kanban_id:
             return jsonify({"ok": False, "error": "missing kanbanId"}), 400
 
+        if _kanban_scan_is_bot():
+            ua = (request.headers.get("User-Agent") or "")[:160]
+            logger.info("[KanbanScan] ignoring bot POST /api/kanban/request %s ua=%s", kanban_id, ua)
+            return jsonify({"ok": False, "error": "ignored"}), 403
+
         rows = _kanban_read_all()
 
         # ✅ debug lines (must be indented inside the try block)
@@ -4567,6 +4675,9 @@ def kanban_request_public():
                 jsonify({"ok": False, "error": f"Kanban ID {kanban_id} not found"}),
                 404,
             )
+
+        if _kanban_has_open_request(rows, kanban_id):
+            return jsonify({"ok": True, "alreadyOpen": True})
 
         # === Build the request row ===
         now_iso = (
