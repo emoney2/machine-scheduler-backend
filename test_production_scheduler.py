@@ -1083,6 +1083,153 @@ class ScheduleTests(unittest.TestCase):
                 gap = (datetime.fromisoformat(nxt) - datetime.fromisoformat(prev)).days
                 self.assertLessEqual(gap, 3, f"{oid} {unique}")
 
+    def test_job_sews_on_its_empty_ship_day(self):
+        result = build_schedule(
+            [
+                order(1360, Quantity=110, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "09/17/2026",
+                    "Due Date": "09/17/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Country Club of Columbus",
+                    "_transit_business_days": 0,
+                }),
+                order(1281, Quantity=44, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "09/28/2026",
+                    "Due Date": "10/01/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "TDG",
+                    "_transit_business_days": 2,
+                    "_shipping_address": {
+                        "addr1": "1 Main", "city": "Herndon", "state": "VA", "zip": "20170"
+                    },
+                }),
+                order(1280, Quantity=45, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "09/28/2026",
+                    "Due Date": "10/01/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "TDG",
+                    "_transit_business_days": 2,
+                    "_shipping_address": {
+                        "addr1": "1 Main", "city": "Herndon", "state": "VA", "zip": "20170"
+                    },
+                }),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        tdg = [r for r in result["sewing"] if r["orderNumber"] in {"1280", "1281"}]
+        self.assertTrue(tdg)
+        self.assertTrue(all(r["date"] == "2026-09-28" for r in tdg), [r["date"] for r in tdg])
+        self.assertEqual(sum(r["dayQuantity"] for r in tdg), 89)
+
+    def test_late_job_fills_an_empty_weekday(self):
+        result = build_schedule(
+            [
+                order(100, Quantity=95, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "09/21/2026",
+                    "Due Date": "09/21/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Monday Club",
+                    "_transit_business_days": 0,
+                }),
+                order(101, Quantity=95, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "09/22/2026",
+                    "Due Date": "09/22/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Tuesday Club",
+                    "_transit_business_days": 0,
+                }),
+                order(102, Quantity=95, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "09/23/2026",
+                    "Due Date": "09/23/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Wednesday Club",
+                    "_transit_business_days": 0,
+                }),
+                order(200, Quantity=110, **{
+                    "Hard Date/Soft Date": "Hard Date",
+                    "Ship Date": "09/17/2026",
+                    "Due Date": "09/17/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Late Columbus",
+                    "_transit_business_days": 0,
+                }),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        late = [r for r in result["sewing"] if r["orderNumber"] == "200"]
+        by_day = {}
+        for row in result["sewing"]:
+            by_day[row["date"]] = by_day.get(row["date"], 0) + float(row.get("capacityUnits") or 0)
+        self.assertTrue(late)
+        self.assertIn("2026-09-21", {r["date"] for r in late} | {d for d, u in by_day.items() if u >= 90})
+        self.assertGreaterEqual(by_day.get("2026-09-21", 0), 90)
+        self.assertFalse(
+            min(r["date"] for r in late) <= "2026-09-23"
+            and max(r["date"] for r in late) >= "2026-09-28"
+        )
+
+    def test_empty_thursday_takes_the_late_job(self):
+        result = build_schedule(
+            [
+                order(100, Quantity=83, **{
+                    "Ship Date": "09/21/2026",
+                    "Due Date": "09/21/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Monday Fill",
+                    "_transit_business_days": 0,
+                }),
+                order(101, Quantity=95, **{
+                    "Ship Date": "09/22/2026",
+                    "Due Date": "09/22/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Tuesday Fill",
+                    "_transit_business_days": 0,
+                }),
+                order(102, Quantity=95, **{
+                    "Ship Date": "09/23/2026",
+                    "Due Date": "09/23/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Wednesday Fill",
+                    "_transit_business_days": 0,
+                }),
+                order(103, Quantity=12, **{
+                    "Ship Date": "09/25/2026",
+                    "Due Date": "09/25/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Friday Fill",
+                    "_transit_business_days": 0,
+                }),
+                order(300, Quantity=110, **{
+                    "Ship Date": "09/23/2026",
+                    "Due Date": "09/23/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Late Thursday",
+                    "_transit_business_days": 0,
+                }),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        late = [r for r in result["sewing"] if r["orderNumber"] == "300"]
+        days = sorted({r["date"] for r in late})
+        by_day = {}
+        for row in result["sewing"]:
+            by_day[row["date"]] = by_day.get(row["date"], 0) + float(row.get("capacityUnits") or 0)
+        self.assertEqual(sum(r["dayQuantity"] for r in late), 110)
+        self.assertTrue(all(d <= "2026-09-25" for d in days), days)
+        self.assertGreaterEqual(by_day.get("2026-09-21", 0), 90)
+        self.assertTrue(
+            by_day.get("2026-09-24", 0) >= 90 or by_day.get("2026-09-21", 0) >= 90
+        )
+
     def test_hard_date_is_never_late(self):
         result = build_schedule(
             [order(100, Quantity=400, **{

@@ -1142,7 +1142,12 @@ def _schedule_sewing(
                     break
                 place = previous_workday(place, off)
 
-        def take_until_done(start: date, allow_emergency: bool, limit: Optional[date] = None) -> None:
+        def take_until_done(
+            start: date,
+            allow_emergency: bool,
+            limit: Optional[date] = None,
+            take_scraps: bool = False,
+        ) -> None:
             nonlocal remaining_units, guard
             started = False
             place = start
@@ -1151,7 +1156,7 @@ def _schedule_sewing(
                 guard += 1
                 if place > stop:
                     break
-                if _is_sewing_scrap(day_free(place, allow_emergency), remaining_units):
+                if not take_scraps and _is_sewing_scrap(day_free(place, allow_emergency), remaining_units):
                     if started:
                         break
                     place = next_workday(place, off)
@@ -1159,6 +1164,7 @@ def _schedule_sewing(
                 remaining_units, entry = take_day(
                     place, order, group, group_ship, remaining_units,
                     allow_emergency=allow_emergency, existing_entries=order_entries,
+                    force=take_scraps,
                 )
                 if entry:
                     started = True
@@ -1217,7 +1223,7 @@ def _schedule_sewing(
             clear_order_entries()
             if not force:
                 return False
-            take_until_done(next_workday(planning_start, off, include=True), True)
+            take_until_done(next_workday(planning_start, off, include=True), True, take_scraps=True)
             if not order_entries:
                 attempt_conflicts.append({
                     "type": "sewing_unscheduled",
@@ -1340,28 +1346,10 @@ def _schedule_sewing(
             if oid:
                 embroidery_deadlines[oid] = datetime.fromisoformat(entry["start"])
 
-    MAX_SLIP = 15
-    placed_ok = False
-    for slip in range(0, MAX_SLIP + 1):
-        reset_to_locks()
-        ok = True
-        for group, order in hard_jobs:
-            if not place_order(order, group, slip, force=slip == MAX_SLIP):
-                ok = False
-                break
-        if ok:
-            for group, order in hard_jobs:
-                rows = [row for row in entries if row.get("orderNumber") == order["order_number"]]
-                if _interior_sewing_hole(_sewing_entry_dates(rows), off):
-                    ok = False
-                    break
-        if ok:
-            placed_ok = True
-            break
-    if not placed_ok:
-        reset_to_locks()
-        for group, order in hard_jobs:
-            place_order(order, group, MAX_SLIP, force=True)
+    reset_to_locks()
+    for group, order in hard_jobs:
+        if not place_order(order, group, 0, force=False):
+            place_order(order, group, 0, force=True)
     conflicts.extend(attempt_conflicts)
 
     for group in groups:
@@ -1399,6 +1387,8 @@ def _schedule_sewing(
     )
     _keep_sewing_together(*pass_args)
     _tighten_smeared_sewing(*pass_args)
+    _fill_empty_days_with_late_jobs(*pass_args)
+    _keep_sewing_together(*pass_args)
     _spill_sewing_over_capacity(*pass_args)
     entries.sort(key=lambda e: (e.get("date", ""), e.get("start", ""), e.get("orderNumber", "")))
     return entries, conflicts, embroidery_deadlines
@@ -1996,6 +1986,151 @@ def _front_load_sewing(
             continue
         _release_sewing_rows(new_entries, entries, reserved, day_job_count)
         _restore_sewing_rows(old, entries, reserved, day_job_count)
+
+
+def _fill_empty_days_with_late_jobs(
+    entries: List[dict],
+    order_lookup: Dict[str, dict],
+    group_lookup: Dict[str, dict],
+    config: SchedulerConfig,
+    planning_start: date,
+    locks_by_order: Dict[str, List[dict]],
+    reserved: Dict[date, float],
+    day_job_count: Dict[date, int],
+    setup_units: float,
+    take_day,
+    embroidery_deadlines: Dict[str, datetime],
+) -> None:
+    """Pull late hard jobs onto earlier open days. Do not skip an empty ship day."""
+    off = config.sewing_off_days()
+
+    def regular_free(day: date) -> float:
+        _regular, _emergency, _total, _already, _setup, free = _sewing_capacity(
+            day, config, reserved, day_job_count, setup_units, False
+        )
+        return free
+
+    def rows_for(oid: str) -> List[dict]:
+        return [row for row in entries if _text(row.get("orderNumber")) == oid]
+
+    def finish_day(oid: str) -> Optional[date]:
+        dates = _sewing_entry_dates(rows_for(oid))
+        return max(dates) if dates else None
+
+    def placed_units(oid: str) -> float:
+        return sum(_number(row.get("capacityUnits")) for row in rows_for(oid))
+
+    def is_late(oid: str) -> bool:
+        order = order_lookup.get(oid)
+        group = group_lookup.get(oid)
+        if not order or not group or not is_hard_date(order):
+            return False
+        if oid in locks_by_order or any(row.get("locked") for row in rows_for(oid)):
+            return False
+        units = max(0.0, _number(order.get("sewing_units")))
+        if placed_units(oid) + 1e-9 < units:
+            return True
+        ship = group.get("required_ship_date") or order.get("required_ship_date")
+        done = finish_day(oid)
+        if not done:
+            return True
+        if ship and done > ship:
+            return True
+        if ship and ship < planning_start:
+            return True
+        return False
+
+    def place_from(oid: str, start: date, old_finish: date, complete: bool) -> bool:
+        order = order_lookup[oid]
+        group = group_lookup[oid]
+        group_ship = group.get("required_ship_date") or order.get("required_ship_date")
+        units = max(0.0, _number(order.get("sewing_units")))
+        remaining = units
+        new_entries: List[dict] = []
+        place = start
+        started = False
+        guard = 0
+        last = old_finish if complete else add_workdays(start, 40, off)
+        last = max(last, add_workdays(start, _needed_sewing_days(units, config.regular_sewing_capacity), off))
+        while remaining > 1e-9 and guard < 80:
+            guard += 1
+            if place > last:
+                break
+            remaining, entry = take_day(
+                place, order, group, group_ship, remaining,
+                allow_emergency=True, existing_entries=new_entries, force=True,
+            )
+            if entry:
+                if entry not in new_entries:
+                    new_entries.append(entry)
+                started = True
+                place = next_workday(place, off)
+            elif started:
+                break
+            else:
+                place = next_workday(place, off)
+        dates = _sewing_entry_dates(new_entries)
+        if remaining > 1e-9 or not dates or _interior_sewing_hole(dates, off):
+            _release_sewing_rows(new_entries, entries, reserved, day_job_count)
+            return False
+        if start not in dates:
+            _release_sewing_rows(new_entries, entries, reserved, day_job_count)
+            return False
+        if complete and max(dates) > old_finish:
+            _release_sewing_rows(new_entries, entries, reserved, day_job_count)
+            return False
+        _annotate_day_quantities(new_entries, order)
+        entries.extend(new_entries)
+        embroidery_deadlines[oid] = datetime.fromisoformat(
+            min(new_entries, key=lambda row: row["start"])["start"]
+        )
+        return True
+
+    changed = True
+    outer = 0
+    while changed and outer < 40:
+        changed = False
+        outer += 1
+        late_oids = []
+        seen: set[str] = set()
+        for row in entries:
+            oid = _text(row.get("orderNumber"))
+            if oid and oid not in seen and is_late(oid):
+                seen.add(oid)
+                late_oids.append(oid)
+        if not late_oids:
+            return
+        last = max(
+            [finish_day(oid) for oid in late_oids if finish_day(oid)]
+            or [planning_start]
+        )
+        cursor = next_workday(planning_start, off, include=True)
+        while cursor <= last:
+            if regular_free(cursor) <= 1e-6:
+                cursor = next_workday(cursor, off)
+                continue
+            candidates = []
+            for oid in late_oids:
+                if cursor in _sewing_entry_dates(rows_for(oid)):
+                    continue
+                candidates.append(oid)
+            candidates.sort(key=lambda oid: (finish_day(oid) or date.min, _number((order_lookup.get(oid) or {}).get("sewing_units"))), reverse=True)
+            moved = False
+            for oid in candidates:
+                old = rows_for(oid)
+                old_finish = finish_day(oid)
+                if not old or old_finish is None:
+                    continue
+                units = max(0.0, _number((order_lookup.get(oid) or {}).get("sewing_units")))
+                was_complete = placed_units(oid) + 1e-9 >= units
+                _release_sewing_rows(old, entries, reserved, day_job_count)
+                if place_from(oid, cursor, old_finish, was_complete):
+                    changed = True
+                    moved = True
+                    break
+                _restore_sewing_rows(old, entries, reserved, day_job_count)
+            if not moved:
+                cursor = next_workday(cursor, off)
 
 
 def _spill_sewing_over_capacity(
