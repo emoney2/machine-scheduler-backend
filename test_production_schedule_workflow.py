@@ -251,6 +251,25 @@ class WorkflowTests(unittest.TestCase):
         carlsbad = {"city": "Carlsbad", "state": "CA", "zip": "92008"}
         self.assertEqual(service._planning_transit({}, {"city": "Carlsbad", "state": "CA"}, "03"), 5)
         self.assertEqual(service._planning_transit({}, carlsbad, "03"), 5)
+        planned = [
+            {
+                "row": {"Company Name": "TaylorMade", "Shipping Method": "UPS Ground"},
+                "address": carlsbad,
+                "service_code": "03",
+                "transit": 5,
+                "live": 3,
+            },
+            {
+                "row": {"Company Name": "TaylorMade", "Shipping Method": "UPS Ground"},
+                "address": {"city": "Carlsbad", "state": "CA", "zip": "92008"},
+                "service_code": "03",
+                "transit": 5,
+                "live": 3,
+            },
+        ]
+        service._unify_destination_transit(planned)
+        self.assertEqual(planned[0]["transit"], 5)
+        self.assertEqual(planned[1]["transit"], 5)
 
     def test_embroidery_list_quantity_made_is_used(self):
         parsed = _parse_embroidery_progress([

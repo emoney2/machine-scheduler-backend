@@ -403,10 +403,26 @@ class ProductionScheduleService:
         live = self._transit_days(address, service_code) if address else None
         if live is None:
             return estimate
-        # Ground to the west coast is 4–5 days. A 3-day UPS "guarantee" field is not transit.
-        if estimate >= 5 and live <= 3:
+        # Ground to CA/west coast is 5 days. UPS often reports a 3-day
+        # "guarantee" that is not the real lane length.
+        if self._west_coast_destination(address) and live < 5:
+            return max(estimate, 5)
+        if estimate >= 5 and live < estimate:
             return estimate
         return live
+
+    def _west_coast_destination(self, address: Optional[dict]) -> bool:
+        addr = address or {}
+        st = _text(addr.get("state")).upper()[:2]
+        if st in {"CA", "OR", "WA", "HI", "AK"}:
+            return True
+        if (self._zip5(addr) or "")[:1] == "9":
+            return True
+        city = re.sub(r"[^a-z]+", " ", _text(addr.get("city")).lower()).strip()
+        return any(part in city for part in (
+            "carlsbad", "san diego", "los angeles", "la jolla", "irvine",
+            "newport", "san francisco", "oakland", "seattle", "portland",
+        ))
 
     def _unify_destination_transit(self, planned: Sequence[dict]) -> None:
         """Same destination ZIP + same UPS service share one transit time."""
@@ -421,20 +437,24 @@ class ProductionScheduleService:
                 by_dest.setdefault(f"{zip5}|{service}", []).append(item)
 
         def apply_shared(group: Sequence[dict]) -> None:
-            live_days = [int(item["live"]) for item in group if item.get("live") not in (None, "")]
-            if live_days:
-                chosen = max(live_days)
-            else:
-                values = [int(item["transit"]) for item in group if item.get("transit") not in (None, "")]
-                if not values:
-                    return
-                chosen = max(values)
+            values = [int(item["transit"]) for item in group if item.get("transit") not in (None, "")]
+            if not values:
+                return
+            chosen = max(values)
             for item in group:
                 item["transit"] = chosen
 
         for group in by_dest.values():
             if len(group) > 1:
                 apply_shared(group)
+        for item in planned:
+            if self._west_coast_destination(item.get("address")):
+                try:
+                    current = int(item.get("transit"))
+                except (TypeError, ValueError):
+                    current = 0
+                if current < 5:
+                    item["transit"] = 5
 
     def load_inputs(self) -> tuple[List[dict], Dict[str, dict], dict]:
         batched = self.store.batch_values([
