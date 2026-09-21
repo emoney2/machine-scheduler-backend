@@ -172,6 +172,14 @@ from magnet_kanban import (
     build_status as build_magnet_kanban_status,
     fur_magnet_totals,
 )
+from material_kanban import (
+    TRACKED_MATERIALS,
+    build_status as build_material_kanban_status,
+    material_from_name,
+    rolls_from_yards,
+    tracked_kanban_ids,
+    yards_from_rolls,
+)
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
@@ -386,6 +394,14 @@ _MAGNET_STATUS_TTL_SECONDS = 300
 _magnet_trigger_lock = Semaphore(1)
 _magnet_background_check_last = 0.0
 _MAGNET_BACKGROUND_CHECK_SECONDS = 6 * 60 * 60
+MATERIAL_KANBAN_NOTIFY_EMAIL = (
+    os.environ.get("MATERIAL_KANBAN_NOTIFY_EMAIL")
+    or os.environ.get("MAGNET_KANBAN_NOTIFY_EMAIL")
+    or "info@jrco.us"
+).strip()
+_material_status_cache = {"ts": 0.0, "payload": None}
+_MATERIAL_STATUS_TTL_SECONDS = 300
+_material_trigger_lock = Semaphore(1)
 
 
 import re, os
@@ -5059,6 +5075,10 @@ def _magnet_background_status_check():
         _magnet_status(force=True, allow_trigger=True)
     except Exception:
         logger.exception("[MagnetKanban] scheduled status check failed")
+    try:
+        _material_status(force=True, allow_trigger=True)
+    except Exception:
+        logger.exception("[MaterialKanban] scheduled status check failed")
 
 
 @app.before_request
@@ -5162,6 +5182,269 @@ def magnet_kanban_record_count():
         return jsonify({"ok": False, "error": str(exc)}), 400
     except Exception as exc:
         logger.exception("[MagnetKanban] count update failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+def _material_load_source_rows():
+    ranges = [
+        OVERVIEW_PRODUCTION_ORDERS_RANGE,
+        CUT_RANGE,
+        TABLE_RANGE,
+        f"{KANBAN_SHEET_TAB}!A1:ZZ",
+    ]
+    with acquire_sheet_lock(timeout=45):
+        response = (
+            get_sheets_service()
+            .spreadsheets()
+            .values()
+            .batchGet(
+                spreadsheetId=SPREADSHEET_ID,
+                ranges=ranges,
+                valueRenderOption="UNFORMATTED_VALUE",
+            )
+            .execute()
+        )
+    value_ranges = response.get("valueRanges", [])
+    while len(value_ranges) < 4:
+        value_ranges.append({})
+    values = [entry.get("values", []) or [] for entry in value_ranges[:4]]
+    return (
+        _magnet_rows_to_dicts(values[0]),
+        _magnet_rows_to_dicts(values[1]),
+        _magnet_rows_to_dicts(values[2]),
+        _magnet_rows_to_dicts(values[3]),
+        values[3],
+    )
+
+
+def _send_material_reorder_email(materials):
+    to_email = MATERIAL_KANBAN_NOTIFY_EMAIL
+    from_email = (
+        os.environ.get("DESIGN_CONFIRMATION_FROM_EMAIL") or "info@jrco.us"
+    ).strip()
+    smtp_host = (os.environ.get("SMTP_HOST") or "").strip()
+    smtp_port = int(os.environ.get("SMTP_PORT") or "587")
+    smtp_user = (os.environ.get("SMTP_USER") or "").strip()
+    smtp_password = (os.environ.get("SMTP_PASSWORD") or "").strip()
+    if not to_email or not smtp_host or not smtp_user or not smtp_password:
+        logger.warning("[MaterialKanban] SMTP not configured; reorder email not sent")
+        return False
+
+    lines = []
+    for item in materials or []:
+        qty = int(item.get("recommendedOrderYards") or 0)
+        lines.append(
+            f"{item.get('name')}: order {qty:,} yards "
+            f"(position {item.get('inventoryPositionYards')} yd, "
+            f"reorder at {item.get('reorderPointYards')} yd)"
+        )
+    names = ", ".join(item.get("name") or "material" for item in materials or [])
+    subject = f"ORDER LONG-LEAD MATERIAL — {names}"
+    queue_url = "https://machineschedule.netlify.app/kanban/queue"
+    plain = (
+        "The electronic material Kanban reached its reorder point.\n\n"
+        + "\n".join(lines)
+        + f"\n\nLead time is 90 days from Turkey plus a 21-day delay buffer.\nQueue: {queue_url}\n"
+    )
+
+    import smtplib
+    from email.mime.text import MIMEText
+
+    message = MIMEText(plain, "plain")
+    message["Subject"] = subject
+    message["From"] = from_email
+    message["To"] = to_email
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.sendmail(from_email, [to_email], message.as_string())
+        logger.info("[MaterialKanban] reorder email sent to %s", to_email)
+        return True
+    except Exception as exc:
+        logger.warning("[MaterialKanban] reorder email failed: %s", exc)
+        return False
+
+
+def _material_create_requests_if_needed(status):
+    needed = [
+        item
+        for item in (status.get("materials") or [])
+        if item.get("shouldCreateRequest")
+    ]
+    if not needed:
+        return status
+    created = []
+    with _material_trigger_lock:
+        values = _kanban_read_all()
+        rows = _magnet_rows_to_dicts(values)
+        active_ids = {
+            str(row.get("Kanban ID") or "").strip().upper()
+            for row in rows
+            if str(row.get("Type") or "").strip().upper() == KANBAN_REQUEST_TYPE
+            and str(row.get("Event Status") or "").strip().lower() in ("open", "ordered")
+        }
+        for item in needed:
+            if item["kanbanId"] in active_ids:
+                continue
+            catalog = next(
+                (row for row in TRACKED_MATERIALS if row["kanbanId"] == item["kanbanId"]),
+                None,
+            )
+            quantity = int(item.get("recommendedOrderYards") or 700)
+            event_id = f"MAT-{uuid4().hex[:12].upper()}"
+            event = {
+                "Type": KANBAN_REQUEST_TYPE,
+                "Kanban ID": item["kanbanId"],
+                "Item Name": item.get("name") or "Long-lead material",
+                "SKU": item.get("id"),
+                "Dept": "Purchasing",
+                "Category": "Long-lead Fur",
+                "Reorder Qty (basis)": quantity,
+                "Units Basis (units/cases)": "yards",
+                "Lead Time (days)": 90,
+                "Order Method (Email/Online)": "Email",
+                "Order Email": MATERIAL_KANBAN_NOTIFY_EMAIL,
+                "Notes": (
+                    f"Electronic trigger at {item.get('inventoryPositionYards')} yd; "
+                    f"reorder point {item.get('reorderPointYards')} yd."
+                ),
+                "Event ID": event_id,
+                "Event Qty": quantity,
+                "Event Status": "Open",
+                "Requested By": "Electronic Material Kanban",
+                "Timestamp": _now_iso_utc(),
+            }
+            _magnet_append_event(event, values)
+            values.append([event.get(header, "") for header in (values[0] if values else [])])
+            item["activeRequest"] = {
+                "eventId": event_id,
+                "status": "open",
+                "quantity": quantity,
+            }
+            item["shouldCreateRequest"] = False
+            created.append(item)
+            del catalog
+    if created:
+        try:
+            eventlet.spawn_n(_send_material_reorder_email, list(created))
+        except Exception as exc:
+            logger.warning("[MaterialKanban] could not schedule reorder email: %s", exc)
+    status["shouldCreateRequests"] = []
+    return status
+
+
+def _material_status(force=False, allow_trigger=True):
+    now = time.time()
+    cached = _material_status_cache.get("payload")
+    if (
+        not force
+        and cached is not None
+        and now - float(_material_status_cache.get("ts") or 0) < _MATERIAL_STATUS_TTL_SECONDS
+    ):
+        return cached
+
+    production_rows, cut_rows, table_rows, kanban_rows, _values = _material_load_source_rows()
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    status = build_material_kanban_status(
+        production_rows,
+        cut_rows,
+        table_rows,
+        kanban_rows,
+        today=today,
+    )
+    if allow_trigger and status.get("shouldCreateRequests"):
+        status = _material_create_requests_if_needed(status)
+    _material_status_cache["ts"] = now
+    _material_status_cache["payload"] = status
+    return status
+
+
+def _invalidate_material_status():
+    _material_status_cache["ts"] = 0.0
+    _material_status_cache["payload"] = None
+
+
+@app.route("/api/kanban/materials/status", methods=["GET"])
+@login_required_session
+def material_kanban_status():
+    try:
+        force = str(request.args.get("fresh") or "").strip().lower() in ("1", "true", "yes")
+        return jsonify(_material_status(force=force, allow_trigger=True))
+    except Exception as exc:
+        logger.exception("[MaterialKanban] status failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/kanban/materials/count", methods=["POST"])
+@login_required_session
+def material_kanban_record_count():
+    try:
+        data = request.get_json(silent=True) or {}
+        material_id = str(data.get("materialId") or data.get("kanbanId") or "").strip()
+        catalog = material_from_name(material_id) or next(
+            (
+                item
+                for item in TRACKED_MATERIALS
+                if item["id"] == material_id.upper()
+                or item["kanbanId"] == material_id.upper()
+            ),
+            None,
+        )
+        if not catalog:
+            raise ValueError("unknown material")
+        if data.get("rolls") not in (None, ""):
+            rolls = float(data.get("rolls"))
+            yards = yards_from_rolls(rolls)
+        else:
+            yards = float(data.get("yards"))
+            rolls = rolls_from_yards(yards)
+        if rolls < 0 or yards < 0:
+            raise ValueError("counts must be non-negative")
+        production_rows, cut_rows, table_rows, _kanban_rows, kanban_values = (
+            _material_load_source_rows()
+        )
+        status = build_material_kanban_status(
+            production_rows,
+            cut_rows,
+            table_rows,
+            [],
+            today=datetime.now(ZoneInfo("America/New_York")).date(),
+        )
+        current = next(
+            (row for row in status["materials"] if row["id"] == catalog["id"]),
+            None,
+        )
+        consumed = float((current or {}).get("consumedYards") or 0)
+        _magnet_append_event(
+            {
+                "Type": "MATERIAL_COUNT",
+                "Kanban ID": catalog["kanbanId"],
+                "Item Name": catalog["name"],
+                "SKU": catalog["id"],
+                "Event Qty": round(yards, 2),
+                "Event Status": "Counted",
+                "Requested By": (
+                    request.headers.get("X-User-Name") or "Manager"
+                ).strip(),
+                "Timestamp": _now_iso_utc(),
+                "Notes": json.dumps(
+                    {
+                        "rolls": rolls,
+                        "yards": yards,
+                        "consumedYards": consumed,
+                    },
+                    separators=(",", ":"),
+                ),
+            },
+            kanban_values,
+        )
+        _invalidate_material_status()
+        return jsonify(_material_status(force=True, allow_trigger=True))
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        logger.exception("[MaterialKanban] count update failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
@@ -5275,8 +5558,11 @@ def kanban_mark_ordered_v2():
             body={"values": [cur[: len(headers)]]},
         ).execute()
 
-    if str(req.get("Kanban ID") or "").strip().upper() == MAGNET_KANBAN_ID:
+    kid = str(req.get("Kanban ID") or "").strip().upper()
+    if kid == MAGNET_KANBAN_ID:
         _invalidate_magnet_status()
+    if kid in tracked_kanban_ids():
+        _invalidate_material_status()
     return jsonify({"ok": True})
 
 
@@ -5383,8 +5669,11 @@ def kanban_mark_received():
             body={"values": [cur[: len(headers)]]},
         ).execute()
 
-    if str(req.get("Kanban ID") or "").strip().upper() == MAGNET_KANBAN_ID:
+    kid = str(req.get("Kanban ID") or "").strip().upper()
+    if kid == MAGNET_KANBAN_ID:
         _invalidate_magnet_status()
+    if kid in tracked_kanban_ids():
+        _invalidate_material_status()
     return jsonify({"ok": True})
 
 
@@ -10954,6 +11243,7 @@ STOCK_PRODUCTS_RANGE = os.environ.get("STOCK_PRODUCTS_RANGE", "Stock Products!A1
 # Supabase table for Shopify product-builder orders
 SUPABASE_PB_ORDERS_TABLE = os.environ.get("SUPABASE_PB_ORDERS_TABLE", "Production Orders TEST")
 FUR_RANGE = os.environ.get("FUR_RANGE", "Fur List!A1:Z")
+TABLE_RANGE = os.environ.get("TABLE_RANGE", "Table!A1:Z")
 # Sales Rep commission list (Order Submission REP dropdown)
 SALES_REP_LIST_RANGE = os.environ.get("SALES_REP_LIST_RANGE", "Sales Rep!A2:A10")
 CUT_RANGE = os.environ.get("CUT_RANGE", "Cut List!A1:Z")
@@ -14147,6 +14437,7 @@ def cut_complete():
         with sheet_lock:
             svc.batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
 
+        _invalidate_material_status()
         return jsonify(ok=True, wrote=len(updates))
     except Exception as e:
         app.logger.exception("cut_complete failed")
@@ -14440,6 +14731,7 @@ def cut_complete_batch():
             wrote_cells,
             len(missing),
         )
+        _invalidate_material_status()
         return jsonify(
             ok=True,
             wrote=wrote_cells,
