@@ -1210,8 +1210,10 @@ def _transit_and_schedule_from_rated(rated: Dict[str, Any]) -> Tuple[Any, Any]:
         return None, None
     gd = rated.get("GuaranteedDelivery") or {}
     tit = rated.get("TimeInTransit") or {}
-    eta = gd.get("BusinessDaysInTransit") or tit.get("DaysInTransit")
-    sched = gd.get("ScheduledDeliveryDate") or tit.get("Date")
+    # Time-in-transit is the lane length. GuaranteedDelivery is often a 3-day
+    # product promise and must not shorten Ground to California.
+    eta = tit.get("DaysInTransit") or tit.get("BusinessDaysInTransit")
+    sched = tit.get("Date") or gd.get("ScheduledDeliveryDate")
 
     ss = tit.get("ServiceSummary")
     summaries = ss if isinstance(ss, list) else ([ss] if isinstance(ss, dict) else [])
@@ -1248,6 +1250,8 @@ def _transit_and_schedule_from_rated(rated: Dict[str, Any]) -> Tuple[Any, Any]:
             if eta not in (None, "") and sched not in (None, ""):
                 break
 
+    if eta in (None, ""):
+        eta = gd.get("BusinessDaysInTransit")
     if eta == "":
         eta = None
     if sched == "":

@@ -234,6 +234,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(zip_only.get("zip"), "37203")
         self.assertEqual(service._planning_transit({}, zip_only, "03"), 2)
 
+    def test_carlsbad_ground_is_five_days(self):
+        def live_three(_ship_to, _pkgs, ask_all_services=False):
+            return [{"code": "03", "business_days": 3}]
+
+        service = ProductionScheduleService(
+            store=FakeStore(),
+            fetch_sheet=lambda *a, **k: [],
+            orders_range="Production Orders!A1:BZ",
+            resolve_order_address=lambda *_a, **_k: {},
+            fetch_directory_row=lambda _name: None,
+            normalize_directory_address=lambda _row: {},
+            ups_get_rate=live_three,
+            frontend_url="https://example.test",
+        )
+        carlsbad = {"city": "Carlsbad", "state": "CA", "zip": "92008"}
+        self.assertEqual(service._planning_transit({}, {"city": "Carlsbad", "state": "CA"}, "03"), 5)
+        self.assertEqual(service._planning_transit({}, carlsbad, "03"), 5)
+
     def test_embroidery_list_quantity_made_is_used(self):
         parsed = _parse_embroidery_progress([
             ["Order #", "Status", "Quantity Made"],

@@ -332,19 +332,26 @@ class ProductionScheduleService:
 
     def _address(self, row: dict, by_id: dict, directory_by_customer: Optional[dict] = None) -> dict:
         specific = self.resolve_order_address(row, by_id, None) or {}
-        if self._usable_ship_address(specific):
-            return specific
         company = _text(row.get("Company Name"))
         directory = None
         if company and directory_by_customer is not None:
             directory = directory_by_customer.get(company.lower())
         elif company:
             directory = self.fetch_directory_row(company)
-        if not directory:
-            return {}
-        address = self.normalize_directory_address(directory) or {}
+        company_addr = self.normalize_directory_address(directory) or {} if directory else {}
+        if self._usable_ship_address(specific):
+            if not self._zip5(specific) and company_addr:
+                same_city = _text(specific.get("city")).casefold() == _text(company_addr.get("city")).casefold()
+                same_state = _text(specific.get("state")).upper()[:2] == _text(company_addr.get("state")).upper()[:2]
+                if same_city or (same_state and not _text(company_addr.get("city"))):
+                    specific = {
+                        **specific,
+                        "zip": company_addr.get("zip") or specific.get("zip"),
+                        "addr1": _text(specific.get("addr1")) or company_addr.get("addr1"),
+                    }
+            return specific
         required = ("addr1", "city", "state", "zip")
-        return address if all(_text(address.get(k)) for k in required) else {}
+        return company_addr if all(_text(company_addr.get(k)) for k in required) else {}
 
     def _usable_ship_address(self, addr: Any) -> bool:
         if not isinstance(addr, dict):
@@ -386,10 +393,20 @@ class ProductionScheduleService:
     def _planning_transit(self, row: dict, address: dict, service_code: str) -> int:
         if self._is_local_delivery(row):
             return LOCAL_DELIVERY_TRANSIT_DAYS
+        address = address or {}
+        estimate = transit_days_for_service(
+            service_code,
+            address.get("zip"),
+            address.get("state"),
+            address.get("city"),
+        )
         live = self._transit_days(address, service_code) if address else None
-        if live is not None:
-            return live
-        return transit_days_for_service(service_code, address.get("zip"), address.get("state"))
+        if live is None:
+            return estimate
+        # Ground to the west coast is 4–5 days. A 3-day UPS "guarantee" field is not transit.
+        if estimate >= 5 and live <= 3:
+            return estimate
+        return live
 
     def _unify_destination_transit(self, planned: Sequence[dict]) -> None:
         """Same destination ZIP + same UPS service share one transit time."""

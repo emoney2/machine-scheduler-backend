@@ -127,16 +127,19 @@ DEFAULT_GROUND_TRANSIT_DAYS = 3
 SHIPPING_DELAY_BUFFER_DAYS = 1
 
 
-def estimate_ground_transit_days(zip_code: Any = "", state: Any = "") -> int:
+def estimate_ground_transit_days(zip_code: Any = "", state: Any = "", city: Any = "") -> int:
     """Typical UPS Ground business days from Buford, GA (30519).
 
     Used when live UPS transit is missing. Nearby Southeast jobs are 1–2 days,
-    not a blanket week.
+    not a blanket week. West-coast states stay 5 days even without a ZIP.
     """
     digits = re.sub(r"\D", "", _text(zip_code))
     prefix = digits[:3]
     lead = prefix[:1]
     st = _text(state).upper()
+    if len(st) > 2:
+        st = st[:2]
+    city_key = re.sub(r"[^a-z]+", " ", _text(city).lower()).strip()
     if st == "GA" or prefix.startswith("30") or prefix.startswith("31"):
         return 1
     if st in {"SC", "AL", "TN", "FL", "NC"} or lead == "3":
@@ -147,9 +150,15 @@ def estimate_ground_transit_days(zip_code: Any = "", state: Any = "") -> int:
         "MO", "AR",
     } or lead in {"1", "2", "4"}:
         return 3
-    if lead in {"5", "6", "7"}:
+    if st in {"CA", "OR", "WA", "HI", "AK"} or lead in {"8", "9"}:
+        return 5
+    if st in {"TX", "OK", "KS", "NE", "SD", "ND", "MN", "IA", "AZ", "NM", "NV", "UT", "CO", "ID", "MT", "WY"} or lead in {"5", "6", "7"}:
         return 4
-    if lead in {"8", "9"}:
+    if any(part in city_key for part in (
+        "carlsbad", "san diego", "los angeles", "la jolla", "irvine",
+        "newport", "orange county", "san francisco", "oakland", "seattle",
+        "portland",
+    )):
         return 5
     return DEFAULT_GROUND_TRANSIT_DAYS
 
@@ -162,7 +171,12 @@ def is_local_delivery(value: Any) -> bool:
     return "local" in _text(value).casefold()
 
 
-def transit_days_for_service(service_code: Any, zip_code: Any = "", state: Any = "") -> int:
+def transit_days_for_service(
+    service_code: Any,
+    zip_code: Any = "",
+    state: Any = "",
+    city: Any = "",
+) -> int:
     code = _text(service_code).zfill(2)
     if code in {"01", "13", "14"}:
         return 1
@@ -170,7 +184,7 @@ def transit_days_for_service(service_code: Any, zip_code: Any = "", state: Any =
         return 2
     if code == "12":
         return 3
-    return estimate_ground_transit_days(zip_code, state)
+    return estimate_ground_transit_days(zip_code, state, city)
 
 
 def resolve_required_ship_date(
