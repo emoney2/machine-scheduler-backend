@@ -1096,6 +1096,7 @@ def _schedule_sewing(
         order_entries: List[dict] = []
         guard = 0
         ship_in_horizon = bool(group_ship and group_ship >= planning_start)
+        customer_key = normalize_customer(order.get("customer"))
         full_units = remaining_units
 
         def clear_order_entries() -> None:
@@ -1117,36 +1118,27 @@ def _schedule_sewing(
             )
             return free
 
-        def walk_back_from(end_day: date, allow_emergency: bool) -> None:
-            nonlocal remaining_units, guard
-            started = False
-            place = previous_workday(end_day, off, include=True)
-            while remaining_units > 1e-9 and guard < 5000:
-                guard += 1
-                if place < planning_start:
-                    break
-                if _is_sewing_scrap(day_free(place, allow_emergency), remaining_units):
-                    if started:
-                        break
-                    place = previous_workday(place, off)
+        def other_customer_owns(place: date) -> bool:
+            if remaining_units < 40:
+                return False
+            counts: Dict[str, float] = defaultdict(float)
+            for row in entries:
+                if parse_date(row.get("date")) != place:
                     continue
-                remaining_units, entry = take_day(
-                    place, order, group, group_ship, remaining_units,
-                    allow_emergency=allow_emergency, existing_entries=order_entries,
-                )
-                if entry:
-                    started = True
-                    if entry not in order_entries:
-                        order_entries.append(entry)
-                elif started:
-                    break
-                place = previous_workday(place, off)
+                owner = normalize_customer(row.get("customer")) or _text(row.get("orderNumber"))
+                counts[owner] += _number(row.get("capacityUnits"))
+            if not counts:
+                return False
+            owner, qty = max(counts.items(), key=lambda item: item[1])
+            me = customer_key or order["order_number"]
+            return bool(owner and owner != me and qty >= 80)
 
         def take_until_done(
             start: date,
             allow_emergency: bool,
             limit: Optional[date] = None,
-            take_scraps: bool = False,
+            take_scraps: bool = True,
+            skip_owned: bool = True,
         ) -> None:
             nonlocal remaining_units, guard
             started = False
@@ -1156,9 +1148,7 @@ def _schedule_sewing(
                 guard += 1
                 if place > stop:
                     break
-                if not take_scraps and _is_sewing_scrap(day_free(place, allow_emergency), remaining_units):
-                    if started:
-                        break
+                if skip_owned and not started and other_customer_owns(place):
                     place = next_workday(place, off)
                     continue
                 remaining_units, entry = take_day(
@@ -1176,6 +1166,29 @@ def _schedule_sewing(
                 else:
                     place = next_workday(place, off)
 
+        def walk_back_from(end_day: date, allow_emergency: bool) -> None:
+            nonlocal remaining_units, guard
+            started = False
+            place = previous_workday(end_day, off, include=True)
+            while remaining_units > 1e-9 and guard < 5000:
+                guard += 1
+                if place < planning_start:
+                    break
+                if other_customer_owns(place) and not started:
+                    place = previous_workday(place, off)
+                    continue
+                remaining_units, entry = take_day(
+                    place, order, group, group_ship, remaining_units,
+                    allow_emergency=allow_emergency, existing_entries=order_entries,
+                )
+                if entry:
+                    started = True
+                    if entry not in order_entries:
+                        order_entries.append(entry)
+                elif started:
+                    break
+                place = previous_workday(place, off)
+
         def try_hard_ending(end_day: date, allow_emergency: bool) -> bool:
             clear_order_entries()
             walk_back_from(end_day, allow_emergency)
@@ -1183,47 +1196,56 @@ def _schedule_sewing(
                 return False
             return _interior_sewing_hole(_sewing_entry_dates(order_entries), off) is None
 
-        needed = _needed_sewing_days(full_units, config.regular_sewing_capacity)
-        if ship_in_horizon:
-            target_end = add_workdays(
-                previous_workday(group_ship, off, include=True), slip, off
+        def finishes_by_ship() -> bool:
+            if remaining_units > 1e-9 or not order_entries or not group_ship:
+                return remaining_units <= 1e-9 and bool(order_entries)
+            finish = datetime.fromisoformat(max(order_entries, key=lambda e: e["finish"])["finish"])
+            return finish <= _at(group_ship, SEWING_DAY_END)
+
+        def pack_from_today(allow_emergency: bool, skip_owned: bool) -> bool:
+            clear_order_entries()
+            take_until_done(
+                next_workday(planning_start, off, include=True),
+                allow_emergency,
+                take_scraps=True,
+                skip_owned=skip_owned,
             )
-        else:
-            target_end = add_workdays(planning_start, max(0, needed - 1), off)
-        target_end = previous_workday(target_end, off, include=True)
+            return remaining_units <= 1e-9 and _interior_sewing_hole(
+                _sewing_entry_dates(order_entries), off
+            ) is None
 
         placed = False
-        cursor = target_end
-        for _ in range(40):
-            if cursor < planning_start:
-                break
-            if try_hard_ending(cursor, False):
-                placed = True
-                break
-            cursor = previous_workday(cursor, off)
-        if not placed:
-            cursor = target_end
+        if ship_in_horizon:
+            cursor = previous_workday(group_ship, off, include=True)
             for _ in range(40):
                 if cursor < planning_start:
                     break
-                if try_hard_ending(cursor, True):
+                if try_hard_ending(cursor, False) and finishes_by_ship():
                     placed = True
                     break
                 cursor = previous_workday(cursor, off)
-        if not placed and not ship_in_horizon:
-            clear_order_entries()
-            take_until_done(next_workday(planning_start, off, include=True), False)
-            if remaining_units > 1e-9:
-                clear_order_entries()
-                take_until_done(next_workday(planning_start, off, include=True), True)
-            placed = remaining_units <= 1e-9 and _interior_sewing_hole(
-                _sewing_entry_dates(order_entries), off
-            ) is None
+            if not placed:
+                cursor = previous_workday(group_ship, off, include=True)
+                for _ in range(40):
+                    if cursor < planning_start:
+                        break
+                    if try_hard_ending(cursor, True) and finishes_by_ship():
+                        placed = True
+                        break
+                    cursor = previous_workday(cursor, off)
+        if not placed:
+            placed = pack_from_today(False, True) and (not ship_in_horizon or finishes_by_ship())
+        if not placed:
+            placed = pack_from_today(True, False) and (not ship_in_horizon or finishes_by_ship())
+        if not placed:
+            placed = pack_from_today(False, False)
+        if not placed:
+            placed = pack_from_today(True, False)
         if not placed:
             clear_order_entries()
             if not force:
                 return False
-            take_until_done(next_workday(planning_start, off, include=True), True, take_scraps=True)
+            take_until_done(next_workday(planning_start, off, include=True), True, take_scraps=True, skip_owned=False)
             if not order_entries:
                 attempt_conflicts.append({
                     "type": "sewing_unscheduled",
@@ -1311,21 +1333,26 @@ def _schedule_sewing(
 
     def _group_place_key(group: dict) -> tuple:
         ship = group.get("required_ship_date") or date.max
-        hard = 0 if any(is_hard_date(order) for order in group["orders"]) else 1
-        units = sum(_number(order.get("sewing_units")) for order in group["orders"])
-        return (hard, ship, units, group.get("id") or "")
+        total = sum(_number(order.get("sewing_units")) for order in group["orders"])
+        if ship < planning_start:
+            return (0, ship, -total, group.get("id") or "")
+        return (1, ship, total, group.get("id") or "")
 
-    def _member_place_key(order: dict) -> tuple:
+    def _member_place_key(order: dict, group: dict) -> tuple:
         try:
             oid = int(order["order_number"])
         except (TypeError, ValueError):
             oid = 10**15
-        return (_number(order.get("sewing_units")), oid)
+        units = _number(order.get("sewing_units"))
+        ship = group.get("required_ship_date") or date.max
+        if ship < planning_start:
+            return (-units, oid)
+        return (units, oid)
 
     hard_jobs = [
         (group, order)
         for group in sorted(groups, key=_group_place_key)
-        for order in sorted(group["orders"], key=_member_place_key)
+        for order in sorted(group["orders"], key=lambda o: _member_place_key(o, group))
         if is_hard_date(order)
     ]
     lock_reserved = defaultdict(float, reserved)
@@ -1385,10 +1412,7 @@ def _schedule_sewing(
         take_day,
         embroidery_deadlines,
     )
-    _keep_sewing_together(*pass_args)
-    _tighten_smeared_sewing(*pass_args)
     _fill_empty_days_with_late_jobs(*pass_args)
-    _keep_sewing_together(*pass_args)
     _spill_sewing_over_capacity(*pass_args)
     entries.sort(key=lambda e: (e.get("date", ""), e.get("start", ""), e.get("orderNumber", "")))
     return entries, conflicts, embroidery_deadlines

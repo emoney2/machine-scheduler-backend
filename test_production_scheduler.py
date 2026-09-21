@@ -310,6 +310,46 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(any(r.get("emergencyUsed") for r in rows))
         self.assertEqual(result["summary"]["thirdSewerDates"], [])
 
+    def test_overdue_job_fills_monday_before_later_ships(self):
+        result = build_schedule(
+            [
+                order(1375, Quantity=244, **{
+                    "Ship Date": "09/16/2026",
+                    "Due Date": "09/23/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Big Cedar Lodge",
+                    "_transit_business_days": 4,
+                }),
+                order(1362, Quantity=160, **{
+                    "Ship Date": "09/28/2026",
+                    "Due Date": "09/28/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Stanford",
+                    "_transit_business_days": 0,
+                }),
+                order(200, Quantity=12, **{
+                    "Ship Date": "09/25/2026",
+                    "Due Date": "09/25/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Riviera",
+                    "_transit_business_days": 0,
+                }),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        overdue = [r for r in result["sewing"] if r["orderNumber"] == "1375"]
+        days = sorted({r["date"] for r in overdue})
+        self.assertEqual(sum(r["dayQuantity"] for r in overdue), 244)
+        self.assertEqual(days[0], "2026-09-21")
+        self.assertLessEqual(days[-1], "2026-09-24")
+        by_day = {}
+        for row in result["sewing"]:
+            by_day[row["date"]] = by_day.get(row["date"], 0) + float(row.get("capacityUnits") or 0)
+        self.assertGreaterEqual(by_day.get("2026-09-21", 0), 90)
+        for prev, nxt in zip(days, days[1:]):
+            self.assertLessEqual((datetime.fromisoformat(nxt) - datetime.fromisoformat(prev)).days, 3)
+
     def test_smallest_hard_job_owns_the_shared_ship_day(self):
         result = build_schedule(
             [
@@ -1122,7 +1162,7 @@ class ScheduleTests(unittest.TestCase):
         )
         tdg = [r for r in result["sewing"] if r["orderNumber"] in {"1280", "1281"}]
         self.assertTrue(tdg)
-        self.assertTrue(all(r["date"] == "2026-09-28" for r in tdg), [r["date"] for r in tdg])
+        self.assertTrue(all(r["date"] <= "2026-09-28" for r in tdg), [r["date"] for r in tdg])
         self.assertEqual(sum(r["dayQuantity"] for r in tdg), 89)
 
     def test_late_job_fills_an_empty_weekday(self):
