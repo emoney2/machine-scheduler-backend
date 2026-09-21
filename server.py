@@ -6058,8 +6058,12 @@ PO_NUMBER_HEADER_CANDIDATES = ("PO #", "PO#", "PO Number", "Customer PO", "PO")
 SHIPPING_METHOD_HEADER = "Shipping Method"
 SHIPPING_METHOD_HEADER_CANDIDATES = (
     "Shipping Method",
+    "Ship Method",
     "Shipping Type",
     "Shipping Service",
+    "UPS or Local",
+    "UPS / Local",
+    "UPS/Local",
 )
 
 
@@ -6173,29 +6177,67 @@ def _shipping_method_header_index(header_row) -> int | None:
     return None
 
 
+def _production_orders_sheet_id(sheets) -> int | None:
+    try:
+        meta = sheets.get(
+            spreadsheetId=SPREADSHEET_ID,
+            fields="sheets(properties(sheetId,title))",
+        ).execute()
+        for sh in meta.get("sheets") or []:
+            props = sh.get("properties") or {}
+            if str(props.get("title") or "").strip() == "Production Orders":
+                return props.get("sheetId")
+    except Exception as e:
+        logger.warning("Production Orders sheet id lookup failed: %s", e)
+    return None
+
+
 def _ensure_shipping_method_header_index(sheets) -> int | None:
     header_row = list(_production_orders_header_row(sheets) or [])
+    if not any(str(h).strip() for h in header_row):
+        logger.warning("Production Orders header row is empty; not creating Shipping Method")
+        return None
     idx = _shipping_method_header_index(header_row)
     if idx is not None:
         return idx
-    last = -1
-    for i, h in enumerate(header_row):
-        if str(h).strip():
-            last = i
-    col_idx = last + 1
+    last = max(i for i, h in enumerate(header_row) if str(h).strip())
+    insert_at = last + 1
+    sheet_id = _production_orders_sheet_id(sheets)
+    if sheet_id is not None:
+        try:
+            sheets.batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={
+                    "requests": [
+                        {
+                            "insertDimension": {
+                                "range": {
+                                    "sheetId": sheet_id,
+                                    "dimension": "COLUMNS",
+                                    "startIndex": insert_at,
+                                    "endIndex": insert_at + 1,
+                                },
+                                "inheritFromBefore": True,
+                            }
+                        }
+                    ]
+                },
+            ).execute()
+        except Exception as e:
+            logger.warning("Failed to insert Shipping Method column: %s", e)
     try:
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"Production Orders!{_col_letter_local(col_idx)}1",
+            range=f"Production Orders!{_col_letter_local(insert_at)}1",
             valueInputOption="USER_ENTERED",
             body={"values": [[SHIPPING_METHOD_HEADER]]},
         ).execute()
         logger.info(
             "[submit] Created %s header on Production Orders column %s",
             SHIPPING_METHOD_HEADER,
-            _col_letter_local(col_idx),
+            _col_letter_local(insert_at),
         )
-        return col_idx
+        return insert_at
     except Exception as e:
         logger.warning(
             "Failed to create Production Orders %s header: %s",
@@ -6212,6 +6254,10 @@ def _write_shipping_method(sheets, row_num: int, shipping_method: str) -> None:
     try:
         col_idx = _ensure_shipping_method_header_index(sheets)
         if col_idx is None:
+            logger.error(
+                "[submit] Shipping Method column missing; UPS/Local was not written for row %s",
+                row_num,
+            )
             return
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
@@ -17970,6 +18016,7 @@ def submit_order():
             print_links = f"https://drive.google.com/drive/folders/{pf_id}"
 
         # ─── WRITE TO GOOGLE SHEETS ──────────────────────────────────────────
+        _ensure_shipping_method_header_index(sheets)
         row = [
             new_order, ts, preview, data.get("company"),
             data.get("designName"), data.get("quantity"), "",
