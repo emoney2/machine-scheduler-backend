@@ -788,6 +788,21 @@ def _reserve_locked_sewing(
     return reserved, normalized
 
 
+def _needed_sewing_days(units: Any, regular: float) -> int:
+    qty = max(0.0, _number(units))
+    cap = max(1.0, _number(regular, 95.0))
+    if qty <= 1e-9:
+        return 0
+    return max(1, int(math.ceil(qty / cap - 1e-9)))
+
+
+def _is_sewing_scrap(free: float, remaining: float, useful: float = 40.0) -> bool:
+    """True when a day only has leftover scraps and the job would smear across extra days."""
+    if remaining <= free + 1e-9:
+        return False
+    return free + 1e-9 < min(remaining, useful)
+
+
 def _day_sewing_cap(cursor: date, config: SchedulerConfig) -> Tuple[float, float, float]:
     """Regular, emergency, and hard daily max (regular + emergency)."""
     if config.sewers:
@@ -976,6 +991,8 @@ def _schedule_sewing(
             room = max(0.0, total - already - setup)
             if room <= 1e-9:
                 return remaining_units, None
+        if not force and _is_sewing_scrap(room, remaining_units):
+            return remaining_units, None
         used = min(room, remaining_units)
         same_day = next(
             (row for row in (existing_entries or []) if row.get("date") == iso_day(cursor)),
@@ -1090,6 +1107,12 @@ def _schedule_sewing(
             order_entries.clear()
             remaining_units = full_units
 
+        def day_free(place: date, allow_emergency: bool) -> float:
+            _regular, _emergency, _total, _already, _setup, free = _sewing_capacity(
+                place, config, reserved, day_job_count, setup_units, allow_emergency
+            )
+            return free
+
         def walk_back_from(end_day: date, allow_emergency: bool) -> None:
             nonlocal remaining_units, guard
             started = False
@@ -1098,6 +1121,11 @@ def _schedule_sewing(
                 guard += 1
                 if place < planning_start:
                     break
+                if _is_sewing_scrap(day_free(place, allow_emergency), remaining_units):
+                    if started:
+                        break
+                    place = previous_workday(place, off)
+                    continue
                 remaining_units, entry = take_day(
                     place, order, group, group_ship, remaining_units,
                     allow_emergency=allow_emergency, existing_entries=order_entries,
@@ -1120,6 +1148,11 @@ def _schedule_sewing(
                 if place > stop:
                     break
                 if skip_owned and not started and other_customer_owns(place):
+                    place = next_workday(place, off)
+                    continue
+                if _is_sewing_scrap(day_free(place, allow_emergency), remaining_units):
+                    if started:
+                        break
                     place = next_workday(place, off)
                     continue
                 remaining_units, entry = take_day(
@@ -1342,6 +1375,7 @@ def _schedule_sewing(
     _keep_sewing_together(*pass_args)
     _fill_soft_sewing_gaps(*pass_args)
     _keep_sewing_together(*pass_args)
+    _tighten_smeared_sewing(*pass_args)
     _spill_sewing_over_capacity(*pass_args)
     entries.sort(key=lambda e: (e.get("date", ""), e.get("start", ""), e.get("orderNumber", "")))
     return entries, conflicts, embroidery_deadlines
@@ -1447,6 +1481,8 @@ def _can_place_contiguous(
             return False
         free = day_free(cursor)
         if free <= 1e-6:
+            return False
+        if _is_sewing_scrap(free, remaining):
             return False
         remaining -= free
         cursor = next_workday(cursor, off)
@@ -2016,6 +2052,73 @@ def _spill_sewing_over_capacity(
                     order,
                 )
                 changed = True
+
+
+def _tighten_smeared_sewing(
+    entries: List[dict],
+    order_lookup: Dict[str, dict],
+    group_lookup: Dict[str, dict],
+    config: SchedulerConfig,
+    planning_start: date,
+    locks_by_order: Dict[str, List[dict]],
+    reserved: Dict[date, float],
+    day_job_count: Dict[date, int],
+    setup_units: float,
+    take_day,
+    embroidery_deadlines: Dict[str, datetime],
+) -> None:
+    """If one job was nibbled across extra days, pack it back onto fewer consecutive days."""
+    off = config.sewing_off_days()
+    regular = config.regular_sewing_capacity
+    seen: List[str] = []
+    for row in entries:
+        oid = _text(row.get("orderNumber"))
+        if oid and oid not in seen:
+            seen.append(oid)
+    for oid in seen:
+        order = order_lookup.get(oid)
+        group = group_lookup.get(oid)
+        if not order or not group or oid in locks_by_order:
+            continue
+        old = [row for row in entries if _text(row.get("orderNumber")) == oid]
+        if not old or any(row.get("locked") for row in old):
+            continue
+        dates = _sewing_entry_dates(old)
+        units = _number(order.get("sewing_units"))
+        needed = _needed_sewing_days(units, regular)
+        if needed <= 0 or len(dates) <= needed + 1:
+            continue
+        last = max(dates)
+        window: List[date] = []
+        cursor = last
+        guard = 0
+        while len(window) < needed and guard < 20:
+            if cursor >= planning_start:
+                window.append(cursor)
+            cursor = previous_workday(cursor, off)
+            guard += 1
+        if len(window) < needed:
+            continue
+        group_ship = group.get("required_ship_date") or order.get("required_ship_date")
+        _release_sewing_rows(old, entries, reserved, day_job_count)
+        remaining = units
+        new_entries: List[dict] = []
+        for day in sorted(window, reverse=True):
+            remaining, entry = take_day(
+                day, order, group, group_ship, remaining,
+                allow_emergency=True, existing_entries=new_entries,
+            )
+            if entry and entry not in new_entries:
+                new_entries.append(entry)
+        if remaining <= 1e-9 and new_entries:
+            _annotate_day_quantities(new_entries, order)
+            entries.extend(new_entries)
+            embroidery_deadlines[oid] = datetime.fromisoformat(
+                min(new_entries, key=lambda row: row["start"])["start"]
+            )
+            continue
+        _release_sewing_rows(new_entries, entries, reserved, day_job_count)
+        _restore_sewing_rows(old, entries, reserved, day_job_count)
 
 
 def _keep_sewing_together(

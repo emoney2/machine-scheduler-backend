@@ -945,6 +945,50 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(any(r["orderNumber"] == "100" for r in result["sewing"]))
         self.assertTrue(any(r["orderNumber"] == "100" for r in result["embroidery"]))
 
+    def test_job_does_not_smear_across_four_days(self):
+        result = build_schedule(
+            [
+                order(10, Quantity=80, **{
+                    "Ship Date": "09/21/2026",
+                    "Due Date": "09/21/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Monday Fill",
+                }),
+                order(11, Quantity=80, **{
+                    "Ship Date": "09/22/2026",
+                    "Due Date": "09/22/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Tuesday Fill",
+                }),
+                order(12, Quantity=80, **{
+                    "Ship Date": "09/23/2026",
+                    "Due Date": "09/23/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Wednesday Fill",
+                }),
+                order(13, Quantity=80, **{
+                    "Ship Date": "09/24/2026",
+                    "Due Date": "09/24/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Thursday Fill",
+                }),
+                order(1360, Quantity=110, **{
+                    "Ship Date": "09/24/2026",
+                    "Due Date": "09/25/2026",
+                    "Stitch Count": 1000,
+                    "Company Name": "Country Club of Columbus",
+                    "_transit_business_days": 0,
+                }),
+            ],
+            thread_inventory=inventory(),
+            now=NOW,
+        )
+        days = sorted({
+            row["date"] for row in result["sewing"] if row["orderNumber"] == "1360"
+        })
+        self.assertTrue(days)
+        self.assertLessEqual(len(days), 2, days)
+
     def test_hard_job_does_not_ship_the_week_after_it_is_due(self):
         later = datetime(2026, 9, 28, 8, 30, tzinfo=ET)
         result = build_schedule(
