@@ -18,6 +18,7 @@ PROTECTED_WEEKS = 16
 LONG_NECK_FACTOR = 1.15
 DRIVER_YARD_CALIBRATION = 9.5 / (160.0 / 14.0)
 DEFAULT_ORDER_YARDS = 700
+PHYSICAL_BASELINE_DATE = date(2026, 9, 18)
 
 TRACKED_MATERIALS = (
     {
@@ -103,6 +104,86 @@ def material_from_name(name):
         if key == _norm(item["name"]) or key in item["aliases"]:
             return item
     return None
+
+
+def _log_header_index(headers, names, start_at=0) -> int:
+    normalized = [_norm(header) for header in headers]
+    wanted = [_norm(name) for name in names]
+    for index, key in enumerate(normalized):
+        if index >= start_at and key in wanted:
+            return index
+    return -1
+
+
+def _material_log_dicts(log_rows) -> list[dict]:
+    if not log_rows:
+        return []
+    if isinstance(log_rows[0], dict):
+        return list(log_rows)
+    headers = [str(header or "").strip() for header in (log_rows[0] or [])]
+    if not headers:
+        headers = ["Date", "Order #", "", "", "", "Material", "QTY", "IN/OUT", "O/R"]
+    material_col = _log_header_index(headers, ("material", "materials"))
+    if material_col < 0:
+        headers = list(headers)
+        while len(headers) < 9:
+            headers.append("")
+        headers[5] = headers[5] or "Material"
+        headers[6] = headers[6] or "QTY"
+        headers[7] = headers[7] or "IN/OUT"
+        headers[8] = headers[8] or "O/R"
+        headers[0] = headers[0] or "Date"
+        headers[1] = headers[1] or "Order #"
+    rows = []
+    for raw in log_rows[1:]:
+        row = list(raw or []) + [""] * max(0, len(headers) - len(raw or []))
+        rows.append(dict(zip(headers, row)))
+    return rows
+
+
+def parse_material_log(log_rows) -> list[dict]:
+    """Read Material Log IN/OUT + O/R rows used for vendor inbound."""
+    events = []
+    for row in _material_log_dicts(log_rows):
+        catalog = material_from_name(
+            row.get("Material") or row.get("Materials") or row.get("material")
+        )
+        if not catalog:
+            continue
+        qty = _number(row.get("QTY") if row.get("QTY") not in (None, "") else None)
+        if qty <= 0:
+            qty = _number(row.get("Qty") or row.get("Quantity"))
+        if qty <= 0:
+            continue
+        events.append(
+            {
+                "materialId": catalog["id"],
+                "qty": qty,
+                "inout": _norm(row.get("IN/OUT") or row.get("In/Out") or row.get("inout")),
+                "status": _norm(row.get("O/R") or row.get("O / R") or row.get("Ordered/Received")),
+                "when": _date(row.get("Date") or row.get("Timestamp")),
+                "orderKey": _norm(row.get("Order #") or row.get("Order") or row.get("Order Number")),
+            }
+        )
+    return events
+
+
+def vendor_log_quantities(item, log_rows, cutoff: date) -> dict:
+    inbound = 0.0
+    received_after = 0.0
+    for event in parse_material_log(log_rows):
+        if event["materialId"] != item["id"] or event["inout"] != "in":
+            continue
+        if event["orderKey"] == "readjustment":
+            continue
+        if event["status"] == "ordered":
+            inbound += event["qty"]
+        elif event["status"] == "received" and event["when"] and event["when"] >= cutoff:
+            received_after += event["qty"]
+    return {
+        "inboundYards": inbound,
+        "receivedAfterYards": received_after,
+    }
 
 
 def tracked_kanban_ids():
@@ -373,7 +454,7 @@ def _project_date(start: date, weekly_rate: float, weekly_growth: float, yards: 
     return None
 
 
-def inventory_state(item, kanban_rows, consumed_yards: float, today: date) -> dict:
+def inventory_state(item, kanban_rows, consumed_yards: float, today: date, log_rows=None) -> dict:
     relevant = [
         row
         for row in (kanban_rows or [])
@@ -431,6 +512,17 @@ def inventory_state(item, kanban_rows, consumed_yards: float, today: date) -> di
         max(0.0, quantity - received_by_event.get(event_id, 0.0))
         for event_id, quantity in ordered_by_event.items()
     )
+    cutoff = count_date if has_count else PHYSICAL_BASELINE_DATE
+    log_state = vendor_log_quantities(item, log_rows, cutoff)
+    inbound += _number(log_state.get("inboundYards"))
+    receipts_after_count += _number(log_state.get("receivedAfterYards"))
+    if log_state.get("inboundYards") and not active_request:
+        active_request = {
+            "eventId": "",
+            "status": "ordered",
+            "quantity": round(_number(log_state.get("inboundYards"))),
+            "source": "material-log",
+        }
     used_since_count = max(0.0, consumed_yards - count_consumed) if has_count else 0.0
     physical = max(0.0, count_yards + receipts_after_count - used_since_count)
     return {
@@ -442,8 +534,8 @@ def inventory_state(item, kanban_rows, consumed_yards: float, today: date) -> di
     }
 
 
-def _build_material_status(item, usage, kanban_rows, today: date) -> dict:
-    inventory = inventory_state(item, kanban_rows, usage["consumedYards"], today)
+def _build_material_status(item, usage, kanban_rows, today: date, log_rows=None) -> dict:
+    inventory = inventory_state(item, kanban_rows, usage["consumedYards"], today, log_rows)
     forecast = demand_forecast(usage["history"], today)
     committed = _number(usage.get("committedYards"))
     deferred = _number(usage.get("deferredYards"))
@@ -465,7 +557,9 @@ def _build_material_status(item, usage, kanban_rows, today: date) -> dict:
         "kanbanId": item["kanbanId"],
         "name": item["name"],
         "level": level,
-        "shouldCreateRequest": trigger and not inventory["activeRequest"],
+        "shouldCreateRequest": trigger
+        and not inventory["activeRequest"]
+        and _number(inventory.get("inboundYards")) <= 0,
         "physicalYards": inventory["physicalYards"],
         "physicalRolls": round(rolls_from_yards(inventory["physicalYards"]), 1),
         "committedYards": round(committed, 1),
@@ -489,10 +583,12 @@ def _build_material_status(item, usage, kanban_rows, today: date) -> dict:
     }
 
 
-def build_status(production_rows, cut_rows, table_rows, kanban_rows, *, today: date) -> dict:
+def build_status(
+    production_rows, cut_rows, table_rows, kanban_rows, *, today: date, log_rows=None
+) -> dict:
     usage = usage_by_material(production_rows, cut_rows, table_rows, today=today)
     materials = [
-        _build_material_status(item, usage[item["id"]], kanban_rows, today)
+        _build_material_status(item, usage[item["id"]], kanban_rows, today, log_rows)
         for item in TRACKED_MATERIALS
     ]
     order_now = [row for row in materials if row["level"] == "order_now"]

@@ -191,6 +191,44 @@ class MaterialKanbanTests(unittest.TestCase):
         self.assertAlmostEqual(usage["BLACK-FUR"]["committedYards"], 1.0)
         self.assertAlmostEqual(usage["BLACK-FUR"]["deferredYards"], 0.0)
 
+    def test_material_log_in_ordered_counts_as_inbound(self):
+        today = date(2026, 9, 22)
+        table = [{"Product": "Mallet", "PPY": 20}]
+        log = [
+            ["Date", "Order #", "", "", "", "Material", "QTY", "IN/OUT", "O/R"],
+            ["09/21/2026 10:00:00", "RESTOCK", "", "", "", "Black Fur", 700, "IN", "Ordered"],
+            ["09/21/2026 10:00:00", "RESTOCK", "", "", "", "Light Grey Fur", 700, "IN", "Ordered"],
+            ["09/21/2026 10:00:00", "10", "", "", "", "Black Fur", 2, "OUT", ""],
+        ]
+        result = build_status([], [], table, [], today=today, log_rows=log)
+        black = next(row for row in result["materials"] if row["id"] == "BLACK-FUR")
+        grey = next(row for row in result["materials"] if row["id"] == "LIGHT-GREY-FUR")
+        self.assertAlmostEqual(black["inboundYards"], 700)
+        self.assertAlmostEqual(grey["inboundYards"], 700)
+        self.assertFalse(black["shouldCreateRequest"])
+        self.assertGreater(black["inventoryPositionYards"], black["physicalYards"])
+
+    def test_material_log_received_clears_inbound_and_adds_physical(self):
+        today = date(2026, 9, 22)
+        table = [{"Product": "Mallet", "PPY": 20}]
+        log = [
+            {
+                "Date": today,
+                "Order #": "RESTOCK",
+                "Material": "Black Fur",
+                "QTY": 700,
+                "IN/OUT": "IN",
+                "O/R": "Received",
+            }
+        ]
+        result = build_status([], [], table, [], today=today, log_rows=log)
+        black = next(row for row in result["materials"] if row["id"] == "BLACK-FUR")
+        self.assertAlmostEqual(black["inboundYards"], 0)
+        self.assertAlmostEqual(
+            black["physicalYards"],
+            round(yards_from_rolls(4) + 700, 1),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
