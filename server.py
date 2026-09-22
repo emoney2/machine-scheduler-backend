@@ -5191,6 +5191,7 @@ def _material_load_source_rows():
         CUT_RANGE,
         TABLE_RANGE,
         f"{KANBAN_SHEET_TAB}!A1:ZZ",
+        MATERIAL_LOG_RANGE,
     ]
     with acquire_sheet_lock(timeout=45):
         response = (
@@ -5205,15 +5206,16 @@ def _material_load_source_rows():
             .execute()
         )
     value_ranges = response.get("valueRanges", [])
-    while len(value_ranges) < 4:
+    while len(value_ranges) < 5:
         value_ranges.append({})
-    values = [entry.get("values", []) or [] for entry in value_ranges[:4]]
+    values = [entry.get("values", []) or [] for entry in value_ranges[:5]]
     return (
         _magnet_rows_to_dicts(values[0]),
         _magnet_rows_to_dicts(values[1]),
         values[2],
         _magnet_rows_to_dicts(values[3]),
         values[3],
+        values[4],
     )
 
 
@@ -5344,7 +5346,9 @@ def _material_status(force=False, allow_trigger=True):
     ):
         return cached
 
-    production_rows, cut_rows, table_rows, kanban_rows, _values = _material_load_source_rows()
+    production_rows, cut_rows, table_rows, kanban_rows, _values, log_rows = (
+        _material_load_source_rows()
+    )
     today = datetime.now(ZoneInfo("America/New_York")).date()
     status = build_material_kanban_status(
         production_rows,
@@ -5352,6 +5356,7 @@ def _material_status(force=False, allow_trigger=True):
         table_rows,
         kanban_rows,
         today=today,
+        log_rows=log_rows,
     )
     if allow_trigger and status.get("shouldCreateRequests"):
         status = _material_create_requests_if_needed(status)
@@ -5401,7 +5406,7 @@ def material_kanban_record_count():
             rolls = rolls_from_yards(yards)
         if rolls < 0 or yards < 0:
             raise ValueError("counts must be non-negative")
-        production_rows, cut_rows, table_rows, _kanban_rows, kanban_values = (
+        production_rows, cut_rows, table_rows, _kanban_rows, kanban_values, log_rows = (
             _material_load_source_rows()
         )
         status = build_material_kanban_status(
@@ -5410,6 +5415,7 @@ def material_kanban_record_count():
             table_rows,
             [],
             today=datetime.now(ZoneInfo("America/New_York")).date(),
+            log_rows=log_rows,
         )
         current = next(
             (row for row in status["materials"] if row["id"] == catalog["id"]),
@@ -9666,20 +9672,50 @@ def _qbo_invoice_record_url(realm_id, invoice_id, env_override=None):
     Browser link to open the invoice editor for an existing invoice.
 
     txnId must be the QuickBooks API entity Id for the Invoice (same as in API responses),
-    not the customer-facing DocNumber.
+    not the customer-facing DocNumber. Matches the live QBO address bar:
+    https://qbo.intuit.com/app/invoice?txnId=1466
     """
     iid = str(invoice_id or "").strip()
     if not iid:
         return ""
     e = str(env_override or QBO_ENV or os.getenv("QBO_ENV") or "sandbox").strip().lower()
     txn = urllib.parse.quote(iid, safe="")
-    # QBO's existing-transaction route expects the minimal txnId URL. Extra txnType/company
-    # parameters on app.qbo.intuit.com can fall through to the blank new-invoice editor.
     if e in ("production", "prod", "live"):
         base = "https://qbo.intuit.com"
     else:
         base = "https://sandbox.qbo.intuit.com"
     return f"{base}/app/invoice?txnId={txn}"
+
+
+def _qbo_confirm_invoice_id(
+    headers, realm_id, invoice_id, doc_number=None, env_override=None
+):
+    """
+    Return the live QBO Invoice.Id. Prefer GET-by-Id so we never open a DocNumber
+    or stale id that QBO treats as a blank new invoice.
+    """
+    iid = str(invoice_id or "").strip()
+    if iid:
+        inv, _err = _qbo_get_invoice(headers, realm_id, iid, env_override)
+        if inv:
+            got = str(inv.get("Id") or inv.get("id") or "").strip()
+            if got:
+                return got
+    for candidate in (doc_number, invoice_id):
+        dn = str(candidate or "").strip()
+        if not dn:
+            continue
+        looked = _query_invoice_id_by_doc_number(
+            dn, headers, realm_id, env_override
+        )
+        if looked:
+            logging.info(
+                "QBO invoice id resolved via DocNumber %s -> Id %s",
+                dn,
+                looked,
+            )
+            return looked
+    return iid or None
 
 
 def fetch_customer_email_from_directory(sheet_service, company_name):
@@ -10845,6 +10881,20 @@ def create_consolidated_invoice_in_quickbooks(
             "Check server logs; verify QBO query access for Invoice."
         )
 
+    confirmed_id = _qbo_confirm_invoice_id(
+        headers, realm_id, inv_id, doc_number=doc_number, env_override=env_override
+    )
+    if confirmed_id and confirmed_id != str(inv_id):
+        logging.warning(
+            "QBO invoice id corrected after create: extracted=%s confirmed=%s DocNumber=%s",
+            inv_id,
+            confirmed_id,
+            doc_number,
+        )
+        inv_id = confirmed_id
+    elif confirmed_id:
+        inv_id = confirmed_id
+
     has_opt_in_shipping_line = any(
         str((ln or {}).get("Description") or "").startswith("Shipping (")
         for ln in (invoice_payload.get("Line") or [])
@@ -11244,6 +11294,7 @@ STOCK_PRODUCTS_RANGE = os.environ.get("STOCK_PRODUCTS_RANGE", "Stock Products!A1
 SUPABASE_PB_ORDERS_TABLE = os.environ.get("SUPABASE_PB_ORDERS_TABLE", "Production Orders TEST")
 FUR_RANGE = os.environ.get("FUR_RANGE", "Fur List!A1:Z")
 TABLE_RANGE = os.environ.get("TABLE_RANGE", "Table!A1:Z")
+MATERIAL_LOG_RANGE = os.environ.get("MATERIAL_LOG_RANGE", "Material Log!A1:Z")
 # Sales Rep commission list (Order Submission REP dropdown)
 SALES_REP_LIST_RANGE = os.environ.get("SALES_REP_LIST_RANGE", "Sales Rep!A2:A10")
 CUT_RANGE = os.environ.get("CUT_RANGE", "Cut List!A1:Z")
@@ -22303,6 +22354,10 @@ def material_inventory_readjustment():
         invalidate_materials_needed_cache()
         invalidate_material_inventory_status_cache()
         try:
+            _invalidate_material_status()
+        except Exception:
+            pass
+        try:
             socketio.emit(
                 "materialsUpdated",
                 {
@@ -22525,6 +22580,10 @@ def submit_material_inventory():
         invalidate_materials_needed_cache()
         try:
             invalidate_material_inventory_status_cache()
+        except Exception:
+            pass
+        try:
+            _invalidate_material_status()
         except Exception:
             pass
 
@@ -23018,6 +23077,10 @@ def mark_inventory_received():
         invalidate_material_inventory_status_cache()
     except Exception:
         pass
+    try:
+        _invalidate_material_status()
+    except Exception:
+        pass
 
     resp = jsonify({"ok": True})
     resp.headers["Cache-Control"] = "no-store, max-age=0"
@@ -23102,6 +23165,10 @@ def mark_inventory_received_batch():
         pass
     try:
         invalidate_material_inventory_status_cache()
+    except Exception:
+        pass
+    try:
+        _invalidate_material_status()
     except Exception:
         pass
 
@@ -23407,6 +23474,43 @@ def mark_shipped():
     except Exception as e:
         logging.exception("mark_shipped failed")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/qbo/open-invoice/<invoice_id>", methods=["GET"])
+def qbo_open_invoice(invoice_id):
+    """
+    Resolve the created invoice's API Id, then redirect the browser to that QBO record.
+    Using DocNumber or an unconfirmed id as txnId opens a blank new invoice.
+    """
+    wanted = str(invoice_id or "").strip()
+    if not wanted:
+        return jsonify({"error": "missing invoice id"}), 400
+    confirmed = wanted
+    realm_id = ""
+    env_override = None
+    try:
+        headers, realm_id = get_quickbooks_credentials()
+        resolved = _qbo_confirm_invoice_id(
+            headers,
+            realm_id,
+            wanted,
+            doc_number=wanted,
+            env_override=env_override,
+        )
+        if resolved:
+            confirmed = resolved
+    except Exception as ex:
+        logging.warning("QBO open-invoice confirm failed for %s: %s", wanted, ex)
+    target = _qbo_invoice_record_url(realm_id, confirmed, env_override)
+    if not target:
+        return jsonify({"error": "could not build invoice URL"}), 404
+    logging.info(
+        "QBO open-invoice redirect wanted=%s confirmed=%s url=%s",
+        wanted,
+        confirmed,
+        target,
+    )
+    return redirect(target, code=302)
 
 
 @app.route("/api/process-shipment", methods=["OPTIONS", "POST"])
