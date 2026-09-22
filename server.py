@@ -8062,15 +8062,6 @@ def _qbo_invoice_memo_when_ship_method_unavailable(
         tk = ", ".join(str(x).strip() for x in track_parts if str(x).strip())
         if tk:
             bits.append(f"Tracking: {tk}")
-    try:
-        amt = round(float(ship_amt_r or 0), 2)
-    except (TypeError, ValueError):
-        amt = 0.0
-    if amt > 0.001:
-        if freight_on_sales_line:
-            bits.append(f"Shipping ${amt:.2f} (see Shipping line item)")
-        else:
-            bits.append(f"Shipping ${amt:.2f}")
     if not bits:
         return None
     return " | ".join(bits)[:1000]
@@ -9423,8 +9414,15 @@ def _qbo_customer_memo_shipping_fallback(
     if not inv:
         return
     want_amt = round(float(ship_amt_r or 0), 2)
+    snap = _qbo_invoice_shipping_snapshot(inv)
     try:
-        cur_amt = round(float(inv.get("ShipAmt") or 0), 2)
+        cur_amt = round(
+            max(
+                float(inv.get("ShipAmt") or 0),
+                float(snap.get("shipping_box_amount") or 0),
+            ),
+            2,
+        )
     except (TypeError, ValueError):
         cur_amt = 0.0
     ship_amt_ok = (
@@ -9477,8 +9475,6 @@ def _qbo_customer_memo_shipping_fallback(
     if memo_customer:
         memo = str(inv.get("CustomerMemo") or "").strip()
         extras = []
-        if want_amt > 0.001 and cur_amt <= 0.001 and not shipping_on_line_item:
-            extras.append(f"UPS shipping ${want_amt:.2f}")
         if not sm_ok and (ship_via_label or "").strip():
             extras.append(f"Ship via: {str(ship_via_label).strip()}")
         if track_parts:
@@ -9574,11 +9570,6 @@ def _qbo_customer_memo_shipping_fallback(
         return
     trk_on_invoice = str(inv.get("TrackingNum") or "").strip()
     pn_parts = []
-    if want_amt > 0.001 and cur_amt <= 0.001 and not shipping_on_line_item:
-        pn_parts.append(
-            f"Freight ${want_amt:.2f} — QBO declined native ShipAmt on this company "
-            "(Sales → Delivery method / ShipMethod)."
-        )
     if not sm_ok and (ship_via_label or "").strip():
         pn_parts.append(f"Carrier (API): {str(ship_via_label).strip()}")
     tk = ", ".join(str(t).strip() for t in (track_parts or []) if str(t).strip())
@@ -10452,8 +10443,6 @@ def create_consolidated_invoice_in_quickbooks(
         return out
 
     memo_fallback_parts = [f"Ship via: {ship_via_label}"]
-    if ship_amt_r > 0:
-        memo_fallback_parts.append(f"Shipping ${ship_amt_r:.2f}")
     if track_parts:
         memo_fallback_parts.append(f"Tracking: {', '.join(track_parts)}")
     memo_fallback = " | ".join(memo_fallback_parts)
