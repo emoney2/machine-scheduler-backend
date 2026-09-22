@@ -62,6 +62,7 @@ from requests.exceptions import (
 
 import hashlib
 import hmac
+import html
 import json
 import time
 from flask import request, jsonify, Response, make_response, redirect
@@ -9716,19 +9717,22 @@ def _qbo_invoice_record_url(realm_id, invoice_id, env_override=None):
     """
     Browser link to open the invoice editor for an existing invoice.
 
-    txnId must be the QuickBooks API entity Id for the Invoice (same as in API responses),
-    not the customer-facing DocNumber. Matches the live QBO address bar:
-    https://qbo.intuit.com/app/invoice?txnId=1466
+    Intuit's current sample deep link is app.qbo.intuit.com with txnId + companyId.
+    qbo.intuit.com/app/invoice without company context lands on the IUX blank composer
+    (locale=en-us&iux_intuit_tid=...).
     """
     iid = str(invoice_id or "").strip()
     if not iid:
         return ""
     e = str(env_override or QBO_ENV or os.getenv("QBO_ENV") or "sandbox").strip().lower()
     txn = urllib.parse.quote(iid, safe="")
+    cid = urllib.parse.quote(str(realm_id or "").strip(), safe="")
     if e in ("production", "prod", "live"):
-        base = "https://qbo.intuit.com"
+        base = "https://app.qbo.intuit.com"
     else:
-        base = "https://sandbox.qbo.intuit.com"
+        base = "https://app.sandbox.qbo.intuit.com"
+    if cid:
+        return f"{base}/app/invoice?txnId={txn}&companyId={cid}"
     return f"{base}/app/invoice?txnId={txn}"
 
 
@@ -23522,8 +23526,9 @@ def mark_shipped():
 @app.route("/api/qbo/open-invoice/<invoice_id>", methods=["GET"])
 def qbo_open_invoice(invoice_id):
     """
-    Resolve the created invoice's API Id, then redirect the browser to that QBO record.
-    Using DocNumber or an unconfirmed id as txnId opens a blank new invoice.
+    Confirm the created invoice, then send the browser to Intuit's existing-invoice
+    deep link. A raw 302 to qbo.intuit.com/app/invoice is rewritten by IUX into a
+    blank new invoice (locale + iux_intuit_tid, no txnId).
     """
     wanted = str(invoice_id or "").strip()
     if not wanted:
@@ -23531,6 +23536,7 @@ def qbo_open_invoice(invoice_id):
     confirmed = wanted
     realm_id = ""
     env_override = None
+    doc_number = ""
     try:
         headers, realm_id = get_quickbooks_credentials()
         resolved = _qbo_confirm_invoice_id(
@@ -23542,18 +23548,36 @@ def qbo_open_invoice(invoice_id):
         )
         if resolved:
             confirmed = resolved
+        inv, _err = _qbo_get_invoice(headers, realm_id, confirmed, env_override)
+        if inv:
+            doc_number = str(inv.get("DocNumber") or "").strip()
     except Exception as ex:
         logging.warning("QBO open-invoice confirm failed for %s: %s", wanted, ex)
     target = _qbo_invoice_record_url(realm_id, confirmed, env_override)
     if not target:
         return jsonify({"error": "could not build invoice URL"}), 404
     logging.info(
-        "QBO open-invoice redirect wanted=%s confirmed=%s url=%s",
+        "QBO open-invoice bounce wanted=%s confirmed=%s doc=%s url=%s",
         wanted,
         confirmed,
+        doc_number,
         target,
     )
-    return redirect(target, code=302)
+    label = html.escape(doc_number or confirmed)
+    href = html.escape(target, quote=True)
+    page = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Opening invoice {label}</title>
+</head>
+<body style="font-family:sans-serif;padding:2rem">
+  <p>Opening QuickBooks invoice {label}&hellip;</p>
+  <p><a id="go" href="{href}">Open invoice {label}</a></p>
+  <script>window.location.replace(document.getElementById("go").href);</script>
+</body>
+</html>"""
+    return Response(page, status=200, mimetype="text/html; charset=utf-8")
 
 
 @app.route("/api/process-shipment", methods=["OPTIONS", "POST"])
