@@ -352,14 +352,117 @@ def _add_order_to_bucket(bucket: Dict[str, Any], order: Dict[str, Any]) -> None:
         bucket["owed"] += comm
 
 
+def _dashboard_group_key(order: Dict[str, Any]) -> str:
+    """One payout row per invoice (or one estimated row per uninvoiced order)."""
+    qbo = str(order.get("invoiceQboId") or "").strip()
+    if qbo:
+        return f"qbo:{qbo}"
+    num = str(order.get("invoiceNum") or "").strip()
+    if num:
+        return f"inv:{str(order.get('rep') or '').strip().lower()}:{num}"
+    return f"ord:{str(order.get('rep') or '').strip().lower()}:{str(order.get('orderId') or '').strip()}"
+
+
+def _unique_join(values) -> str:
+    seen: List[str] = []
+    for v in values:
+        s = str(v or "").strip()
+        if s and s not in seen:
+            seen.append(s)
+    return ", ".join(seen)
+
+
+def _as_qty(val: Any) -> float:
+    try:
+        n = float(val or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return n if n > 0 else 0.0
+
+
+def _qty_display(qty: float) -> Any:
+    if abs(qty - round(qty)) < 1e-9:
+        return int(round(qty))
+    return round(qty, 2)
+
+
+def merge_dashboard_group(members: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Collapse production-order lines that share an invoice into one payout row.
+
+    Sales and commission come from the invoice (ledger) once — invoice total
+    less shipping — not from each design line. Quantity is total pieces.
+    """
+    if not members:
+        return {}
+    first = dict(members[0])
+    invoiced = bool(
+        str(first.get("invoiceQboId") or "").strip()
+        or str(first.get("invoiceNum") or "").strip()
+    )
+    qty = sum(_as_qty(m.get("quantity")) for m in members)
+    if invoiced:
+        try:
+            sales = float(first.get("salesAmount") or 0)
+        except (TypeError, ValueError):
+            sales = 0.0
+        try:
+            commission = float(first.get("commission") or 0)
+        except (TypeError, ValueError):
+            commission = 0.0
+    else:
+        sales = 0.0
+        commission = 0.0
+        for m in members:
+            try:
+                sales += float(m.get("salesAmount") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                commission += float(m.get("commission") or 0)
+            except (TypeError, ValueError):
+                pass
+    first["orderId"] = _unique_join(m.get("orderId") for m in members)
+    first["orderIds"] = [
+        str(m.get("orderId") or "").strip()
+        for m in members
+        if str(m.get("orderId") or "").strip()
+    ]
+    first["company"] = _unique_join(m.get("company") for m in members) or str(
+        first.get("company") or ""
+    )
+    first["design"] = _unique_join(m.get("design") for m in members)
+    first["product"] = _unique_join(m.get("product") for m in members)
+    first["quantity"] = _qty_display(qty)
+    first["salesAmount"] = round(sales, 2)
+    first["commission"] = round(commission, 2)
+    first["stage"] = _unique_join(m.get("stage") for m in members)
+    first["lineCount"] = len(members)
+    return first
+
+
+def group_dashboard_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    keys: List[str] = []
+    for order in orders:
+        key = _dashboard_group_key(order)
+        if key not in groups:
+            groups[key] = []
+            keys.append(key)
+        groups[key].append(order)
+    return [merge_dashboard_group(groups[key]) for key in keys]
+
+
 def build_sales_dashboard(
     service,
     spreadsheet_id: str,
     rep_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    All Production Orders with a REP where the rep has not been marked paid.
-    QuickBooks (via Commission Ledger) only supplies customer-paid status after invoice.
+    Unpaid-to-rep invoices (and uninvoiced sheet estimates), one row per invoice.
+
+    Commission is the invoice merchandise total (less shipping) times the rep rate.
+    QuickBooks (via Commission Ledger) supplies that total and customer-paid status.
     """
     rate = _commission_rate()
     pct = round(rate * 100.0, 2)
@@ -370,7 +473,7 @@ def build_sales_dashboard(
     ledger_by_oid = _build_ledger_by_order_id(ledger_rows)
 
     summary_by_rep: Dict[str, Dict[str, Any]] = {}
-    all_orders: List[Dict[str, Any]] = []
+    raw_orders: List[Dict[str, Any]] = []
 
     rows_with_rep = 0
     for rowd in _dedupe_production_rows(prod_rows):
@@ -382,8 +485,14 @@ def build_sales_dashboard(
         order = _sales_order_from_sheet(rowd, rep, rate, pct, ledger_by_oid)
         if _is_rep_paid_flag(order.get("repPaid")):
             continue
-        all_orders.append(order)
-        _add_order_to_bucket(summary_by_rep.setdefault(rep, _empty_rep_bucket()), order)
+        raw_orders.append(order)
+
+    all_orders = group_dashboard_orders(raw_orders)
+    for order in all_orders:
+        _add_order_to_bucket(
+            summary_by_rep.setdefault(str(order.get("rep") or "").strip(), _empty_rep_bucket()),
+            order,
+        )
 
     if rep_filter:
         target = rep_filter.strip().lower()
@@ -477,8 +586,10 @@ def _rep_from_orders(all_order_data: List[dict]) -> Tuple[str, str]:
 
 def invoice_product_subtotal_for_commission(inv: dict) -> float:
     """
-    Sum SalesItemLineDetail amounts, excluding lines that look like shipping / tax / fees.
-    Also subtract native ShipAmt on the invoice (shipping not in product sales).
+    Invoice merchandise total for commission: sales lines only.
+
+    Native ShipAmt is a header field and is not part of Line amounts, so it is
+    not subtracted again. Shipping / freight / tax / fee sales lines are skipped.
     """
     if not isinstance(inv, dict):
         return 0.0
@@ -511,12 +622,7 @@ def invoice_product_subtotal_for_commission(inv: dict) -> float:
         if any(k in blob for k in skip_kw):
             continue
         total += amt
-    try:
-        ship_amt = float(inv.get("ShipAmt") or 0)
-    except (TypeError, ValueError):
-        ship_amt = 0.0
-    total = max(0.0, total - max(0.0, ship_amt))
-    return round(total, 2)
+    return round(max(0.0, total), 2)
 
 
 def _invoice_balance(inv: dict) -> float:
