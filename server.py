@@ -158,6 +158,7 @@ from ups_service import (
     create_shipment as ups_create_shipment,
     _label_output_path_usable_on_this_host,
     _save_trimmed_label_to_printer_folder,
+    looks_like_street_address,
     quantum_view_fetch_shipment_rows,
 )
 import ship_qbo_file_log as sqlog
@@ -6146,13 +6147,33 @@ def _directory_is_billing_same_as_shipping(row: dict) -> bool:
     return v in ("yes", "y", "true", "1", "same")
 
 
+DIRECTORY_SHIP_ATTN_HEADERS = (
+    "Shipping Attention",
+    "Shipping ATTN",
+    "Ship ATTN",
+    "Ship Attn",
+    "Ship To Attention",
+    "Receiving Attention",
+    "Receiving Department",
+    "Receiving Dept",
+    "ATTN",
+    "Attn",
+)
+
+
 def _directory_shipping_snapshot(row: dict) -> dict:
     """Ship-to fields for UPS / packing slips. Prefer Shipping* over Street/City."""
     if not isinstance(row, dict):
         row = {}
     cfn = _directory_cell(row, "Contact First Name")
     cln = _directory_cell(row, "Contact Last Name")
-    attn = " ".join(p for p in (cfn, cln) if p).strip()
+    contact = " ".join(p for p in (cfn, cln) if p).strip()
+    ship_attn = ""
+    for header in DIRECTORY_SHIP_ATTN_HEADERS:
+        ship_attn = _directory_cell(row, header)
+        if ship_attn:
+            break
+    attn = ship_attn or contact
     ship_street = _directory_cell(row, "Shipping Street Address 1")
     ship_city = _directory_cell(row, "Shipping City")
     ship_state = _directory_cell(row, "Shipping State")
@@ -6162,6 +6183,7 @@ def _directory_shipping_snapshot(row: dict) -> dict:
         "company": _directory_cell(row, "Company Name"),
         "first": cfn,
         "last": cln,
+        "contact": contact,
         "attn": attn,
         "addr1": ship_street or _directory_cell(row, "Street Address 1"),
         "addr2": (
@@ -6617,6 +6639,10 @@ def _order_ship_address_from_production_row(row: dict) -> dict:
     if not phone:
         phone = "0000000000"
     a2 = _order_row_cell(row, "Order Ship Street 2", "Shipping Street Address 2", "Ship To Street 2")
+    if street1 and not looks_like_street_address(street1):
+        if not company:
+            company = street1
+        street1 = ""
     return {
         "name": (company or contact or "Recipient")[:200],
         "attention_name": (contact[:35] if contact else None),
@@ -6848,11 +6874,39 @@ def _order_ship_address_from_production_row_with_pair_fallback(
     return _order_ship_address_from_production_row(front_row)
 
 
+def _coalesce_ups_ship_to(order_ship: dict, directory_ship: dict) -> dict:
+    """
+    Prefer a real street over a Production Orders row that stored the company
+    name (or city/state) as Order Ship Street 1. That is what printed
+    "Brooke Barron / phone / Big Cedar Lodge / Suite B" with no street.
+    """
+    order_ship = order_ship if isinstance(order_ship, dict) else {}
+    directory_ship = directory_ship if isinstance(directory_ship, dict) else {}
+    if looks_like_street_address(order_ship.get("addr1")):
+        out = dict(order_ship)
+        if directory_ship.get("name") and (
+            not out.get("name") or str(out.get("name") or "").strip() == "Recipient"
+        ):
+            out["name"] = directory_ship["name"]
+        if not out.get("attention_name") and directory_ship.get("attention_name"):
+            out["attention_name"] = directory_ship["attention_name"]
+        if not out.get("addr2") and directory_ship.get("addr2"):
+            out["addr2"] = directory_ship["addr2"]
+        if not out.get("phone") or out.get("phone") == "0000000000":
+            if directory_ship.get("phone"):
+                out["phone"] = directory_ship["phone"]
+        return out
+    if looks_like_street_address(directory_ship.get("addr1")):
+        return dict(directory_ship)
+    return dict(order_ship or directory_ship)
+
+
 def _normalize_ups_ship_to_from_directory_row(row: dict) -> dict:
     """
     Build ShipTo for UPS REST Ship/Rating from Directory shipping columns
     (Street Address 1/2, City/State/Zip, Shipping Address 3, Shipping Email/Phone).
-    Contact first+last become AttentionName (e.g. Retail Warehouse).
+    Shipping Attention (or contact first+last) becomes AttentionName
+    (e.g. Retail warehouse).
     """
     ship = _directory_shipping_snapshot(row)
     contact_line = str(ship.get("attn") or "").strip()
@@ -23554,6 +23608,10 @@ def process_shipment():
     service_code = data.get("service_code")  # e.g., "03", "02", "01", etc.
     packages_ups = _normalize_packages_for_ups(data.get("packages"))
     ship_to_override = _normalize_rate_ship_to(data.get("ship_to_override") or {})
+    use_directory_address = bool(
+        data.get("use_directory_address") or data.get("force_directory_ship")
+    )
+    request_po = str(data.get("poNumber") or data.get("po") or "").strip()
     try:
         ups_purchased_rate = float(data.get("ups_purchased_rate") or 0)
     except (TypeError, ValueError):
@@ -23672,7 +23730,16 @@ def process_shipment():
             and bool(packages_ups)
         )
         if do_ups:
-            if (
+            company = str(all_order_data[0].get("Company Name", "") or "").strip()
+            drow = _fetch_directory_row_by_company(company) if company else None
+            directory_ship = (
+                _normalize_ups_ship_to_from_directory_row(drow) if drow else {}
+            )
+            if use_directory_address and looks_like_street_address(
+                directory_ship.get("addr1")
+            ):
+                ship_to = directory_ship
+            elif (
                 ship_to_override
                 and ship_to_override.get("addr1")
                 and ship_to_override.get("city")
@@ -23693,22 +23760,19 @@ def process_shipment():
                 }
                 if ship_to_override.get("email"):
                     ship_to["email"] = ship_to_override.get("email")
+                if directory_ship:
+                    ship_to = _coalesce_ups_ship_to(ship_to, directory_ship)
             else:
-                company = str(all_order_data[0].get("Company Name", "") or "").strip()
                 order_ship = _order_ship_address_from_production_row_with_pair_fallback(
                     all_order_data[0],
                     orders_by_id,
                     service,
                 )
-                if order_ship.get("addr1"):
-                    ship_to = order_ship
-                else:
-                    drow = _fetch_directory_row_by_company(company)
-                    if not drow:
-                        raise Exception(
-                            "Company not found in Directory; cannot create UPS labels."
-                        )
-                    ship_to = _normalize_ups_ship_to_from_directory_row(drow)
+                ship_to = _coalesce_ups_ship_to(order_ship, directory_ship)
+                if not ship_to.get("addr1") and not drow:
+                    raise Exception(
+                        "Company not found in Directory; cannot create UPS labels."
+                    )
             if (
                 not ship_to["addr1"]
                 or not ship_to["city"]
@@ -23755,7 +23819,11 @@ def process_shipment():
                 sc = sc[:2]
             elif len(sc) == 1:
                 sc = sc.zfill(2)
-            shipment_po = _shipment_customer_po(all_order_data)
+            shipment_po = request_po or _shipment_customer_po(all_order_data)
+            if request_po:
+                for order_row in all_order_data:
+                    if isinstance(order_row, dict):
+                        order_row["PO #"] = request_po
             if shipment_po:
                 logging.info("UPS shipment customer PO for label: %s", shipment_po)
             else:

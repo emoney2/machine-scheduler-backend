@@ -409,6 +409,111 @@ def _sanitize_ups_po_value(raw: str | None) -> str:
     return s[:35]
 
 
+def _clip_ups_line(raw: str | None, n: int = 35) -> str:
+    return re.sub(r"\s+", " ", str(raw or "").strip())[:n]
+
+
+def looks_like_street_address(value: str | None) -> bool:
+    """True when a line looks like a deliverable street, not a company or suite-only."""
+    s = _clip_ups_line(value)
+    if not s:
+        return False
+    if re.search(r"(?i)\b(p\.?\s*o\.?\s*box|po box|rural route|\brr\b)\b", s):
+        return True
+    if re.match(r"(?i)^(suite|ste\.?|apt\.?|apartment|unit|floor|bldg|building)\b", s):
+        return False
+    return bool(re.search(r"\d", s))
+
+
+def _format_ups_attn_line(attn: str | None) -> str:
+    a = _clip_ups_line(attn)
+    if not a:
+        return ""
+    if re.match(r"(?i)^attn\b", a):
+        return a[:35]
+    return _clip_ups_line(f"ATTN: {a}")
+
+
+def _format_ups_po_line(po_number: str | None) -> str:
+    po = _sanitize_ups_po_value(po_number)
+    if not po:
+        return ""
+    if re.match(r"(?i)^po\s*#", po):
+        return po[:35]
+    return _clip_ups_line(f"PO# {po}")
+
+
+def _pack_ups_street_lines(*parts: str | None) -> list[str]:
+    streets = []
+    for part in parts:
+        s = _clip_ups_line(part)
+        if not s:
+            continue
+        if re.match(r"(?i)^(attn\b|po\s*#)", s):
+            continue
+        streets.append(s)
+    if not streets:
+        return []
+    joined = ", ".join(streets)
+    if len(joined) <= 35:
+        return [joined]
+    packed = [streets[0][:35]]
+    rest = ", ".join(streets[1:])
+    if rest:
+        packed.append(rest[:35])
+    return packed
+
+
+def format_ship_to_for_ups_label(
+    ship_to: Dict[str, Any] | None,
+    po_number: str | None = None,
+) -> Dict[str, Any]:
+    """
+    Shape ShipTo so the 4x6 label matches wholesale receiving forms:
+
+      Big Cedar Lodge
+      ATTN: Retail warehouse
+      139 Industrial Park Dr, Suite B
+      PO# 12345
+      Hollister MO 65672
+
+    UPS prints AttentionName, then Name, then AddressLine[1..3]. Keep a real
+    street as AddressLine1 so address validation still succeeds. Put PO on a
+    following address line (and still send ReferenceNumber Code PO).
+    """
+    src = dict(ship_to or {})
+    company = _clip_ups_line(src.get("name") or "Recipient")
+    attn_raw = str(src.get("attention_name") or "").strip()
+    attn_line = ""
+    if attn_raw and attn_raw.lower() != company.lower():
+        attn_line = _format_ups_attn_line(attn_raw)
+    po_line = _format_ups_po_line(po_number)
+    streets = _pack_ups_street_lines(src.get("addr1"), src.get("addr2"), src.get("addr3"))
+    if not streets:
+        fallback = _clip_ups_line(src.get("addr1"))
+        streets = [fallback] if fallback else []
+
+    addr_lines: list[str] = []
+    if streets:
+        addr_lines.append(streets[0])
+    if po_line:
+        addr_lines.append(po_line)
+    for extra in streets[1:]:
+        if len(addr_lines) >= 3:
+            break
+        addr_lines.append(extra)
+
+    out = dict(src)
+    out["name"] = company
+    # Always send AttentionName so UPS does not promote the phone into the
+    # address block (the failure mode on the Big Cedar label).
+    out["attention_name"] = attn_line or company
+    out["addr1"] = addr_lines[0] if addr_lines else company
+    out["addr2"] = addr_lines[1] if len(addr_lines) > 1 else None
+    out["addr3"] = addr_lines[2] if len(addr_lines) > 2 else None
+    return out
+
+
 def _pkg_ship(
     dim: Dict[str, Any],
     weight_lbs: float | int,
@@ -1766,6 +1871,17 @@ def create_shipment(
     if qv_notifications:
         service_opts["Notification"] = qv_notifications
 
+    label_ship_to = format_ship_to_for_ups_label(ship_to, po_number)
+    logging.info(
+        "UPS ShipTo for label: name=%r attn=%r addr=%r / %r / %r po=%r",
+        label_ship_to.get("name"),
+        label_ship_to.get("attention_name"),
+        label_ship_to.get("addr1"),
+        label_ship_to.get("addr2"),
+        label_ship_to.get("addr3"),
+        _sanitize_ups_po_value(po_number),
+    )
+
     shipment = {
         "ShipmentRequest": {
             "Request": {"SubVersion": "1707"},
@@ -1774,11 +1890,11 @@ def create_shipment(
                 "Shipper": _shipper(),
                 "ShipFrom": _ship_from(),
                 "ShipTo": _addr(
-                    ship_to["name"], ship_to.get("phone",""),
-                    ship_to["addr1"], ship_to["city"], ship_to["state"], ship_to["zip"], ship_to.get("country","US"),
-                    ship_to.get("addr2") or None,
-                    ship_to.get("attention_name") or None,
-                    ship_to.get("addr3") or None,
+                    label_ship_to["name"], label_ship_to.get("phone",""),
+                    label_ship_to["addr1"], label_ship_to["city"], label_ship_to["state"], label_ship_to["zip"], label_ship_to.get("country","US"),
+                    label_ship_to.get("addr2") or None,
+                    label_ship_to.get("attention_name") or None,
+                    label_ship_to.get("addr3") or None,
                 ),
                 "Service": {"Code": service_code},
                 "PaymentInformation": {
