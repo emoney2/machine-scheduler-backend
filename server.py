@@ -16825,7 +16825,7 @@ def _recut_notify_phones():
     raw = (
         os.environ.get("RECUT_NOTIFY_PHONE")
         or os.environ.get("RECUT_NOTIFY_PHONES")
-        or "6782945350"
+        or "7702657886"
     ).strip()
     phones = []
     seen = set()
