@@ -16814,6 +16814,118 @@ def _send_embroidery_recut_email(payload: dict) -> bool:
     return True
 
 
+def _recut_sms_body(payload: dict) -> str:
+    return (
+        f"Recut needed. Job #{payload.get('orderId') or '?'}. "
+        f"Qty {payload.get('pieces') or '?'}."
+    )
+
+
+def _recut_notify_phones():
+    raw = (
+        os.environ.get("RECUT_NOTIFY_PHONE")
+        or os.environ.get("RECUT_NOTIFY_PHONES")
+        or "6782945350"
+    ).strip()
+    phones = []
+    seen = set()
+    for part in re.split(r"[,;]+", raw):
+        digits = re.sub(r"\D", "", part or "")
+        if len(digits) == 11 and digits.startswith("1"):
+            digits = digits[1:]
+        if len(digits) == 10 and digits not in seen:
+            seen.add(digits)
+            phones.append(digits)
+    return phones
+
+
+def _recut_sms_email_targets(phones):
+    explicit = (os.environ.get("RECUT_NOTIFY_SMS_EMAIL") or "").strip()
+    if explicit:
+        return [addr.strip() for addr in re.split(r"[,;]+", explicit) if addr.strip()]
+    gateway = (os.environ.get("RECUT_NOTIFY_SMS_GATEWAY") or "").strip().lstrip("@")
+    gateways = (
+        [gateway]
+        if gateway
+        else ["vtext.com", "txt.att.net", "tmomail.net", "msg.fi.google.com"]
+    )
+    return [f"{phone}@{gw}" for phone in phones for gw in gateways if gw]
+
+
+def _send_recut_sms_twilio(phones, body: str) -> bool:
+    sid = (os.environ.get("TWILIO_ACCOUNT_SID") or "").strip()
+    token = (os.environ.get("TWILIO_AUTH_TOKEN") or "").strip()
+    from_num = (os.environ.get("TWILIO_FROM_NUMBER") or "").strip()
+    if not (sid and token and from_num and phones):
+        return False
+    sent = False
+    for phone in phones:
+        try:
+            res = requests.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
+                data={"From": from_num, "To": f"+1{phone}", "Body": body},
+                auth=(sid, token),
+                timeout=20,
+            )
+            if res.ok:
+                sent = True
+                logger.info("[EmbroideryRecut] texted %s via Twilio", phone)
+            else:
+                logger.warning(
+                    "[EmbroideryRecut] Twilio %s: %s",
+                    res.status_code,
+                    (res.text or "")[:200],
+                )
+        except Exception:
+            logger.exception("[EmbroideryRecut] Twilio send failed")
+    return sent
+
+
+def _send_recut_sms_via_email(phones, body: str) -> bool:
+    targets = _recut_sms_email_targets(phones)
+    if not targets:
+        return False
+    from_email = (os.environ.get("DESIGN_CONFIRMATION_FROM_EMAIL") or "info@jrco.us").strip()
+    smtp_host = (os.environ.get("SMTP_HOST") or "").strip()
+    smtp_port = int(os.environ.get("SMTP_PORT") or "587")
+    smtp_user = (os.environ.get("SMTP_USER") or "").strip()
+    smtp_password = (os.environ.get("SMTP_PASSWORD") or "").strip()
+    if not smtp_host or not smtp_user or not smtp_password:
+        logger.info("[EmbroideryRecut] SMTP not configured — skipping SMS email")
+        return False
+    import smtplib
+    from email.mime.text import MIMEText
+
+    sent = False
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        for addr in targets:
+            try:
+                msg = MIMEText(body, "plain")
+                msg["Subject"] = ""
+                msg["From"] = from_email
+                msg["To"] = addr
+                server.sendmail(from_email, [addr], msg.as_string())
+                sent = True
+                logger.info("[EmbroideryRecut] SMS email to %s", addr)
+            except Exception:
+                logger.exception("[EmbroideryRecut] SMS email failed for %s", addr)
+    return sent
+
+
+def _send_embroidery_recut_sms(payload: dict) -> bool:
+    """Text the recut contact with job number and quantity."""
+    phones = _recut_notify_phones()
+    if not phones and not (os.environ.get("RECUT_NOTIFY_SMS_EMAIL") or "").strip():
+        logger.warning("[EmbroideryRecut] no RECUT_NOTIFY_PHONE")
+        return False
+    body = _recut_sms_body(payload)
+    twilio_sent = _send_recut_sms_twilio(phones, body)
+    email_sent = _send_recut_sms_via_email(phones, body)
+    return bool(twilio_sent or email_sent)
+
+
 @app.route("/api/embroidery/floor-job/<order_id>", methods=["GET", "OPTIONS"])
 @login_required_session
 def embroidery_floor_job(order_id):
@@ -16983,7 +17095,7 @@ def embroidery_floor_finish():
 @app.route("/api/embroidery/recut", methods=["POST", "OPTIONS"])
 @login_required_session
 def embroidery_floor_recut():
-    """Email the manager immediately when embroidery needs a recut."""
+    """Text (and email) when embroidery needs a recut."""
     if request.method == "OPTIONS":
         return make_response("", 204)
     data = request.get_json(silent=True) or {}
@@ -17002,19 +17114,19 @@ def embroidery_floor_recut():
             return jsonify({"error": "pieces must be a whole number"}), 400
         if pieces <= 0:
             return jsonify({"error": "pieces must be greater than 0"}), 400
-        sent = _send_embroidery_recut_email(
-            {
-                "orderId": payload.get("orderId") or oid,
-                "machine": str(data.get("machine") or "").strip(),
-                "pieces": pieces,
-            }
-        )
-        if not sent:
+        notice = {
+            "orderId": payload.get("orderId") or oid,
+            "machine": str(data.get("machine") or "").strip(),
+            "pieces": pieces,
+        }
+        emailed = _send_embroidery_recut_email(notice)
+        texted = _send_embroidery_recut_sms(notice)
+        if not emailed and not texted:
             return (
                 jsonify(
                     {
                         "ok": False,
-                        "error": "Could not send email. SMTP (SMTP_HOST / SMTP_USER / SMTP_PASSWORD) is not set on the server.",
+                        "error": "Could not send recut text or email. Set RECUT_NOTIFY_PHONE and/or SMTP on the server.",
                     }
                 ),
                 503,
@@ -17023,10 +17135,10 @@ def embroidery_floor_recut():
             socketio.emit("embroideryRecutRequested", {"orderId": oid})
         except Exception:
             pass
-        return jsonify({"ok": True, "orderId": oid}), 200
+        return jsonify({"ok": True, "orderId": oid, "emailed": emailed, "texted": texted}), 200
     except Exception:
-        logger.exception("embroidery recut email failed")
-        return jsonify({"ok": False, "error": "Failed to send recut email"}), 500
+        logger.exception("embroidery recut notify failed")
+        return jsonify({"ok": False, "error": "Failed to send recut notice"}), 500
 
 
 def _wilcom_agent_token():
