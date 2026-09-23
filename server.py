@@ -3014,6 +3014,22 @@ def _kanban_item_field(item, *names):
     return ""
 
 
+def _kanban_order_link(item, qty=None, item_name=""):
+    """Return (url, label) for the card's supplier order page or email."""
+    raw_url = _kanban_item_field(item, "Order URL", "orderUrl", "Order Url")
+    if raw_url:
+        url = raw_url.strip()
+        if re.match(r"^www\.", url, re.I):
+            url = "https://" + url
+        if re.match(r"^https?://", url, re.I):
+            return url, "Order this item"
+    order_email = _kanban_item_field(item, "Order Email", "orderEmail")
+    if order_email and "@" in order_email:
+        subject = f"Order {item_name or 'kanban item'} — qty {qty or '1'}"
+        return f"mailto:{order_email}?subject={urllib.parse.quote(subject)}", "Email supplier to order"
+    return "", ""
+
+
 def _send_kanban_scan_email(kanban_id, qty, item=None, already_open=False):
     """Email Justin that a kanban QR was scanned. Uses the same SMTP as design confirmation."""
     to_email = KANBAN_SCAN_NOTIFY_EMAIL
@@ -3042,6 +3058,7 @@ def _send_kanban_scan_email(kanban_id, qty, item=None, already_open=False):
     sku = _kanban_item_field(item, "SKU", "sku")
     location = _kanban_item_field(item, "Location", "location")
     supplier = _kanban_item_field(item, "Supplier", "supplier")
+    order_href, order_label = _kanban_order_link(item, qty, item_name)
     try:
         scanned_at = datetime.now(ZoneInfo("America/New_York")).strftime(
             "%Y-%m-%d %I:%M %p ET"
@@ -3056,6 +3073,20 @@ def _send_kanban_scan_email(kanban_id, qty, item=None, already_open=False):
     )
     subject = f"Kanban scanned — {item_name} ({kid or '?'})"
     queue_url = "https://machineschedule.netlify.app/kanban/queue"
+    if order_href:
+        order_html = (
+            f'<p style="margin:20px 0;">'
+            f'<a href="{_html_escape(order_href)}" '
+            f'style="display:inline-block;background:#059669;color:#fff;'
+            f'font-weight:800;padding:12px 20px;border-radius:8px;'
+            f'text-decoration:none;">{_html_escape(order_label)}</a></p>'
+            f'<p>Order link: <a href="{_html_escape(order_href)}">'
+            f"{_html_escape(order_href)}</a></p>"
+        )
+        order_plain = f"{order_label}: {order_href}\n"
+    else:
+        order_html = "<p>No order link is saved on this card.</p>"
+        order_plain = "No order link is saved on this card.\n"
     html_body = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"></head>
@@ -3071,6 +3102,7 @@ def _send_kanban_scan_email(kanban_id, qty, item=None, already_open=False):
 <strong>Supplier:</strong> {_html_escape(supplier or "—")}<br>
 <strong>When:</strong> {_html_escape(scanned_at)}
 </p>
+{order_html}
 <p><a href="{queue_url}">Open kanban queue</a></p>
 </body></html>"""
     plain = (
@@ -3083,6 +3115,7 @@ def _send_kanban_scan_email(kanban_id, qty, item=None, already_open=False):
         f"Location: {location or '—'}\n"
         f"Supplier: {supplier or '—'}\n"
         f"When: {scanned_at}\n"
+        f"{order_plain}"
         f"Queue: {queue_url}\n"
     )
 
