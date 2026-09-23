@@ -6369,7 +6369,21 @@ ORDER_SHIP_ADDRESS_HEADERS = (
 
 # Customer PO on Production Orders (Order Submission + order confirmation PDF).
 PO_NUMBER_HEADER = "PO #"
-PO_NUMBER_HEADER_CANDIDATES = ("PO #", "PO#", "PO Number", "Customer PO", "PO")
+PO_NUMBER_HEADER_CANDIDATES = (
+    "PO #",
+    "PO#",
+    "P.O. #",
+    "P.O.#",
+    "P.O. Number",
+    "PO Number",
+    "Customer PO",
+    "Customer PO #",
+    "Customer PO#",
+    "Purchase Order",
+    "Purchase Order #",
+    "Purchase Order Number",
+    "PO",
+)
 
 # Planning shipping type from Order Submission (UPS vs Local delivery).
 # Do not write over Ship Via — that column is used later for QBO / UPS labels.
@@ -11325,7 +11339,7 @@ ORDERS_RANGE = os.environ.get("ORDERS_RANGE", "Production Orders!A1:AZ")
 # Ship tab needs Order Ship * columns; always read through BZ even when ORDERS_RANGE is narrower.
 JOBS_FOR_COMPANY_RANGE = os.environ.get(
     "JOBS_FOR_COMPANY_RANGE",
-    "Production Orders!A1:BZ",
+    "Production Orders!A1:ZZ",
 )
 # Overview “Upcoming Jobs” must read the Production Orders tab only. ORDERS_RANGE may be
 # overridden in env to another tab; this range is used only by build_overview_payload().
@@ -15576,7 +15590,8 @@ def jobs_for_company():
         jobs = []
         # Walk rows safely
         for r in prod_data[1:]:
-            row = dict(zip(headers, r))
+            padded = list(r) + [""] * max(0, len(headers) - len(r))
+            row = dict(zip(headers, padded))
             row_company = str(row.get("Company Name", "")).strip().lower()
             # Return all jobs for the company, including completed ones
             if row_company == company:
@@ -15595,6 +15610,7 @@ def jobs_for_company():
 
                 row["image"] = preview_url
                 row["orderId"] = str(row.get("Order #", "")).strip()
+                row["PO #"] = _po_number_from_row(row)
                 jobs.append(row)
 
         data = {"jobs": jobs}
@@ -23655,13 +23671,13 @@ def process_shipment():
     try:
         service = get_sheets_service()
 
-        # 2) Read the full sheet
+        # 2) Read the full sheet (through ZZ so PO # and Order Ship * are included)
         result = (
             service.spreadsheets()
             .values()
             .get(
                 spreadsheetId=sheet_id,
-                range=f"{sheet_name}!A1:AZ",
+                range=f"{sheet_name}!A1:ZZ",
             )
             .execute()
         )
@@ -23843,11 +23859,11 @@ def process_shipment():
                 sc = sc[:2]
             elif len(sc) == 1:
                 sc = sc.zfill(2)
-            shipment_po = request_po or _shipment_customer_po(all_order_data)
-            if request_po:
+            shipment_po = _shipment_customer_po(all_order_data) or request_po
+            if shipment_po:
                 for order_row in all_order_data:
-                    if isinstance(order_row, dict):
-                        order_row["PO #"] = request_po
+                    if isinstance(order_row, dict) and not _po_number_from_row(order_row):
+                        order_row["PO #"] = shipment_po
             if shipment_po:
                 logging.info("UPS shipment customer PO for label: %s", shipment_po)
             else:
