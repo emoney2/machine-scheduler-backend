@@ -17,7 +17,8 @@ class BoxSuggestionTests(unittest.TestCase):
         counts = result["suggestion"]["box_counts"]
         self.assertEqual(counts["10x10x10"], 1)
         self.assertEqual(counts["20x20x20"], 0)
-        self.assertEqual(counts["14x5x7"], 0)
+        self.assertEqual(counts["9x7x4"], 0)
+        self.assertEqual(counts["14x9x3"], 0)
 
     def test_box_is_sized_for_all_remaining_product_volume(self):
         result = packhist.suggest_boxes(
