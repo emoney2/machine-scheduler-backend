@@ -447,9 +447,17 @@ def merge_live_orders(
         if oid in created:
             out[oid] = overlay_job_from_live(created[oid], order)
     if drop_missing and live_ids:
-        for oid in list(out):
-            if oid not in live_ids:
-                out.pop(oid, None)
+        # A truncated Production Orders read must not wipe the catalog.
+        if len(out) >= 10 and len(live_ids) < len(out) * 0.5:
+            logger.warning(
+                "Live Production Orders look incomplete (%s rows vs %s catalog jobs); keeping missing jobs",
+                len(live_ids),
+                len(out),
+            )
+        else:
+            for oid in list(out):
+                if oid not in live_ids:
+                    out.pop(oid, None)
     return out
 
 
@@ -755,12 +763,17 @@ def snapshot(
             now=now,
         )
         board = load_board()
-        if board.get("resetToken") != RESET_TOKEN:
+        had_placements = bool(board.get("queue") or any((board.get("days") or {}).values()))
+        if board.get("resetToken") != RESET_TOKEN and not had_placements:
             board = reset_to_queue(jobs, now)
         else:
+            if board.get("resetToken") != RESET_TOKEN:
+                board["resetToken"] = RESET_TOKEN
+            before_rollover = board.get("lastRolloverDate") or ""
             board = seed_from_schedule(board, schedule, jobs)
             board, carryovers = rollover_unfinished(board, jobs, now=now)
-            if persist:
+            # Polls must not persist a shrunken catalog — that clears day squares.
+            if persist and (board.get("lastRolloverDate") or "") != before_rollover:
                 board = save_board(board)
         carryovers = list(board.get("carryovers") or [])
         overdue = board.get("overdue") or {}

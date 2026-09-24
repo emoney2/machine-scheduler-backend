@@ -275,6 +275,67 @@ class SewingBoardTests(unittest.TestCase):
         self.assertEqual(merged["9"]["remainingQuantity"], 12)
         self.assertTrue(merged["9"]["embroideryReady"])
 
+    def test_incomplete_live_orders_do_not_drop_catalog(self):
+        schedule = {
+            "orders": [
+                {
+                    "order_number": str(i),
+                    "product": "Driver",
+                    "remaining_quantity": 4,
+                    "quantity": 4,
+                    "customer": f"C{i}",
+                }
+                for i in range(10, 22)
+            ]
+        }
+        jobs = sb.catalog_jobs(schedule, progress={})
+        live = [{
+            "Order #": "10",
+            "Company Name": "C10",
+            "Product": "Driver",
+            "Quantity": 4,
+            "Due Date": "2026-10-08",
+            "Stage": "SEWING",
+        }]
+        merged = sb.merge_live_orders(jobs, live, progress={}, drop_missing=True)
+        self.assertEqual(len(merged), 12)
+        self.assertIn("21", merged)
+
+    def test_missing_reset_token_keeps_day_placements(self):
+        import tempfile
+        from pathlib import Path
+        jobs = dict([job("100"), job("200")])
+        now = datetime(2026, 9, 24, 8, 0, tzinfo=ET)
+        with tempfile.TemporaryDirectory() as tmp:
+            original = sb.BOARD_PATH
+            sb.BOARD_PATH = Path(tmp) / "sewing_board.json"
+            try:
+                board = {
+                    "queue": [],
+                    "days": {"2026-09-24": ["100"], "2026-09-25": ["200"]},
+                    "resetToken": "",
+                    "lastRolloverDate": "2026-09-24",
+                    "carryovers": [],
+                }
+                sb.save_board(board)
+                snap = sb.snapshot(
+                    {"orders": [
+                        {"order_number": "100", "product": "Driver", "remaining_quantity": 4, "quantity": 4, "customer": "A"},
+                        {"order_number": "200", "product": "Mallet", "remaining_quantity": 4, "quantity": 4, "customer": "B"},
+                    ]},
+                    now=now,
+                    persist=True,
+                    progress={},
+                    live_orders=None,
+                )
+                self.assertEqual(snap["board"].get("2026-09-24"), ["100"])
+                self.assertEqual(snap["board"].get("2026-09-25"), ["200"])
+                saved = sb.load_board()
+                self.assertEqual(saved["days"].get("2026-09-24"), ["100"])
+                self.assertNotEqual(saved.get("queue"), ["100", "200"])
+            finally:
+                sb.BOARD_PATH = original
+
     def test_live_ship_date_uses_method_and_travel_days(self):
         jobs = {}
         local = [{
