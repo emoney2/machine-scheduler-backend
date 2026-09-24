@@ -82,6 +82,35 @@ def _date_iso(value: Any) -> str:
     return iso_day(parsed) if parsed else _text(value)[:10]
 
 
+def _drive_id(value: Any) -> str:
+    text = _text(value)
+    if not text:
+        return ""
+    upper = text.upper()
+    if upper.startswith("IMAGE(") and '"' in text:
+        start = text.find('"')
+        end = text.find('"', start + 1)
+        if end > start:
+            text = text[start + 1:end]
+    marker = "/file/d/"
+    if marker in text:
+        rest = text.split(marker, 1)[1]
+        return rest.split("/", 1)[0].split("?", 1)[0]
+    if "id=" in text:
+        rest = text.split("id=", 1)[1]
+        return rest.split("&", 1)[0]
+    if 20 <= len(text) <= 80 and " " not in text and "/" not in text and ":" not in text:
+        return text
+    return ""
+
+
+def sort_queue_by_ship(queue: Sequence[Any], jobs: Dict[str, dict]) -> List[str]:
+    def key(oid: str):
+        job = jobs.get(oid) or {}
+        return (job.get("requiredShipDate") or "9999-12-31", _norm_oid(oid))
+    return sorted(_unique(queue), key=key)
+
+
 def empty_board() -> dict:
     return {
         "queue": [],
@@ -315,8 +344,29 @@ def catalog_jobs(
             "headCount": heads,
             "machine": machine,
             "stage": _text(order.get("stage") or sew.get("stage")),
-            "image": _text(order.get("image") or sew.get("image")),
-            "imageFileId": _text(sew.get("imageFileId")),
+            "image": _text(
+                order.get("image")
+                or order.get("Image")
+                or order.get("imageLink")
+                or sew.get("image")
+                or sew.get("imageLink")
+                or sew.get("Image")
+                or emb.get("image")
+                or emb.get("imageLink")
+            ),
+            "imageFileId": _text(
+                sew.get("imageFileId")
+                or order.get("imageFileId")
+                or emb.get("imageFileId")
+                or _drive_id(
+                    order.get("image")
+                    or order.get("Image")
+                    or order.get("imageLink")
+                    or sew.get("image")
+                    or sew.get("imageLink")
+                    or emb.get("image")
+                )
+            ),
         }
     return jobs
 
@@ -372,6 +422,7 @@ def apply_catalog(board: dict, jobs: Dict[str, dict]) -> dict:
     for oid in jobs:
         if oid not in placed:
             clean["queue"].append(oid)
+    clean["queue"] = sort_queue_by_ship(clean["queue"], jobs)
     clean["carryovers"] = [row for row in clean["carryovers"] if row["orderNumber"] in live]
     clean["overdue"] = {oid: day for oid, day in (clean.get("overdue") or {}).items() if oid in live}
     return clean

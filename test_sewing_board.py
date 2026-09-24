@@ -96,6 +96,16 @@ class SewingBoardTests(unittest.TestCase):
         clean = sb.apply_catalog(board, jobs)
         self.assertEqual(clean["queue"], ["100", "200"])
 
+    def test_queue_sorts_by_ship_date(self):
+        jobs = dict([
+            job("100", requiredShipDate="2026-10-03"),
+            job("200", requiredShipDate="2026-09-26"),
+            job("300", requiredShipDate="2026-09-30"),
+        ])
+        board = {"queue": ["100", "200", "300"], "days": {}, "lastRolloverDate": "2026-09-24", "carryovers": []}
+        clean = sb.apply_catalog(board, jobs)
+        self.assertEqual(clean["queue"], ["200", "300", "100"])
+
     def test_closed_jobs_leave_the_board(self):
         jobs = dict([job("200")])
         board = {"queue": ["100"], "days": {"2026-09-24": ["200"]}, "lastRolloverDate": "", "carryovers": []}
