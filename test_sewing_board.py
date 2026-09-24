@@ -378,6 +378,22 @@ class SewingBoardTests(unittest.TestCase):
         self.assertEqual(air_job["requiredShipDate"], "2026-10-01")
         self.assertNotEqual(west_job["requiredShipDate"], "2026-09-28")
 
+    def test_missing_shipping_method_does_not_invent_ground_ship_date(self):
+        jobs = {}
+        live = [{
+            "Order #": "13",
+            "Company Name": "River Club",
+            "Product": "Driver",
+            "Quantity": 12,
+            "Due Date": "09/25/2026",
+            "Ship Date": "09/21/2026",
+            "Stage": "SEWING",
+        }]
+        merged = sb.merge_live_orders(jobs, live, progress={}, drop_missing=True)["13"]
+        self.assertEqual(merged["dueDate"], "2026-09-25")
+        self.assertFalse(merged.get("shippingMethod"))
+        self.assertNotEqual(merged.get("requiredShipDate"), "2026-09-21")
+
     def test_seed_skipped_when_reset_token_set(self):
         jobs = dict([job("100")])
         board = sb.empty_board()

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from embroidery_progress import compute_timing, expected_cycle_ms, load_all as load_embroidery_progress
 from production_scheduler import (
     is_back_product,
+    is_local_delivery,
     is_towel_or_needlepoint,
     iso_day,
     parse_date,
@@ -85,9 +86,22 @@ def _date_iso(value: Any) -> str:
     return iso_day(parsed) if parsed else _text(value)[:10]
 
 
+def _row_shipping_method(row: Optional[dict] = None) -> str:
+    """Sheet shipping method only — do not invent UPS Ground when the column is blank."""
+    raw = shipping_method_from_row(row or {}, default="")
+    if is_local_delivery(raw):
+        return "Local Delivery"
+    return raw
+
+
 def _calculated_ship_date(row: Optional[dict]) -> Any:
     """Due date minus transit for the job's ship method — not the sheet WORKDAY(-5)."""
-    return required_ship_date_for_row(row)
+    method = _row_shipping_method(row)
+    if not method:
+        return None
+    payload = dict(row or {})
+    payload["Shipping Method"] = method
+    return required_ship_date_for_row(payload)
 
 
 def _drive_id(value: Any) -> str:
@@ -318,7 +332,7 @@ def live_row_as_order(row: dict, sewing_finished: Optional[Dict[str, float]] = N
         "stage": _text(row.get("Stage") or row.get("stage") or row.get("status")),
         "status": _text(row.get("Stage") or row.get("stage") or row.get("status")),
         "due_date": row.get("Due Date") or row.get("dueDate") or row.get("due_date"),
-        "shipping_method": shipping_method_from_row(row),
+        "shipping_method": _row_shipping_method(row),
         "ship_city": _text(
             row.get("Order Ship City") or row.get("Shipping City") or row.get("Ship To City") or row.get("shipCity")
         ),
@@ -369,21 +383,27 @@ def overlay_job_from_live(job: dict, order: dict) -> dict:
         next_job["shipState"] = order["ship_state"]
     if order.get("ship_zip"):
         next_job["shipZip"] = order["ship_zip"]
-    ship = _date_iso(_calculated_ship_date({
-        "Due Date": due or next_job.get("dueDate"),
-        "Shipping Method": next_job.get("shippingMethod") or order.get("shipping_method"),
-        "Shipping City": next_job.get("shipCity") or order.get("ship_city"),
-        "Shipping State": next_job.get("shipState") or order.get("ship_state"),
-        "Shipping Zip": next_job.get("shipZip") or order.get("ship_zip"),
-    }) or order.get("required_ship_date"))
-    if ship:
-        next_job["requiredShipDate"] = ship
-        next_job["transitBusinessDays"] = planning_transit_days({
-            "Shipping Method": next_job.get("shippingMethod"),
-            "Shipping City": next_job.get("shipCity"),
-            "Shipping State": next_job.get("shipState"),
-            "Shipping Zip": next_job.get("shipZip"),
-        })
+    method = next_job.get("shippingMethod") or order.get("shipping_method")
+    due_iso = due or next_job.get("dueDate")
+    if is_local_delivery(method) and due_iso:
+        next_job["requiredShipDate"] = _date_iso(due_iso)
+        next_job["transitBusinessDays"] = 0
+    else:
+        ship = _date_iso(_calculated_ship_date({
+            "Due Date": due_iso,
+            "Shipping Method": method,
+            "Shipping City": next_job.get("shipCity") or order.get("ship_city"),
+            "Shipping State": next_job.get("shipState") or order.get("ship_state"),
+            "Shipping Zip": next_job.get("shipZip") or order.get("ship_zip"),
+        }) or order.get("required_ship_date"))
+        if ship:
+            next_job["requiredShipDate"] = ship
+            next_job["transitBusinessDays"] = planning_transit_days({
+                "Shipping Method": next_job.get("shippingMethod"),
+                "Shipping City": next_job.get("shipCity"),
+                "Shipping State": next_job.get("shipState"),
+                "Shipping Zip": next_job.get("shipZip"),
+            })
     if order.get("due_type"):
         next_job["due_type"] = order["due_type"]
         next_job["hardDate"] = "HARD" in str(order["due_type"]).upper()

@@ -221,7 +221,7 @@ SERVICE_CODES = {
 }
 
 
-def shipping_method_from_row(row: Optional[dict] = None) -> str:
+def shipping_method_from_row(row: Optional[dict] = None, default: str = "UPS Ground") -> str:
     raw = _text(
         (row or {}).get("_shipping_method")
         or (row or {}).get("Shipping Method")
@@ -234,7 +234,7 @@ def shipping_method_from_row(row: Optional[dict] = None) -> str:
     )
     if is_local_delivery(raw):
         return "Local Delivery"
-    return raw or "UPS Ground"
+    return raw or default
 
 
 def service_code_for_method(method: Any) -> str:

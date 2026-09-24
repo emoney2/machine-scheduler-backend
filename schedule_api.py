@@ -55,7 +55,7 @@ def create_schedule_blueprint(
             return live_orders_cache["data"]
         import os
         import sewing_board
-        range_name = os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE", "Production Orders!A1:AZ")
+        range_name = os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE", "Production Orders!A1:ZZ")
         try:
             rows = (
                 values_service.get(
