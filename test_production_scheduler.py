@@ -174,8 +174,10 @@ class ScheduleTests(unittest.TestCase):
             shipping_method_from_row({"Ship Method": "Local delivery", "Ship Via": "UPS Ground"}),
             "Local Delivery",
         )
-        self.assertEqual(production_orders_values_range("Production Orders!A1:AZ"), "Production Orders")
-        self.assertEqual(production_orders_values_range("Production Orders!A1:ZZ"), "Production Orders")
+        self.assertEqual(production_orders_values_range("Production Orders!A1:AZ"), "Production Orders!A1:CZ")
+        self.assertEqual(production_orders_values_range("Production Orders!A1:ZZ"), "Production Orders!A1:CZ")
+        self.assertEqual(production_orders_values_range("Production Orders"), "Production Orders!A1:CZ")
+        self.assertEqual(production_orders_values_range("Production Orders!A1:CZ"), "Production Orders!A1:CZ")
         self.assertEqual(planning_transit_days({"Shipping Method": "Local Delivery"}), 0)
         self.assertEqual(planning_transit_days({"Shipping Method": "UPS Ground", "Shipping State": "CA"}), 5)
         self.assertEqual(

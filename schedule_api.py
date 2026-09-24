@@ -51,13 +51,13 @@ def create_schedule_blueprint(
 
     def load_live_orders():
         now = time.time()
-        if live_orders_cache["data"] is not None and now - live_orders_cache["at"] < 30:
+        if live_orders_cache["data"] is not None and now - live_orders_cache["at"] < 120:
             return live_orders_cache["data"]
         import os
         import sewing_board
         from production_scheduler import production_orders_values_range, shipping_method_from_row
         range_name = production_orders_values_range(
-            os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE", "Production Orders")
+            os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE", "")
         )
         try:
             rows = (
@@ -382,10 +382,20 @@ def create_schedule_blueprint(
             except Exception:
                 logger.exception("Could not load published schedule for sewing board")
         try:
+            finished = load_sewing_finished()
+        except Exception:
+            logger.exception("Sewing finished totals unavailable for sewing board")
+            finished = {}
+        try:
+            live = load_live_orders()
+        except Exception:
+            logger.exception("Live Production Orders unavailable for sewing board")
+            live = live_orders_cache.get("data")
+        try:
             payload = sewing_board.snapshot(
                 schedule,
-                sewing_finished=load_sewing_finished(),
-                live_orders=load_live_orders(),
+                sewing_finished=finished,
+                live_orders=live,
             )
         except Exception as exc:
             logger.exception("Could not load sewing board")

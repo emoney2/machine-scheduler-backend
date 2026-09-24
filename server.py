@@ -11507,10 +11507,10 @@ JOBS_FOR_COMPANY_RANGE = os.environ.get(
 def _overview_production_orders_range():
     raw = (os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE") or "").strip()
     tab = (raw.split("!")[0] if raw else "Production Orders").strip().strip("'\"") or "Production Orders"
-    # Never keep A1:AZ — Shipping Method and other late columns live past AZ.
+    # A1:AZ drops Shipping Method. The whole tab / A1:ZZ times out on Render.
     if tab.casefold() == "production orders":
-        return "Production Orders"
-    return raw or "Production Orders"
+        return "Production Orders!A1:CZ"
+    return raw or "Production Orders!A1:CZ"
 
 
 OVERVIEW_PRODUCTION_ORDERS_RANGE = _overview_production_orders_range()

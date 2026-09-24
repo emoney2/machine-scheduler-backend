@@ -250,13 +250,16 @@ def _normalize_header_key(name: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", _text(name).casefold())
 
 
+PRODUCTION_ORDERS_LIVE_RANGE = "Production Orders!A1:CZ"
+
+
 def production_orders_values_range(raw: Any = "") -> str:
-    """Read the whole Production Orders tab so late columns like Shipping Method are included."""
-    text = _text(raw) or "Production Orders"
+    """Wide enough for Shipping Method / Order Ship, without reading the whole tab."""
+    text = _text(raw) or PRODUCTION_ORDERS_LIVE_RANGE
     tab = text.split("!")[0].strip().strip("'\"") or "Production Orders"
-    if tab.casefold() == "production orders":
-        return "Production Orders"
-    return text
+    if tab.casefold() != "production orders":
+        return text
+    return PRODUCTION_ORDERS_LIVE_RANGE
 
 
 def _is_planning_shipping_method_header(norm: str) -> bool:
