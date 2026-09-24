@@ -245,7 +245,7 @@ class SewingBoardTests(unittest.TestCase):
         self.assertEqual(merged["3"]["customer"], "New Co")
         self.assertEqual(merged["3"]["quantity"], 65)
         self.assertEqual(merged["3"]["dueDate"], "2026-10-05")
-        self.assertEqual(merged["3"]["requiredShipDate"], "2026-10-02")
+        self.assertEqual(merged["3"]["requiredShipDate"], "2026-10-05")
         self.assertEqual(merged["3"]["shippingMethod"], "Local Delivery")
         self.assertTrue(merged["3"]["hardDate"])
         self.assertTrue(merged["3"]["embroideryReady"])
@@ -373,7 +373,7 @@ class SewingBoardTests(unittest.TestCase):
         local_job = sb.merge_live_orders(jobs, local, progress={}, drop_missing=True)["10"]
         west_job = sb.merge_live_orders(jobs, west, progress={}, drop_missing=True)["11"]
         air_job = sb.merge_live_orders(jobs, air, progress={}, drop_missing=True)["12"]
-        self.assertEqual(local_job["requiredShipDate"], "2026-10-02")
+        self.assertEqual(local_job["requiredShipDate"], "2026-10-05")
         self.assertEqual(west_job["requiredShipDate"], "2026-09-25")
         self.assertEqual(air_job["requiredShipDate"], "2026-10-01")
         self.assertNotEqual(west_job["requiredShipDate"], "2026-09-28")

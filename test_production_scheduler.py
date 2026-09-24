@@ -150,11 +150,11 @@ class ScheduleTests(unittest.TestCase):
     def test_required_ship_date_for_row_uses_method_and_destination(self):
         due = date(2026, 10, 5)
         self.assertEqual(shipping_method_from_row({"Shipping Method": "local"}), "Local Delivery")
-        self.assertEqual(planning_transit_days({"Shipping Method": "Local Delivery"}), 1)
+        self.assertEqual(planning_transit_days({"Shipping Method": "Local Delivery"}), 0)
         self.assertEqual(planning_transit_days({"Shipping Method": "UPS Ground", "Shipping State": "CA"}), 5)
         self.assertEqual(
             str(required_ship_date_for_row({"Due Date": due, "Shipping Method": "Local Delivery"})),
-            "2026-10-02",
+            "2026-10-05",
         )
         self.assertEqual(
             str(required_ship_date_for_row({
@@ -186,13 +186,13 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(rows[0]["transitBusinessDays"], 2)
         self.assertFalse(any(r["late"] for r in rows))
 
-    def test_local_delivery_uses_one_day_buffer(self):
+    def test_local_delivery_can_ship_same_day(self):
         self.assertTrue(is_local_delivery("Local Delivery"))
         self.assertTrue(is_local_delivery("local"))
         self.assertFalse(is_local_delivery("UPS"))
-        self.assertEqual(LOCAL_DELIVERY_TRANSIT_DAYS, 1)
+        self.assertEqual(LOCAL_DELIVERY_TRANSIT_DAYS, 0)
         due = date(2026, 9, 30)
-        self.assertEqual(str(resolve_required_ship_date(due, 1, shipping_method="Local Delivery")), "2026-09-29")
+        self.assertEqual(str(resolve_required_ship_date(due, 0, shipping_method="Local Delivery")), "2026-09-30")
         self.assertEqual(str(resolve_required_ship_date(due, 1)), "2026-09-28")
         result = build_schedule(
             [order(100, Quantity=6, **{
@@ -206,8 +206,8 @@ class ScheduleTests(unittest.TestCase):
         rows = [r for r in result["sewing"] if r["orderNumber"] == "100"]
         self.assertTrue(rows)
         self.assertEqual(rows[0]["shippingMethod"], "Local Delivery")
-        self.assertEqual(rows[0]["transitBusinessDays"], 1)
-        self.assertEqual(rows[0]["requiredShipDate"], "2026-09-29")
+        self.assertEqual(rows[0]["transitBusinessDays"], 0)
+        self.assertEqual(rows[0]["requiredShipDate"], "2026-09-30")
         self.assertFalse(any(r["late"] for r in rows))
 
     def test_back_products_are_not_sewn(self):

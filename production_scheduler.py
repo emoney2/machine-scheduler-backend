@@ -170,7 +170,7 @@ def estimate_ground_transit_days(zip_code: Any = "", state: Any = "", city: Any 
     return DEFAULT_GROUND_TRANSIT_DAYS
 
 
-LOCAL_DELIVERY_TRANSIT_DAYS = 1
+LOCAL_DELIVERY_TRANSIT_DAYS = 0
 
 
 def is_local_delivery(value: Any) -> bool:

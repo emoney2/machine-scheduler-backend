@@ -114,7 +114,7 @@ class FakeService(ProductionScheduleService):
 
 
 class WorkflowTests(unittest.TestCase):
-    def test_local_delivery_planning_transit_is_one_day(self):
+    def test_local_delivery_planning_transit_is_same_day(self):
         service = FakeService(FakeStore())
         self.assertEqual(
             service._planning_transit(
@@ -122,7 +122,7 @@ class WorkflowTests(unittest.TestCase):
                 {"zip": "90210", "state": "CA"},
                 "03",
             ),
-            1,
+            0,
         )
 
     def test_same_destination_shares_live_ups_transit(self):
