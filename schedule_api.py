@@ -47,6 +47,32 @@ def create_schedule_blueprint(
         return None
 
     sewing_finished_cache = {"at": 0.0, "data": {}}
+    live_orders_cache = {"at": 0.0, "data": None}
+
+    def load_live_orders():
+        now = time.time()
+        if live_orders_cache["data"] is not None and now - live_orders_cache["at"] < 30:
+            return live_orders_cache["data"]
+        import os
+        import sewing_board
+        range_name = os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE", "Production Orders!A1:AZ")
+        try:
+            rows = (
+                values_service.get(
+                    spreadsheetId=spreadsheet_id,
+                    range=range_name,
+                )
+                .execute()
+                .get("values")
+                or []
+            )
+            live = sewing_board.sheet_rows_to_dicts(rows)
+            live_orders_cache["at"] = now
+            live_orders_cache["data"] = live
+            return live
+        except Exception:
+            logger.exception("Could not read live Production Orders for sewing board")
+            return live_orders_cache["data"]
 
     def load_sewing_finished():
         now = time.time()
@@ -342,7 +368,11 @@ def create_schedule_blueprint(
             except Exception:
                 logger.exception("Could not load published schedule for sewing board")
         try:
-            payload = sewing_board.snapshot(schedule, sewing_finished=load_sewing_finished())
+            payload = sewing_board.snapshot(
+                schedule,
+                sewing_finished=load_sewing_finished(),
+                live_orders=load_live_orders(),
+            )
         except Exception as exc:
             logger.exception("Could not load sewing board")
             return jsonify({"error": friendly_sheets_error(exc)}), 500
@@ -363,10 +393,13 @@ def create_schedule_blueprint(
         cached = getattr(service, "cached_published", lambda: None)()
         if cached and cached.get("schedule"):
             schedule = cached["schedule"]
-        jobs = sewing_board.catalog_jobs(
-            schedule,
-            sewing_board.load_embroidery_progress(),
-            sewing_finished=load_sewing_finished(),
+        progress = sewing_board.load_embroidery_progress()
+        finished = load_sewing_finished()
+        jobs = sewing_board.merge_live_orders(
+            sewing_board.catalog_jobs(schedule, progress, sewing_finished=finished),
+            load_live_orders(),
+            progress=progress,
+            sewing_finished=finished,
         )
         board = sewing_board.save_placements(
             data.get("queue") or [],
@@ -404,10 +437,13 @@ def create_schedule_blueprint(
         cached = getattr(service, "cached_published", lambda: None)()
         if cached and cached.get("schedule"):
             schedule = cached["schedule"]
-        jobs = sewing_board.catalog_jobs(
-            schedule,
-            sewing_board.load_embroidery_progress(),
-            sewing_finished=load_sewing_finished(),
+        progress = sewing_board.load_embroidery_progress()
+        finished = load_sewing_finished()
+        jobs = sewing_board.merge_live_orders(
+            sewing_board.catalog_jobs(schedule, progress, sewing_finished=finished),
+            load_live_orders(),
+            progress=progress,
+            sewing_finished=finished,
         )
         board = sewing_board.reset_to_queue(jobs)
         emit("sewingBoardUpdated", {"updatedAt": board.get("updatedAt")})

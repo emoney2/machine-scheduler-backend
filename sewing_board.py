@@ -277,6 +277,144 @@ def needs_sewing(order: dict) -> bool:
     return remaining > 0
 
 
+def sheet_rows_to_dicts(values: Sequence[Sequence[Any]]) -> List[dict]:
+    rows = [list(row or []) for row in (values or [])]
+    if not rows:
+        return []
+    headers = [str(cell or "").strip() for cell in rows[0]]
+    out: List[dict] = []
+    for row in rows[1:]:
+        padded = list(row or [])
+        if len(padded) < len(headers):
+            padded += [""] * (len(headers) - len(padded))
+        out.append(dict(zip(headers, padded)))
+    return out
+
+
+def live_row_as_order(row: dict, sewing_finished: Optional[Dict[str, float]] = None) -> dict:
+    oid = _norm_oid(row.get("Order #") or row.get("order_number") or row.get("orderNumber"))
+    qty = _int(row.get("Quantity") if row.get("Quantity") is not None else row.get("quantity"))
+    sewn = _int((sewing_finished or {}).get(oid))
+    remaining = max(0, qty - sewn) if qty else _int(
+        row.get("remaining_quantity") if row.get("remaining_quantity") is not None else row.get("remainingQuantity")
+    )
+    if row.get("sewingSummaryComplete"):
+        remaining = 0
+    return {
+        "order_number": oid,
+        "orderNumber": oid,
+        "customer": _text(row.get("Company Name") or row.get("customer")),
+        "product": _text(row.get("Product") or row.get("product")),
+        "quantity": qty,
+        "remaining_quantity": remaining,
+        "stage": _text(row.get("Stage") or row.get("stage") or row.get("status")),
+        "status": _text(row.get("Stage") or row.get("stage") or row.get("status")),
+        "due_date": row.get("Due Date") or row.get("dueDate") or row.get("due_date"),
+        "required_ship_date": (
+            row.get("Ship Date")
+            or row.get("requiredShipDate")
+            or row.get("required_ship_date")
+            or row.get("_required_ship_date")
+        ),
+        "due_type": _text(
+            row.get("Hard Date/Soft Date")
+            or row.get("Hard/Soft")
+            or row.get("due_type")
+            or row.get("dueType")
+        ),
+        "image": _text(row.get("Image") or row.get("Preview") or row.get("Art Link") or row.get("image")),
+        "Image": _text(row.get("Image") or row.get("Preview") or row.get("Art Link")),
+        "shipped": _int(row.get("Shipped") if row.get("Shipped") is not None else row.get("shipped")),
+        "sewingSummaryComplete": bool(row.get("sewingSummaryComplete")),
+        "needs_sewing": remaining > 0,
+    }
+
+
+def overlay_job_from_live(job: dict, order: dict) -> dict:
+    next_job = dict(job)
+    if order.get("customer"):
+        next_job["customer"] = order["customer"]
+    if order.get("product"):
+        next_job["product"] = order["product"]
+    if order.get("quantity"):
+        next_job["quantity"] = order["quantity"]
+    if order.get("remaining_quantity") is not None:
+        next_job["remainingQuantity"] = order["remaining_quantity"]
+    due = _date_iso(order.get("due_date"))
+    ship = _date_iso(order.get("required_ship_date"))
+    if due:
+        next_job["dueDate"] = due
+    if ship:
+        next_job["requiredShipDate"] = ship
+    if order.get("due_type"):
+        next_job["due_type"] = order["due_type"]
+        next_job["hardDate"] = "HARD" in str(order["due_type"]).upper()
+    if order.get("stage"):
+        next_job["stage"] = order["stage"]
+        if str(order["stage"]).upper() in {"SEWING", "COMPLETE", "COMPLETED"}:
+            next_job["embroideryReady"] = True
+            next_job["embroideryPercent"] = 100
+            next_job["embroideryRemaining"] = 0
+    if order.get("image"):
+        next_job["image"] = order["image"]
+        next_job["imageFileId"] = next_job.get("imageFileId") or _drive_id(order["image"])
+    if order.get("sewingSummaryComplete"):
+        next_job["sewingSummaryComplete"] = True
+        next_job["remainingQuantity"] = 0
+    return next_job
+
+
+def merge_live_orders(
+    jobs: Dict[str, dict],
+    live_orders: Optional[Sequence[dict]],
+    *,
+    progress: Optional[Dict[str, dict]] = None,
+    sewing_finished: Optional[Dict[str, float]] = None,
+    now: Optional[datetime] = None,
+    drop_missing: bool = True,
+) -> Dict[str, dict]:
+    """Overwrite catalog fields from live Production Orders and drop finished work."""
+    if not live_orders:
+        return jobs
+    out = {oid: dict(job) for oid, job in (jobs or {}).items()}
+    live_ids = set()
+    for row in live_orders:
+        if not isinstance(row, dict):
+            continue
+        oid = _norm_oid(row.get("Order #") or row.get("order_number") or row.get("orderNumber"))
+        if not oid:
+            continue
+        live_ids.add(oid)
+        order = live_row_as_order(row, sewing_finished)
+        if (
+            is_closed_order(order)
+            or is_back_job(order.get("product"))
+            or is_towel_or_needlepoint(order.get("product"))
+            or is_sewing_finished(oid, _int(order.get("quantity")), sewing_finished)
+            or order.get("sewingSummaryComplete")
+        ):
+            out.pop(oid, None)
+            continue
+        if oid in out:
+            out[oid] = overlay_job_from_live(out[oid], order)
+            continue
+        if not needs_sewing(order):
+            continue
+        created = catalog_jobs(
+            {"orders": [order]},
+            progress if progress is not None else {},
+            now,
+            sewing_finished=sewing_finished,
+        )
+        if oid in created:
+            out[oid] = overlay_job_from_live(created[oid], order)
+    if drop_missing and live_ids:
+        for oid in list(out):
+            if oid not in live_ids:
+                out.pop(oid, None)
+    return out
+
+
 def catalog_jobs(
     schedule: Optional[dict],
     progress: Optional[Dict[str, dict]] = None,
@@ -312,6 +450,8 @@ def catalog_jobs(
             if order.get("remaining_quantity") is not None
             else sew.get("remainingQuantity")
         )
+        if sewing_finished and oid in sewing_finished:
+            remaining = max(0, qty - _int(sewing_finished.get(oid)))
         emb_remaining = _int(
             order.get("embroidery_remaining")
             if order.get("embroidery_remaining") is not None
@@ -325,7 +465,8 @@ def catalog_jobs(
         if qty > 0:
             completed = min(qty, completed)
         emb_status = _text(order.get("embroidery_status") or sew.get("embroideryStatus")).upper()
-        status_complete = emb_status in {"COMPLETE", "COMPLETED"}
+        stage = _text(order.get("stage") or sew.get("stage")).upper()
+        status_complete = emb_status in {"COMPLETE", "COMPLETED"} or stage in {"SEWING", "COMPLETE", "COMPLETED"}
         if emb_remaining <= 0 and completed <= 0 and status_complete:
             completed = qty
             emb_remaining = 0
@@ -558,13 +699,22 @@ def snapshot(
     persist: bool = True,
     progress: Optional[Dict[str, dict]] = None,
     sewing_finished: Optional[Dict[str, float]] = None,
+    live_orders: Optional[Sequence[dict]] = None,
 ) -> dict:
     with _LOCK:
+        progress_map = progress if progress is not None else load_embroidery_progress()
         jobs = catalog_jobs(
             schedule,
-            progress if progress is not None else load_embroidery_progress(),
+            progress_map,
             now,
             sewing_finished=sewing_finished,
+        )
+        jobs = merge_live_orders(
+            jobs,
+            live_orders,
+            progress=progress_map,
+            sewing_finished=sewing_finished,
+            now=now,
         )
         board = load_board()
         if board.get("resetToken") != RESET_TOKEN:

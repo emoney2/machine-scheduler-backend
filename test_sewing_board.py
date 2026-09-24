@@ -213,6 +213,66 @@ class SewingBoardTests(unittest.TestCase):
         self.assertEqual(board["overdue"], {})
         self.assertEqual(board["resetToken"], sb.RESET_TOKEN)
 
+    def test_live_orders_refresh_dates_and_qty(self):
+        schedule = {
+            "orders": [
+                {
+                    "order_number": "3",
+                    "product": "Driver",
+                    "remaining_quantity": 6,
+                    "quantity": 6,
+                    "customer": "Old Co",
+                    "due_date": "2026-09-01",
+                    "required_ship_date": "2026-08-28",
+                    "due_type": "Soft Date",
+                    "stage": "EMBROIDERY",
+                },
+            ]
+        }
+        jobs = sb.catalog_jobs(schedule, progress={})
+        live = [{
+            "Order #": "3",
+            "Company Name": "New Co",
+            "Product": "Driver",
+            "Quantity": 65,
+            "Due Date": "10/05/2026",
+            "Ship Date": 46296,
+            "Hard Date/Soft Date": "Hard Date",
+            "Stage": "SEWING",
+        }]
+        merged = sb.merge_live_orders(jobs, live, progress={}, drop_missing=True)
+        self.assertEqual(merged["3"]["customer"], "New Co")
+        self.assertEqual(merged["3"]["quantity"], 65)
+        self.assertEqual(merged["3"]["dueDate"], "2026-10-05")
+        self.assertEqual(merged["3"]["requiredShipDate"], "2026-10-01")
+        self.assertTrue(merged["3"]["hardDate"])
+        self.assertTrue(merged["3"]["embroideryReady"])
+        self.assertEqual(merged["3"]["stage"], "SEWING")
+
+    def test_live_orders_drop_missing_and_add_new(self):
+        schedule = {
+            "orders": [
+                {"order_number": "3", "product": "Driver", "remaining_quantity": 6, "quantity": 6, "customer": "C"},
+            ]
+        }
+        jobs = sb.catalog_jobs(schedule, progress={})
+        live = [{
+            "Order #": "9",
+            "Company Name": "Fresh",
+            "Product": "Fairway",
+            "Quantity": 12,
+            "Due Date": "2026-10-08",
+            "Ship Date": "2026-10-02",
+            "Stage": "SEWING",
+            "Hard Date/Soft Date": "Soft Date",
+        }]
+        merged = sb.merge_live_orders(jobs, live, progress={}, drop_missing=True)
+        self.assertNotIn("3", merged)
+        self.assertIn("9", merged)
+        self.assertEqual(merged["9"]["customer"], "Fresh")
+        self.assertEqual(merged["9"]["remainingQuantity"], 12)
+        self.assertTrue(merged["9"]["embroideryReady"])
+
     def test_seed_skipped_when_reset_token_set(self):
         jobs = dict([job("100")])
         board = sb.empty_board()
