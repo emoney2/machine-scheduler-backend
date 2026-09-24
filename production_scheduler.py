@@ -89,7 +89,14 @@ def parse_date(value: Any) -> Optional[date]:
             return datetime.strptime(raw, fmt).date()
         except ValueError:
             continue
-    return None
+    try:
+        today = datetime.now(BUSINESS_TZ).date()
+        parsed = datetime.strptime(raw, "%m/%d").date().replace(year=today.year)
+        if parsed < today:
+            parsed = parsed.replace(year=parsed.year + 1)
+        return parsed
+    except ValueError:
+        return None
 
 
 def iso_day(value: Optional[date]) -> str:

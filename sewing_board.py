@@ -84,7 +84,7 @@ def _int(value: Any, default: int = 0) -> int:
 
 def _date_iso(value: Any) -> str:
     parsed = parse_date(value)
-    return iso_day(parsed) if parsed else _text(value)[:10]
+    return iso_day(parsed) if parsed else ""
 
 
 def _row_shipping_method(row: Optional[dict] = None) -> str:

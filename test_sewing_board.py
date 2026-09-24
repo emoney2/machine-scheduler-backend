@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import sewing_board as sb
@@ -420,6 +420,28 @@ class SewingBoardTests(unittest.TestCase):
         self.assertEqual(merged["dueDate"], "2026-09-25")
         self.assertFalse(merged.get("shippingMethod"))
         self.assertNotEqual(merged.get("requiredShipDate"), "2026-09-21")
+
+    def test_month_day_due_does_not_keep_today_sheet_ship(self):
+        today = datetime.now(ET).date()
+        expected_due = date(today.year, 1, 1)
+        if expected_due < today:
+            expected_due = date(today.year + 1, 1, 1)
+        live = [{
+            "Order #": "2099",
+            "Company Name": "Hershey",
+            "Product": "Driver",
+            "Quantity": 24,
+            "Due Date": "1/1",
+            "Shipping Method": "UPS Ground",
+            "Shipping State": "PA",
+            "Ship Date": today.strftime("%m/%d/%Y"),
+            "Stage": "SEWING",
+        }]
+        merged = sb.merge_live_orders({}, live, progress={}, drop_missing=True)["2099"]
+        self.assertEqual(merged["dueDate"], expected_due.isoformat())
+        self.assertNotEqual(merged.get("requiredShipDate"), today.isoformat())
+        self.assertTrue(merged.get("requiredShipDate"))
+        self.assertLessEqual(merged["requiredShipDate"], merged["dueDate"])
 
     def test_seed_skipped_when_reset_token_set(self):
         jobs = dict([job("100")])

@@ -1429,6 +1429,14 @@ class PersistenceSizeTests(unittest.TestCase):
         self.assertEqual(parse_date("45980.0"), expected)
         self.assertEqual(str(parse_date("09/30/2026")), "2026-09-30")
 
+    def test_parse_date_month_day_rolls_past_dates_to_next_year(self):
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        parsed = parse_date("1/1")
+        expected = date(today.year, 1, 1)
+        if expected < today:
+            expected = date(today.year + 1, 1, 1)
+        self.assertEqual(parsed, expected)
+
     def test_version_summary_stays_under_sheet_cell_limit(self):
         rows = [order(1000 + i, Quantity=12) for i in range(250)]
         result = build_schedule(rows, thread_inventory=inventory(120), now=NOW)
