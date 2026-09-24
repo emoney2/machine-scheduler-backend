@@ -284,6 +284,71 @@ def create_schedule_blueprint(
         emit("scheduleProposalUpdated", {"lockId": lock_id, "active": False})
         return jsonify({"ok": True, "rebuild": result}), 200
 
+    @bp.get("/sewing-board")
+    @login_required
+    def get_sewing_board():
+        import sewing_board
+        schedule = None
+        cached = getattr(service, "cached_published", lambda: None)()
+        if cached and cached.get("schedule"):
+            schedule = cached["schedule"]
+        else:
+            try:
+                version = service.store.published_version()
+                if version:
+                    schedule = service.store.load_schedule(str(version.get("Version ID") or ""))
+                    if hasattr(service, "remember_published"):
+                        service.remember_published(version, schedule)
+            except Exception:
+                logger.exception("Could not load published schedule for sewing board")
+        try:
+            payload = sewing_board.snapshot(schedule)
+        except Exception as exc:
+            logger.exception("Could not load sewing board")
+            return jsonify({"error": friendly_sheets_error(exc)}), 500
+        absences = {}
+        try:
+            absences = (service._settings() or {}).get("sewerAbsences") or {}
+        except Exception:
+            logger.exception("Could not load sewer absences for sewing board")
+        payload["absences"] = absences
+        return jsonify(payload), 200
+
+    @bp.put("/sewing-board")
+    @login_required
+    def save_sewing_board():
+        import sewing_board
+        data = request.get_json(silent=True) or {}
+        schedule = None
+        cached = getattr(service, "cached_published", lambda: None)()
+        if cached and cached.get("schedule"):
+            schedule = cached["schedule"]
+        jobs = sewing_board.catalog_jobs(schedule, sewing_board.load_embroidery_progress())
+        board = sewing_board.save_placements(
+            data.get("queue") or [],
+            data.get("days") or {},
+            jobs,
+        )
+        emit("sewingBoardUpdated", {"updatedAt": board.get("updatedAt")})
+        days = sewing_board.rolling_weekdays()
+        absences = {}
+        try:
+            absences = (service._settings() or {}).get("sewerAbsences") or {}
+        except Exception:
+            logger.exception("Could not load sewer absences after sewing board save")
+        return jsonify({
+            "ok": True,
+            "today": days[0] if days else sewing_board.today_iso(),
+            "days": days,
+            "queue": board["queue"],
+            "board": board["days"],
+            "jobs": jobs,
+            "carryovers": board.get("carryovers") or [],
+            "updatedAt": board.get("updatedAt") or "",
+            "lastRolloverDate": board.get("lastRolloverDate") or "",
+            "absences": absences,
+        }), 200
+
     @bp.post("/sewing-completion")
     @login_required
     def sewing_completion():

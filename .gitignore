@@ -25,6 +25,8 @@ token.b64.txt
 # Local packing history (also mirrored to Google Sheet tab Packing History)
 data/packing_history.json
 data/packing_history.tmp
+data/sewing_board.json
+data/sewing_board.tmp
 
 # Warehouse Wilcom helper secrets and local delivery history
 wilcom_agent_config.json
