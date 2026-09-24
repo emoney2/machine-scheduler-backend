@@ -15953,7 +15953,16 @@ def _prepare_pdf_preview_image(img_bytes: bytes, max_px: int = 400):
         return None
 
 
-def _outstanding_orders_for_company_rows(company_lower: str):
+def _truthy_query_flag(name: str) -> bool:
+    return str(request.args.get(name, "") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _outstanding_orders_for_company_rows(company_lower: str, include_completed: bool = False):
     prod_data = fetch_sheet(SPREADSHEET_ID, JOBS_FOR_COMPANY_RANGE)
     if not prod_data or not prod_data[0]:
         return []
@@ -15965,7 +15974,7 @@ def _outstanding_orders_for_company_rows(company_lower: str):
         row_company = str(row.get("Company Name", "")).strip().lower()
         if row_company != company_lower:
             continue
-        if not _is_outstanding_order_row(row):
+        if not include_completed and not _is_outstanding_order_row(row):
             continue
         product_raw = str(row.get("Product", "")).strip()
         if _is_back_product(product_raw):
@@ -16102,7 +16111,7 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
         elems.append(Paragraph(f"PO #: {_html_escape(shared_po)}", po_header_style))
 
     if not jobs:
-        elems.append(Paragraph("No outstanding jobs found for this customer.", normal))
+        elems.append(Paragraph("No jobs found for this customer.", normal))
     else:
         line_total_sum = 0.0
         for job in jobs:
@@ -16204,8 +16213,17 @@ def outstanding_orders_for_company():
         return jsonify({"error": "Missing company parameter"}), 400
 
     try:
-        jobs = _outstanding_orders_for_company_rows(company.lower())
-        return jsonify({"company": company, "jobs": jobs})
+        include_completed = _truthy_query_flag("include_completed")
+        jobs = _outstanding_orders_for_company_rows(
+            company.lower(), include_completed=include_completed
+        )
+        return jsonify(
+            {
+                "company": company,
+                "jobs": jobs,
+                "include_completed": include_completed,
+            }
+        )
     except Exception as e:
         logger.exception("outstanding-orders-for-company failed:")
         resp = jsonify({"error": "outstanding-orders-for-company failed", "detail": str(e)})
@@ -16230,7 +16248,10 @@ def order_confirmation_pdf():
     }
 
     try:
-        jobs = _outstanding_orders_for_company_rows(company.lower())
+        include_completed = _truthy_query_flag("include_completed")
+        jobs = _outstanding_orders_for_company_rows(
+            company.lower(), include_completed=include_completed
+        )
         if wanted_ids:
             jobs = [
                 j
@@ -16238,7 +16259,7 @@ def order_confirmation_pdf():
                 if _overview_normalize_order_key(j.get("Order #")) in wanted_ids
             ]
             if not jobs:
-                return jsonify({"error": "No matching outstanding orders for selection"}), 400
+                return jsonify({"error": "No matching orders for selection"}), 400
 
         pdf_bytes = build_order_confirmation_pdf(company, jobs)
         safe_name = re.sub(r"[^\w\-]+", "_", company).strip("_") or "customer"
