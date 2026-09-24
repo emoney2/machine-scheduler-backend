@@ -144,6 +144,25 @@ class SewingBoardTests(unittest.TestCase):
         self.assertFalse(jobs["3"]["embroideryReady"])
         self.assertEqual(jobs["3"]["embroideryCompletedQty"], 0)
 
+    def test_sewing_log_sum_drops_finished_jobs(self):
+        schedule = {
+            "orders": [
+                {"order_number": "10", "product": "Driver", "remaining_quantity": 6, "quantity": 6, "customer": "J"},
+                {"order_number": "11", "product": "Driver", "remaining_quantity": 4, "quantity": 4, "customer": "K"},
+            ]
+        }
+        finished = sb.parse_sewing_top_by_order([
+            ["Timestamp", "Order #", "Name", "Elastic", "Fur", "Flat", "Round", "Top"],
+            ["2026-09-24", "10", "Ann", 0, 0, 0, 0, 2],
+            ["2026-09-24", "10", "Ann", 0, 0, 0, 0, 4],
+            ["2026-09-24", "11", "Ann", 0, 0, 0, 0, 1],
+        ], accumulate="sum")
+        self.assertEqual(finished["10"], 6)
+        self.assertEqual(finished["11"], 1)
+        jobs = sb.catalog_jobs(schedule, progress={}, sewing_finished=finished)
+        self.assertNotIn("10", jobs)
+        self.assertIn("11", jobs)
+
     def test_catalog_embroidery_ready_only_after_progress(self):
         schedule = {
             "orders": [

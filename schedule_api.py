@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from threading import Lock
 from datetime import datetime
 from uuid import uuid4
@@ -44,6 +45,45 @@ def create_schedule_blueprint(
                     return None
                 return jsonify({"error": friendly_sheets_error(exc)}), 503
         return None
+
+    sewing_finished_cache = {"at": 0.0, "data": {}}
+
+    def load_sewing_finished():
+        now = time.time()
+        if sewing_finished_cache["data"] and now - sewing_finished_cache["at"] < 30:
+            return sewing_finished_cache["data"]
+        import sewing_board
+        finished = {}
+        try:
+            log_rows = (
+                values_service.get(
+                    spreadsheetId=spreadsheet_id,
+                    range="'Sewing Log'!A1:H",
+                )
+                .execute()
+                .get("values")
+                or []
+            )
+            finished = sewing_board.parse_sewing_top_by_order(log_rows, accumulate="sum")
+        except Exception:
+            logger.exception("Could not read Sewing Log tops")
+        if not finished:
+            try:
+                summary_rows = (
+                    values_service.get(
+                        spreadsheetId=spreadsheet_id,
+                        range="Sewing Summary!A1:Z",
+                    )
+                    .execute()
+                    .get("values")
+                    or []
+                )
+                finished = sewing_board.parse_sewing_top_by_order(summary_rows, accumulate="max")
+            except Exception:
+                logger.exception("Could not read Sewing Summary tops")
+        sewing_finished_cache["at"] = now
+        sewing_finished_cache["data"] = finished
+        return finished
 
     def actor() -> str:
         return "admin"
@@ -302,7 +342,7 @@ def create_schedule_blueprint(
             except Exception:
                 logger.exception("Could not load published schedule for sewing board")
         try:
-            payload = sewing_board.snapshot(schedule)
+            payload = sewing_board.snapshot(schedule, sewing_finished=load_sewing_finished())
         except Exception as exc:
             logger.exception("Could not load sewing board")
             return jsonify({"error": friendly_sheets_error(exc)}), 500
@@ -323,7 +363,11 @@ def create_schedule_blueprint(
         cached = getattr(service, "cached_published", lambda: None)()
         if cached and cached.get("schedule"):
             schedule = cached["schedule"]
-        jobs = sewing_board.catalog_jobs(schedule, sewing_board.load_embroidery_progress())
+        jobs = sewing_board.catalog_jobs(
+            schedule,
+            sewing_board.load_embroidery_progress(),
+            sewing_finished=load_sewing_finished(),
+        )
         board = sewing_board.save_placements(
             data.get("queue") or [],
             data.get("days") or {},
@@ -360,7 +404,11 @@ def create_schedule_blueprint(
         cached = getattr(service, "cached_published", lambda: None)()
         if cached and cached.get("schedule"):
             schedule = cached["schedule"]
-        jobs = sewing_board.catalog_jobs(schedule, sewing_board.load_embroidery_progress())
+        jobs = sewing_board.catalog_jobs(
+            schedule,
+            sewing_board.load_embroidery_progress(),
+            sewing_finished=load_sewing_finished(),
+        )
         board = sewing_board.reset_to_queue(jobs)
         emit("sewingBoardUpdated", {"updatedAt": board.get("updatedAt")})
         days = sewing_board.rolling_weekdays()

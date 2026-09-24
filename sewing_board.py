@@ -197,7 +197,52 @@ def save_board(board: dict) -> dict:
     return clean
 
 
-CLOSED_STAGES = {"SHIPPED", "COMPLETE", "COMPLETED", "CANCELED", "CANCELLED"}
+CLOSED_STAGES = {"SHIPPED", "COMPLETE", "COMPLETED", "CANCELED", "CANCELLED", "SEWN"}
+
+
+def parse_sewing_top_by_order(values: Sequence[Sequence[Any]], *, accumulate: str = "sum") -> Dict[str, float]:
+    """Order # -> Top from Sewing Log (sum) or Sewing Summary (max)."""
+    rows = [list(row or []) for row in (values or [])]
+    if not rows:
+        return {}
+    header = [str(cell or "").strip() for cell in rows[0]]
+    header_l = [h.lower() for h in header]
+    has_header = any("order" in h for h in header_l) or any(h == "top" for h in header_l)
+    oid_idx = 1
+    top_idx = 7
+    start = 0
+    if has_header:
+        start = 1
+        for i, h in enumerate(header_l):
+            if oid_idx == 1 and "order" in h:
+                oid_idx = i
+            if h == "top":
+                top_idx = i
+    out: Dict[str, float] = {}
+    for row in rows[start:]:
+        if oid_idx >= len(row):
+            continue
+        oid = _norm_oid(row[oid_idx])
+        if not oid:
+            continue
+        raw = row[top_idx] if top_idx < len(row) else 0
+        try:
+            top = float(str(raw).replace(",", "").strip() or 0)
+        except (TypeError, ValueError):
+            continue
+        if top <= 0:
+            continue
+        if accumulate == "max":
+            out[oid] = max(out.get(oid, 0.0), top)
+        else:
+            out[oid] = out.get(oid, 0.0) + top
+    return out
+
+
+def is_sewing_finished(oid: str, qty: int, finished: Optional[Dict[str, float]]) -> bool:
+    if not oid or qty <= 0 or not finished:
+        return False
+    return float(finished.get(oid) or 0) + 1e-9 >= float(qty)
 
 
 def is_back_job(product: Any) -> bool:
@@ -236,6 +281,7 @@ def catalog_jobs(
     schedule: Optional[dict],
     progress: Optional[Dict[str, dict]] = None,
     now: Optional[datetime] = None,
+    sewing_finished: Optional[Dict[str, float]] = None,
 ) -> Dict[str, dict]:
     """Open sewing jobs from the published schedule, with embroidery % / ETA."""
     stamp = _now_et(now)
@@ -259,6 +305,8 @@ def catalog_jobs(
         sew = sewing_rows.get(oid) or {}
         emb = embroidery_rows.get(oid) or {}
         qty = _int(order.get("quantity") if order.get("quantity") is not None else sew.get("quantity"), 1)
+        if is_sewing_finished(oid, qty, sewing_finished):
+            continue
         remaining = _int(
             order.get("remaining_quantity")
             if order.get("remaining_quantity") is not None
@@ -509,9 +557,15 @@ def snapshot(
     now: Optional[datetime] = None,
     persist: bool = True,
     progress: Optional[Dict[str, dict]] = None,
+    sewing_finished: Optional[Dict[str, float]] = None,
 ) -> dict:
     with _LOCK:
-        jobs = catalog_jobs(schedule, progress if progress is not None else load_embroidery_progress(), now)
+        jobs = catalog_jobs(
+            schedule,
+            progress if progress is not None else load_embroidery_progress(),
+            now,
+            sewing_finished=sewing_finished,
+        )
         board = load_board()
         if board.get("resetToken") != RESET_TOKEN:
             board = reset_to_queue(jobs, now)
