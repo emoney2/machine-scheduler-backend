@@ -19,6 +19,7 @@ from production_scheduler import (
     parse_date,
     planning_transit_days,
     required_ship_date_for_row,
+    ship_address_from_row,
     shipping_method_from_row,
 )
 
@@ -336,6 +337,7 @@ def live_row_as_order(row: dict, sewing_finished: Optional[Dict[str, float]] = N
     )
     if row.get("sewingSummaryComplete"):
         remaining = 0
+    addr = ship_address_from_row(row)
     return {
         "order_number": oid,
         "orderNumber": oid,
@@ -347,20 +349,9 @@ def live_row_as_order(row: dict, sewing_finished: Optional[Dict[str, float]] = N
         "status": _text(row.get("Stage") or row.get("stage") or row.get("status")),
         "due_date": row.get("Due Date") or row.get("dueDate") or row.get("due_date"),
         "shipping_method": _row_shipping_method(row),
-        "ship_city": _text(
-            row.get("Order Ship City") or row.get("Shipping City") or row.get("Ship To City") or row.get("shipCity")
-        ),
-        "ship_state": _text(
-            row.get("Order Ship State") or row.get("Shipping State") or row.get("Ship To State") or row.get("shipState")
-        ),
-        "ship_zip": _text(
-            row.get("Order Ship ZIP")
-            or row.get("Order Ship Zip")
-            or row.get("Shipping Zip")
-            or row.get("Shipping Zip Code")
-            or row.get("Ship To Zip")
-            or row.get("zip")
-        ),
+        "ship_city": addr["city"],
+        "ship_state": addr["state"],
+        "ship_zip": addr["zip"],
         "required_ship_date": _calculated_ship_date(row),
         "due_type": _text(
             row.get("Hard Date/Soft Date")

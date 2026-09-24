@@ -134,6 +134,24 @@ class ScheduleTests(unittest.TestCase):
     def test_nearby_ground_transit_is_not_a_week(self):
         self.assertEqual(estimate_ground_transit_days("30519", "GA"), 1)
         self.assertEqual(estimate_ground_transit_days("30305", "GA"), 1)
+        self.assertEqual(estimate_ground_transit_days("", "Georgia"), 1)
+        self.assertEqual(estimate_ground_transit_days("30024", "Georgia"), 1)
+        self.assertEqual(
+            str(required_ship_date_for_row({
+                "Due Date": date(2026, 9, 25),
+                "Shipping Method": "UPS Ground",
+                "Order Ship State": "Georgia",
+            })),
+            "2026-09-23",
+        )
+        self.assertEqual(
+            str(required_ship_date_for_row({
+                "Due Date": "09/25/2026",
+                "Shipping Method": "UPS Ground",
+                "Order Ship ZIP": "30024",
+            })),
+            "2026-09-23",
+        )
         self.assertEqual(estimate_ground_transit_days("28202", "NC"), 2)
         self.assertEqual(estimate_ground_transit_days("37203", "TN"), 2)
         self.assertEqual(estimate_ground_transit_days("10001", "NY"), 3)

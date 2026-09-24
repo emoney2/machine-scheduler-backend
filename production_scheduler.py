@@ -133,6 +133,33 @@ def add_workdays(value: date, days: int, holidays: Iterable[date]) -> date:
 DEFAULT_GROUND_TRANSIT_DAYS = 3
 SHIPPING_DELAY_BUFFER_DAYS = 1
 
+US_STATE_NAMES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "district of columbia": "DC", "florida": "FL", "georgia": "GA", "hawaii": "HI",
+    "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA",
+    "kansas": "KS", "kentucky": "KY", "louisiana": "LA", "maine": "ME",
+    "maryland": "MD", "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE",
+    "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM",
+    "new york": "NY", "north carolina": "NC", "north dakota": "ND", "ohio": "OH",
+    "oklahoma": "OK", "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI",
+    "south carolina": "SC", "south dakota": "SD", "tennessee": "TN", "texas": "TX",
+    "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+}
+
+
+def normalize_state(value: Any) -> str:
+    raw = _text(value)
+    if not raw:
+        return ""
+    named = US_STATE_NAMES.get(re.sub(r"[^a-z]+", " ", raw.casefold()).strip())
+    if named:
+        return named
+    letters = re.sub(r"[^A-Za-z]", "", raw).upper()
+    return letters if len(letters) == 2 else ""
+
 
 def estimate_ground_transit_days(zip_code: Any = "", state: Any = "", city: Any = "") -> int:
     """Typical UPS Ground business days from Buford, GA (30519).
@@ -143,9 +170,7 @@ def estimate_ground_transit_days(zip_code: Any = "", state: Any = "", city: Any 
     digits = re.sub(r"\D", "", _text(zip_code))
     prefix = digits[:3]
     lead = prefix[:1]
-    st = _text(state).upper()
-    if len(st) > 2:
-        st = st[:2]
+    st = normalize_state(state)
     city_key = re.sub(r"[^a-z]+", " ", _text(city).lower()).strip()
     if st == "GA" or prefix.startswith("30") or prefix.startswith("31"):
         return 1
@@ -279,24 +304,38 @@ def service_code_for_method(method: Any) -> str:
     return "03"
 
 
+def _address_header_kind(norm: str) -> str:
+    if not norm or norm.startswith("_"):
+        return ""
+    is_ship = any(part in norm for part in ("ship", "shipping", "shipto", "ordership"))
+    if "zip" in norm:
+        return "zip_ship" if is_ship else "zip"
+    if norm.endswith("state") or norm in {"st", "shipstate"}:
+        return "state_ship" if is_ship else "state"
+    if norm.endswith("city"):
+        return "city_ship" if is_ship else "city"
+    return ""
+
+
 def ship_address_from_row(row: Optional[dict] = None) -> dict:
     row = row if isinstance(row, dict) else {}
     nested = row.get("_shipping_address") if isinstance(row.get("_shipping_address"), dict) else {}
-
-    def first(*keys: str) -> str:
-        for key in keys:
-            val = _text(row.get(key) or nested.get(key))
-            if val:
-                return val
-        return ""
-
+    found = {
+        "zip_ship": "", "zip": "",
+        "state_ship": "", "state": "",
+        "city_ship": "", "city": "",
+    }
+    for key, val in {**nested, **row}.items():
+        text = _text(val)
+        if not text:
+            continue
+        kind = _address_header_kind(_normalize_header_key(key))
+        if kind and not found[kind]:
+            found[kind] = text
     return {
-        "zip": first(
-            "Order Ship ZIP", "Order Ship Zip", "Shipping Zip", "Shipping Zip Code",
-            "Ship To Zip", "Ship To ZIP", "zip",
-        ),
-        "state": first("Order Ship State", "Shipping State", "Ship To State", "state", "shipState"),
-        "city": first("Order Ship City", "Shipping City", "Ship To City", "city", "shipCity"),
+        "zip": found["zip_ship"] or found["zip"],
+        "state": found["state_ship"] or found["state"],
+        "city": found["city_ship"] or found["city"],
     }
 
 

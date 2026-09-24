@@ -13366,6 +13366,35 @@ def _overview_shipping_method(row: dict) -> str:
     return planning or via
 
 
+def _overview_ship_address(row: dict) -> dict:
+    city = state = zipc = ""
+    city_g = state_g = zip_g = ""
+    if not isinstance(row, dict):
+        return {"city": "", "state": "", "zip": ""}
+    for key, val in row.items():
+        text = str(val or "").strip()
+        if not text:
+            continue
+        norm = re.sub(r"[^a-z0-9]+", "", str(key or "").strip().lower())
+        ship = any(part in norm for part in ("ship", "shipping", "shipto", "ordership"))
+        if "zip" in norm:
+            if ship and not zipc:
+                zipc = text
+            elif not ship and not zip_g:
+                zip_g = text
+        elif norm.endswith("state") or norm in {"st", "shipstate"}:
+            if ship and not state:
+                state = text
+            elif not ship and not state_g:
+                state_g = text
+        elif norm.endswith("city"):
+            if ship and not city:
+                city = text
+            elif not ship and not city_g:
+                city_g = text
+    return {"city": city or city_g, "state": state or state_g, "zip": zipc or zip_g}
+
+
 def build_overview_payload():
     """
     Returns upcoming + overdue job data from Google Sheets Production Orders
@@ -13591,9 +13620,9 @@ def build_overview_payload():
             "Due Date": r.get("Due Date"),  # Changed from "Due" to "Due Date"
             "Ship Date": r.get("Ship Date"),  # Changed from "Ship" to "Ship Date"
             "Shipping Method": _overview_shipping_method(r),
-            "Shipping City": r.get("Shipping City") or r.get("Ship To City") or r.get("Order Ship City"),
-            "Shipping State": r.get("Shipping State") or r.get("Ship To State") or r.get("Order Ship State"),
-            "Shipping Zip": r.get("Shipping Zip") or r.get("Ship To Zip") or r.get("Order Ship ZIP") or r.get("Order Ship Zip"),
+            "Shipping City": _overview_ship_address(r)["city"],
+            "Shipping State": _overview_ship_address(r)["state"],
+            "Shipping Zip": _overview_ship_address(r)["zip"],
             "Hard Date/Soft Date": r.get("Hard Date/Soft Date"),
             "Hard/Soft": r.get("Hard Date/Soft Date"),  # Keep both for compatibility
             # Image fields - try multiple possible field names

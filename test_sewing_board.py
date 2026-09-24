@@ -389,6 +389,16 @@ class SewingBoardTests(unittest.TestCase):
         self.assertEqual(merged["dueDate"], "2026-09-25")
         self.assertEqual(merged["requiredShipDate"], "2026-09-25")
 
+    def test_ups_ground_georgia_is_one_transit_day_plus_buffer(self):
+        values = [
+            ["Order #", "Company Name", "Product", "Quantity", "Due Date", "Shipping Method", "Order Ship State", "Stage"],
+            ["132", "River Club", "Driver", "12", "09/25/2026", "UPS Ground", "Georgia", "SEWING"],
+        ]
+        live = sb.sheet_rows_to_dicts(values)
+        merged = sb.merge_live_orders({}, live, progress={}, drop_missing=True)["132"]
+        self.assertEqual(merged["dueDate"], "2026-09-25")
+        self.assertEqual(merged["requiredShipDate"], "2026-09-23")
+
     def test_missing_shipping_method_does_not_invent_ground_ship_date(self):
         jobs = {}
         live = [{
