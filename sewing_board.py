@@ -284,7 +284,21 @@ def catalog_jobs(
             "shippingMethod": _text(order.get("shipping_method") or sew.get("shippingMethod")),
             "shipCity": _text((order.get("shipping_address") or {}).get("city") or sew.get("shipCity")),
             "shipState": _text((order.get("shipping_address") or {}).get("state") or sew.get("shipState")),
-            "hardDate": "HARD" in _text(order.get("due_type") or ("Hard Date" if sew.get("hardDate") else "")).upper(),
+            "due_type": _text(
+                order.get("due_type")
+                or order.get("dueType")
+                or order.get("Hard Date/Soft Date")
+                or sew.get("due_type")
+                or sew.get("dueType")
+            ),
+            "hardDate": "HARD" in _text(
+                order.get("due_type")
+                or order.get("dueType")
+                or order.get("Hard Date/Soft Date")
+                or sew.get("due_type")
+                or sew.get("dueType")
+                or ("Hard Date" if sew.get("hardDate") else "")
+            ).upper(),
             "embroideryReady": ready,
             "embroideryRemaining": max(0, emb_remaining),
             "embroideryCompletedQty": completed,

@@ -132,6 +132,22 @@ class SewingBoardTests(unittest.TestCase):
         self.assertEqual(list(jobs), ["3"])
         self.assertTrue(jobs["3"]["hardDate"])
 
+    def test_catalog_reads_sheet_hard_date_column(self):
+        schedule = {
+            "orders": [
+                {
+                    "order_number": "7",
+                    "product": "Driver",
+                    "remaining_quantity": 4,
+                    "customer": "G",
+                    "Hard Date/Soft Date": "Hard Date",
+                },
+            ]
+        }
+        jobs = sb.catalog_jobs(schedule, progress={})
+        self.assertTrue(jobs["7"]["hardDate"])
+        self.assertIn("HARD", jobs["7"]["due_type"].upper())
+
     def test_queue_return_clears_overdue(self):
         board = {
             "queue": ["100"],
