@@ -13433,6 +13433,10 @@ def build_overview_payload():
             "Stage": r.get("Stage"),
             "Due Date": r.get("Due Date"),  # Changed from "Due" to "Due Date"
             "Ship Date": r.get("Ship Date"),  # Changed from "Ship" to "Ship Date"
+            "Shipping Method": r.get("Shipping Method") or r.get("Ship Via") or r.get("Shipping Type"),
+            "Shipping City": r.get("Shipping City") or r.get("Ship To City") or r.get("Order Ship City"),
+            "Shipping State": r.get("Shipping State") or r.get("Ship To State") or r.get("Order Ship State"),
+            "Shipping Zip": r.get("Shipping Zip") or r.get("Ship To Zip") or r.get("Order Ship ZIP") or r.get("Order Ship Zip"),
             "Hard Date/Soft Date": r.get("Hard Date/Soft Date"),
             "Hard/Soft": r.get("Hard Date/Soft Date"),  # Keep both for compatibility
             # Image fields - try multiple possible field names

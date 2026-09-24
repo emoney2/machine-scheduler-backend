@@ -16,6 +16,9 @@ from production_scheduler import (
     is_towel_or_needlepoint,
     iso_day,
     parse_date,
+    planning_transit_days,
+    required_ship_date_for_row,
+    shipping_method_from_row,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,6 +83,11 @@ def _int(value: Any, default: int = 0) -> int:
 def _date_iso(value: Any) -> str:
     parsed = parse_date(value)
     return iso_day(parsed) if parsed else _text(value)[:10]
+
+
+def _calculated_ship_date(row: Optional[dict]) -> Any:
+    """Due date minus transit for the job's ship method — not the sheet WORKDAY(-5)."""
+    return required_ship_date_for_row(row)
 
 
 def _drive_id(value: Any) -> str:
@@ -310,12 +318,22 @@ def live_row_as_order(row: dict, sewing_finished: Optional[Dict[str, float]] = N
         "stage": _text(row.get("Stage") or row.get("stage") or row.get("status")),
         "status": _text(row.get("Stage") or row.get("stage") or row.get("status")),
         "due_date": row.get("Due Date") or row.get("dueDate") or row.get("due_date"),
-        "required_ship_date": (
-            row.get("Ship Date")
-            or row.get("requiredShipDate")
-            or row.get("required_ship_date")
-            or row.get("_required_ship_date")
+        "shipping_method": shipping_method_from_row(row),
+        "ship_city": _text(
+            row.get("Order Ship City") or row.get("Shipping City") or row.get("Ship To City") or row.get("shipCity")
         ),
+        "ship_state": _text(
+            row.get("Order Ship State") or row.get("Shipping State") or row.get("Ship To State") or row.get("shipState")
+        ),
+        "ship_zip": _text(
+            row.get("Order Ship ZIP")
+            or row.get("Order Ship Zip")
+            or row.get("Shipping Zip")
+            or row.get("Shipping Zip Code")
+            or row.get("Ship To Zip")
+            or row.get("zip")
+        ),
+        "required_ship_date": _calculated_ship_date(row),
         "due_type": _text(
             row.get("Hard Date/Soft Date")
             or row.get("Hard/Soft")
@@ -341,11 +359,31 @@ def overlay_job_from_live(job: dict, order: dict) -> dict:
     if order.get("remaining_quantity") is not None:
         next_job["remainingQuantity"] = order["remaining_quantity"]
     due = _date_iso(order.get("due_date"))
-    ship = _date_iso(order.get("required_ship_date"))
     if due:
         next_job["dueDate"] = due
+    if order.get("shipping_method"):
+        next_job["shippingMethod"] = order["shipping_method"]
+    if order.get("ship_city"):
+        next_job["shipCity"] = order["ship_city"]
+    if order.get("ship_state"):
+        next_job["shipState"] = order["ship_state"]
+    if order.get("ship_zip"):
+        next_job["shipZip"] = order["ship_zip"]
+    ship = _date_iso(_calculated_ship_date({
+        "Due Date": due or next_job.get("dueDate"),
+        "Shipping Method": next_job.get("shippingMethod") or order.get("shipping_method"),
+        "Shipping City": next_job.get("shipCity") or order.get("ship_city"),
+        "Shipping State": next_job.get("shipState") or order.get("ship_state"),
+        "Shipping Zip": next_job.get("shipZip") or order.get("ship_zip"),
+    }) or order.get("required_ship_date"))
     if ship:
         next_job["requiredShipDate"] = ship
+        next_job["transitBusinessDays"] = planning_transit_days({
+            "Shipping Method": next_job.get("shippingMethod"),
+            "Shipping City": next_job.get("shipCity"),
+            "Shipping State": next_job.get("shipState"),
+            "Shipping Zip": next_job.get("shipZip"),
+        })
     if order.get("due_type"):
         next_job["due_type"] = order["due_type"]
         next_job["hardDate"] = "HARD" in str(order["due_type"]).upper()

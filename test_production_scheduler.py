@@ -17,7 +17,10 @@ from production_scheduler import (
     normalize_orders,
     parse_date,
     parse_sewers,
+    planning_transit_days,
+    required_ship_date_for_row,
     resolve_required_ship_date,
+    shipping_method_from_row,
 )
 from schedule_store import (
     SHEET_CELL_LIMIT,
@@ -143,6 +146,29 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(str(nearby), "2026-09-25")
         self.assertEqual(str(week), "2026-09-22")
         self.assertGreater(nearby, week)
+
+    def test_required_ship_date_for_row_uses_method_and_destination(self):
+        due = date(2026, 10, 5)
+        self.assertEqual(shipping_method_from_row({"Shipping Method": "local"}), "Local Delivery")
+        self.assertEqual(planning_transit_days({"Shipping Method": "Local Delivery"}), 1)
+        self.assertEqual(planning_transit_days({"Shipping Method": "UPS Ground", "Shipping State": "CA"}), 5)
+        self.assertEqual(
+            str(required_ship_date_for_row({"Due Date": due, "Shipping Method": "Local Delivery"})),
+            "2026-10-02",
+        )
+        self.assertEqual(
+            str(required_ship_date_for_row({
+                "Due Date": due,
+                "Shipping Method": "UPS Ground",
+                "Shipping City": "Carlsbad",
+                "Shipping State": "CA",
+            })),
+            "2026-09-25",
+        )
+        self.assertEqual(
+            str(required_ship_date_for_row({"Due Date": due, "Shipping Method": "Next Day Air"})),
+            "2026-10-01",
+        )
 
     def test_actual_transit_overrides_conservative_sheet_ship_date(self):
         result = build_schedule(

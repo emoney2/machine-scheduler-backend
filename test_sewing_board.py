@@ -236,6 +236,7 @@ class SewingBoardTests(unittest.TestCase):
             "Product": "Driver",
             "Quantity": 65,
             "Due Date": "10/05/2026",
+            "Shipping Method": "Local Delivery",
             "Ship Date": 46296,
             "Hard Date/Soft Date": "Hard Date",
             "Stage": "SEWING",
@@ -244,7 +245,8 @@ class SewingBoardTests(unittest.TestCase):
         self.assertEqual(merged["3"]["customer"], "New Co")
         self.assertEqual(merged["3"]["quantity"], 65)
         self.assertEqual(merged["3"]["dueDate"], "2026-10-05")
-        self.assertEqual(merged["3"]["requiredShipDate"], "2026-10-01")
+        self.assertEqual(merged["3"]["requiredShipDate"], "2026-10-02")
+        self.assertEqual(merged["3"]["shippingMethod"], "Local Delivery")
         self.assertTrue(merged["3"]["hardDate"])
         self.assertTrue(merged["3"]["embroideryReady"])
         self.assertEqual(merged["3"]["stage"], "SEWING")
@@ -272,6 +274,48 @@ class SewingBoardTests(unittest.TestCase):
         self.assertEqual(merged["9"]["customer"], "Fresh")
         self.assertEqual(merged["9"]["remainingQuantity"], 12)
         self.assertTrue(merged["9"]["embroideryReady"])
+
+    def test_live_ship_date_uses_method_and_travel_days(self):
+        jobs = {}
+        local = [{
+            "Order #": "10",
+            "Company Name": "River Club",
+            "Product": "Driver",
+            "Quantity": 12,
+            "Due Date": "10/05/2026",
+            "Shipping Method": "Local Delivery",
+            "Ship Date": "09/28/2026",
+            "Stage": "SEWING",
+        }]
+        west = [{
+            "Order #": "11",
+            "Company Name": "TaylorMade",
+            "Product": "Mallet",
+            "Quantity": 65,
+            "Due Date": "10/05/2026",
+            "Shipping Method": "UPS Ground",
+            "Shipping City": "Carlsbad",
+            "Shipping State": "CA",
+            "Ship Date": "09/28/2026",
+            "Stage": "SEWING",
+        }]
+        air = [{
+            "Order #": "12",
+            "Company Name": "Club",
+            "Product": "Fairway",
+            "Quantity": 12,
+            "Due Date": "10/05/2026",
+            "Shipping Method": "Next Day Air",
+            "Ship Date": "09/28/2026",
+            "Stage": "SEWING",
+        }]
+        local_job = sb.merge_live_orders(jobs, local, progress={}, drop_missing=True)["10"]
+        west_job = sb.merge_live_orders(jobs, west, progress={}, drop_missing=True)["11"]
+        air_job = sb.merge_live_orders(jobs, air, progress={}, drop_missing=True)["12"]
+        self.assertEqual(local_job["requiredShipDate"], "2026-10-02")
+        self.assertEqual(west_job["requiredShipDate"], "2026-09-25")
+        self.assertEqual(air_job["requiredShipDate"], "2026-10-01")
+        self.assertNotEqual(west_job["requiredShipDate"], "2026-09-28")
 
     def test_seed_skipped_when_reset_token_set(self):
         jobs = dict([job("100")])

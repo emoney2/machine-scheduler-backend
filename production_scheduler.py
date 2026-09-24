@@ -209,6 +209,99 @@ def resolve_required_ship_date(
     return fallback_ship or due
 
 
+SERVICE_CODES = {
+    "NEXT DAY AIR EARLY": "14",
+    "NEXT DAY AIR SAVER": "13",
+    "NEXT DAY AIR": "01",
+    "2ND DAY AIR": "02",
+    "SECOND DAY AIR": "02",
+    "3 DAY SELECT": "12",
+    "UPS GROUND": "03",
+    "GROUND": "03",
+}
+
+
+def shipping_method_from_row(row: Optional[dict] = None) -> str:
+    raw = _text(
+        (row or {}).get("_shipping_method")
+        or (row or {}).get("Shipping Method")
+        or (row or {}).get("Shipping Type")
+        or (row or {}).get("Shipping Service")
+        or (row or {}).get("Ship Via")
+        or (row or {}).get("UPS Service")
+        or (row or {}).get("shippingMethod")
+        or (row or {}).get("shipping_method")
+    )
+    if is_local_delivery(raw):
+        return "Local Delivery"
+    return raw or "UPS Ground"
+
+
+def service_code_for_method(method: Any) -> str:
+    raw = _text(method).upper()
+    if is_local_delivery(raw):
+        return "03"
+    for label, code in sorted(SERVICE_CODES.items(), key=lambda kv: -len(kv[0])):
+        if label in raw:
+            return code
+    return "03"
+
+
+def ship_address_from_row(row: Optional[dict] = None) -> dict:
+    row = row if isinstance(row, dict) else {}
+    nested = row.get("_shipping_address") if isinstance(row.get("_shipping_address"), dict) else {}
+
+    def first(*keys: str) -> str:
+        for key in keys:
+            val = _text(row.get(key) or nested.get(key))
+            if val:
+                return val
+        return ""
+
+    return {
+        "zip": first(
+            "Order Ship ZIP", "Order Ship Zip", "Shipping Zip", "Shipping Zip Code",
+            "Ship To Zip", "Ship To ZIP", "zip",
+        ),
+        "state": first("Order Ship State", "Shipping State", "Ship To State", "state", "shipState"),
+        "city": first("Order Ship City", "Shipping City", "Ship To City", "city", "shipCity"),
+    }
+
+
+def planning_transit_days(
+    row: Optional[dict] = None,
+    *,
+    shipping_method: Any = "",
+    zip_code: Any = "",
+    state: Any = "",
+    city: Any = "",
+) -> int:
+    """Transit days from ship method + destination. No live UPS call."""
+    method = shipping_method or shipping_method_from_row(row)
+    if is_local_delivery(method):
+        return LOCAL_DELIVERY_TRANSIT_DAYS
+    addr = ship_address_from_row(row)
+    return transit_days_for_service(
+        service_code_for_method(method),
+        zip_code or addr.get("zip"),
+        state or addr.get("state"),
+        city or addr.get("city"),
+    )
+
+
+def required_ship_date_for_row(
+    row: Optional[dict] = None,
+    due: Optional[date] = None,
+    holidays: Iterable[date] = (),
+) -> Optional[date]:
+    """Ship date from due date, shipping method, and destination travel days."""
+    row = row if isinstance(row, dict) else {}
+    due = due or parse_date(row.get("Due Date") or row.get("due_date") or row.get("dueDate"))
+    method = shipping_method_from_row(row)
+    transit = planning_transit_days(row, shipping_method=method)
+    return resolve_required_ship_date(due, transit, holidays, shipping_method=method)
+
+
 def embroidery_heads(machine: Any) -> int:
     name = _text(machine)
     if name in {"Machine 1", "Single Head", "Single Head Machine"}:
