@@ -164,6 +164,7 @@ from ups_service import (
 )
 import ship_qbo_file_log as sqlog
 import packing_history as packhist
+import label_archive as lblarch
 import sewing_priority_waiting as sew_waiting
 import embroidery_progress as emb_progress
 from wilcom_dispatch import MACHINE_IDS as WILCOM_MACHINE_IDS
@@ -7135,20 +7136,16 @@ def _get_packing_slip_print_drive_folder_id(drive):
     return fid
 
 
-def _get_label_print_drive_folder_id(drive):
-    """
-    Drive folder where UPS label files are uploaded (works on Render; mirrors packing-slip flow).
-
-    - If UPS_LABEL_PRINT_FOLDER_ID is set, use that folder id (from Drive URL).
-    - Else find or create UPS_LABEL_PRINT_FOLDER_NAME (default Label Printer) under My Drive root.
-    With Google Drive for desktop, that folder often syncs to G:\\My Drive\\Label Printer.
-    """
-    explicit = (os.environ.get("UPS_LABEL_PRINT_FOLDER_ID") or "").strip()
+def _get_named_drive_folder_id(
+    drive, *, folder_id_env: str, folder_name_env: str, default_name: str
+):
+    """Find or create a My Drive folder. Explicit folder id env wins."""
+    explicit = (os.environ.get(folder_id_env) or "").strip()
     if explicit:
         return explicit
-    folder_name = (os.environ.get("UPS_LABEL_PRINT_FOLDER_NAME") or "Label Printer").strip()
+    folder_name = (os.environ.get(folder_name_env) or default_name).strip()
     if not folder_name:
-        folder_name = "Label Printer"
+        folder_name = default_name
     safe_name = folder_name.replace("'", "\\'")
     list_kw = dict(
         fields="files(id,name)",
@@ -7178,17 +7175,18 @@ def _get_label_print_drive_folder_id(drive):
     files2 = res2.get("files", []) or []
     if len(files2) == 1:
         logging.info(
-            "UPS label folder: using sole %r match id=%s (not under Drive root)",
+            "Drive folder: using sole %r match id=%s (not under Drive root)",
             folder_name,
             files2[0]["id"],
         )
         return files2[0]["id"]
     if len(files2) > 1:
         logging.warning(
-            "Multiple %r folders in Drive (%s…); set UPS_LABEL_PRINT_FOLDER_ID to the "
-            "folder Google Drive Desktop syncs. Using first id=%s",
+            "Multiple %r folders in Drive (%s…); set %s to the folder Google Drive "
+            "Desktop syncs. Using first id=%s",
             folder_name,
             ", ".join(f["id"] for f in files2[:5]),
+            folder_id_env,
             files2[0]["id"],
         )
         return files2[0]["id"]
@@ -7198,18 +7196,179 @@ def _get_label_print_drive_folder_id(drive):
     ).execute()
     fid = created["id"]
     logging.info(
-        "Created UPS label print folder %r in My Drive (sync locally e.g. G:\\\\My Drive\\\\%s): %s",
-        folder_name,
+        "Created Drive folder %r in My Drive (id=%s)",
         folder_name,
         fid,
     )
     return fid
 
 
+def _get_label_print_drive_folder_id(drive):
+    """
+    Drive folder where UPS label files are uploaded for the shop printer.
+
+    - If UPS_LABEL_PRINT_FOLDER_ID is set, use that folder id (from Drive URL).
+    - Else find or create UPS_LABEL_PRINT_FOLDER_NAME (default Label Printer) under My Drive root.
+    With Google Drive for desktop, that folder often syncs to G:\\My Drive\\Label Printer.
+    """
+    return _get_named_drive_folder_id(
+        drive,
+        folder_id_env="UPS_LABEL_PRINT_FOLDER_ID",
+        folder_name_env="UPS_LABEL_PRINT_FOLDER_NAME",
+        default_name="Label Printer",
+    )
+
+
+def _get_label_archive_drive_folder_id(drive):
+    """
+    Durable reprint copies. Separate from Label Printer so the watcher does not delete them.
+    Override with UPS_LABEL_ARCHIVE_FOLDER_ID or UPS_LABEL_ARCHIVE_FOLDER_NAME.
+    """
+    return _get_named_drive_folder_id(
+        drive,
+        folder_id_env="UPS_LABEL_ARCHIVE_FOLDER_ID",
+        folder_name_env="UPS_LABEL_ARCHIVE_FOLDER_NAME",
+        default_name=lblarch.archive_folder_name(),
+    )
+
+
+def _ups_label_mime_for_ext(ext: str) -> str:
+    e = (ext or "").lower().lstrip(".")
+    if e == "pdf":
+        return "application/pdf"
+    if e == "png":
+        return "image/png"
+    if e in ("jpg", "jpeg"):
+        return "image/jpeg"
+    return "application/octet-stream"
+
+
+def _drive_query_escape_name(name: str) -> str:
+    """Escape a file name for use inside a Drive API q= string literal."""
+    return (name or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _download_drive_file_bytes(drive, file_id: str):
+    request_drive = drive.files().get_media(fileId=file_id)
+    buf = BytesIO()
+    downloader = MediaIoBaseDownload(buf, request_drive)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+
+def _find_drive_file_in_folder(drive, parent_id: str, fname: str):
+    q = (
+        f"name = '{_drive_query_escape_name(fname)}' and "
+        f"'{parent_id}' in parents and trashed = false"
+    )
+    res = drive.files().list(
+        q=q,
+        fields="files(id,name)",
+        pageSize=5,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    files = res.get("files") or []
+    return files[0] if files else None
+
+
+def _upsert_drive_file_bytes(drive, parent_id: str, fname: str, body: bytes, mime: str):
+    existing = _find_drive_file_in_folder(drive, parent_id, fname)
+    buf = BytesIO(body)
+    buf.seek(0)
+    media = MediaIoBaseUpload(buf, mimetype=mime, resumable=False)
+    if existing:
+        drive.files().update(
+            fileId=existing["id"],
+            media_body=media,
+            fields="id,name",
+            supportsAllDrives=True,
+        ).execute()
+        return existing["id"]
+    created = drive.files().create(
+        body={"name": fname, "parents": [parent_id]},
+        media_body=media,
+        fields="id,name",
+        supportsAllDrives=True,
+    ).execute()
+    return created.get("id")
+
+
+def _list_drive_folder_files(drive, parent_id: str):
+    files = []
+    page_token = None
+    while True:
+        res = drive.files().list(
+            q=f"'{parent_id}' in parents and trashed = false",
+            fields="nextPageToken, files(id,name,createdTime,modifiedTime)",
+            pageSize=100,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files.extend(res.get("files") or [])
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+def _prune_label_archive(drive, parent_id: str) -> int:
+    """Trash archive files outside the revolving window. Returns how many were trashed."""
+    try:
+        files = _list_drive_folder_files(drive, parent_id)
+        trash_ids = lblarch.files_to_trash(files)
+        for fid in trash_ids:
+            try:
+                drive.files().update(
+                    fileId=fid,
+                    body={"trashed": True},
+                    supportsAllDrives=True,
+                ).execute()
+            except Exception as e:
+                logging.warning("label archive: could not trash %s: %s", fid, e)
+        if trash_ids:
+            logging.info(
+                "label archive: trashed %s file(s) (keep %s days / max %s)",
+                len(trash_ids),
+                lblarch.archive_days(),
+                lblarch.archive_max(),
+            )
+        return len(trash_ids)
+    except Exception as e:
+        logging.warning("label archive prune failed: %s", e)
+        return 0
+
+
+def _touch_drive_file(drive, file_id: str) -> None:
+    if not file_id:
+        return
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    try:
+        drive.files().update(
+            fileId=file_id,
+            body={"modifiedTime": now},
+            fields="id",
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as e:
+        logging.warning("label archive: could not touch %s: %s", file_id, e)
+
+
+def _archive_label_bytes(drive, fname: str, body: bytes, mime: str) -> str:
+    parent_id = _get_label_archive_drive_folder_id(drive)
+    fid = _upsert_drive_file_bytes(drive, parent_id, fname, body, mime)
+    logging.info("UPS label archived to Drive: %s", fname)
+    _prune_label_archive(drive, parent_id)
+    return fid or ""
+
+
 def _upload_ups_labels_to_drive_folder(label_relative_urls) -> bool:
     """
-    Upload each label file from the temp dir into the Drive label folder.
-    Returns True only if every list entry had a temp file and every upload succeeded.
+    Upload each label file from the temp dir into the Drive print folder and archive.
+    Returns True only if every list entry had a temp file and every print upload succeeded.
     """
     if not label_relative_urls:
         return False
@@ -7227,90 +7386,59 @@ def _upload_ups_labels_to_drive_folder(label_relative_urls) -> bool:
             all_ok = False
             continue
         ext = (os.path.splitext(fname)[1] or ".pdf").lower()
-        if ext == ".pdf":
-            mime = "application/pdf"
-        elif ext == ".png":
-            mime = "image/png"
-        elif ext in (".jpg", ".jpeg"):
-            mime = "image/jpeg"
-        else:
-            mime = "application/octet-stream"
+        mime = _ups_label_mime_for_ext(ext)
         try:
             with open(fpath, "rb") as f:
                 body = f.read()
-            buf = BytesIO(body)
-            buf.seek(0)
-            media = MediaIoBaseUpload(buf, mimetype=mime, resumable=False)
-            drive.files().create(
-                body={"name": fname, "parents": [parent_id]},
-                media_body=media,
-                fields="id,name",
-                supportsAllDrives=True,
-            ).execute()
-            logging.info("UPS label uploaded to Drive: %s", fname)
+            _upsert_drive_file_bytes(drive, parent_id, fname, body, mime)
+            logging.info("UPS label uploaded to Drive print folder: %s", fname)
         except Exception as e:
             logging.warning("UPS label Drive upload failed for %s: %s", fname, e)
             all_ok = False
+            continue
+        try:
+            _archive_label_bytes(drive, fname, body, mime)
+        except Exception as e:
+            logging.warning("UPS label archive upload failed for %s: %s", fname, e)
     return all_ok
-
-
-def _drive_query_escape_name(name: str) -> str:
-    """Escape a file name for use inside a Drive API q= string literal."""
-    return (name or "").replace("\\", "\\\\").replace("'", "\\'")
 
 
 def _fetch_ups_label_bytes_for_tracking(tracking: str):
     """
-    Locate label bytes for a UPS tracking number: temp dir first, then Drive Label Printer folder.
-    Returns (body: bytes|None, ext: str, source: str) where ext is pdf|png|zpl and source is temp|drive|''.
+    Locate label bytes: temp, then Drive Label Archive, then Label Printer folder.
+    Returns (body, ext, source, archive_file_id).
     """
     t = str(tracking or "").strip()
     if not t:
-        return None, "", ""
+        return None, "", "", ""
     base = re.sub(r"[^\w.\-]+", "_", t)[:120]
     if not base:
-        return None, "", ""
+        return None, "", "", ""
     for ext in ("pdf", "png", "zpl"):
         fname = f"ups_{base}.{ext}"
         fpath = os.path.join(tempfile.gettempdir(), fname)
         if os.path.isfile(fpath):
             try:
                 with open(fpath, "rb") as lf:
-                    return lf.read(), ext, "temp"
+                    return lf.read(), ext, "temp", ""
             except OSError as e:
                 logging.warning("reprint: could not read temp label %s: %s", fpath, e)
     try:
         drive = get_drive_service()
-        parent_id = _get_label_print_drive_folder_id(drive)
-        list_kw = dict(
-            fields="files(id,name)",
-            pageSize=10,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-        for ext in ("pdf", "png", "zpl"):
-            fname = f"ups_{base}.{ext}"
-            q = (
-                f"name = '{_drive_query_escape_name(fname)}' and "
-                f"'{parent_id}' in parents and trashed = false"
-            )
-            res = drive.files().list(q=q, **list_kw).execute()
-            files = res.get("files") or []
-            if not files:
-                continue
-            fid = files[0]["id"]
-            request_drive = drive.files().get_media(fileId=fid)
-            buf = BytesIO()
-            downloader = MediaIoBaseDownload(buf, request_drive)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-            data = buf.getvalue()
-            if data:
-                return data, ext, "drive"
+        archive_id = _get_label_archive_drive_folder_id(drive)
+        print_id = _get_label_print_drive_folder_id(drive)
+        for parent_id, source in ((archive_id, "archive"), (print_id, "drive")):
+            for ext in ("pdf", "png", "zpl"):
+                fname = f"ups_{base}.{ext}"
+                found = _find_drive_file_in_folder(drive, parent_id, fname)
+                if not found:
+                    continue
+                data = _download_drive_file_bytes(drive, found["id"])
+                if data:
+                    return data, ext, source, (found["id"] if source == "archive" else "")
     except Exception as e:
         logging.warning("reprint: Drive lookup failed for tracking=%s: %s", t, e)
-    return None, "", ""
+    return None, "", "", ""
 
 
 def _packing_slip_local_sync_dir() -> str:
@@ -24540,7 +24668,7 @@ def process_shipment():
 def reprint_label():
     """
     Re-save a UPS label to the Label Printer folder (Google Drive + local sync when configured).
-    Body JSON: { "tracking": "1Z..." }. Label bytes are read from server temp or from the Drive label folder.
+    Body JSON: { "tracking": "1Z..." }. Label bytes come from temp, Drive Label Archive, or Label Printer.
     """
     if request.method == "OPTIONS":
         resp = make_response("", 204)
@@ -24553,15 +24681,17 @@ def reprint_label():
         return resp
     data = request.get_json() or {}
     tracking = str(data.get("tracking") or "").strip()
-    body, ext, src = _fetch_ups_label_bytes_for_tracking(tracking)
+    body, ext, src, archive_file_id = _fetch_ups_label_bytes_for_tracking(tracking)
     if not body or not ext:
+        days = lblarch.archive_days()
         resp = jsonify(
             {
                 "success": False,
                 "error": (
                     "Label not found for that tracking number. "
-                    "It may still be on this server’s temp disk, or in Drive as ups_<tracking>.pdf "
-                    "under your Label Printer folder."
+                    f"New shipments keep a copy in Google Drive “{lblarch.archive_folder_name()}” "
+                    f"for {days} day(s). Older labels are gone after that window, unless the file "
+                    "is still in Label Printer or on this server’s temp disk."
                 ),
             }
         )
@@ -24606,6 +24736,15 @@ def reprint_label():
         logging.warning("reprint: Drive upload failed: %s", e)
 
     local_ok = bool(_save_trimmed_label_to_printer_folder(tmp_reprint, out_fname))
+    try:
+        drive_arch = get_drive_service()
+        if archive_file_id:
+            _touch_drive_file(drive_arch, archive_file_id)
+        else:
+            archive_name = f"ups_{base}.{ext}"
+            _archive_label_bytes(drive_arch, archive_name, body, mime)
+    except Exception as e:
+        logging.warning("reprint: could not refresh label archive: %s", e)
     try:
         sqlog.log_ship(
             "reprint_label",
@@ -24709,7 +24848,16 @@ def shipping_history():
         limit = 400
     limit = max(1, min(limit, 1000))
     rows = packhist.flatten_shipping_rows(history)[:limit]
-    resp = jsonify({"success": True, "count": len(rows), "rows": rows})
+    resp = jsonify(
+        {
+            "success": True,
+            "count": len(rows),
+            "rows": rows,
+            "label_archive_days": lblarch.archive_days(),
+            "label_archive_max": lblarch.archive_max(),
+            "label_archive_folder": lblarch.archive_folder_name(),
+        }
+    )
     resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
     resp.headers["Access-Control-Allow-Credentials"] = "true"
     return resp
