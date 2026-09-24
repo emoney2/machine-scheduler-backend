@@ -50,37 +50,14 @@ def create_schedule_blueprint(
     live_orders_cache = {"at": 0.0, "data": None}
 
     def load_live_orders():
+        """Same Production Orders snapshot as /api/changes and /combined."""
         now = time.time()
-        if live_orders_cache["data"] is not None and now - live_orders_cache["at"] < 120:
+        if live_orders_cache["data"] is not None and now - live_orders_cache["at"] < 15:
             return live_orders_cache["data"]
-        import os
-        import sewing_board
-        from production_scheduler import production_orders_values_range, shipping_method_from_row
-        range_name = production_orders_values_range(
-            os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE", "")
-        )
         try:
-            rows = (
-                values_service.get(
-                    spreadsheetId=spreadsheet_id,
-                    range=range_name,
-                )
-                .execute()
-                .get("values")
-                or []
-            )
-            live = sewing_board.sheet_rows_to_dicts(rows)
-            headers = list((rows[0] if rows else []) or [])
-            has_method_col = any(
-                shipping_method_from_row({str(h): "local"}, default="") == "Local Delivery"
-                for h in headers
-            )
-            logger.info(
-                "Sewing board Production Orders range=%s columns=%s has_shipping_method_column=%s",
-                range_name,
-                len(headers),
-                has_method_col,
-            )
+            import server as srv
+            rows, _ = srv._orders_rows_snapshot()
+            live = list(rows or [])
             live_orders_cache["at"] = now
             live_orders_cache["data"] = live
             return live

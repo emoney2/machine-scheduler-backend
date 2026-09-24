@@ -1804,9 +1804,13 @@ def _orders_list_for_changes():
     We read many columns so we get fields like Order #, Due Date, Stage, etc.
     Uses fetch_sheet for retry on SSL/transport errors.
     """
+    from production_scheduler import production_orders_values_range
+    range_name = production_orders_values_range(
+        os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE") or ORDERS_RANGE
+    )
     rows = fetch_sheet(
         SPREADSHEET_ID,
-        ORDERS_RANGE,
+        range_name,
         value_render_option="FORMATTED_VALUE",
     )
     return _rows_to_dicts(rows)
@@ -1821,6 +1825,10 @@ _HASH_FIELDS = [
     "Product",
     "Stage",
     "Due Date",
+    "Ship Date",
+    "Shipping Method",
+    "Order Ship State",
+    "Order Ship ZIP",
     "Hard Date/Soft Date",
     "Embroidery Start Time",
     "Stitch Count",
