@@ -247,13 +247,19 @@ def catalog_jobs(
         completed = max(0, _int(prow.get("completedQty")))
         if qty > 0:
             completed = min(qty, completed)
-        if emb_remaining <= 0 and completed <= 0 and _text(order.get("embroidery_status")).upper() == "COMPLETE":
+        emb_status = _text(order.get("embroidery_status") or sew.get("embroideryStatus")).upper()
+        status_complete = emb_status in {"COMPLETE", "COMPLETED"}
+        if emb_remaining <= 0 and completed <= 0 and status_complete:
             completed = qty
             emb_remaining = 0
         if emb_remaining <= 0 and completed > 0:
             emb_remaining = max(0, qty - completed)
-        ready = emb_remaining <= 0 or _text(order.get("embroidery_status")).upper() == "COMPLETE"
-        if sew.get("embroideryReady") is True and emb_remaining <= 0:
+        ready = (
+            status_complete
+            or (qty > 0 and completed >= qty)
+            or (completed > 0 and emb_remaining <= 0)
+        )
+        if sew.get("embroideryReady") is True and (completed > 0 or status_complete):
             ready = True
         percent = 100 if ready and qty else (round(100.0 * completed / qty, 1) if qty else 0)
         timing = compute_timing(prow, stitch, heads)

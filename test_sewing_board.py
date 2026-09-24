@@ -131,6 +131,21 @@ class SewingBoardTests(unittest.TestCase):
         jobs = sb.catalog_jobs(schedule, progress={})
         self.assertEqual(list(jobs), ["3"])
         self.assertTrue(jobs["3"]["hardDate"])
+        self.assertFalse(jobs["3"]["embroideryReady"])
+        self.assertEqual(jobs["3"]["embroideryCompletedQty"], 0)
+
+    def test_catalog_embroidery_ready_only_after_progress(self):
+        schedule = {
+            "orders": [
+                {"order_number": "8", "product": "Driver", "remaining_quantity": 4, "quantity": 4, "customer": "H"},
+                {"order_number": "9", "product": "Driver", "remaining_quantity": 4, "quantity": 4, "customer": "I", "embroidery_status": "COMPLETE"},
+            ]
+        }
+        jobs = sb.catalog_jobs(schedule, progress={"8": {"completedQty": 2}})
+        self.assertFalse(jobs["8"]["embroideryReady"])
+        self.assertEqual(jobs["8"]["embroideryPercent"], 50.0)
+        self.assertTrue(jobs["9"]["embroideryReady"])
+        self.assertEqual(jobs["9"]["embroideryPercent"], 100)
 
     def test_catalog_reads_sheet_hard_date_column(self):
         schedule = {
