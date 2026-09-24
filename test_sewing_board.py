@@ -60,6 +60,9 @@ class SewingBoardTests(unittest.TestCase):
         self.assertNotIn("2026-09-23", next_board["days"])
         self.assertEqual([c["orderNumber"] for c in carryovers], ["100", "200"])
         self.assertEqual(next_board["lastRolloverDate"], "2026-09-24")
+        self.assertEqual(next_board["overdue"]["100"], "2026-09-23")
+        self.assertEqual(next_board["overdue"]["200"], "2026-09-23")
+        self.assertNotIn("300", next_board["overdue"])
 
     def test_finished_yesterday_does_not_roll(self):
         jobs = dict([job("100", remaining=0), job("200")])
@@ -128,6 +131,35 @@ class SewingBoardTests(unittest.TestCase):
         jobs = sb.catalog_jobs(schedule, progress={})
         self.assertEqual(list(jobs), ["3"])
         self.assertTrue(jobs["3"]["hardDate"])
+
+    def test_queue_return_clears_overdue(self):
+        board = {
+            "queue": ["100"],
+            "days": {"2026-09-24": ["200"]},
+            "overdue": {"100": "2026-09-23", "200": "2026-09-23"},
+            "lastRolloverDate": "2026-09-24",
+            "carryovers": [],
+        }
+        clean = sb.clear_queue_overdue(board)
+        self.assertNotIn("100", clean["overdue"])
+        self.assertEqual(clean["overdue"]["200"], "2026-09-23")
+
+    def test_reset_puts_every_job_in_queue(self):
+        jobs = dict([job("100"), job("200")])
+        now = datetime(2026, 9, 24, 8, 0, tzinfo=ET)
+        board = sb.board_reset_to_queue(jobs, now=now)
+        self.assertEqual(board["queue"], ["100", "200"])
+        self.assertEqual(board["days"], {})
+        self.assertEqual(board["overdue"], {})
+        self.assertEqual(board["resetToken"], sb.RESET_TOKEN)
+
+    def test_seed_skipped_when_reset_token_set(self):
+        jobs = dict([job("100")])
+        board = sb.empty_board()
+        board["resetToken"] = sb.RESET_TOKEN
+        schedule = {"sewing": [{"orderNumber": "100", "date": "2026-09-25"}]}
+        seeded = sb.seed_from_schedule(board, schedule, jobs)
+        self.assertEqual(seeded["days"], {})
 
 
 if __name__ == "__main__":

@@ -331,6 +331,8 @@ def create_schedule_blueprint(
         )
         emit("sewingBoardUpdated", {"updatedAt": board.get("updatedAt")})
         days = sewing_board.rolling_weekdays()
+        overdue = board.get("overdue") or {}
+        sewing_board.stamp_overdue(jobs, overdue)
         absences = {}
         try:
             absences = (service._settings() or {}).get("sewerAbsences") or {}
@@ -344,6 +346,39 @@ def create_schedule_blueprint(
             "board": board["days"],
             "jobs": jobs,
             "carryovers": board.get("carryovers") or [],
+            "overdue": overdue,
+            "updatedAt": board.get("updatedAt") or "",
+            "lastRolloverDate": board.get("lastRolloverDate") or "",
+            "absences": absences,
+        }), 200
+
+    @bp.post("/sewing-board/clear")
+    @login_required
+    def clear_sewing_board():
+        import sewing_board
+        schedule = None
+        cached = getattr(service, "cached_published", lambda: None)()
+        if cached and cached.get("schedule"):
+            schedule = cached["schedule"]
+        jobs = sewing_board.catalog_jobs(schedule, sewing_board.load_embroidery_progress())
+        board = sewing_board.reset_to_queue(jobs)
+        emit("sewingBoardUpdated", {"updatedAt": board.get("updatedAt")})
+        days = sewing_board.rolling_weekdays()
+        sewing_board.stamp_overdue(jobs, {})
+        absences = {}
+        try:
+            absences = (service._settings() or {}).get("sewerAbsences") or {}
+        except Exception:
+            logger.exception("Could not load sewer absences after sewing board clear")
+        return jsonify({
+            "ok": True,
+            "today": days[0] if days else sewing_board.today_iso(),
+            "days": days,
+            "queue": board["queue"],
+            "board": board["days"],
+            "jobs": jobs,
+            "carryovers": [],
+            "overdue": {},
             "updatedAt": board.get("updatedAt") or "",
             "lastRolloverDate": board.get("lastRolloverDate") or "",
             "absences": absences,

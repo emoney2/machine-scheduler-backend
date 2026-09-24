@@ -26,6 +26,7 @@ _BASE = Path(__file__).resolve().parent
 DATA_DIR = _BASE / "data"
 BOARD_PATH = DATA_DIR / "sewing_board.json"
 WEEKDAY_HORIZON = 10
+RESET_TOKEN = "scratch-2026-09-24"
 
 
 def _now_et(now: Optional[datetime] = None) -> datetime:
@@ -87,6 +88,8 @@ def empty_board() -> dict:
         "days": {},
         "lastRolloverDate": "",
         "carryovers": [],
+        "overdue": {},
+        "resetToken": "",
         "updatedAt": "",
     }
 
@@ -126,11 +129,19 @@ def _normalize_board(raw: Any) -> dict:
             "product": _text(row.get("product")),
             "rolledAt": _text(row.get("rolledAt")),
         })
+    overdue = {}
+    for key, value in (data.get("overdue") or {}).items():
+        oid = _norm_oid(key)
+        day = str(value or "")[:10]
+        if oid and day:
+            overdue[oid] = day
     return {
         "queue": _unique(data.get("queue") or []),
         "days": days,
         "lastRolloverDate": str(data.get("lastRolloverDate") or "")[:10],
         "carryovers": carryovers,
+        "overdue": overdue,
+        "resetToken": _text(data.get("resetToken")),
         "updatedAt": _text(data.get("updatedAt")),
     }
 
@@ -293,7 +304,7 @@ def catalog_jobs(
 def seed_from_schedule(board: dict, schedule: Optional[dict], jobs: Dict[str, dict]) -> dict:
     """First visit: place published sewing dates, then leftover work goes to the queue."""
     clean = _normalize_board(board)
-    if clean["queue"] or any(clean["days"].values()):
+    if clean.get("resetToken") == RESET_TOKEN or clean["queue"] or any(clean["days"].values()):
         return clean
     days: Dict[str, List[str]] = {}
     placed = set()
@@ -306,6 +317,24 @@ def seed_from_schedule(board: dict, schedule: Optional[dict], jobs: Dict[str, di
         placed.add(oid)
     clean["days"] = days
     return apply_catalog(clean, jobs)
+
+
+def clear_queue_overdue(board: dict) -> dict:
+    """Returning a job to the queue clears its missed-day overdue flag."""
+    clean = _normalize_board(board)
+    overdue = dict(clean.get("overdue") or {})
+    for oid in clean["queue"]:
+        overdue.pop(oid, None)
+    clean["overdue"] = overdue
+    return clean
+
+
+def stamp_overdue(jobs: Dict[str, dict], overdue: Optional[Dict[str, str]] = None) -> Dict[str, dict]:
+    marks = overdue or {}
+    for oid, job in jobs.items():
+        job["overdue"] = oid in marks
+        job["overdueFrom"] = marks.get(oid) or ""
+    return jobs
 
 
 def apply_catalog(board: dict, jobs: Dict[str, dict]) -> dict:
@@ -324,6 +353,7 @@ def apply_catalog(board: dict, jobs: Dict[str, dict]) -> dict:
         if oid not in placed:
             clean["queue"].append(oid)
     clean["carryovers"] = [row for row in clean["carryovers"] if row["orderNumber"] in live]
+    clean["overdue"] = {oid: day for oid, day in (clean.get("overdue") or {}).items() if oid in live}
     return clean
 
 
@@ -342,6 +372,7 @@ def rollover_unfinished(
     past_days = sorted(day for day in clean["days"] if day and day < today)
     rolled: List[str] = []
     carryovers: List[dict] = []
+    overdue = dict(clean.get("overdue") or {})
     rolled_at = _now_et(now).isoformat()
     for day in past_days:
         leftovers = []
@@ -358,6 +389,7 @@ def rollover_unfinished(
                 "product": job.get("product") or "",
                 "rolledAt": rolled_at,
             })
+            overdue[oid] = day
         if leftovers:
             rolled.extend(leftovers)
         clean["days"].pop(day, None)
@@ -369,7 +401,8 @@ def rollover_unfinished(
 
     clean["lastRolloverDate"] = today
     clean["carryovers"] = carryovers
-    return clean, carryovers
+    clean["overdue"] = overdue
+    return clear_queue_overdue(clean), carryovers
 
 
 def save_placements(queue: Sequence[Any], days: Dict[str, Sequence[Any]], jobs: Dict[str, dict]) -> dict:
@@ -382,7 +415,21 @@ def save_placements(queue: Sequence[Any], days: Dict[str, Sequence[Any]], jobs: 
     board["queue"] = _unique(queue)
     board["days"] = incoming_days
     board = apply_catalog(board, jobs)
-    return save_board(board)
+    return save_board(clear_queue_overdue(board))
+
+
+def board_reset_to_queue(jobs: Dict[str, dict], now: Optional[datetime] = None) -> dict:
+    """In-memory wipe: every open sewing job starts in the queue."""
+    board = empty_board()
+    board["queue"] = _unique(jobs)
+    board["resetToken"] = RESET_TOKEN
+    board["lastRolloverDate"] = rolling_weekdays(now, 1)[0]
+    return apply_catalog(board, jobs)
+
+
+def reset_to_queue(jobs: Dict[str, dict], now: Optional[datetime] = None) -> dict:
+    """Wipe day placements so every open sewing job starts in the queue."""
+    return save_board(board_reset_to_queue(jobs, now))
 
 
 def snapshot(
@@ -394,10 +441,17 @@ def snapshot(
 ) -> dict:
     with _LOCK:
         jobs = catalog_jobs(schedule, progress if progress is not None else load_embroidery_progress(), now)
-        board = seed_from_schedule(load_board(), schedule, jobs)
-        board, carryovers = rollover_unfinished(board, jobs, now=now)
-        if persist:
-            board = save_board(board)
+        board = load_board()
+        if board.get("resetToken") != RESET_TOKEN:
+            board = reset_to_queue(jobs, now)
+        else:
+            board = seed_from_schedule(board, schedule, jobs)
+            board, carryovers = rollover_unfinished(board, jobs, now=now)
+            if persist:
+                board = save_board(board)
+        carryovers = list(board.get("carryovers") or [])
+        overdue = board.get("overdue") or {}
+        stamp_overdue(jobs, overdue)
         days = rolling_weekdays(now)
         return {
             "today": days[0] if days else today_iso(now),
@@ -406,6 +460,7 @@ def snapshot(
             "board": board["days"],
             "jobs": jobs,
             "carryovers": carryovers,
+            "overdue": overdue,
             "updatedAt": board.get("updatedAt") or "",
             "lastRolloverDate": board.get("lastRolloverDate") or "",
         }
