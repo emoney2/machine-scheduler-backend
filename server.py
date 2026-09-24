@@ -11378,7 +11378,7 @@ JOBS_FOR_COMPANY_RANGE = os.environ.get(
 # overridden in env to another tab; this range is used only by build_overview_payload().
 OVERVIEW_PRODUCTION_ORDERS_RANGE = os.environ.get(
     "OVERVIEW_PRODUCTION_ORDERS_RANGE",
-    "Production Orders!A1:AZ",
+    "Production Orders!A1:ZZ",
 )
 # Sheet tab for Shopify product-builder webhook rows (same tab as main Production Orders by default)
 PRODUCTION_ORDERS_PB_SHEET_TAB = os.environ.get("PRODUCTION_ORDERS_PB_SHEET_TAB", "Production Orders")
