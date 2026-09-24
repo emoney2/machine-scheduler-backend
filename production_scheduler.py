@@ -236,7 +236,7 @@ def resolve_required_ship_date(
     """Ship date = due minus transit, minus a workday UPS-delay buffer for Ground."""
     days = int(_number(transit_days, -1))
     if due and days >= 0:
-        extra = 0 if is_local_delivery(shipping_method) or days <= 0 else SHIPPING_DELAY_BUFFER_DAYS
+        extra = SHIPPING_DELAY_BUFFER_DAYS if (is_local_delivery(shipping_method) or days > 0) else 0
         return subtract_workdays(due, days + extra, holidays)
     return fallback_ship or due
 

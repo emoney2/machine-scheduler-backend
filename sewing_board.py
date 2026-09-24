@@ -392,7 +392,11 @@ def overlay_job_from_live(job: dict, order: dict) -> dict:
     method = next_job.get("shippingMethod") or order.get("shipping_method")
     due_iso = due or next_job.get("dueDate")
     if is_local_delivery(method) and due_iso:
-        next_job["requiredShipDate"] = _date_iso(due_iso)
+        ship = _date_iso(_calculated_ship_date({
+            "Due Date": due_iso,
+            "Shipping Method": "Local Delivery",
+        }))
+        next_job["requiredShipDate"] = ship
         next_job["transitBusinessDays"] = 0
     else:
         ship = _date_iso(_calculated_ship_date({
