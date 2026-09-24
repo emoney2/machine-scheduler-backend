@@ -127,10 +127,11 @@ def _drive_id(value: Any) -> str:
     return ""
 
 
-def sort_queue_by_ship(queue: Sequence[Any], jobs: Dict[str, dict]) -> List[str]:
+def sort_queue_by_due(queue: Sequence[Any], jobs: Dict[str, dict]) -> List[str]:
+    """Queue is due date, then order number. Hard/soft and ship date do not affect order."""
     def key(oid: str):
         job = jobs.get(oid) or {}
-        return (job.get("requiredShipDate") or "9999-12-31", _norm_oid(oid))
+        return (job.get("dueDate") or "9999-12-31", _norm_oid(oid))
     return sorted(_unique(queue), key=key)
 
 
@@ -671,18 +672,24 @@ def apply_catalog(board: dict, jobs: Dict[str, dict]) -> dict:
     """Keep placements for open jobs; new work lands in the queue."""
     clean = _normalize_board(board)
     live = set(jobs)
-    clean["queue"] = [oid for oid in clean["queue"] if oid in live]
     next_days = {}
-    placed = set(clean["queue"])
+    placed = set()
     for day, ids in clean["days"].items():
-        kept = [oid for oid in ids if oid in live]
-        next_days[day] = kept
-        placed.update(kept)
+        kept = []
+        for oid in ids:
+            job = jobs.get(oid)
+            # Missing from this refresh is not a reason to evict a day placement.
+            remaining = None if job is None else job.get("remainingQuantity")
+            if job is None or remaining is None or remaining > 0:
+                kept.append(oid)
+        next_days[day] = _unique(kept)
+        placed.update(next_days[day])
     clean["days"] = next_days
+    clean["queue"] = [oid for oid in clean["queue"] if oid in live and oid not in placed]
     for oid in jobs:
         if oid not in placed:
             clean["queue"].append(oid)
-    clean["queue"] = sort_queue_by_ship(clean["queue"], jobs)
+    clean["queue"] = sort_queue_by_due(clean["queue"], jobs)
     clean["carryovers"] = [row for row in clean["carryovers"] if row["orderNumber"] in live]
     clean["overdue"] = {oid: day for oid, day in (clean.get("overdue") or {}).items() if oid in live}
     return clean

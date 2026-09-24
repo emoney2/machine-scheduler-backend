@@ -96,15 +96,21 @@ class SewingBoardTests(unittest.TestCase):
         clean = sb.apply_catalog(board, jobs)
         self.assertEqual(clean["queue"], ["100", "200"])
 
-    def test_queue_sorts_by_ship_date(self):
+    def test_queue_sorts_by_due_date_not_ship_or_hard_soft(self):
         jobs = dict([
-            job("100", requiredShipDate="2026-10-03"),
-            job("200", requiredShipDate="2026-09-26"),
-            job("300", requiredShipDate="2026-09-30"),
+            job("100", dueDate="2026-10-03", requiredShipDate="2026-09-20", due_type="Soft Date"),
+            job("200", dueDate="2026-09-26", requiredShipDate="2026-09-26", due_type="Hard Date"),
+            job("300", dueDate="2026-09-30", requiredShipDate="2026-09-22", due_type="Soft Date"),
         ])
         board = {"queue": ["100", "200", "300"], "days": {}, "lastRolloverDate": "2026-09-24", "carryovers": []}
         clean = sb.apply_catalog(board, jobs)
         self.assertEqual(clean["queue"], ["200", "300", "100"])
+
+    def test_apply_catalog_keeps_day_placement_if_job_missing_this_refresh(self):
+        jobs = dict([job("200")])
+        board = {"queue": [], "days": {"2026-09-24": ["100", "200"]}, "lastRolloverDate": "2026-09-24", "carryovers": []}
+        clean = sb.apply_catalog(board, jobs)
+        self.assertEqual(clean["days"]["2026-09-24"], ["100", "200"])
 
     def test_closed_jobs_leave_the_board(self):
         jobs = dict([job("200")])
