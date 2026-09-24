@@ -120,6 +120,9 @@ class SewingBoardTests(unittest.TestCase):
                 {"order_number": "1", "product": "Driver Back", "remaining_quantity": 4, "customer": "A"},
                 {"order_number": "2", "product": "Driver", "remaining_quantity": 0, "customer": "B"},
                 {"order_number": "3", "product": "Driver", "remaining_quantity": 6, "customer": "C", "due_type": "Hard Date"},
+                {"order_number": "4", "product": "Fairway", "remaining_quantity": 8, "stage": "SHIPPED", "customer": "D"},
+                {"order_number": "5", "product": "HybridBack", "remaining_quantity": 3, "customer": "E"},
+                {"order_number": "6", "product": "Driver", "remaining_quantity": 4, "quantity": 4, "shipped": 4, "customer": "F"},
             ]
         }
         jobs = sb.catalog_jobs(schedule, progress={})

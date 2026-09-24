@@ -157,11 +157,32 @@ def save_board(board: dict) -> dict:
     return clean
 
 
+CLOSED_STAGES = {"SHIPPED", "COMPLETE", "COMPLETED", "CANCELED", "CANCELLED"}
+
+
+def is_back_job(product: Any) -> bool:
+    if is_back_product(product):
+        return True
+    name = " ".join(str(product or "").lower().replace("_", " ").replace("-", " ").split())
+    return "back" in name
+
+
+def is_closed_order(order: dict) -> bool:
+    stage = _text(order.get("stage") or order.get("Stage") or order.get("status") or order.get("Status")).upper()
+    if stage in CLOSED_STAGES:
+        return True
+    qty = _int(order.get("quantity") if order.get("quantity") is not None else order.get("Quantity"))
+    shipped = _int(order.get("shipped") if order.get("shipped") is not None else order.get("Shipped"))
+    return qty > 0 and shipped >= qty
+
+
 def needs_sewing(order: dict) -> bool:
     if order.get("needs_sewing") is False or order.get("needsSewing") is False:
         return False
     product = order.get("product") or order.get("Product")
-    if is_back_product(product) or is_towel_or_needlepoint(product):
+    if is_back_job(product) or is_towel_or_needlepoint(product):
+        return False
+    if is_closed_order(order):
         return False
     remaining = _int(
         order.get("remaining_quantity")
@@ -262,6 +283,7 @@ def catalog_jobs(
             "stitchCount": stitch,
             "headCount": heads,
             "machine": machine,
+            "stage": _text(order.get("stage") or sew.get("stage")),
             "image": _text(order.get("image") or sew.get("image")),
             "imageFileId": _text(sew.get("imageFileId")),
         }
