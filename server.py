@@ -24644,6 +24644,77 @@ def reprint_label():
     return resp
 
 
+@app.route("/api/shipping-history", methods=["OPTIONS", "GET", "POST"])
+@login_required_session
+def shipping_history():
+    """
+    Shared shipment history (any computer). GET lists rows saved when we ship
+    (local JSON + Google Sheet Packing History). POST imports browser-only rows.
+    """
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Requested-With, Accept"
+        )
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return resp
+
+    history = packhist.load_history()
+    try:
+        sheet_history = packhist.load_history_from_sheet(fetch_sheet, SPREADSHEET_ID)
+        history = packhist.merge_history(sheet_history, history)
+    except Exception:
+        logging.exception("shipping-history: durable sheet unavailable")
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        entries = data.get("entries")
+        if entries is None:
+            entries = data.get("rows") or []
+        created = []
+        try:
+            sheets_svc = None
+            try:
+                sheets_svc = get_sheets_service()
+            except Exception:
+                sheets_svc = None
+            created = packhist.import_shipping_entries(
+                entries,
+                existing=history,
+                sheets_service=sheets_svc,
+                spreadsheet_id=SPREADSHEET_ID,
+            )
+            if created:
+                history = packhist.merge_history(history, created)
+        except Exception:
+            logging.exception("shipping-history: import failed")
+        rows = packhist.flatten_shipping_rows(history)
+        resp = jsonify(
+            {
+                "success": True,
+                "imported": len(created),
+                "count": len(rows),
+                "rows": rows,
+            }
+        )
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        return resp
+
+    try:
+        limit = int(request.args.get("limit") or 400)
+    except (TypeError, ValueError):
+        limit = 400
+    limit = max(1, min(limit, 1000))
+    rows = packhist.flatten_shipping_rows(history)[:limit]
+    resp = jsonify({"success": True, "count": len(rows), "rows": rows})
+    resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
+
 @app.route("/api/shipping-history-ups", methods=["OPTIONS", "GET"])
 @login_required_session
 def shipping_history_ups():

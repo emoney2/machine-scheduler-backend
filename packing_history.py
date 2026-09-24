@@ -409,7 +409,10 @@ def build_record(
 ) -> Optional[Dict[str, Any]]:
     norm_boxes = normalize_boxes_summary(boxes)
     norm_pieces = normalize_pieces(pieces)
-    if not norm_boxes and not norm_pieces:
+    norm_tracking = [
+        str(t).strip() for t in (tracking_numbers or []) if str(t).strip()
+    ]
+    if not norm_boxes and not norm_pieces and not norm_tracking:
         return None
     contents = normalize_box_contents(box_contents)
     if not contents:
@@ -423,9 +426,7 @@ def build_record(
         "pieces": norm_pieces,
         "box_contents": contents,
         "mix_signature": mix_signature(norm_pieces),
-        "tracking_numbers": [
-            str(t).strip() for t in (tracking_numbers or []) if str(t).strip()
-        ],
+        "tracking_numbers": norm_tracking,
     }
     return rec
 
@@ -518,6 +519,132 @@ def append_record_to_sheet(sheets_service, spreadsheet_id: str, record: Dict[str
         insertDataOption="INSERT_ROWS",
         body={"values": [row]},
     ).execute()
+
+
+def tracking_numbers_of(records: Optional[List[Dict[str, Any]]]) -> set:
+    out = set()
+    for rec in records or []:
+        for t in rec.get("tracking_numbers") or []:
+            s = str(t).strip()
+            if s:
+                out.add(s)
+    return out
+
+
+def _shipped_at_ts(raw: Any) -> float:
+    s = str(raw or "").strip()
+    if not s:
+        return 0.0
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def flatten_shipping_rows(records: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """One row per tracking number for the shared Shipments page."""
+    rows: List[Dict[str, Any]] = []
+    for rec in records or []:
+        tracks = [
+            str(t).strip()
+            for t in (rec.get("tracking_numbers") or [])
+            if str(t).strip()
+        ]
+        if not tracks:
+            continue
+        company = str(rec.get("company") or "").strip() or "—"
+        shipped_at = str(rec.get("shipped_at") or "").strip()
+        order_ids = [
+            str(x).strip() for x in (rec.get("order_ids") or []) if str(x).strip()
+        ]
+        rid = str(rec.get("id") or "").strip()
+        for t in tracks:
+            rows.append(
+                {
+                    "tracking_number": t,
+                    "company": company,
+                    "shipped_at": shipped_at,
+                    "order_ids": order_ids,
+                    "id": rid,
+                    "source": "server",
+                }
+            )
+    rows.sort(
+        key=lambda r: (_shipped_at_ts(r.get("shipped_at")), str(r.get("tracking_number") or "")),
+        reverse=True,
+    )
+    return rows
+
+
+def load_merged_history(
+    fetch_sheet_fn: Optional[Callable] = None,
+    spreadsheet_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    local = load_history()
+    sheet: List[Dict[str, Any]] = []
+    if fetch_sheet_fn and spreadsheet_id:
+        try:
+            sheet = load_history_from_sheet(fetch_sheet_fn, spreadsheet_id)
+        except Exception:
+            logger.exception("load_merged_history: sheet load failed")
+    return merge_history(sheet, local)
+
+
+def import_shipping_entries(
+    entries: Any,
+    *,
+    existing: Optional[List[Dict[str, Any]]] = None,
+    sheets_service=None,
+    spreadsheet_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Insert client/browser shipment rows that are not already stored. Never raises."""
+    created: List[Dict[str, Any]] = []
+    try:
+        seen = tracking_numbers_of(
+            existing if existing is not None else load_history()
+        )
+        if not isinstance(entries, list):
+            return created
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            raw_tracks = (
+                entry.get("tracking_numbers")
+                or entry.get("trackingNumbers")
+                or []
+            )
+            if isinstance(raw_tracks, str):
+                raw_tracks = [x.strip() for x in raw_tracks.split(",") if x.strip()]
+            tracks = []
+            for t in raw_tracks:
+                s = str(t).strip()
+                if s and s not in seen:
+                    tracks.append(s)
+            if not tracks:
+                continue
+            rec = build_record(
+                company=str(entry.get("company") or "").strip(),
+                order_ids=entry.get("order_ids") or entry.get("orderIds") or [],
+                tracking_numbers=tracks,
+                shipped_at=(
+                    str(entry.get("shipped_at") or entry.get("shippedAt") or "").strip()
+                    or None
+                ),
+            )
+            if not rec:
+                continue
+            append_record(rec)
+            if sheets_service and spreadsheet_id:
+                try:
+                    append_record_to_sheet(sheets_service, spreadsheet_id, rec)
+                except Exception:
+                    logger.exception("Shipping history sheet append failed (local ok)")
+            for t in tracks:
+                seen.add(t)
+            created.append(rec)
+    except Exception:
+        logger.exception("import_shipping_entries failed")
+    return created
 
 
 def record_shipment_packing(
