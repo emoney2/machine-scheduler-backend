@@ -303,13 +303,27 @@ def sheet_rows_to_dicts(values: Sequence[Sequence[Any]]) -> List[dict]:
     rows = [list(row or []) for row in (values or [])]
     if not rows:
         return []
-    headers = [str(cell or "").strip() for cell in rows[0]]
+    raw_headers = [str(cell or "").strip() for cell in rows[0]]
+    seen: Dict[str, int] = {}
+    headers: List[str] = []
+    for idx, header in enumerate(raw_headers):
+        key = header or f"__col{idx}"
+        if key in seen:
+            seen[key] += 1
+            key = f"{key}__{seen[key]}"
+        else:
+            seen[key] = 1
+        headers.append(key)
     out: List[dict] = []
     for row in rows[1:]:
         padded = list(row or [])
         if len(padded) < len(headers):
             padded += [""] * (len(headers) - len(padded))
-        out.append(dict(zip(headers, padded)))
+        item = dict(zip(headers, padded))
+        method = shipping_method_from_row(item, default="")
+        if method:
+            item["Shipping Method"] = method
+        out.append(item)
     return out
 
 

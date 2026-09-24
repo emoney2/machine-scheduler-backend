@@ -221,17 +221,49 @@ SERVICE_CODES = {
 }
 
 
+def _normalize_header_key(name: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _text(name).casefold())
+
+
+def production_orders_values_range(raw: Any = "") -> str:
+    """Read the whole Production Orders tab so late columns like Shipping Method are included."""
+    text = _text(raw) or "Production Orders"
+    tab = text.split("!")[0].strip().strip("'\"") or "Production Orders"
+    if tab.casefold() == "production orders":
+        return "Production Orders"
+    return text
+
+
+def _is_planning_shipping_method_header(norm: str) -> bool:
+    if not norm:
+        return False
+    if norm in {
+        "shippingmethod",
+        "shipmethod",
+        "shippingtype",
+        "shippingservice",
+        "upsorlocal",
+        "upslocal",
+        "shipping_method",
+    }:
+        return True
+    return "shippingmethod" in norm or norm.endswith("shipmethod")
+
+
 def shipping_method_from_row(row: Optional[dict] = None, default: str = "UPS Ground") -> str:
-    raw = _text(
-        (row or {}).get("_shipping_method")
-        or (row or {}).get("Shipping Method")
-        or (row or {}).get("Shipping Type")
-        or (row or {}).get("Shipping Service")
-        or (row or {}).get("Ship Via")
-        or (row or {}).get("UPS Service")
-        or (row or {}).get("shippingMethod")
-        or (row or {}).get("shipping_method")
-    )
+    row = row if isinstance(row, dict) else {}
+    planning = _text(row.get("_shipping_method"))
+    via = ""
+    for key, val in row.items():
+        text = _text(val)
+        if not text:
+            continue
+        norm = _normalize_header_key(key)
+        if _is_planning_shipping_method_header(norm) and not planning:
+            planning = text
+        elif norm in {"shipvia", "upsservice"} and not via:
+            via = text
+    raw = planning or via
     if is_local_delivery(raw):
         return "Local Delivery"
     return raw or default

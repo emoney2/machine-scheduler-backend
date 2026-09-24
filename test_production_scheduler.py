@@ -18,6 +18,7 @@ from production_scheduler import (
     parse_date,
     parse_sewers,
     planning_transit_days,
+    production_orders_values_range,
     required_ship_date_for_row,
     resolve_required_ship_date,
     shipping_method_from_row,
@@ -150,6 +151,13 @@ class ScheduleTests(unittest.TestCase):
     def test_required_ship_date_for_row_uses_method_and_destination(self):
         due = date(2026, 10, 5)
         self.assertEqual(shipping_method_from_row({"Shipping Method": "local"}), "Local Delivery")
+        self.assertEqual(shipping_method_from_row({"Shipping method": "Local delivery"}), "Local Delivery")
+        self.assertEqual(
+            shipping_method_from_row({"Ship Method": "Local delivery", "Ship Via": "UPS Ground"}),
+            "Local Delivery",
+        )
+        self.assertEqual(production_orders_values_range("Production Orders!A1:AZ"), "Production Orders")
+        self.assertEqual(production_orders_values_range("Production Orders!A1:ZZ"), "Production Orders")
         self.assertEqual(planning_transit_days({"Shipping Method": "Local Delivery"}), 0)
         self.assertEqual(planning_transit_days({"Shipping Method": "UPS Ground", "Shipping State": "CA"}), 5)
         self.assertEqual(

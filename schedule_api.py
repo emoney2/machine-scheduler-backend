@@ -55,7 +55,10 @@ def create_schedule_blueprint(
             return live_orders_cache["data"]
         import os
         import sewing_board
-        range_name = os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE", "Production Orders!A1:ZZ")
+        from production_scheduler import production_orders_values_range, shipping_method_from_row
+        range_name = production_orders_values_range(
+            os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE", "Production Orders")
+        )
         try:
             rows = (
                 values_service.get(
@@ -67,6 +70,17 @@ def create_schedule_blueprint(
                 or []
             )
             live = sewing_board.sheet_rows_to_dicts(rows)
+            headers = list((rows[0] if rows else []) or [])
+            has_method_col = any(
+                shipping_method_from_row({str(h): "local"}, default="") == "Local Delivery"
+                for h in headers
+            )
+            logger.info(
+                "Sewing board Production Orders range=%s columns=%s has_shipping_method_column=%s",
+                range_name,
+                len(headers),
+                has_method_col,
+            )
             live_orders_cache["at"] = now
             live_orders_cache["data"] = live
             return live

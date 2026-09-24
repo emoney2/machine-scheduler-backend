@@ -27,6 +27,7 @@ from production_scheduler import (
     parse_date,
     parse_sewers,
     resolve_required_ship_date,
+    shipping_method_from_row,
     transit_days_for_service,
 )
 from schedule_store import ScheduleSheetStore, friendly_sheets_error
@@ -310,13 +311,7 @@ class ProductionScheduleService:
         return result
 
     def _shipping_method_raw(self, row: dict) -> str:
-        return _text(
-            row.get("Shipping Type")
-            or row.get("Shipping Method")
-            or row.get("Shipping Service")
-            or row.get("Ship Via")
-            or row.get("UPS Service")
-        )
+        return shipping_method_from_row(row, default="")
 
     def _is_local_delivery(self, row: dict) -> bool:
         return is_local_delivery(self._shipping_method_raw(row))

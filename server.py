@@ -11504,10 +11504,16 @@ JOBS_FOR_COMPANY_RANGE = os.environ.get(
 )
 # Overview “Upcoming Jobs” must read the Production Orders tab only. ORDERS_RANGE may be
 # overridden in env to another tab; this range is used only by build_overview_payload().
-OVERVIEW_PRODUCTION_ORDERS_RANGE = os.environ.get(
-    "OVERVIEW_PRODUCTION_ORDERS_RANGE",
-    "Production Orders!A1:ZZ",
-)
+def _overview_production_orders_range():
+    raw = (os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE") or "").strip()
+    tab = (raw.split("!")[0] if raw else "Production Orders").strip().strip("'\"") or "Production Orders"
+    # Never keep A1:AZ — Shipping Method and other late columns live past AZ.
+    if tab.casefold() == "production orders":
+        return "Production Orders"
+    return raw or "Production Orders"
+
+
+OVERVIEW_PRODUCTION_ORDERS_RANGE = _overview_production_orders_range()
 # Sheet tab for Shopify product-builder webhook rows (same tab as main Production Orders by default)
 PRODUCTION_ORDERS_PB_SHEET_TAB = os.environ.get("PRODUCTION_ORDERS_PB_SHEET_TAB", "Production Orders")
 # Template rows for stock headcovers (matched by Design + variant name → Product)
@@ -13337,6 +13343,29 @@ def _overview_parse_material_lines_to_vendor_groups(lines, material_color_map):
     return [{"vendor": v, "items": items} for v, items in grouped.items()]
 
 
+def _overview_shipping_method(row: dict) -> str:
+    """Production Orders planning column, matched even if the header casing differs."""
+    if not isinstance(row, dict):
+        return ""
+    planning = ""
+    via = ""
+    for key, val in row.items():
+        text = str(val or "").strip()
+        if not text:
+            continue
+        norm = re.sub(r"[^a-z0-9]+", "", str(key or "").strip().lower())
+        if (
+            norm in {"shippingmethod", "shipmethod", "shippingtype", "shippingservice", "upsorlocal", "upslocal"}
+            or "shippingmethod" in norm
+            or norm.endswith("shipmethod")
+        ):
+            if not planning:
+                planning = text
+        elif norm in {"shipvia", "upsservice"} and not via:
+            via = text
+    return planning or via
+
+
 def build_overview_payload():
     """
     Returns upcoming + overdue job data from Google Sheets Production Orders
@@ -13561,7 +13590,7 @@ def build_overview_payload():
             "Stage": r.get("Stage"),
             "Due Date": r.get("Due Date"),  # Changed from "Due" to "Due Date"
             "Ship Date": r.get("Ship Date"),  # Changed from "Ship" to "Ship Date"
-            "Shipping Method": r.get("Shipping Method") or r.get("Ship Via") or r.get("Shipping Type"),
+            "Shipping Method": _overview_shipping_method(r),
             "Shipping City": r.get("Shipping City") or r.get("Ship To City") or r.get("Order Ship City"),
             "Shipping State": r.get("Shipping State") or r.get("Ship To State") or r.get("Order Ship State"),
             "Shipping Zip": r.get("Shipping Zip") or r.get("Ship To Zip") or r.get("Order Ship ZIP") or r.get("Order Ship Zip"),
