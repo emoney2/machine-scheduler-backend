@@ -77,6 +77,47 @@ class SewingBoardTests(unittest.TestCase):
         self.assertEqual(next_board["days"]["2026-09-24"], ["200"])
         self.assertEqual([c["orderNumber"] for c in carryovers], ["200"])
 
+    def test_unfinished_still_rolls_if_already_marked_today(self):
+        jobs = dict([job("100"), job("200")])
+        board = {
+            "queue": [],
+            "days": {"2026-09-24": ["100"], "2026-09-25": ["200"]},
+            "lastRolloverDate": "2026-09-25",
+            "carryovers": [],
+        }
+        now = datetime(2026, 9, 25, 8, 0, tzinfo=ET)
+        next_board, carryovers = sb.rollover_unfinished(board, jobs, now=now)
+        self.assertEqual(next_board["days"]["2026-09-25"], ["100", "200"])
+        self.assertNotIn("2026-09-24", next_board["days"])
+        self.assertEqual([c["orderNumber"] for c in carryovers], ["100"])
+
+    def test_missing_remaining_still_rolls(self):
+        oid, row = job("100")
+        del row["remainingQuantity"]
+        jobs = {oid: row, "200": job("200")[1]}
+        board = {
+            "queue": [],
+            "days": {"2026-09-24": ["100"], "2026-09-25": ["200"]},
+            "lastRolloverDate": "2026-09-24",
+            "carryovers": [],
+        }
+        now = datetime(2026, 9, 25, 8, 0, tzinfo=ET)
+        next_board, _ = sb.rollover_unfinished(board, jobs, now=now)
+        self.assertEqual(next_board["days"]["2026-09-25"], ["100", "200"])
+
+    def test_friday_leftovers_land_on_monday(self):
+        jobs = dict([job("100")])
+        board = {
+            "queue": [],
+            "days": {"2026-09-25": ["100"]},
+            "lastRolloverDate": "2026-09-25",
+            "carryovers": [],
+        }
+        now = datetime(2026, 9, 26, 9, 0, tzinfo=ET)  # Saturday
+        next_board, _ = sb.rollover_unfinished(board, jobs, now=now)
+        self.assertEqual(next_board["days"]["2026-09-28"], ["100"])
+        self.assertNotIn("2026-09-25", next_board["days"])
+
     def test_future_days_do_not_move(self):
         jobs = dict([job("100"), job("200")])
         board = {

@@ -664,6 +664,21 @@ def clear_queue_overdue(board: dict) -> dict:
     return clean
 
 
+def is_unfinished_job(job: Optional[dict]) -> bool:
+    """Open sewing work. Missing remaining still counts as unfinished."""
+    if not job:
+        return False
+    if job.get("sewingSummaryComplete") or job.get("sewingComplete"):
+        return False
+    remaining = job.get("remainingQuantity")
+    if remaining is None:
+        return True
+    try:
+        return float(remaining) > 0
+    except (TypeError, ValueError):
+        return True
+
+
 def stamp_overdue(jobs: Dict[str, dict], overdue: Optional[Dict[str, str]] = None) -> Dict[str, dict]:
     marks = overdue or {}
     for oid, job in jobs.items():
@@ -705,35 +720,44 @@ def rollover_unfinished(
     *,
     now: Optional[datetime] = None,
 ) -> Tuple[dict, List[dict]]:
-    """Move unfinished jobs from past weekdays to the top of today. Nothing else moves."""
+    """When a weekday ends, dump its unfinished jobs onto the next weekday."""
     clean = apply_catalog(board, jobs)
     today = rolling_weekdays(now, 1)[0]
-    if clean.get("lastRolloverDate") == today:
+    past_days = sorted(day for day in clean["days"] if day and day < today)
+    if not past_days:
+        clean["lastRolloverDate"] = today
+        return clean, list(clean.get("carryovers") or [])
+    if not jobs:
         return clean, list(clean.get("carryovers") or [])
 
-    past_days = sorted(day for day in clean["days"] if day and day < today)
     rolled: List[str] = []
-    carryovers: List[dict] = []
+    carryovers: List[dict] = list(clean.get("carryovers") or [])
+    seen_carry = {
+        (row.get("orderNumber"), row.get("fromDate"), row.get("toDate"))
+        for row in carryovers
+    }
     overdue = dict(clean.get("overdue") or {})
     rolled_at = _now_et(now).isoformat()
     for day in past_days:
         leftovers = []
         for oid in clean["days"].get(day) or []:
             job = jobs.get(oid)
-            if not job or job.get("remainingQuantity", 0) <= 0:
+            if not is_unfinished_job(job):
                 continue
             leftovers.append(oid)
-            carryovers.append({
-                "orderNumber": oid,
-                "fromDate": day,
-                "toDate": today,
-                "customer": job.get("customer") or "",
-                "product": job.get("product") or "",
-                "rolledAt": rolled_at,
-            })
-            overdue[oid] = day
-        if leftovers:
-            rolled.extend(leftovers)
+            key = (oid, day, today)
+            if key not in seen_carry:
+                carryovers.append({
+                    "orderNumber": oid,
+                    "fromDate": day,
+                    "toDate": today,
+                    "customer": job.get("customer") or "",
+                    "product": job.get("product") or "",
+                    "rolledAt": rolled_at,
+                })
+                seen_carry.add(key)
+            overdue.setdefault(oid, day)
+        rolled.extend(leftovers)
         clean["days"].pop(day, None)
 
     if rolled:
@@ -742,9 +766,9 @@ def rollover_unfinished(
         clean["queue"] = [oid for oid in clean["queue"] if oid not in set(rolled)]
 
     clean["lastRolloverDate"] = today
-    clean["carryovers"] = carryovers
+    clean["carryovers"] = [row for row in carryovers if row.get("orderNumber") in (set(jobs) | set(rolled))]
     clean["overdue"] = overdue
-    return clear_queue_overdue(clean), carryovers
+    return clear_queue_overdue(clean), [row for row in clean["carryovers"] if row.get("toDate") == today]
 
 
 def save_placements(queue: Sequence[Any], days: Dict[str, Sequence[Any]], jobs: Dict[str, dict]) -> dict:
@@ -757,6 +781,7 @@ def save_placements(queue: Sequence[Any], days: Dict[str, Sequence[Any]], jobs: 
     board["queue"] = _unique(queue)
     board["days"] = incoming_days
     board = apply_catalog(board, jobs)
+    board, _ = rollover_unfinished(board, jobs)
     return save_board(clear_queue_overdue(board))
 
 
@@ -805,11 +830,20 @@ def snapshot(
         else:
             if board.get("resetToken") != RESET_TOKEN:
                 board["resetToken"] = RESET_TOKEN
+            before_days = {
+                day: list(ids)
+                for day, ids in (board.get("days") or {}).items()
+            }
             before_rollover = board.get("lastRolloverDate") or ""
             board = seed_from_schedule(board, schedule, jobs)
             board, carryovers = rollover_unfinished(board, jobs, now=now)
-            # Polls must not persist a shrunken catalog — that clears day squares.
-            if persist and (board.get("lastRolloverDate") or "") != before_rollover:
+            days_changed = {
+                day: list(ids)
+                for day, ids in (board.get("days") or {}).items()
+            } != before_days
+            rolled_forward = (board.get("lastRolloverDate") or "") != before_rollover
+            # Persist real leftover moves. Do not save an empty catalog wipe.
+            if persist and jobs and (rolled_forward or days_changed):
                 board = save_board(board)
         carryovers = list(board.get("carryovers") or [])
         overdue = board.get("overdue") or {}
