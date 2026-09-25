@@ -8,6 +8,7 @@ import time
 import uuid
 
 PREVIEW_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".tif", ".tiff", ".bmp")
+REORDER_COPY_EXTS = (".emb", ".dst", ".dxf", ".svg")
 
 
 _LOCK = threading.Lock()
@@ -182,6 +183,36 @@ def drive_file_view_url(file_id):
 def is_preview_image_name(name):
     lower = str(name or "").lower()
     return any(lower.endswith(ext) for ext in PREVIEW_IMAGE_EXTS)
+
+
+def is_reorder_pattern_file(name):
+    lower = str(name or "").lower()
+    return any(lower.endswith(ext) for ext in REORDER_COPY_EXTS)
+
+
+def pick_reorder_source_files(files, preferred_image_file_id=""):
+    """Only the original artwork image plus .emb/.dst/.dxf/.svg."""
+    preferred = str(preferred_image_file_id or "").strip()
+    selected = []
+    seen = set()
+    preferred_file = None
+    fallback_image = None
+    for item in files or []:
+        fid = str((item or {}).get("id") or "").strip()
+        name = (item or {}).get("name") or ""
+        if is_reorder_pattern_file(name) and fid and fid not in seen:
+            seen.add(fid)
+            selected.append(item)
+        if preferred and fid == preferred:
+            preferred_file = item
+        elif fallback_image is None and is_preview_image_name(name):
+            fallback_image = item
+    image = preferred_file or fallback_image
+    if image:
+        fid = str(image.get("id") or "").strip()
+        if fid and fid not in seen:
+            selected.append(image)
+    return selected
 
 
 def first_drive_file_id_from_image_cell(image_cell):

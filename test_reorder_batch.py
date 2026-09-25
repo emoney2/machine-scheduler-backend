@@ -55,6 +55,23 @@ class ReorderBatchHelpersTests(unittest.TestCase):
         self.assertNotIn(",", url)
         self.assertNotIn("/folders/", url)
 
+    def test_pick_reorder_files_skips_extras(self):
+        files = [
+            {"id": "img1", "name": "cover.jpg"},
+            {"id": "img2", "name": "extra.png"},
+            {"id": "emb1", "name": "1234.emb"},
+            {"id": "dst1", "name": "1234.dst"},
+            {"id": "dxf1", "name": "cut.dxf"},
+            {"id": "svg1", "name": "art.svg"},
+            {"id": "pdf1", "name": "notes.pdf"},
+            {"id": "ai1", "name": "logo.ai"},
+        ]
+        picked = rb.pick_reorder_source_files(files, "img1")
+        names = [f["name"] for f in picked]
+        self.assertEqual(set(names), {"cover.jpg", "1234.emb", "1234.dst", "cut.dxf", "art.svg"})
+        self.assertNotIn("extra.png", names)
+        self.assertNotIn("notes.pdf", names)
+
     def test_parse_job_requests_keeps_per_job_qty_and_due(self):
         reqs = rb.parse_reorder_job_requests(
             {

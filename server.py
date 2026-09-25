@@ -19242,29 +19242,23 @@ def _copy_drive_file(drive, file_id, new_name, parent_id):
 def _copy_order_folder_contents(
     drive, source_folder_id, dest_folder_id, new_order_num, preferred_image_file_id=None
 ):
-    """Copy production files and a Print Files subfolder into the new order folder."""
+    """Copy only the original image plus .emb/.dst/.dxf/.svg into the new order folder."""
     import reorder_batch as reorder_batch_mod
 
     folder_mime = "application/vnd.google-apps.folder"
-    print_links = ""
-    copied_print = False
     emb_used = False
     image_link = ""
-    fallback_image_ids = []
     children = _list_drive_children(drive, source_folder_id)
-    print_folder = None
-    files = []
-    for child in children:
-        name = str(child.get("name") or "")
-        if child.get("mimeType") == folder_mime and name.strip().lower() == "print files":
-            print_folder = child
-        elif child.get("mimeType") == folder_mime:
-            continue
-        else:
-            files.append(child)
-
+    files = [
+        child
+        for child in children
+        if child.get("mimeType") != folder_mime
+    ]
     preferred = str(preferred_image_file_id or "").strip()
-    for child in files:
+    to_copy = reorder_batch_mod.pick_reorder_source_files(files, preferred)
+    copied_ids = {str(item.get("id") or "") for item in to_copy}
+
+    for child in to_copy:
         name = str(child.get("name") or "file")
         lower = name.lower()
         if lower.endswith(".emb"):
@@ -19274,14 +19268,13 @@ def _copy_order_folder_contents(
             dest_name = name
         copied = _copy_drive_file(drive, child["id"], dest_name, dest_folder_id)
         copied_id = copied.get("id") or ""
-        if preferred and child.get("id") == preferred and copied_id:
+        if copied_id and (
+            (preferred and child.get("id") == preferred)
+            or (not preferred and reorder_batch_mod.is_preview_image_name(name) and not image_link)
+        ):
             image_link = reorder_batch_mod.drive_file_view_url(copied_id)
-        elif reorder_batch_mod.is_preview_image_name(name) and copied_id:
-            fallback_image_ids.append(copied_id)
 
-    if not image_link and fallback_image_ids:
-        image_link = reorder_batch_mod.drive_file_view_url(fallback_image_ids[0])
-    if not image_link and preferred:
+    if not image_link and preferred and preferred not in copied_ids:
         try:
             meta = drive.files().get(fileId=preferred, fields="name").execute()
             copied = _copy_drive_file(
@@ -19294,19 +19287,7 @@ def _copy_order_folder_contents(
                 "[reorder-batch] could not copy preferred image %s: %s", preferred, exc
             )
 
-    if print_folder:
-        pf_id = _create_named_drive_folder(drive, "Print Files", parent_id=dest_folder_id)
-        _make_drive_public(drive, pf_id)
-        for child in _list_drive_children(drive, print_folder["id"]):
-            if child.get("mimeType") == folder_mime:
-                continue
-            _copy_drive_file(
-                drive, child["id"], child.get("name") or "file", pf_id
-            )
-            copied_print = True
-        print_links = reorder_batch_mod.drive_folder_url(pf_id)
-
-    return image_link, print_links, copied_print
+    return image_link, "", False
 
 
 def _copy_print_folder_by_url(drive, print_url, dest_folder_id):
@@ -19524,11 +19505,7 @@ def _create_reorder_from_existing_order(
                 exc,
             )
 
-    if not print_links:
-        print_links, copied_print = _copy_print_folder_by_url(
-            drive, source_row.get("Print Files") or "", order_folder_id
-        )
-    print_cell = "YES" if (print_yes or copied_print) else "NO"
+    print_cell = "YES" if print_yes else "NO"
 
     back_order_folder_id = None
     back_image_link = ""
@@ -19552,10 +19529,6 @@ def _create_reorder_from_existing_order(
                 new_order_num=back_order,
                 drive_service=drive,
                 new_folder_id=back_order_folder_id,
-            )
-        if not back_print_links and (print_yes or copied_print):
-            back_print_links, _ = _copy_print_folder_by_url(
-                drive, source_row.get("Print Files") or "", back_order_folder_id
             )
 
     _ensure_shipping_method_header_index(sheets)
@@ -26499,8 +26472,7 @@ def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
                     fileId=file["id"],
                     body={"name": f"{new_order_num}.emb", "parents": [new_folder_id]},
                 ).execute()
-            elif file_name_lower.endswith(".svg"):
-                # Keep .svg files with their original names
+            elif file_name_lower.endswith((".svg", ".dst", ".dxf")):
                 print(
                     f"📤 Copying {file['name']} from order {old_order_num} → {new_order_num} (keeping original name)"
                 )
