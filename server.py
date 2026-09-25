@@ -19092,6 +19092,708 @@ def reorder():
     )
 
 
+def _submit_timestamp():
+    now = datetime.now(ZoneInfo("America/New_York"))
+    try:
+        return now.strftime("%-m/%-d/%Y %H:%M:%S")
+    except ValueError:
+        return now.strftime("%#m/%#d/%Y %H:%M:%S")
+
+
+def _orders_drive_parent_id():
+    return os.environ.get(
+        "ORDERS_PARENT_FOLDER_ID", "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
+    )
+
+
+def _folder_id_from_drive_url(url):
+    m = re.search(r"/folders/([A-Za-z0-9_-]{10,})", str(url or ""))
+    return m.group(1) if m else None
+
+
+def _file_id_from_drive_url(url):
+    m = re.search(r"/file/d/([A-Za-z0-9_-]{10,})", str(url or ""))
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([A-Za-z0-9_-]{10,})", str(url or ""))
+    return m.group(1) if m else None
+
+
+def _escape_drive_query_name(name):
+    return str(name).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _make_drive_public(drive, file_id):
+    try:
+        drive.permissions().create(
+            fileId=file_id, body={"role": "reader", "type": "anyone"}
+        ).execute()
+    except Exception:
+        logger.warning("[reorder-batch] could not make file %s public", file_id)
+
+
+def _create_named_drive_folder(drive, name, parent_id=None):
+    from googleapiclient.errors import HttpError
+
+    safe = _escape_drive_query_name(name)
+    query = (
+        f"name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' "
+        "and trashed = false"
+    )
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    existing = (
+        drive.files().list(q=query, fields="files(id)").execute().get("files", [])
+    )
+    for f in existing:
+        fid = f["id"]
+        try:
+            retry_google_api_call(lambda: drive.files().delete(fileId=fid).execute())
+        except HttpError as e:
+            try:
+                retry_google_api_call(
+                    lambda: drive.files()
+                    .update(fileId=fid, body={"trashed": True})
+                    .execute()
+                )
+            except Exception:
+                raise e
+    meta = {"name": str(name), "mimeType": "application/vnd.google-apps.folder"}
+    if parent_id:
+        meta["parents"] = [parent_id]
+    folder = retry_google_api_call(
+        lambda: drive.files().create(body=meta, fields="id").execute()
+    )
+    return folder["id"]
+
+
+def _list_drive_children(drive, folder_id):
+    files = []
+    page_token = None
+    query = f"'{folder_id}' in parents and trashed = false"
+    while True:
+        resp = (
+            drive.files()
+            .list(
+                q=query,
+                fields="nextPageToken, files(id, name, mimeType, webViewLink)",
+                pageToken=page_token,
+                pageSize=100,
+            )
+            .execute()
+        )
+        files.extend(resp.get("files") or [])
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+def _find_source_order_folder_id(drive, source_row):
+    image = str((source_row or {}).get("Image") or "")
+    folder_id = _folder_id_from_drive_url(image)
+    if folder_id:
+        return folder_id
+    file_id = _file_id_from_drive_url(image)
+    if file_id:
+        try:
+            meta = drive.files().get(fileId=file_id, fields="parents").execute()
+            parents = meta.get("parents") or []
+            if parents:
+                return parents[0]
+        except Exception as exc:
+            logger.warning(
+                "[reorder-batch] parent lookup failed for file %s: %s", file_id, exc
+            )
+    order_num = str((source_row or {}).get("Order #") or "").strip()
+    if not order_num:
+        return None
+    safe = _escape_drive_query_name(order_num)
+    parent = _orders_drive_parent_id()
+    query = (
+        f"name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' "
+        f"and trashed = false and '{parent}' in parents"
+    )
+    found = drive.files().list(q=query, fields="files(id)").execute().get("files", [])
+    if found:
+        return found[0]["id"]
+    query = (
+        f"name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' "
+        "and trashed = false"
+    )
+    found = drive.files().list(q=query, fields="files(id)").execute().get("files", [])
+    return found[0]["id"] if found else None
+
+
+def _copy_drive_file(drive, file_id, new_name, parent_id):
+    copied = retry_google_api_call(
+        lambda: drive.files()
+        .copy(
+            fileId=file_id,
+            body={"name": new_name, "parents": [parent_id]},
+            fields="id, webViewLink, name",
+        )
+        .execute()
+    )
+    _make_drive_public(drive, copied["id"])
+    return copied
+
+
+def _copy_order_folder_contents(drive, source_folder_id, dest_folder_id, new_order_num):
+    """Copy production files and a Print Files subfolder into the new order folder."""
+    folder_mime = "application/vnd.google-apps.folder"
+    prod_links = []
+    print_links = ""
+    copied_print = False
+    emb_used = False
+    children = _list_drive_children(drive, source_folder_id)
+    print_folder = None
+    files = []
+    for child in children:
+        name = str(child.get("name") or "")
+        if child.get("mimeType") == folder_mime and name.strip().lower() == "print files":
+            print_folder = child
+        elif child.get("mimeType") == folder_mime:
+            continue
+        else:
+            files.append(child)
+
+    for child in files:
+        name = str(child.get("name") or "file")
+        lower = name.lower()
+        if lower.endswith(".emb"):
+            dest_name = f"{new_order_num}.emb" if not emb_used else f"{new_order_num}_{name}"
+            emb_used = True
+        else:
+            dest_name = name
+        copied = _copy_drive_file(drive, child["id"], dest_name, dest_folder_id)
+        link = copied.get("webViewLink") or ""
+        if link:
+            prod_links.append(link)
+
+    if print_folder:
+        pf_id = _create_named_drive_folder(drive, "Print Files", parent_id=dest_folder_id)
+        _make_drive_public(drive, pf_id)
+        for child in _list_drive_children(drive, print_folder["id"]):
+            if child.get("mimeType") == folder_mime:
+                continue
+            _copy_drive_file(
+                drive, child["id"], child.get("name") or "file", pf_id
+            )
+            copied_print = True
+        print_links = f"https://drive.google.com/drive/folders/{pf_id}"
+
+    if not prod_links:
+        prod_links = [f"https://drive.google.com/drive/folders/{dest_folder_id}"]
+    return prod_links, print_links, copied_print
+
+
+def _copy_print_folder_by_url(drive, print_url, dest_folder_id):
+    src_id = _folder_id_from_drive_url(print_url)
+    if not src_id:
+        return "", False
+    pf_id = _create_named_drive_folder(drive, "Print Files", parent_id=dest_folder_id)
+    _make_drive_public(drive, pf_id)
+    copied = False
+    folder_mime = "application/vnd.google-apps.folder"
+    for child in _list_drive_children(drive, src_id):
+        if child.get("mimeType") == folder_mime:
+            continue
+        _copy_drive_file(drive, child["id"], child.get("name") or "file", pf_id)
+        copied = True
+    return f"https://drive.google.com/drive/folders/{pf_id}", copied
+
+
+def _production_row_values_for_reorder(
+    new_order,
+    ts,
+    preview,
+    source_row,
+    due_date,
+    date_type,
+    notes,
+    print_cell,
+    materials,
+    material_percents,
+    prod_links,
+    print_links,
+    stage,
+    ship_date,
+    stitch_count,
+    schedule_str,
+    product_override=None,
+    price_override=None,
+):
+    return [
+        new_order,
+        ts,
+        preview,
+        source_row.get("Company Name"),
+        source_row.get("Design"),
+        source_row.get("Quantity"),
+        "",
+        product_override if product_override is not None else source_row.get("Product"),
+        stage,
+        "0" if price_override == 0 else source_row.get("Price"),
+        due_date,
+        print_cell,
+        *materials,
+        source_row.get("Back Material"),
+        source_row.get("Fur Color"),
+        source_row.get("EMB Backing") or "",
+        "",
+        ship_date,
+        stitch_count,
+        notes,
+        ",".join(prod_links) if isinstance(prod_links, list) else (prod_links or ""),
+        print_links or "",
+        "",
+        date_type,
+        schedule_str,
+        "",
+        "",
+        "",
+        *material_percents,
+    ]
+
+
+def _write_reorder_followup_fields(
+    sheets_svc,
+    row_num,
+    sales_rep,
+    shipping_method,
+    source_row,
+    threads_formula,
+):
+    sheets_svc.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"Production Orders!AQ{row_num}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [[sales_rep]]},
+    ).execute()
+    _write_shipping_method(sheets_svc, row_num, shipping_method)
+    ship_map = _order_ship_field_map_from_row_dict(source_row)
+    if ship_map.get("Order Ship Street 1"):
+        _write_order_ship_address_fields(sheets_svc, row_num, ship_map)
+    if threads_formula:
+        sheets_svc.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!AF{row_num}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[threads_formula]]},
+        ).execute()
+
+
+def _create_reorder_from_existing_order(source_row, due_date, date_type, extra_notes=""):
+    """Create one new Production Order (and paired back when submit would) from a past job."""
+    import reorder_batch as reorder_batch_mod
+
+    if not isinstance(source_row, dict):
+        raise ValueError("Missing source order")
+    materials, material_percents = reorder_batch_mod.material_fields_from_row(source_row)
+    if not materials[0].strip():
+        raise ValueError("Material1 is required on the original job.")
+    for idx, mat in enumerate(materials):
+        if mat.strip() and not str(material_percents[idx] or "").strip():
+            raise ValueError(f'Percentage for Material{idx + 1} ("{mat}") is required.')
+    qty_db = _form_quantity_for_db(source_row.get("Quantity"))
+    price_db = _form_price_for_db(source_row.get("Price"))
+    product = source_row.get("Product") or ""
+    is_quilted_front = _product_creates_paired_back_order(product)
+    notes = reorder_batch_mod.combine_notes(source_row.get("Notes"), extra_notes)
+    sales_rep = reorder_batch_mod.sales_rep_from_row(source_row)
+    shipping_method = reorder_batch_mod.shipping_method_from_row(source_row)
+    print_yes = reorder_batch_mod.print_yes_from_row(source_row)
+    reorder_from = str(source_row.get("Order #") or "").strip()
+
+    col_a = (
+        sheets.values()
+        .get(spreadsheetId=SPREADSHEET_ID, range="Production Orders!A:A")
+        .execute()
+        .get("values", [])
+    )
+    next_row = len(col_a) + 1
+    prev_order = _last_order_num_from_col_a(col_a)
+    new_order = prev_order + 1
+    back_order = new_order + 1 if is_quilted_front else None
+
+    def tpl_formula(col_letter, target_row):
+        raw = (
+            sheets.values()
+            .get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"Production Orders!{col_letter}2",
+                valueRenderOption="FORMULA",
+            )
+            .execute()
+            .get("values", [[""]])[0][0]
+            or ""
+        )
+        return re.sub(r"(\b[A-Z]+)2\b", lambda m: f"{m.group(1)}{target_row}", raw)
+
+    ts = _submit_timestamp()
+    preview = tpl_formula("C", next_row)
+    stage = tpl_formula("I", next_row)
+    ship_date = tpl_formula("V", next_row)
+    stitch_count = tpl_formula("W", next_row)
+    schedule_str = tpl_formula("AC", next_row)
+    threads_formula_raw = (
+        sheets.values()
+        .get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Production Orders!AF2",
+            valueRenderOption="FORMULA",
+        )
+        .execute()
+        .get("values", [[""]])[0][0]
+        or ""
+    )
+    threads_formula = (
+        re.sub(r"(\b[A-Z]+)2\b", lambda m: f"{m.group(1)}{next_row}", threads_formula_raw)
+        if threads_formula_raw
+        else ""
+    )
+
+    drive = get_drive_service()
+    parent_id = _orders_drive_parent_id()
+    order_folder_id = _create_named_drive_folder(drive, new_order, parent_id=parent_id)
+    _make_drive_public(drive, order_folder_id)
+
+    source_folder_id = _find_source_order_folder_id(drive, source_row)
+    prod_links = [f"https://drive.google.com/drive/folders/{order_folder_id}"]
+    print_links = ""
+    copied_print = False
+    if source_folder_id:
+        prod_links, print_links, copied_print = _copy_order_folder_contents(
+            drive, source_folder_id, order_folder_id, new_order
+        )
+    elif reorder_from:
+        copy_emb_files(
+            old_order_num=reorder_from,
+            new_order_num=new_order,
+            drive_service=drive,
+            new_folder_id=order_folder_id,
+        )
+
+    if not print_links:
+        print_links, copied_print = _copy_print_folder_by_url(
+            drive, source_row.get("Print Files") or "", order_folder_id
+        )
+    print_cell = "YES" if (print_yes or copied_print) else "NO"
+
+    back_order_folder_id = None
+    back_prod_links = []
+    back_print_links = ""
+    if is_quilted_front and back_order:
+        back_order_folder_id = _create_named_drive_folder(
+            drive, back_order, parent_id=parent_id
+        )
+        _make_drive_public(drive, back_order_folder_id)
+        if source_folder_id:
+            back_prod_links, back_print_links, _ = _copy_order_folder_contents(
+                drive, source_folder_id, back_order_folder_id, back_order
+            )
+        elif reorder_from:
+            copy_emb_files(
+                old_order_num=reorder_from,
+                new_order_num=back_order,
+                drive_service=drive,
+                new_folder_id=back_order_folder_id,
+            )
+        if not back_print_links and (print_yes or copied_print):
+            back_print_links, _ = _copy_print_folder_by_url(
+                drive, source_row.get("Print Files") or "", back_order_folder_id
+            )
+
+    _ensure_shipping_method_header_index(sheets)
+    row = _production_row_values_for_reorder(
+        new_order,
+        ts,
+        preview,
+        source_row,
+        due_date,
+        date_type,
+        notes,
+        print_cell,
+        materials,
+        material_percents,
+        prod_links,
+        print_links,
+        stage,
+        ship_date,
+        stitch_count,
+        schedule_str,
+    )
+    sheets.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"Production Orders!A{next_row}:AK{next_row}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [row]},
+    ).execute()
+    _write_reorder_followup_fields(
+        sheets, next_row, sales_rep, shipping_method, source_row, threads_formula
+    )
+
+    if supabase:
+        try:
+            supabase.table("Production Orders TEST").insert(
+                {
+                    "Order #": new_order,
+                    "Date": ts,
+                    "Company Name": source_row.get("Company Name"),
+                    "Design": source_row.get("Design"),
+                    "Quantity": qty_db,
+                    "Product": product,
+                    "Price": price_db,
+                    "Due Date": due_date,
+                    "Stage": "ORDERED",
+                }
+            ).execute()
+        except Exception as sb_err:
+            logger.error(
+                "[reorder-batch] Supabase insert failed for order %s: %s",
+                new_order,
+                sb_err,
+            )
+    try:
+        write_material_log_for_order(new_order)
+    except Exception as e:
+        logger.error("[MaterialLog] Failed for reorder %s: %s", new_order, e)
+    try:
+        log_material_to_google_sheets(new_order)
+    except Exception as e:
+        logger.error(
+            "[MaterialLog] Failed to log to Google Sheets for reorder %s: %s",
+            new_order,
+            e,
+        )
+
+    if is_quilted_front and back_order:
+        back_next_row = next_row + 1
+        back_preview = tpl_formula("C", back_next_row)
+        back_stage = tpl_formula("I", back_next_row)
+        back_ship_date = tpl_formula("V", back_next_row)
+        back_stitch_count = tpl_formula("W", back_next_row)
+        back_schedule_str = tpl_formula("AC", back_next_row)
+        back_threads = (
+            re.sub(
+                r"(\b[A-Z]+)2\b",
+                lambda m: f"{m.group(1)}{back_next_row}",
+                threads_formula_raw,
+            )
+            if threads_formula_raw
+            else ""
+        )
+        back_product = str(product).replace("Front", "Back").replace("front", "back")
+        back_row = _production_row_values_for_reorder(
+            back_order,
+            ts,
+            back_preview,
+            source_row,
+            due_date,
+            date_type,
+            notes,
+            print_cell,
+            materials,
+            material_percents,
+            back_prod_links or [f"https://drive.google.com/drive/folders/{back_order_folder_id}"],
+            back_print_links,
+            back_stage,
+            back_ship_date,
+            back_stitch_count,
+            back_schedule_str,
+            product_override=back_product,
+            price_override=0,
+        )
+        sheets.values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Production Orders!A{back_next_row}:AK{back_next_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [back_row]},
+        ).execute()
+        _write_reorder_followup_fields(
+            sheets,
+            back_next_row,
+            sales_rep,
+            shipping_method,
+            source_row,
+            back_threads,
+        )
+        if supabase:
+            try:
+                supabase.table("Production Orders TEST").insert(
+                    {
+                        "Order #": back_order,
+                        "Date": ts,
+                        "Company Name": source_row.get("Company Name"),
+                        "Design": source_row.get("Design"),
+                        "Quantity": qty_db,
+                        "Product": back_product,
+                        "Price": 0.0,
+                        "Due Date": due_date,
+                        "Stage": "ORDERED",
+                    }
+                ).execute()
+            except Exception as sb_err:
+                logger.error(
+                    "[reorder-batch] Supabase insert failed for back order %s: %s",
+                    back_order,
+                    sb_err,
+                )
+        try:
+            write_material_log_for_order(back_order)
+        except Exception as e:
+            logger.error("[MaterialLog] Failed for back reorder %s: %s", back_order, e)
+        try:
+            log_material_to_google_sheets(back_order)
+        except Exception as e:
+            logger.error(
+                "[MaterialLog] Failed to log to Google Sheets for back reorder %s: %s",
+                back_order,
+                e,
+            )
+
+    invalidate_upcoming_cache()
+    result = {"status": "ok", "order": new_order}
+    if back_order:
+        result["back_order"] = back_order
+    return result
+
+
+def _jobs_for_company_rows(company):
+    company_key = str(company or "").strip().lower()
+    if not company_key:
+        return []
+    prod_data = fetch_sheet(SPREADSHEET_ID, JOBS_FOR_COMPANY_RANGE)
+    if not prod_data or not prod_data[0]:
+        return []
+    headers = prod_data[0]
+    jobs = []
+    for r in prod_data[1:]:
+        padded = list(r) + [""] * max(0, len(headers) - len(r))
+        row = dict(zip(headers, padded))
+        if str(row.get("Company Name", "")).strip().lower() == company_key:
+            jobs.append(row)
+    return jobs
+
+
+def _run_reorder_batch(batch_id):
+    import reorder_batch as reorder_batch_mod
+
+    public = reorder_batch_mod.public_reorder_batch(batch_id)
+    if not public:
+        return
+    reorder_batch_mod.mark_reorder_batch_running(batch_id)
+    extra_notes = ""
+    stored = reorder_batch_mod.get_reorder_batch(batch_id) or {}
+    extra_notes = stored.get("notes") or ""
+    due_date = stored.get("dueDate") or ""
+    date_type = stored.get("dateType") or "Hard Date"
+    company = stored.get("company") or ""
+    try:
+        source_rows = {
+            reorder_batch_mod.normalize_order_id(row.get("Order #")): row
+            for row in _jobs_for_company_rows(company)
+            if reorder_batch_mod.normalize_order_id(row.get("Order #"))
+        }
+        for item in list(public.get("items") or []):
+            if item.get("status") == "skipped":
+                continue
+            source_id = item.get("sourceOrder")
+            reorder_batch_mod.mark_reorder_item(batch_id, source_id, status="running")
+            try:
+                source_row = source_rows.get(
+                    reorder_batch_mod.normalize_order_id(source_id)
+                )
+                if not source_row:
+                    source_row = _production_order_row_dict_by_number(sheets, source_id)
+                if not source_row:
+                    raise ValueError(f"Order #{source_id} was not found")
+                result = _create_reorder_from_existing_order(
+                    source_row,
+                    due_date=due_date,
+                    date_type=date_type,
+                    extra_notes=extra_notes,
+                )
+                reorder_batch_mod.mark_reorder_item(
+                    batch_id,
+                    source_id,
+                    status="done",
+                    newOrder=result.get("order"),
+                    backOrder=result.get("back_order"),
+                    error="",
+                )
+            except Exception as exc:
+                logger.exception("[reorder-batch] item %s failed", source_id)
+                reorder_batch_mod.mark_reorder_item(
+                    batch_id,
+                    source_id,
+                    status="error",
+                    error=str(exc),
+                )
+    finally:
+        reorder_batch_mod.mark_reorder_batch_finished(batch_id)
+        logger.info("[reorder-batch] finished batch %s", batch_id)
+
+
+@app.route("/api/reorder-batch", methods=["POST", "OPTIONS"])
+@login_required_session
+def start_reorder_batch():
+    import reorder_batch as reorder_batch_mod
+
+    data = request.get_json(silent=True) or {}
+    company = str(data.get("company") or "").strip()
+    due_date = str(data.get("dueDate") or "").strip()
+    date_type = str(data.get("dateType") or "Hard Date").strip() or "Hard Date"
+    notes = str(data.get("notes") or "").strip()
+    order_ids = data.get("orderIds") or data.get("order_ids") or []
+    if isinstance(order_ids, str):
+        order_ids = [part.strip() for part in order_ids.split(",") if part.strip()]
+    if not company:
+        return jsonify({"error": "Select a customer first."}), 400
+    if not due_date:
+        return jsonify({"error": "Pick a due date for the new jobs."}), 400
+    if not isinstance(order_ids, list) or not order_ids:
+        return jsonify({"error": "Select at least one job to reorder."}), 400
+    if len(order_ids) > reorder_batch_mod.MAX_BATCH_JOBS:
+        return jsonify(
+            {"error": f"Select at most {reorder_batch_mod.MAX_BATCH_JOBS} jobs at once."}
+        ), 400
+
+    try:
+        jobs = _jobs_for_company_rows(company)
+        to_process, skipped = reorder_batch_mod.filter_selected_reorder_jobs(
+            jobs, order_ids
+        )
+        if not to_process:
+            return jsonify({"error": "None of the selected jobs can be reordered."}), 400
+        public = reorder_batch_mod.create_reorder_batch(
+            company, to_process, skipped, due_date, date_type, notes
+        )
+        eventlet.spawn_n(_run_reorder_batch, public["batchId"])
+        logger.info(
+            "[reorder-batch] queued %s jobs for %s (batch %s)",
+            len(to_process),
+            company,
+            public["batchId"],
+        )
+        return jsonify(public), 202
+    except Exception as exc:
+        logger.exception("[reorder-batch] failed to start")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/reorder-batch/<batch_id>", methods=["GET", "OPTIONS"])
+@login_required_session
+def get_reorder_batch_status(batch_id):
+    import reorder_batch as reorder_batch_mod
+
+    public = reorder_batch_mod.public_reorder_batch(batch_id)
+    if not public:
+        return jsonify({"error": "Batch not found"}), 404
+    return jsonify(public), 200
+
+
 # ─── Shopify Product Builder orders → Google Sheets (PB Test tab) + Supabase ───
 def _get_prop(properties, name):
     """Get line item property value by name. properties is list of {name, value}."""
