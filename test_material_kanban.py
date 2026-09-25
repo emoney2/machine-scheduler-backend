@@ -229,6 +229,78 @@ class MaterialKanbanTests(unittest.TestCase):
             round(yards_from_rolls(4) + 700, 1),
         )
 
+    def test_material_inventory_overrides_roll_count_and_inbound(self):
+        today = date(2026, 9, 24)
+        table = [{"Product": "Mallet", "PPY": 20}]
+        inventory = [
+            ["Materials", "Inventory", "On Order", "Unit", "Min. Inv", "Reorder", "Cost"],
+            ["Black Fur", 339, 700, "Yards", 200, 0, 7.9],
+            ["Light Grey Fur", 472.08, 700, "Yards", 250, 0, 7.9],
+        ]
+        log = [
+            ["Date", "Order #", "", "", "", "Material", "QTY", "IN/OUT", "O/R"],
+            ["09/21/2026 10:00:00", "RESTOCK", "", "", "", "Black Fur", 700, "IN", "Ordered"],
+            ["09/21/2026 10:00:00", "RESTOCK", "", "", "", "Light Grey Fur", 700, "IN", "Ordered"],
+        ]
+        kanban = [
+            {
+                "Type": "ORDERED",
+                "Kanban ID": "MAT-LIGHT-GREY-FUR",
+                "Event ID": "MAT-DUP",
+                "Event Qty": 700,
+                "Timestamp": "2026-09-21T10:00:00Z",
+            }
+        ]
+        production = [
+            {
+                "Order #": "400",
+                "Date": today,
+                "Company Name": "Club",
+                "Product": "Mallet",
+                "Quantity": 40,
+                "Fur Color": "Light Grey Fur",
+            }
+        ]
+        result = build_status(
+            production,
+            [],
+            table,
+            kanban,
+            today=today,
+            log_rows=log,
+            inventory_rows=inventory,
+        )
+        grey = next(row for row in result["materials"] if row["id"] == "LIGHT-GREY-FUR")
+        black = next(row for row in result["materials"] if row["id"] == "BLACK-FUR")
+        self.assertAlmostEqual(grey["physicalYards"], 472.08)
+        self.assertAlmostEqual(grey["inboundYards"], 700)
+        self.assertAlmostEqual(grey["committedYards"], 2.0)
+        self.assertAlmostEqual(grey["uncommittedYards"], 472.08)
+        self.assertAlmostEqual(grey["inventoryPositionYards"], 1172.08)
+        self.assertTrue(grey["fromInventorySheet"])
+        self.assertAlmostEqual(black["physicalYards"], 339)
+        self.assertAlmostEqual(black["inboundYards"], 700)
+
+    def test_inventory_on_order_zero_falls_back_to_material_log(self):
+        today = date(2026, 9, 24)
+        inventory = [
+            {"Materials": "Black Fur", "Inventory": 339, "On Order": 0},
+        ]
+        log = [
+            {
+                "Date": today,
+                "Order #": "RESTOCK",
+                "Material": "Black Fur",
+                "QTY": 700,
+                "IN/OUT": "IN",
+                "O/R": "Ordered",
+            }
+        ]
+        result = build_status([], [], [], [], today=today, log_rows=log, inventory_rows=inventory)
+        black = next(row for row in result["materials"] if row["id"] == "BLACK-FUR")
+        self.assertAlmostEqual(black["physicalYards"], 339)
+        self.assertAlmostEqual(black["inboundYards"], 700)
+
 
 if __name__ == "__main__":
     unittest.main()

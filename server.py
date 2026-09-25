@@ -5236,6 +5236,7 @@ def _material_load_source_rows():
         TABLE_RANGE,
         f"{KANBAN_SHEET_TAB}!A1:ZZ",
         MATERIAL_LOG_RANGE,
+        MATERIAL_INVENTORY_RANGE,
     ]
     with acquire_sheet_lock(timeout=45):
         response = (
@@ -5250,9 +5251,9 @@ def _material_load_source_rows():
             .execute()
         )
     value_ranges = response.get("valueRanges", [])
-    while len(value_ranges) < 5:
+    while len(value_ranges) < 6:
         value_ranges.append({})
-    values = [entry.get("values", []) or [] for entry in value_ranges[:5]]
+    values = [entry.get("values", []) or [] for entry in value_ranges[:6]]
     return (
         _magnet_rows_to_dicts(values[0]),
         _magnet_rows_to_dicts(values[1]),
@@ -5260,6 +5261,7 @@ def _material_load_source_rows():
         _magnet_rows_to_dicts(values[3]),
         values[3],
         values[4],
+        values[5],
     )
 
 
@@ -5390,9 +5392,15 @@ def _material_status(force=False, allow_trigger=True):
     ):
         return cached
 
-    production_rows, cut_rows, table_rows, kanban_rows, _values, log_rows = (
-        _material_load_source_rows()
-    )
+    (
+        production_rows,
+        cut_rows,
+        table_rows,
+        kanban_rows,
+        _values,
+        log_rows,
+        inventory_rows,
+    ) = _material_load_source_rows()
     today = datetime.now(ZoneInfo("America/New_York")).date()
     status = build_material_kanban_status(
         production_rows,
@@ -5401,6 +5409,7 @@ def _material_status(force=False, allow_trigger=True):
         kanban_rows,
         today=today,
         log_rows=log_rows,
+        inventory_rows=inventory_rows,
     )
     if allow_trigger and status.get("shouldCreateRequests"):
         status = _material_create_requests_if_needed(status)
@@ -5450,9 +5459,15 @@ def material_kanban_record_count():
             rolls = rolls_from_yards(yards)
         if rolls < 0 or yards < 0:
             raise ValueError("counts must be non-negative")
-        production_rows, cut_rows, table_rows, _kanban_rows, kanban_values, log_rows = (
-            _material_load_source_rows()
-        )
+        (
+            production_rows,
+            cut_rows,
+            table_rows,
+            _kanban_rows,
+            kanban_values,
+            log_rows,
+            inventory_rows,
+        ) = _material_load_source_rows()
         status = build_material_kanban_status(
             production_rows,
             cut_rows,
@@ -5460,6 +5475,7 @@ def material_kanban_record_count():
             [],
             today=datetime.now(ZoneInfo("America/New_York")).date(),
             log_rows=log_rows,
+            inventory_rows=inventory_rows,
         )
         current = next(
             (row for row in status["materials"] if row["id"] == catalog["id"]),
@@ -11531,6 +11547,9 @@ SUPABASE_PB_ORDERS_TABLE = os.environ.get("SUPABASE_PB_ORDERS_TABLE", "Productio
 FUR_RANGE = os.environ.get("FUR_RANGE", "Fur List!A1:Z")
 TABLE_RANGE = os.environ.get("TABLE_RANGE", "Table!A1:Z")
 MATERIAL_LOG_RANGE = os.environ.get("MATERIAL_LOG_RANGE", "Material Log!A1:Z")
+MATERIAL_INVENTORY_RANGE = os.environ.get(
+    "MATERIAL_INVENTORY_RANGE", "Material Inventory!A1:J"
+)
 # Sales Rep commission list (Order Submission REP dropdown)
 SALES_REP_LIST_RANGE = os.environ.get("SALES_REP_LIST_RANGE", "Sales Rep!A2:A10")
 CUT_RANGE = os.environ.get("CUT_RANGE", "Cut List!A1:Z")

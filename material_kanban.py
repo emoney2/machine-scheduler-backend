@@ -186,6 +186,50 @@ def vendor_log_quantities(item, log_rows, cutoff: date) -> dict:
     }
 
 
+def _header_name(value) -> str:
+    return _norm(value).rstrip(" .")
+
+
+def _inventory_row_dicts(inventory_rows) -> list[dict]:
+    if not inventory_rows:
+        return []
+    if isinstance(inventory_rows[0], dict):
+        return list(inventory_rows)
+    headers = [str(header or "").strip() for header in (inventory_rows[0] or [])]
+    rows = []
+    for raw in inventory_rows[1:]:
+        row = list(raw or []) + [""] * max(0, len(headers) - len(raw or []))
+        rows.append(dict(zip(headers, row)))
+    return rows
+
+
+def inventory_levels_from_sheet(inventory_rows) -> dict:
+    """Read Material Inventory on-hand and On Order for tracked furs."""
+    levels = {}
+    for row in _inventory_row_dicts(inventory_rows):
+        name = None
+        inventory = None
+        on_order = 0.0
+        for key, value in row.items():
+            header = _header_name(key)
+            if header in ("materials", "material") and name is None:
+                name = value
+            elif header == "inventory" and inventory is None:
+                if value not in (None, ""):
+                    inventory = _number(value)
+            elif header in ("on order", "on-order"):
+                if value not in (None, ""):
+                    on_order = _number(value)
+        catalog = material_from_name(name)
+        if not catalog or inventory is None:
+            continue
+        levels[catalog["id"]] = {
+            "inventoryYards": max(0.0, inventory),
+            "onOrderYards": max(0.0, on_order),
+        }
+    return levels
+
+
 def tracked_kanban_ids():
     return {item["kanbanId"] for item in TRACKED_MATERIALS}
 
@@ -454,7 +498,14 @@ def _project_date(start: date, weekly_rate: float, weekly_growth: float, yards: 
     return None
 
 
-def inventory_state(item, kanban_rows, consumed_yards: float, today: date, log_rows=None) -> dict:
+def inventory_state(
+    item,
+    kanban_rows,
+    consumed_yards: float,
+    today: date,
+    log_rows=None,
+    sheet_level=None,
+) -> dict:
     relevant = [
         row
         for row in (kanban_rows or [])
@@ -508,38 +559,72 @@ def inventory_state(item, kanban_rows, consumed_yards: float, today: date, log_r
                     "quantity": round(quantity),
                 }
 
-    inbound = sum(
+    kanban_inbound = sum(
         max(0.0, quantity - received_by_event.get(event_id, 0.0))
         for event_id, quantity in ordered_by_event.items()
     )
     cutoff = count_date if has_count else PHYSICAL_BASELINE_DATE
     log_state = vendor_log_quantities(item, log_rows, cutoff)
-    inbound += _number(log_state.get("inboundYards"))
+    log_inbound = _number(log_state.get("inboundYards"))
     receipts_after_count += _number(log_state.get("receivedAfterYards"))
-    if log_state.get("inboundYards") and not active_request:
+    if log_inbound and not active_request:
         active_request = {
             "eventId": "",
             "status": "ordered",
-            "quantity": round(_number(log_state.get("inboundYards"))),
+            "quantity": round(log_inbound),
             "source": "material-log",
         }
-    used_since_count = max(0.0, consumed_yards - count_consumed) if has_count else 0.0
-    physical = max(0.0, count_yards + receipts_after_count - used_since_count)
+
+    from_sheet = isinstance(sheet_level, dict) and "inventoryYards" in sheet_level
+    if from_sheet:
+        # Material Inventory is the live ledger (OUTs already posted at order submit).
+        physical = max(0.0, _number(sheet_level.get("inventoryYards")))
+        inbound = max(0.0, _number(sheet_level.get("onOrderYards")))
+        if inbound <= 0:
+            inbound = log_inbound
+        if inbound <= 0:
+            inbound = kanban_inbound
+        if inbound and not active_request:
+            active_request = {
+                "eventId": "",
+                "status": "ordered",
+                "quantity": round(inbound),
+                "source": "material-inventory",
+            }
+        used_since_count = 0.0
+        has_count = True
+        count_consumed = consumed_yards
+    else:
+        inbound = kanban_inbound + log_inbound
+        used_since_count = max(0.0, consumed_yards - count_consumed) if has_count else 0.0
+        physical = max(0.0, count_yards + receipts_after_count - used_since_count)
+
+    places = 2 if from_sheet else 1
     return {
-        "physicalYards": round(physical, 1),
-        "inboundYards": round(inbound, 1),
+        "physicalYards": round(physical, places),
+        "inboundYards": round(inbound, places),
         "hasCount": has_count,
+        "fromInventorySheet": from_sheet,
         "countConsumedYards": round(count_consumed, 2),
         "activeRequest": active_request,
     }
 
 
-def _build_material_status(item, usage, kanban_rows, today: date, log_rows=None) -> dict:
-    inventory = inventory_state(item, kanban_rows, usage["consumedYards"], today, log_rows)
+def _build_material_status(
+    item, usage, kanban_rows, today: date, log_rows=None, sheet_level=None
+) -> dict:
+    inventory = inventory_state(
+        item, kanban_rows, usage["consumedYards"], today, log_rows, sheet_level
+    )
     forecast = demand_forecast(usage["history"], today)
     committed = _number(usage.get("committedYards"))
     deferred = _number(usage.get("deferredYards"))
-    uncommitted = max(0.0, _number(inventory.get("physicalYards")) - committed)
+    physical = _number(inventory.get("physicalYards"))
+    # Sheet inventory already deducted Material Log OUTs at submit time.
+    if inventory.get("fromInventorySheet"):
+        uncommitted = physical
+    else:
+        uncommitted = max(0.0, physical - committed)
     position = max(0.0, uncommitted + _number(inventory.get("inboundYards")))
     reorder_point = _number(forecast.get("reorderPointYards"))
     trigger = position <= reorder_point
@@ -564,9 +649,13 @@ def _build_material_status(item, usage, kanban_rows, today: date, log_rows=None)
         "physicalRolls": round(rolls_from_yards(inventory["physicalYards"]), 1),
         "committedYards": round(committed, 1),
         "deferredYards": round(deferred, 1),
-        "uncommittedYards": round(uncommitted, 1),
+        "uncommittedYards": round(
+            uncommitted, 2 if inventory.get("fromInventorySheet") else 1
+        ),
         "inboundYards": inventory["inboundYards"],
-        "inventoryPositionYards": round(position, 1),
+        "inventoryPositionYards": round(
+            position, 2 if inventory.get("fromInventorySheet") else 1
+        ),
         "reorderPointYards": reorder_point,
         "recommendedOrderYards": item["orderYards"],
         "weeklyDemandYards": weekly_rate,
@@ -578,17 +667,33 @@ def _build_material_status(item, usage, kanban_rows, today: date, log_rows=None)
         "activeRequest": inventory["activeRequest"],
         "consumedYards": usage["consumedYards"],
         "hasCount": inventory["hasCount"],
+        "fromInventorySheet": bool(inventory.get("fromInventorySheet")),
         "unit": "yards",
         "metersPerRoll": METERS_PER_ROLL,
     }
 
 
 def build_status(
-    production_rows, cut_rows, table_rows, kanban_rows, *, today: date, log_rows=None
+    production_rows,
+    cut_rows,
+    table_rows,
+    kanban_rows,
+    *,
+    today: date,
+    log_rows=None,
+    inventory_rows=None,
 ) -> dict:
     usage = usage_by_material(production_rows, cut_rows, table_rows, today=today)
+    sheet_levels = inventory_levels_from_sheet(inventory_rows)
     materials = [
-        _build_material_status(item, usage[item["id"]], kanban_rows, today, log_rows)
+        _build_material_status(
+            item,
+            usage[item["id"]],
+            kanban_rows,
+            today,
+            log_rows,
+            sheet_levels.get(item["id"]),
+        )
         for item in TRACKED_MATERIALS
     ]
     order_now = [row for row in materials if row["level"] == "order_now"]
