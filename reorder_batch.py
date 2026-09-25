@@ -162,6 +162,68 @@ def shipping_method_from_row(row):
     return "UPS"
 
 
+def drive_folder_url(folder_id):
+    fid = str(folder_id or "").strip()
+    if not fid:
+        return ""
+    return f"https://drive.google.com/drive/folders/{fid}"
+
+
+def parse_reorder_job_requests(data, default_due_date=""):
+    """
+    Accept jobs: [{orderId, quantity, dueDate}] or orderIds plus a shared due date.
+    Each request keeps its own quantity/due date when provided.
+    """
+    default_due = str(default_due_date or "").strip()
+    payload = data if isinstance(data, dict) else {}
+    raw_jobs = payload.get("jobs")
+    requests = []
+    seen = set()
+
+    def add(order_id, quantity, due_date):
+        oid = normalize_order_id(order_id)
+        if not oid or oid in seen:
+            return
+        seen.add(oid)
+        requests.append(
+            {
+                "orderId": oid,
+                "quantity": "" if quantity in (None, "") else str(quantity).strip(),
+                "dueDate": str(due_date or default_due or "").strip(),
+            }
+        )
+
+    if isinstance(raw_jobs, list) and raw_jobs:
+        for item in raw_jobs:
+            if not isinstance(item, dict):
+                continue
+            add(
+                item.get("orderId") or item.get("order_id") or item.get("Order #"),
+                item.get("quantity") if item.get("quantity") not in (None, "") else item.get("Quantity"),
+                item.get("dueDate") or item.get("due_date") or "",
+            )
+    else:
+        order_ids = payload.get("orderIds") or payload.get("order_ids") or []
+        if isinstance(order_ids, str):
+            order_ids = [part.strip() for part in order_ids.split(",") if part.strip()]
+        for oid in order_ids or []:
+            add(oid, "", default_due)
+
+    return requests
+
+
+def apply_overrides_to_jobs(jobs, requests):
+    by_id = {item["orderId"]: item for item in (requests or []) if item.get("orderId")}
+    for job in jobs or []:
+        oid = normalize_order_id(job.get("Order #") or job.get("orderId"))
+        ov = by_id.get(oid) or {}
+        job["_reorder_quantity"] = str(
+            ov.get("quantity") or job.get("Quantity") or ""
+        ).strip()
+        job["_reorder_due_date"] = str(ov.get("dueDate") or "").strip()
+    return jobs
+
+
 def _prune_locked(now=None):
     now = time.time() if now is None else now
     expired = [
@@ -186,6 +248,10 @@ def _item_from_job(job, status="queued", error=""):
         ),
         "design": str((job or {}).get("Design") or ""),
         "product": str((job or {}).get("Product") or ""),
+        "quantity": str(
+            (job or {}).get("_reorder_quantity") or (job or {}).get("Quantity") or ""
+        ).strip(),
+        "dueDate": str((job or {}).get("_reorder_due_date") or "").strip(),
         "status": status,
         "newOrder": None,
         "backOrder": None,

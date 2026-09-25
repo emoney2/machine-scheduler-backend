@@ -43,6 +43,28 @@ class ReorderBatchHelpersTests(unittest.TestCase):
         self.assertEqual(skipped[0]["sourceOrder"], "101")
         self.assertEqual(skipped[0]["status"], "skipped")
 
+    def test_drive_folder_url_is_short(self):
+        url = rb.drive_folder_url("1k0ifnmHsYqbMfYOlkSGWdG0oEjUSoJro")
+        self.assertEqual(
+            url, "https://drive.google.com/drive/folders/1k0ifnmHsYqbMfYOlkSGWdG0oEjUSoJro"
+        )
+        self.assertNotIn(",", url)
+
+    def test_parse_job_requests_keeps_per_job_qty_and_due(self):
+        reqs = rb.parse_reorder_job_requests(
+            {
+                "jobs": [
+                    {"orderId": "10", "quantity": "25", "dueDate": "2026-10-01"},
+                    {"orderId": "11", "quantity": "8", "dueDate": "2026-11-15"},
+                ]
+            },
+            "2026-12-01",
+        )
+        self.assertEqual(reqs[0]["quantity"], "25")
+        self.assertEqual(reqs[0]["dueDate"], "2026-10-01")
+        self.assertEqual(reqs[1]["quantity"], "8")
+        self.assertEqual(reqs[1]["dueDate"], "2026-11-15")
+
     def test_combine_notes(self):
         self.assertEqual(rb.combine_notes("old", "new"), "old\nnew")
         self.assertEqual(rb.combine_notes("old", ""), "old")

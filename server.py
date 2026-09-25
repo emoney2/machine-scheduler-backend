@@ -19241,8 +19241,9 @@ def _copy_drive_file(drive, file_id, new_name, parent_id):
 
 def _copy_order_folder_contents(drive, source_folder_id, dest_folder_id, new_order_num):
     """Copy production files and a Print Files subfolder into the new order folder."""
+    import reorder_batch as reorder_batch_mod
+
     folder_mime = "application/vnd.google-apps.folder"
-    prod_links = []
     print_links = ""
     copied_print = False
     emb_used = False
@@ -19266,10 +19267,7 @@ def _copy_order_folder_contents(drive, source_folder_id, dest_folder_id, new_ord
             emb_used = True
         else:
             dest_name = name
-        copied = _copy_drive_file(drive, child["id"], dest_name, dest_folder_id)
-        link = copied.get("webViewLink") or ""
-        if link:
-            prod_links.append(link)
+        _copy_drive_file(drive, child["id"], dest_name, dest_folder_id)
 
     if print_folder:
         pf_id = _create_named_drive_folder(drive, "Print Files", parent_id=dest_folder_id)
@@ -19281,11 +19279,9 @@ def _copy_order_folder_contents(drive, source_folder_id, dest_folder_id, new_ord
                 drive, child["id"], child.get("name") or "file", pf_id
             )
             copied_print = True
-        print_links = f"https://drive.google.com/drive/folders/{pf_id}"
+        print_links = reorder_batch_mod.drive_folder_url(pf_id)
 
-    if not prod_links:
-        prod_links = [f"https://drive.google.com/drive/folders/{dest_folder_id}"]
-    return prod_links, print_links, copied_print
+    return print_links, copied_print
 
 
 def _copy_print_folder_by_url(drive, print_url, dest_folder_id):
@@ -19301,7 +19297,9 @@ def _copy_print_folder_by_url(drive, print_url, dest_folder_id):
             continue
         _copy_drive_file(drive, child["id"], child.get("name") or "file", pf_id)
         copied = True
-    return f"https://drive.google.com/drive/folders/{pf_id}", copied
+    import reorder_batch as reorder_batch_mod
+
+    return reorder_batch_mod.drive_folder_url(pf_id), copied
 
 
 def _production_row_values_for_reorder(
@@ -19315,7 +19313,7 @@ def _production_row_values_for_reorder(
     print_cell,
     materials,
     material_percents,
-    prod_links,
+    image_link,
     print_links,
     stage,
     ship_date,
@@ -19323,6 +19321,7 @@ def _production_row_values_for_reorder(
     schedule_str,
     product_override=None,
     price_override=None,
+    quantity=None,
 ):
     return [
         new_order,
@@ -19330,7 +19329,7 @@ def _production_row_values_for_reorder(
         preview,
         source_row.get("Company Name"),
         source_row.get("Design"),
-        source_row.get("Quantity"),
+        source_row.get("Quantity") if quantity in (None, "") else quantity,
         "",
         product_override if product_override is not None else source_row.get("Product"),
         stage,
@@ -19345,7 +19344,7 @@ def _production_row_values_for_reorder(
         ship_date,
         stitch_count,
         notes,
-        ",".join(prod_links) if isinstance(prod_links, list) else (prod_links or ""),
+        image_link or "",
         print_links or "",
         "",
         date_type,
@@ -19384,7 +19383,9 @@ def _write_reorder_followup_fields(
         ).execute()
 
 
-def _create_reorder_from_existing_order(source_row, due_date, date_type, extra_notes=""):
+def _create_reorder_from_existing_order(
+    source_row, due_date, date_type, extra_notes="", quantity=None
+):
     """Create one new Production Order (and paired back when submit would) from a past job."""
     import reorder_batch as reorder_batch_mod
 
@@ -19396,7 +19397,8 @@ def _create_reorder_from_existing_order(source_row, due_date, date_type, extra_n
     for idx, mat in enumerate(materials):
         if mat.strip() and not str(material_percents[idx] or "").strip():
             raise ValueError(f'Percentage for Material{idx + 1} ("{mat}") is required.')
-    qty_db = _form_quantity_for_db(source_row.get("Quantity"))
+    qty_raw = quantity if quantity not in (None, "") else source_row.get("Quantity")
+    qty_db = _form_quantity_for_db(qty_raw)
     price_db = _form_price_for_db(source_row.get("Price"))
     product = source_row.get("Product") or ""
     is_quilted_front = _product_creates_paired_back_order(product)
@@ -19460,11 +19462,11 @@ def _create_reorder_from_existing_order(source_row, due_date, date_type, extra_n
     _make_drive_public(drive, order_folder_id)
 
     source_folder_id = _find_source_order_folder_id(drive, source_row)
-    prod_links = [f"https://drive.google.com/drive/folders/{order_folder_id}"]
+    image_link = reorder_batch_mod.drive_folder_url(order_folder_id)
     print_links = ""
     copied_print = False
     if source_folder_id:
-        prod_links, print_links, copied_print = _copy_order_folder_contents(
+        print_links, copied_print = _copy_order_folder_contents(
             drive, source_folder_id, order_folder_id, new_order
         )
     elif reorder_from:
@@ -19482,15 +19484,16 @@ def _create_reorder_from_existing_order(source_row, due_date, date_type, extra_n
     print_cell = "YES" if (print_yes or copied_print) else "NO"
 
     back_order_folder_id = None
-    back_prod_links = []
+    back_image_link = ""
     back_print_links = ""
     if is_quilted_front and back_order:
         back_order_folder_id = _create_named_drive_folder(
             drive, back_order, parent_id=parent_id
         )
         _make_drive_public(drive, back_order_folder_id)
+        back_image_link = reorder_batch_mod.drive_folder_url(back_order_folder_id)
         if source_folder_id:
-            back_prod_links, back_print_links, _ = _copy_order_folder_contents(
+            back_print_links, _ = _copy_order_folder_contents(
                 drive, source_folder_id, back_order_folder_id, back_order
             )
         elif reorder_from:
@@ -19517,12 +19520,13 @@ def _create_reorder_from_existing_order(source_row, due_date, date_type, extra_n
         print_cell,
         materials,
         material_percents,
-        prod_links,
+        image_link,
         print_links,
         stage,
         ship_date,
         stitch_count,
         schedule_str,
+        quantity=qty_raw,
     )
     sheets.values().update(
         spreadsheetId=SPREADSHEET_ID,
@@ -19596,7 +19600,7 @@ def _create_reorder_from_existing_order(source_row, due_date, date_type, extra_n
             print_cell,
             materials,
             material_percents,
-            back_prod_links or [f"https://drive.google.com/drive/folders/{back_order_folder_id}"],
+            back_image_link,
             back_print_links,
             back_stage,
             back_ship_date,
@@ -19604,6 +19608,7 @@ def _create_reorder_from_existing_order(source_row, due_date, date_type, extra_n
             back_schedule_str,
             product_override=back_product,
             price_override=0,
+            quantity=qty_raw,
         )
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
@@ -19711,9 +19716,10 @@ def _run_reorder_batch(batch_id):
                     raise ValueError(f"Order #{source_id} was not found")
                 result = _create_reorder_from_existing_order(
                     source_row,
-                    due_date=due_date,
+                    due_date=item.get("dueDate") or due_date,
                     date_type=date_type,
                     extra_notes=extra_notes,
+                    quantity=item.get("quantity") or None,
                 )
                 reorder_batch_mod.mark_reorder_item(
                     batch_id,
@@ -19746,16 +19752,19 @@ def start_reorder_batch():
     due_date = str(data.get("dueDate") or "").strip()
     date_type = str(data.get("dateType") or "Hard Date").strip() or "Hard Date"
     notes = str(data.get("notes") or "").strip()
-    order_ids = data.get("orderIds") or data.get("order_ids") or []
-    if isinstance(order_ids, str):
-        order_ids = [part.strip() for part in order_ids.split(",") if part.strip()]
+    job_requests = reorder_batch_mod.parse_reorder_job_requests(data, due_date)
+    order_ids = [item["orderId"] for item in job_requests]
     if not company:
         return jsonify({"error": "Select a customer first."}), 400
-    if not due_date:
-        return jsonify({"error": "Pick a due date for the new jobs."}), 400
-    if not isinstance(order_ids, list) or not order_ids:
+    if not job_requests:
         return jsonify({"error": "Select at least one job to reorder."}), 400
-    if len(order_ids) > reorder_batch_mod.MAX_BATCH_JOBS:
+    if any(not item.get("dueDate") for item in job_requests):
+        return jsonify(
+            {
+                "error": "Each job needs a due date. Set one for all, or a date on each job."
+            }
+        ), 400
+    if len(job_requests) > reorder_batch_mod.MAX_BATCH_JOBS:
         return jsonify(
             {"error": f"Select at most {reorder_batch_mod.MAX_BATCH_JOBS} jobs at once."}
         ), 400
@@ -19767,6 +19776,7 @@ def start_reorder_batch():
         )
         if not to_process:
             return jsonify({"error": "None of the selected jobs can be reordered."}), 400
+        reorder_batch_mod.apply_overrides_to_jobs(to_process, job_requests)
         public = reorder_batch_mod.create_reorder_batch(
             company, to_process, skipped, due_date, date_type, notes
         )
