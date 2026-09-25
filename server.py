@@ -19239,7 +19239,9 @@ def _copy_drive_file(drive, file_id, new_name, parent_id):
     return copied
 
 
-def _copy_order_folder_contents(drive, source_folder_id, dest_folder_id, new_order_num):
+def _copy_order_folder_contents(
+    drive, source_folder_id, dest_folder_id, new_order_num, preferred_image_file_id=None
+):
     """Copy production files and a Print Files subfolder into the new order folder."""
     import reorder_batch as reorder_batch_mod
 
@@ -19247,6 +19249,8 @@ def _copy_order_folder_contents(drive, source_folder_id, dest_folder_id, new_ord
     print_links = ""
     copied_print = False
     emb_used = False
+    image_link = ""
+    fallback_image_ids = []
     children = _list_drive_children(drive, source_folder_id)
     print_folder = None
     files = []
@@ -19259,6 +19263,7 @@ def _copy_order_folder_contents(drive, source_folder_id, dest_folder_id, new_ord
         else:
             files.append(child)
 
+    preferred = str(preferred_image_file_id or "").strip()
     for child in files:
         name = str(child.get("name") or "file")
         lower = name.lower()
@@ -19267,7 +19272,27 @@ def _copy_order_folder_contents(drive, source_folder_id, dest_folder_id, new_ord
             emb_used = True
         else:
             dest_name = name
-        _copy_drive_file(drive, child["id"], dest_name, dest_folder_id)
+        copied = _copy_drive_file(drive, child["id"], dest_name, dest_folder_id)
+        copied_id = copied.get("id") or ""
+        if preferred and child.get("id") == preferred and copied_id:
+            image_link = reorder_batch_mod.drive_file_view_url(copied_id)
+        elif reorder_batch_mod.is_preview_image_name(name) and copied_id:
+            fallback_image_ids.append(copied_id)
+
+    if not image_link and fallback_image_ids:
+        image_link = reorder_batch_mod.drive_file_view_url(fallback_image_ids[0])
+    if not image_link and preferred:
+        try:
+            meta = drive.files().get(fileId=preferred, fields="name").execute()
+            copied = _copy_drive_file(
+                drive, preferred, meta.get("name") or "image", dest_folder_id
+            )
+            if copied.get("id"):
+                image_link = reorder_batch_mod.drive_file_view_url(copied["id"])
+        except Exception as exc:
+            logger.warning(
+                "[reorder-batch] could not copy preferred image %s: %s", preferred, exc
+            )
 
     if print_folder:
         pf_id = _create_named_drive_folder(drive, "Print Files", parent_id=dest_folder_id)
@@ -19281,7 +19306,7 @@ def _copy_order_folder_contents(drive, source_folder_id, dest_folder_id, new_ord
             copied_print = True
         print_links = reorder_batch_mod.drive_folder_url(pf_id)
 
-    return print_links, copied_print
+    return image_link, print_links, copied_print
 
 
 def _copy_print_folder_by_url(drive, print_url, dest_folder_id):
@@ -19462,12 +19487,19 @@ def _create_reorder_from_existing_order(
     _make_drive_public(drive, order_folder_id)
 
     source_folder_id = _find_source_order_folder_id(drive, source_row)
-    image_link = reorder_batch_mod.drive_folder_url(order_folder_id)
+    preferred_image_id = reorder_batch_mod.first_drive_file_id_from_image_cell(
+        source_row.get("Image")
+    )
+    image_link = ""
     print_links = ""
     copied_print = False
     if source_folder_id:
-        print_links, copied_print = _copy_order_folder_contents(
-            drive, source_folder_id, order_folder_id, new_order
+        image_link, print_links, copied_print = _copy_order_folder_contents(
+            drive,
+            source_folder_id,
+            order_folder_id,
+            new_order,
+            preferred_image_file_id=preferred_image_id,
         )
     elif reorder_from:
         copy_emb_files(
@@ -19476,6 +19508,21 @@ def _create_reorder_from_existing_order(
             drive_service=drive,
             new_folder_id=order_folder_id,
         )
+
+    if not image_link and preferred_image_id:
+        try:
+            meta = drive.files().get(fileId=preferred_image_id, fields="name").execute()
+            copied = _copy_drive_file(
+                drive, preferred_image_id, meta.get("name") or "image", order_folder_id
+            )
+            if copied.get("id"):
+                image_link = reorder_batch_mod.drive_file_view_url(copied["id"])
+        except Exception as exc:
+            logger.warning(
+                "[reorder-batch] could not copy source image %s: %s",
+                preferred_image_id,
+                exc,
+            )
 
     if not print_links:
         print_links, copied_print = _copy_print_folder_by_url(
@@ -19491,10 +19538,13 @@ def _create_reorder_from_existing_order(
             drive, back_order, parent_id=parent_id
         )
         _make_drive_public(drive, back_order_folder_id)
-        back_image_link = reorder_batch_mod.drive_folder_url(back_order_folder_id)
         if source_folder_id:
-            back_print_links, _ = _copy_order_folder_contents(
-                drive, source_folder_id, back_order_folder_id, back_order
+            back_image_link, back_print_links, _ = _copy_order_folder_contents(
+                drive,
+                source_folder_id,
+                back_order_folder_id,
+                back_order,
+                preferred_image_file_id=preferred_image_id,
             )
         elif reorder_from:
             copy_emb_files(

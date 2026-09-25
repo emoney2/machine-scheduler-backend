@@ -43,12 +43,17 @@ class ReorderBatchHelpersTests(unittest.TestCase):
         self.assertEqual(skipped[0]["sourceOrder"], "101")
         self.assertEqual(skipped[0]["status"], "skipped")
 
-    def test_drive_folder_url_is_short(self):
-        url = rb.drive_folder_url("1k0ifnmHsYqbMfYOlkSGWdG0oEjUSoJro")
-        self.assertEqual(
-            url, "https://drive.google.com/drive/folders/1k0ifnmHsYqbMfYOlkSGWdG0oEjUSoJro"
+    def test_image_cell_uses_one_file_url(self):
+        long_cell = (
+            "https://drive.google.com/file/d/1k0ifnmHsYqbMfYOlkSGWdG0oEjUSoJro/view?usp=drivesdk,"
+            "https://drive.google.com/file/d/1f5GaaSnOZXJ3ZJaJdQ3Op2znvuHLO78u/view?usp=drivesdk"
         )
+        file_id = rb.first_drive_file_id_from_image_cell(long_cell)
+        self.assertEqual(file_id, "1k0ifnmHsYqbMfYOlkSGWdG0oEjUSoJro")
+        url = rb.drive_file_view_url(file_id)
+        self.assertEqual(url, "https://drive.google.com/file/d/1k0ifnmHsYqbMfYOlkSGWdG0oEjUSoJro/view")
         self.assertNotIn(",", url)
+        self.assertNotIn("/folders/", url)
 
     def test_parse_job_requests_keeps_per_job_qty_and_due(self):
         reqs = rb.parse_reorder_job_requests(

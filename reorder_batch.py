@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 import uuid
+
+PREVIEW_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".tif", ".tiff", ".bmp")
 
 
 _LOCK = threading.Lock()
@@ -167,6 +170,32 @@ def drive_folder_url(folder_id):
     if not fid:
         return ""
     return f"https://drive.google.com/drive/folders/{fid}"
+
+
+def drive_file_view_url(file_id):
+    fid = str(file_id or "").strip()
+    if not fid:
+        return ""
+    return f"https://drive.google.com/file/d/{fid}/view"
+
+
+def is_preview_image_name(name):
+    lower = str(name or "").lower()
+    return any(lower.endswith(ext) for ext in PREVIEW_IMAGE_EXTS)
+
+
+def first_drive_file_id_from_image_cell(image_cell):
+    """First artwork file id from Image — one URL or a comma-separated list."""
+    for part in str(image_cell or "").split(","):
+        if "/folders/" in part:
+            continue
+        match = re.search(r"/file/d/([A-Za-z0-9_-]{10,})", part)
+        if match:
+            return match.group(1)
+        match = re.search(r"[?&]id=([A-Za-z0-9_-]{10,})", part)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def parse_reorder_job_requests(data, default_due_date=""):
