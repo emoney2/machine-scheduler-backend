@@ -224,7 +224,8 @@ def inventory_levels_from_sheet(inventory_rows) -> dict:
         if not catalog or inventory is None:
             continue
         levels[catalog["id"]] = {
-            "inventoryYards": max(0.0, inventory),
+            # Material Inventory is a ledger and can be negative.
+            "inventoryYards": inventory,
             "onOrderYards": max(0.0, on_order),
         }
     return levels
@@ -578,7 +579,7 @@ def inventory_state(
     from_sheet = isinstance(sheet_level, dict) and "inventoryYards" in sheet_level
     if from_sheet:
         # Material Inventory is the live ledger (OUTs already posted at order submit).
-        physical = max(0.0, _number(sheet_level.get("inventoryYards")))
+        physical = _number(sheet_level.get("inventoryYards"))
         inbound = max(0.0, _number(sheet_level.get("onOrderYards")))
         if inbound <= 0:
             inbound = log_inbound
@@ -623,9 +624,10 @@ def _build_material_status(
     # Sheet inventory already deducted Material Log OUTs at submit time.
     if inventory.get("fromInventorySheet"):
         uncommitted = physical
+        position = uncommitted + _number(inventory.get("inboundYards"))
     else:
         uncommitted = max(0.0, physical - committed)
-    position = max(0.0, uncommitted + _number(inventory.get("inboundYards")))
+        position = max(0.0, uncommitted + _number(inventory.get("inboundYards")))
     reorder_point = _number(forecast.get("reorderPointYards"))
     trigger = position <= reorder_point
     weekly_rate = forecast["weeklyRate"]

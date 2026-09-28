@@ -234,7 +234,7 @@ class MaterialKanbanTests(unittest.TestCase):
         table = [{"Product": "Mallet", "PPY": 20}]
         inventory = [
             ["Materials", "Inventory", "On Order", "Unit", "Min. Inv", "Reorder", "Cost"],
-            ["Black Fur", 339, 700, "Yards", 200, 0, 7.9],
+            ["Black Fur", -47.87, 700, "Yards", 0, 0, 3.9],
             ["Light Grey Fur", 472.08, 700, "Yards", 250, 0, 7.9],
         ]
         log = [
@@ -278,8 +278,11 @@ class MaterialKanbanTests(unittest.TestCase):
         self.assertAlmostEqual(grey["uncommittedYards"], 472.08)
         self.assertAlmostEqual(grey["inventoryPositionYards"], 1172.08)
         self.assertTrue(grey["fromInventorySheet"])
-        self.assertAlmostEqual(black["physicalYards"], 339)
+        self.assertAlmostEqual(black["physicalYards"], -47.87)
+        self.assertAlmostEqual(black["uncommittedYards"], -47.87)
         self.assertAlmostEqual(black["inboundYards"], 700)
+        self.assertAlmostEqual(black["inventoryPositionYards"], 652.13)
+        self.assertEqual(black["physicalRolls"], 0.0)
 
     def test_inventory_on_order_zero_falls_back_to_material_log(self):
         today = date(2026, 9, 24)
@@ -300,6 +303,20 @@ class MaterialKanbanTests(unittest.TestCase):
         black = next(row for row in result["materials"] if row["id"] == "BLACK-FUR")
         self.assertAlmostEqual(black["physicalYards"], 339)
         self.assertAlmostEqual(black["inboundYards"], 700)
+
+    def test_negative_inventory_ledger_is_not_clamped_to_zero(self):
+        today = date(2026, 9, 28)
+        inventory = [
+            {"Materials": "Black Fur", "Inventory": -47.87, "On Order": 700},
+        ]
+        result = build_status([], [], [], [], today=today, inventory_rows=inventory)
+        black = next(row for row in result["materials"] if row["id"] == "BLACK-FUR")
+        self.assertAlmostEqual(black["physicalYards"], -47.87)
+        self.assertAlmostEqual(black["uncommittedYards"], -47.87)
+        self.assertAlmostEqual(black["inboundYards"], 700)
+        self.assertAlmostEqual(black["inventoryPositionYards"], 652.13)
+        self.assertEqual(black["physicalRolls"], 0.0)
+        self.assertEqual(black["level"], "healthy")
 
 
 if __name__ == "__main__":
