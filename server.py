@@ -6761,6 +6761,41 @@ def _production_orders_header_row(sheets):
         return []
 
 
+def _normalize_order_number_headers(headers):
+    """Column A is always Order #. A renamed A1 used to blank every tab."""
+    out = [str(h or "").strip() for h in (headers or [])]
+    if not out:
+        return ["Order #"]
+    key = out[0].lower().replace(" ", "").replace("_", "")
+    if key not in ("order#", "order", "ordernumber"):
+        logger.warning(
+            "Production Orders A1 is %r; treating column A as Order #",
+            out[0],
+        )
+    out[0] = "Order #"
+    return out
+
+
+def _next_production_orders_row(col_a):
+    """Never return row 1 — that cell is the Order # header."""
+    return max(len(col_a or []) + 1, 2)
+
+
+def _ensure_order_number_header(sheets):
+    """Put Order # back in A1 if someone (or a write) overwrote it."""
+    header = _production_orders_header_row(sheets)
+    a1 = str(header[0] if header else "").strip()
+    if a1 == "Order #":
+        return
+    sheets.values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Production Orders!A1",
+        valueInputOption="RAW",
+        body={"values": [["Order #"]]},
+    ).execute()
+    logger.warning("Restored Production Orders!A1 to 'Order #' (was %r)", a1)
+
+
 def _col_letter_local(idx0: int) -> str:
     n = idx0 + 1
     s = ""
@@ -13498,7 +13533,7 @@ def build_overview_payload():
         def _rows_to_dicts_local(rws):
             if not rws:
                 return []
-            headers = [str(h).strip() for h in rws[0]]
+            headers = _normalize_order_number_headers(rws[0])
             out = []
             for r in rws[1:]:
                 r = r or []
@@ -17669,7 +17704,7 @@ def get_combined():
         def rows_to_dicts(rows):
             if not rows:
                 return []
-            headers = [str(h).strip() for h in rows[0]]
+            headers = _normalize_order_number_headers(rows[0])
             out = []
             for r in rows[1:]:
                 r = r or []
@@ -18656,10 +18691,11 @@ def submit_order():
             range="Production Orders!A:A"
         ).execute().get("values", [])
 
-        next_row = len(col_a) + 1
+        next_row = _next_production_orders_row(col_a)
         prev_order = _last_order_num_from_col_a(col_a)
         new_order = prev_order + 1
-        
+        _ensure_order_number_header(sheets)
+
         # For quilted front products, we'll create two orders (front and back)
         # The back order will be new_order + 1
         back_order = new_order + 1 if is_quilted_front else None
@@ -19516,9 +19552,10 @@ def _create_reorder_from_existing_order_locked(
         .execute()
         .get("values", [])
     )
-    next_row = len(col_a) + 1
+    next_row = _next_production_orders_row(col_a)
     prev_order = _last_order_num_from_col_a(col_a)
     new_order = prev_order + 1
+    _ensure_order_number_header(sheets)
     back_order = new_order + 1 if is_quilted_front else None
 
     def tpl_formula(col_letter, target_row):
@@ -20921,7 +20958,7 @@ def shopify_webhook_orders_create():
 
     # Read sheet state first so we can check recent rows for duplicate and reserve rows
     col_a = sheets.get(spreadsheetId=SPREADSHEET_ID, range=f"{PRODUCTION_ORDERS_PB_SHEET_TAB}!A:A").execute().get("values", [])
-    next_row = len(col_a) + 1
+    next_row = _next_production_orders_row(col_a)
     prev_order = int(col_a[-1][0]) if len(col_a) > 1 and col_a[-1] else 0
     try:
         header_row = sheets.get(
