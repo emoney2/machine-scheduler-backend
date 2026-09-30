@@ -1126,3 +1126,29 @@ def mark_manual_start(order_id: str, started_at: str = "") -> dict:
         _MEM[oid] = prev
         _save_to_file(rows)
         return dict(prev)
+
+
+def completed_qty_for_scheduler(file_done, list_done, order_qty, emb_status) -> int:
+    """Pieces finished for scheduler cards.
+
+    Embroidery List "Quantity Made" is often the planned job size, not pieces
+    finished. Treat it as progress only when Status is COMPLETE or the made
+    count is still below the order quantity. Floor-tablet progress in
+    Embroidery Progress still wins via file_done.
+    """
+    try:
+        file_done = max(0, int(file_done or 0))
+    except (TypeError, ValueError):
+        file_done = 0
+    try:
+        list_done = max(0, int(list_done or 0))
+    except (TypeError, ValueError):
+        list_done = 0
+    try:
+        order_qty = max(0, int(order_qty or 0))
+    except (TypeError, ValueError):
+        order_qty = 0
+    status = str(emb_status or "").strip().upper()
+    if status != "COMPLETE" and order_qty > 0 and list_done >= order_qty:
+        list_done = 0
+    return max(file_done, list_done)

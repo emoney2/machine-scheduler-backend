@@ -1866,6 +1866,7 @@ def _bump_embroidery_scheduler_signal():
     _embroidery_scheduler_rev += 1
     try:
         _json_cache.pop("changes-v1", None)
+        _json_cache.pop("combined-v7", None)
         _json_cache.pop("combined-v6", None)
         _json_cache.pop("combined-v5", None)
         _json_cache.pop("combined-v4", None)
@@ -12602,7 +12603,7 @@ def invalidate_material_inventory_status_cache():
 def _invalidate_combined_orders_cache():
     """Clear `/api/combined` caches so Fur List sees sheet updates on all clients."""
     global _json_cache
-    for key in ("combined-v6", "combined-v5", "combined-v4", "combined-v3", "combined-v2", "combined"):
+    for key in ("combined-v7", "combined-v6", "combined-v5", "combined-v4", "combined-v3", "combined-v2", "combined"):
         _json_cache.pop(key, None)
 
 
@@ -17772,7 +17773,11 @@ def get_combined():
             prow = prog.get(nk) or prog.get(oid) or {}
             file_done = int(prow.get("completedQty") or 0) if prow else 0
             list_done = int(emb_made_map.get(nk) or 0)
-            done = max(file_done, list_done)
+            order_qty = int(round(_parse_qty_number(o.get("Quantity"), 0.0)))
+            emb_st = str(o.get("Embroidery List Status") or "").strip()
+            done = emb_progress.completed_qty_for_scheduler(
+                file_done, list_done, order_qty, emb_st
+            )
             o["Embroidery Completed Qty"] = done
             if prow:
                 stitch = int(round(_parse_qty_number(o.get("Stitch Count"), 0.0)))
@@ -17791,12 +17796,12 @@ def get_combined():
     # Use caching to reduce Google Sheets API calls (stale-while-revalidate on expiry)
     TTL = int(os.environ.get("COMBINED_CACHE_TTL", "45"))
     try:
-        result = send_cached_json("combined-v6", TTL, build_payload)
+        result = send_cached_json("combined-v7", TTL, build_payload)
         if result is None:
             # If send_cached_json failed, fall through to exception handler
             raise Exception("send_cached_json returned None")
-        # Override Cache-Control to allow short-term browser caching
-        result.headers["Cache-Control"] = f"public, max-age={TTL}"
+        # Authenticated payload — do not let browsers/CDNs cache an empty board
+        result.headers["Cache-Control"] = "private, no-store"
         return result
 
     except Exception:
