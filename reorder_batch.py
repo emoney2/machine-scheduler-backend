@@ -191,7 +191,7 @@ def is_reorder_pattern_file(name):
 
 
 def pick_reorder_source_files(files, preferred_image_file_id=""):
-    """Only the original artwork image plus .emb/.dst/.dxf/.svg."""
+    """Only the original artwork image plus .emb/.dst/.dxf/.svg from ONE job folder."""
     preferred = str(preferred_image_file_id or "").strip()
     selected = []
     seen = set()

@@ -70,7 +70,6 @@ class ReorderBatchHelpersTests(unittest.TestCase):
         names = [f["name"] for f in picked]
         self.assertEqual(set(names), {"cover.jpg", "1234.emb", "1234.dst", "cut.dxf", "art.svg"})
         self.assertNotIn("extra.png", names)
-        self.assertNotIn("notes.pdf", names)
 
     def test_parse_job_requests_keeps_per_job_qty_and_due(self):
         reqs = rb.parse_reorder_job_requests(

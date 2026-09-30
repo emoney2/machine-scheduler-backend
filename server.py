@@ -19133,48 +19133,87 @@ def _escape_drive_query_name(name):
     return str(name).replace("\\", "\\\\").replace("'", "\\'")
 
 
+_REORDER_SERIAL_LOCK = threading.RLock()
+
+
+def _drive_list_kwargs():
+    return {
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+    }
+
+
 def _make_drive_public(drive, file_id):
     try:
         drive.permissions().create(
-            fileId=file_id, body={"role": "reader", "type": "anyone"}
+            fileId=file_id,
+            body={"role": "reader", "type": "anyone"},
+            supportsAllDrives=True,
         ).execute()
     except Exception:
         logger.warning("[reorder-batch] could not make file %s public", file_id)
 
 
-def _create_named_drive_folder(drive, name, parent_id=None):
-    from googleapiclient.errors import HttpError
-
+def _find_folder_in_parent(drive, name, parent_id):
+    if not name or not parent_id:
+        return None
     safe = _escape_drive_query_name(name)
     query = (
         f"name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' "
-        "and trashed = false"
+        f"and trashed = false and '{parent_id}' in parents"
     )
-    if parent_id:
-        query += f" and '{parent_id}' in parents"
-    existing = (
-        drive.files().list(q=query, fields="files(id)").execute().get("files", [])
+    found = (
+        drive.files()
+        .list(
+            q=query,
+            fields="files(id, name)",
+            pageSize=10,
+            **_drive_list_kwargs(),
+        )
+        .execute()
+        .get("files", [])
     )
-    for f in existing:
-        fid = f["id"]
-        try:
-            retry_google_api_call(lambda: drive.files().delete(fileId=fid).execute())
-        except HttpError as e:
-            try:
-                retry_google_api_call(
-                    lambda: drive.files()
-                    .update(fileId=fid, body={"trashed": True})
-                    .execute()
-                )
-            except Exception:
-                raise e
+    return found[0]["id"] if found else None
+
+
+def _create_named_drive_folder(drive, name, parent_id=None):
+    existing = _find_folder_in_parent(drive, name, parent_id) if parent_id else None
+    if existing:
+        return existing
     meta = {"name": str(name), "mimeType": "application/vnd.google-apps.folder"}
     if parent_id:
         meta["parents"] = [parent_id]
     folder = retry_google_api_call(
-        lambda: drive.files().create(body=meta, fields="id").execute()
+        lambda: drive.files()
+        .create(body=meta, fields="id", supportsAllDrives=True)
+        .execute()
     )
     return folder["id"]
+
+
+def _create_unique_order_folder(drive, start_num, parent_id):
+    """Create folder named for this order. Never delete another job's folder."""
+    n = int(start_num)
+    while True:
+        if not _find_folder_in_parent(drive, str(n), parent_id):
+            meta = {
+                "name": str(n),
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [parent_id],
+            }
+
+            def _create(n=n, meta=meta):
+                return drive.files().create(
+                    body=meta, fields="id,name", supportsAllDrives=True
+                ).execute()
+
+            folder = retry_google_api_call(_create)
+            return n, folder["id"]
+        logger.warning(
+            "[reorder-batch] Drive folder %s already exists; using the next number",
+            n,
+        )
+        n += 1
 
 
 def _list_drive_children(drive, folder_id):
@@ -19189,6 +19228,7 @@ def _list_drive_children(drive, folder_id):
                 fields="nextPageToken, files(id, name, mimeType, webViewLink)",
                 pageToken=page_token,
                 pageSize=100,
+                **_drive_list_kwargs(),
             )
             .execute()
         )
@@ -19200,39 +19240,20 @@ def _list_drive_children(drive, folder_id):
 
 
 def _find_source_order_folder_id(drive, source_row):
-    image = str((source_row or {}).get("Image") or "")
-    folder_id = _folder_id_from_drive_url(image)
-    if folder_id:
-        return folder_id
-    file_id = _file_id_from_drive_url(image)
-    if file_id:
-        try:
-            meta = drive.files().get(fileId=file_id, fields="parents").execute()
-            parents = meta.get("parents") or []
-            if parents:
-                return parents[0]
-        except Exception as exc:
-            logger.warning(
-                "[reorder-batch] parent lookup failed for file %s: %s", file_id, exc
-            )
-    order_num = str((source_row or {}).get("Order #") or "").strip()
-    if not order_num:
-        return None
-    safe = _escape_drive_query_name(order_num)
+    """Only the original job's numbered folder — never the image file's parent."""
+    import reorder_batch as reorder_batch_mod
+
+    order_num = reorder_batch_mod.normalize_order_id(
+        (source_row or {}).get("Order #")
+    )
     parent = _orders_drive_parent_id()
-    query = (
-        f"name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' "
-        f"and trashed = false and '{parent}' in parents"
-    )
-    found = drive.files().list(q=query, fields="files(id)").execute().get("files", [])
-    if found:
-        return found[0]["id"]
-    query = (
-        f"name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' "
-        "and trashed = false"
-    )
-    found = drive.files().list(q=query, fields="files(id)").execute().get("files", [])
-    return found[0]["id"] if found else None
+    folder_id = _find_folder_in_parent(drive, order_num, parent)
+    if not folder_id:
+        logger.warning(
+            "[reorder-batch] no Drive folder named %s under orders parent",
+            order_num,
+        )
+    return folder_id
 
 
 def _copy_drive_file(drive, file_id, new_name, parent_id):
@@ -19241,10 +19262,29 @@ def _copy_drive_file(drive, file_id, new_name, parent_id):
         .copy(
             fileId=file_id,
             body={"name": new_name, "parents": [parent_id]},
-            fields="id, webViewLink, name",
+            fields="id, webViewLink, name, parents",
+            supportsAllDrives=True,
         )
         .execute()
     )
+    parents = copied.get("parents") or []
+    if parent_id and parent_id not in parents:
+        retry_google_api_call(
+            lambda: drive.files()
+            .update(
+                fileId=copied["id"],
+                addParents=parent_id,
+                removeParents=",".join(parents) if parents else None,
+                fields="id, parents",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        logger.info(
+            "[reorder-batch] moved copy %s into folder %s",
+            copied.get("id"),
+            parent_id,
+        )
     _make_drive_public(drive, copied["id"])
     return copied
 
@@ -19278,6 +19318,13 @@ def _copy_order_folder_contents(
             dest_name = name
         copied = _copy_drive_file(drive, child["id"], dest_name, dest_folder_id)
         copied_id = copied.get("id") or ""
+        logger.info(
+            "[reorder-batch] copied %s (%s) -> %s into folder %s",
+            name,
+            child.get("id"),
+            dest_name,
+            dest_folder_id,
+        )
         if copied_id and (
             (preferred and child.get("id") == preferred)
             or (not preferred and reorder_batch_mod.is_preview_image_name(name) and not image_link)
@@ -19286,7 +19333,9 @@ def _copy_order_folder_contents(
 
     if not image_link and preferred and preferred not in copied_ids:
         try:
-            meta = drive.files().get(fileId=preferred, fields="name").execute()
+            meta = drive.files().get(
+                fileId=preferred, fields="name", supportsAllDrives=True
+            ).execute()
             copied = _copy_drive_file(
                 drive, preferred, meta.get("name") or "image", dest_folder_id
             )
@@ -19403,6 +19452,15 @@ def _create_reorder_from_existing_order(
     source_row, due_date, date_type, extra_notes="", quantity=None
 ):
     """Create one new Production Order (and paired back when submit would) from a past job."""
+    with _REORDER_SERIAL_LOCK:
+        return _create_reorder_from_existing_order_locked(
+            source_row, due_date, date_type, extra_notes, quantity
+        )
+
+
+def _create_reorder_from_existing_order_locked(
+    source_row, due_date, date_type, extra_notes="", quantity=None
+):
     import reorder_batch as reorder_batch_mod
 
     if not isinstance(source_row, dict):
@@ -19474,12 +19532,24 @@ def _create_reorder_from_existing_order(
 
     drive = get_drive_service()
     parent_id = _orders_drive_parent_id()
-    order_folder_id = _create_named_drive_folder(drive, new_order, parent_id=parent_id)
+    new_order, order_folder_id = _create_unique_order_folder(
+        drive, new_order, parent_id
+    )
+    if back_order:
+        back_order = new_order + 1
     _make_drive_public(drive, order_folder_id)
 
     source_folder_id = _find_source_order_folder_id(drive, source_row)
     preferred_image_id = reorder_batch_mod.first_drive_file_id_from_image_cell(
         source_row.get("Image")
+    )
+    logger.info(
+        "[reorder-batch] source order %s -> new %s | source_folder=%s dest_folder=%s image=%s",
+        reorder_from,
+        new_order,
+        source_folder_id,
+        order_folder_id,
+        preferred_image_id,
     )
     image_link = ""
     print_links = ""
@@ -19492,17 +19562,17 @@ def _create_reorder_from_existing_order(
             new_order,
             preferred_image_file_id=preferred_image_id,
         )
-    elif reorder_from:
-        copy_emb_files(
-            old_order_num=reorder_from,
-            new_order_num=new_order,
-            drive_service=drive,
-            new_folder_id=order_folder_id,
+    elif preferred_image_id:
+        logger.warning(
+            "[reorder-batch] no source folder for order %s; copying artwork file only",
+            reorder_from,
         )
 
     if not image_link and preferred_image_id:
         try:
-            meta = drive.files().get(fileId=preferred_image_id, fields="name").execute()
+            meta = drive.files().get(
+                fileId=preferred_image_id, fields="name", supportsAllDrives=True
+            ).execute()
             copied = _copy_drive_file(
                 drive, preferred_image_id, meta.get("name") or "image", order_folder_id
             )
@@ -19521,8 +19591,8 @@ def _create_reorder_from_existing_order(
     back_image_link = ""
     back_print_links = ""
     if is_quilted_front and back_order:
-        back_order_folder_id = _create_named_drive_folder(
-            drive, back_order, parent_id=parent_id
+        back_order, back_order_folder_id = _create_unique_order_folder(
+            drive, back_order, parent_id
         )
         _make_drive_public(drive, back_order_folder_id)
         if source_folder_id:
@@ -19532,13 +19602,6 @@ def _create_reorder_from_existing_order(
                 back_order_folder_id,
                 back_order,
                 preferred_image_file_id=preferred_image_id,
-            )
-        elif reorder_from:
-            copy_emb_files(
-                old_order_num=reorder_from,
-                new_order_num=back_order,
-                drive_service=drive,
-                new_folder_id=back_order_folder_id,
             )
 
     _ensure_shipping_method_header_index(sheets)
@@ -19722,37 +19785,44 @@ def _run_reorder_batch(batch_id):
     if not public:
         return
     reorder_batch_mod.mark_reorder_batch_running(batch_id)
-    extra_notes = ""
     stored = reorder_batch_mod.get_reorder_batch(batch_id) or {}
     extra_notes = stored.get("notes") or ""
     due_date = stored.get("dueDate") or ""
     date_type = stored.get("dateType") or "Hard Date"
     company = stored.get("company") or ""
+    company_key = str(company).strip().lower()
     try:
-        source_rows = {
-            reorder_batch_mod.normalize_order_id(row.get("Order #")): row
-            for row in _jobs_for_company_rows(company)
-            if reorder_batch_mod.normalize_order_id(row.get("Order #"))
-        }
-        for item in list(public.get("items") or []):
+        items = list((reorder_batch_mod.get_reorder_batch(batch_id) or {}).get("items") or [])
+        for item in items:
             if item.get("status") == "skipped":
                 continue
             source_id = item.get("sourceOrder")
             reorder_batch_mod.mark_reorder_item(batch_id, source_id, status="running")
             try:
-                source_row = source_rows.get(
-                    reorder_batch_mod.normalize_order_id(source_id)
+                logger.info(
+                    "[reorder-batch] starting source order %s (%s)",
+                    source_id,
+                    item.get("design") or "",
                 )
-                if not source_row:
-                    source_row = _production_order_row_dict_by_number(sheets, source_id)
+                source_row = _production_order_row_dict_by_number(sheets, source_id)
                 if not source_row:
                     raise ValueError(f"Order #{source_id} was not found")
+                row_company = str(source_row.get("Company Name") or "").strip().lower()
+                if company_key and row_company != company_key:
+                    raise ValueError(
+                        f"Order #{source_id} is {source_row.get('Company Name')}, not {company}"
+                    )
                 result = _create_reorder_from_existing_order(
                     source_row,
                     due_date=item.get("dueDate") or due_date,
                     date_type=date_type,
                     extra_notes=extra_notes,
                     quantity=item.get("quantity") or None,
+                )
+                logger.info(
+                    "[reorder-batch] finished source order %s -> new %s",
+                    source_id,
+                    result.get("order"),
                 )
                 reorder_batch_mod.mark_reorder_item(
                     batch_id,
