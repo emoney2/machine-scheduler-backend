@@ -16054,8 +16054,9 @@ def _outstanding_orders_for_company_rows(company_lower: str, include_completed: 
 
     headers = prod_data[0]
     jobs = []
-    for r in prod_data[1:]:
-        row = dict(zip(headers, r))
+    for sheet_row, r in enumerate(prod_data[1:], start=2):
+        padded = list(r) + [""] * max(0, len(headers) - len(r))
+        row = dict(zip(headers, padded))
         row_company = str(row.get("Company Name", "")).strip().lower()
         if row_company != company_lower:
             continue
@@ -16076,9 +16077,10 @@ def _outstanding_orders_for_company_rows(company_lower: str, include_completed: 
         except (TypeError, ValueError):
             qty = 0
 
+        order_num = str(row.get("Order #", "")).strip()
         jobs.append(
             {
-                "Order #": str(row.get("Order #", "")).strip(),
+                "Order #": order_num,
                 "Design": str(row.get("Design", "")).strip(),
                 "Product": _normalize_product_display(
                     product_raw, str(row.get("Design", "")).strip()
@@ -16091,7 +16093,9 @@ def _outstanding_orders_for_company_rows(company_lower: str, include_completed: 
                 "Due Date": row.get("Due Date", ""),
                 "PO #": _po_number_from_row(row),
                 "image": preview_url,
-                "orderId": str(row.get("Order #", "")).strip(),
+                "orderId": order_num,
+                "jobKey": str(sheet_row),
+                "sheetRow": sheet_row,
             }
         )
 
@@ -16325,6 +16329,8 @@ def order_confirmation_pdf():
     if not company:
         return jsonify({"error": "Missing company parameter"}), 400
 
+    job_keys_raw = request.args.get("job_keys", "").strip()
+    wanted_keys = {part.strip() for part in job_keys_raw.split(",") if part.strip()}
     order_ids_raw = request.args.get("order_ids", "").strip()
     wanted_ids = {
         _overview_normalize_order_key(part)
@@ -16337,7 +16343,11 @@ def order_confirmation_pdf():
         jobs = _outstanding_orders_for_company_rows(
             company.lower(), include_completed=include_completed
         )
-        if wanted_ids:
+        if wanted_keys:
+            jobs = [j for j in jobs if str(j.get("jobKey") or "").strip() in wanted_keys]
+            if not jobs:
+                return jsonify({"error": "No matching orders for selection"}), 400
+        elif wanted_ids:
             jobs = [
                 j
                 for j in jobs
