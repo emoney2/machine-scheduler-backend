@@ -1108,6 +1108,27 @@ _google_creds_cache_ts = 0
 _google_creds_cache_ttl = 300  # Cache for 5 minutes
 
 
+def _persist_google_creds(creds):
+    """Write a refreshed access token to disk so the next worker isn't expired."""
+    if not creds:
+        return
+    try:
+        with open(GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+    except Exception:
+        logger.warning("Could not persist refreshed Google token", exc_info=True)
+
+
+def _refresh_google_creds(creds):
+    if creds.valid:
+        return creds
+    if not getattr(creds, "refresh_token", None):
+        raise RuntimeError("Google token expired and no refresh_token is present")
+    creds.refresh(GoogleRequest())
+    _persist_google_creds(creds)
+    return creds
+
+
 def get_google_credentials():
     """
     Returns OAuthCredentials using:
@@ -1117,43 +1138,30 @@ def get_google_credentials():
     Uses caching to avoid reloading on every request.
     """
     global _google_creds_cache, _google_creds_cache_ts
-    
+
     now = time.time()
-    
-    # Return cached creds if still valid and within TTL
+
     if _google_creds_cache and (now - _google_creds_cache_ts) < _google_creds_cache_ttl:
-        # Only refresh if actually expired (not just checking)
-        if _google_creds_cache.valid:
-            return _google_creds_cache
-        # If expired, try refresh but don't fail if it errors
         try:
-            if getattr(_google_creds_cache, "refresh_token", None):
-                _google_creds_cache.refresh(GoogleRequest())
-                _google_creds_cache_ts = now  # Update cache time after refresh
-                return _google_creds_cache
+            return _refresh_google_creds(_google_creds_cache)
         except Exception:
-            # If refresh fails, fall through to reload
-            pass
-    
-    # Load fresh credentials
+            logger.exception("Cached Google credential refresh failed")
+            _google_creds_cache = None
+
     creds = _load_google_creds()
     if not creds:
         raise RuntimeError(
             "No Google OAuth credentials found. Set GOOGLE_TOKEN_JSON or provide token.json"
         )
 
-    # Only refresh if actually expired (not on every load)
     try:
-        if not creds.valid and getattr(creds, "refresh_token", None):
-            creds.refresh(GoogleRequest())
+        creds = _refresh_google_creds(creds)
     except Exception:
-        # Ignore refresh hiccups here; the API client will retry/raise cleanly.
-        pass
+        logger.exception("Google credential refresh failed")
+        raise RuntimeError("Google Sheets token refresh failed") from None
 
-    # Cache the credentials
     _google_creds_cache = creds
     _google_creds_cache_ts = now
-    
     return creds
 
 
@@ -5794,24 +5802,32 @@ def token_status():
     file_exists = os.path.exists("token.json")
     cwd = os.getcwd()
 
-    creds = _load_google_creds()
+    stored = _load_google_creds()
+    live = None
+    refresh_error = None
+    try:
+        live = get_google_credentials()
+    except Exception as e:
+        refresh_error = str(e)[:200]
+
     info = {
-        "ok": bool(creds and creds.valid),
-        "expired": bool(creds and creds.expired),
-        "has_refresh_token": bool(creds and getattr(creds, "refresh_token", None)),
-        "valid": bool(creds and creds.valid),
+        "ok": bool(live and live.valid),
+        "expired": bool(stored and stored.expired),
+        "has_refresh_token": bool(stored and getattr(stored, "refresh_token", None)),
+        "valid": bool(live and live.valid),
         "env_present": env_present,
         "file_exists": file_exists,
         "cwd": cwd,
     }
-    # If not ok, include a short reason without leaking secrets
-    if not info["ok"]:
+    if refresh_error:
+        info["reason"] = refresh_error
+    elif not info["ok"]:
         info["reason"] = (
             "no creds"
-            if not creds
+            if not stored
             else (
                 "expired without refresh_token"
-                if creds and creds.expired and not creds.refresh_token
+                if stored.expired and not stored.refresh_token
                 else "invalid"
             )
         )
@@ -11325,8 +11341,13 @@ socketio = SocketIO(
     ping_interval=25,
     ping_timeout=20,
     max_http_buffer_size=1_000_000,
-    logger=False,  # NEW: silence Socket.IO logs
-    engineio_logger=False,  # NEW: silence low-level engine logs
+    logger=False,
+    engineio_logger=False,
+    # Do not copy Flask session cookies onto Engine.IO; a stale `io` cookie
+    # after a Render recycle is the 400 "Session ID unknown" in the browser.
+    manage_session=False,
+    cookie=None,
+    cors_credentials=False,
 )
 
 
