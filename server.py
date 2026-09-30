@@ -2100,6 +2100,8 @@ CORS(
                 "Authorization",
                 "X-Requested-With",
                 "Accept",
+                "Cache-Control",
+                "Pragma",
             ],
             "expose_headers": [
                 "ETag",
@@ -2408,7 +2410,7 @@ def login_required_session(f):
                 origin if origin in allowed else fallback
             )
             response.headers["Access-Control-Allow-Credentials"] = "true"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With,Accept,Cache-Control,Pragma"
             response.headers["Access-Control-Allow-Methods"] = (
                 "GET,POST,PUT,PATCH,OPTIONS"
             )
@@ -2835,7 +2837,7 @@ def _attach_cors_headers(response):
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Vary"] = "Origin"
     response.headers["Access-Control-Allow-Headers"] = (
-        "Content-Type,Authorization,X-Requested-With,Accept"
+        "Content-Type,Authorization,X-Requested-With,Accept,Cache-Control,Pragma"
     )
     response.headers["Access-Control-Allow-Methods"] = (
         "GET,POST,PUT,PATCH,DELETE,OPTIONS"
