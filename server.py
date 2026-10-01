@@ -18628,7 +18628,21 @@ def _form_price_for_db(praw):
     return float(s)
 
 
+def _frontend_order_submission_url():
+    frontend = (
+        os.environ.get("FRONTEND_URL") or "https://machineschedule.netlify.app"
+    ).strip().rstrip("/")
+    return f"{frontend}/order"
+
+
+@app.route("/submit", methods=["GET", "HEAD"], endpoint="submit_order_page")
+def submit_order_page_redirect():
+    """Browser reloads of the Order Submission page must not hit the POST /submit API."""
+    return redirect(_frontend_order_submission_url())
+
+
 @app.route("/submit", methods=["OPTIONS", "POST"])
+@app.route("/api/submit", methods=["OPTIONS", "POST"], endpoint="submit_order_api")
 @login_required_session
 def submit_order():
     if request.method == "OPTIONS":
