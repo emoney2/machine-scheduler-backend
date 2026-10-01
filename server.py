@@ -183,6 +183,20 @@ from material_kanban import (
     tracked_kanban_ids,
     yards_from_rolls,
 )
+from needlepoint_belts import (
+    BELT_SIZES as NEEDLEPOINT_BELT_SIZES,
+    append_order as append_needlepoint_order,
+    build_email_text as build_needlepoint_email_text,
+    collect_renamed_attachments as collect_needlepoint_attachments,
+    deliver_belt_order_email,
+    get_order as get_needlepoint_order,
+    is_needlepoint_product,
+    list_pending_orders as list_pending_needlepoint_orders,
+    mark_orders_ordered as mark_needlepoint_orders_ordered,
+    parse_size_quantities as parse_needlepoint_sizes,
+    supplier_email as needlepoint_supplier_email,
+    total_quantity as needlepoint_total_quantity,
+)
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
@@ -18642,42 +18656,55 @@ def submit_order():
         materials[:] = (materials + [""] * 5)[:5]
         material_percents[:] = (material_percents + [""] * 5)[:5]
 
-        if not materials[0].strip():
-            return jsonify({"error": "Material1 is required."}), 400
-
         product_lower = (data.get("product") or "").strip().lower()
         product = data.get("product") or ""
-        
+        is_needlepoint = is_needlepoint_product(product)
+        needlepoint_sizes = {}
+        if is_needlepoint:
+            needlepoint_sizes = parse_needlepoint_sizes(data.get("needlepointSizes") or "")
+            if not needlepoint_sizes:
+                return jsonify({"error": "Enter at least one needlepoint belt size quantity."}), 400
+            materials[:] = [""] * 5
+            material_percents[:] = [""] * 5
+        elif not materials[0].strip():
+            return jsonify({"error": "Material1 is required."}), 400
+
         # Front products that auto-create a paired back order (N+1)
         is_quilted_front = _product_creates_paired_back_order(product)
         logger.info(
-            "[submit] product=%r creates_paired_back=%s",
+            "[submit] product=%r creates_paired_back=%s needlepoint=%s",
             product,
             is_quilted_front,
+            is_needlepoint,
         )
         
-        if "full" in product_lower and not data.get("backMaterial", "").strip():
+        if (not is_needlepoint) and "full" in product_lower and not data.get("backMaterial", "").strip():
             return jsonify({"error": 'Back Material is required for "Full" products.'}), 400
 
-        for idx, mat in enumerate(materials):
-            if mat.strip():
-                pct = material_percents[idx].strip()
-                if not pct:
-                    return jsonify({
-                        "error": f'Percentage for Material{idx+1} ("{mat}") is required.'
-                    }), 400
-                try:
-                    float(pct)
-                except ValueError:
-                    return jsonify({
-                        "error": f'Material{idx+1} percentage ("{pct}") must be a number.'
-                    }), 400
+        if not is_needlepoint:
+            for idx, mat in enumerate(materials):
+                if mat.strip():
+                    pct = material_percents[idx].strip()
+                    if not pct:
+                        return jsonify({
+                            "error": f'Percentage for Material{idx+1} ("{mat}") is required.'
+                        }), 400
+                    try:
+                        float(pct)
+                    except ValueError:
+                        return jsonify({
+                            "error": f'Material{idx+1} percentage ("{pct}") must be a number.'
+                        }), 400
 
         # Unknown materials must be saved via the Add New Material modal
         # (unit / min / reorder / cost). Do not insert name-only stub rows here.
 
         try:
-            qty_db = _form_quantity_for_db(data.get("quantity"))
+            qty_db = (
+                needlepoint_total_quantity(needlepoint_sizes)
+                if is_needlepoint
+                else _form_quantity_for_db(data.get("quantity"))
+            )
         except ValueError:
             return jsonify({"error": "Quantity must be a valid number."}), 400
         try:
@@ -18882,7 +18909,7 @@ def submit_order():
         _ensure_shipping_method_header_index(sheets)
         row = [
             new_order, ts, preview, data.get("company"),
-            data.get("designName"), data.get("quantity"), "",
+            data.get("designName"), qty_db, "",
             data.get("product"), stage, data.get("price"),
             data.get("dueDate"), print_cell,  # Print column: YES when checkbox checked
             *materials,
@@ -18973,18 +19000,19 @@ def submit_order():
         # ─────────────────────────────────────────────────────────────────────
         # ✅ NEW: WRITE MATERIAL LOG ROWS TO SUPABASE (OPTION B)
         # ─────────────────────────────────────────────────────────────────────
-        try:
-            write_material_log_for_order(new_order)
-        except Exception as e:
-            logger.error("[MaterialLog] Failed for order %s: %s", new_order, e)
+        if not is_needlepoint:
+            try:
+                write_material_log_for_order(new_order)
+            except Exception as e:
+                logger.error("[MaterialLog] Failed for order %s: %s", new_order, e)
 
-        # ─────────────────────────────────────────────────────────────────────
-        # ✅ NEW: LOG MATERIALS TO GOOGLE SHEETS MATERIAL LOG VIA APPS SCRIPT
-        # ─────────────────────────────────────────────────────────────────────
-        try:
-            log_material_to_google_sheets(new_order)
-        except Exception as e:
-            logger.error("[MaterialLog] Failed to log to Google Sheets for order %s: %s", new_order, e)
+            # ─────────────────────────────────────────────────────────────────────
+            # ✅ NEW: LOG MATERIALS TO GOOGLE SHEETS MATERIAL LOG VIA APPS SCRIPT
+            # ─────────────────────────────────────────────────────────────────────
+            try:
+                log_material_to_google_sheets(new_order)
+            except Exception as e:
+                logger.error("[MaterialLog] Failed to log to Google Sheets for order %s: %s", new_order, e)
 
         # ─── WRITE SECOND ORDER (BACK) ROW FOR QUILTED FRONT PRODUCTS ──────────
         # (Files already uploaded to back_order_folder_id one-at-a-time above)
@@ -19108,6 +19136,27 @@ def submit_order():
             except Exception:
                 primary_file_id = None
 
+        if is_needlepoint:
+            try:
+                append_needlepoint_order(
+                    get_sheets_service(),
+                    SPREADSHEET_ID,
+                    order_number=new_order,
+                    company=data.get("company") or "",
+                    design=data.get("designName") or "",
+                    product=product,
+                    due_date=data.get("dueDate") or "",
+                    sizes=needlepoint_sizes,
+                    notes=data.get("notes") or "",
+                    preview_file_id=primary_file_id or "",
+                )
+            except Exception as e:
+                logger.error(
+                    "[Needlepoint] Failed to save size chart for order %s: %s",
+                    new_order,
+                    e,
+                )
+
         invalidate_upcoming_cache()
 
         # Return both order numbers if quilted front, otherwise just the one
@@ -19144,6 +19193,106 @@ def submit_order():
 def add_submit_cors_headers(resp):
     return _attach_cors_headers(resp)
 
+
+@app.route("/needlepoint/pending", methods=["GET"], endpoint="needlepoint_pending_plain")
+@app.route("/api/needlepoint/pending", methods=["GET"], endpoint="needlepoint_pending_api")
+@login_required_session
+def needlepoint_pending():
+    try:
+        rows = list_pending_needlepoint_orders(get_sheets_service(), SPREADSHEET_ID)
+        return jsonify(
+            {
+                "ok": True,
+                "orders": rows,
+                "sizes": list(NEEDLEPOINT_BELT_SIZES),
+                "supplierEmail": needlepoint_supplier_email(),
+            }
+        )
+    except Exception as exc:
+        logger.exception("[Needlepoint] pending list failed")
+        return jsonify({"ok": False, "error": str(exc), "orders": []}), 500
+
+
+@app.route("/needlepoint/order/<order_number>", methods=["GET"], endpoint="needlepoint_get_order_plain")
+@app.route("/api/needlepoint/order/<order_number>", methods=["GET"], endpoint="needlepoint_get_order_api")
+@login_required_session
+def needlepoint_get_order_route(order_number):
+    try:
+        item = get_needlepoint_order(get_sheets_service(), SPREADSHEET_ID, order_number)
+        if not item:
+            return jsonify({"ok": False, "error": "not found"}), 404
+        return jsonify({"ok": True, "order": item})
+    except Exception as exc:
+        logger.exception("[Needlepoint] get order failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/needlepoint/order-belts", methods=["POST", "OPTIONS"], endpoint="needlepoint_order_belts_plain")
+@app.route("/api/needlepoint/order-belts", methods=["POST", "OPTIONS"], endpoint="needlepoint_order_belts_api")
+@login_required_session
+def needlepoint_order_belts():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    selected = data.get("orders") or []
+    to_email = str(data.get("to") or data.get("supplierEmail") or needlepoint_supplier_email() or "").strip()
+    extra_notes = str(data.get("notes") or "").strip()
+    if not selected:
+        return jsonify({"ok": False, "error": "Select at least one belt order."}), 400
+    if "@" not in to_email:
+        return jsonify({"ok": False, "error": "Enter a supplier email address."}), 400
+    normalized = []
+    for raw in selected:
+        order_num = str(raw.get("orderNumber") or raw.get("order") or "").strip()
+        colors = str(raw.get("threadColors") or raw.get("thread_colors") or "").strip()
+        if not order_num:
+            return jsonify({"ok": False, "error": "Each selected belt needs an order number."}), 400
+        if not colors:
+            return jsonify({"ok": False, "error": f"Enter thread colors for order {order_num}."}), 400
+        item = dict(raw)
+        item["orderNumber"] = order_num
+        item["threadColors"] = colors
+        if not item.get("sizes"):
+            try:
+                saved = get_needlepoint_order(get_sheets_service(), SPREADSHEET_ID, order_num)
+                if saved:
+                    item.setdefault("sizes", saved.get("sizes") or {})
+                    item.setdefault("sizeSummary", saved.get("sizeSummary") or "")
+                    item.setdefault("company", saved.get("company") or "")
+                    item.setdefault("design", saved.get("design") or "")
+                    item.setdefault("qty", saved.get("qty"))
+            except Exception:
+                logger.warning("[Needlepoint] could not reload saved row for %s", order_num)
+        normalized.append(item)
+
+    drive = get_drive_service()
+    attachments = []
+    missing = []
+    for item in normalized:
+        atts = collect_needlepoint_attachments(drive, item.get("orderNumber"))
+        if not atts:
+            missing.append(str(item.get("orderNumber")))
+        attachments.extend(atts)
+
+    subject, body = build_needlepoint_email_text(normalized, extra_notes=extra_notes)
+    if missing:
+        body += "\n\nNote: no design file was found to attach for order(s): " + ", ".join(missing)
+
+    delivered = deliver_belt_order_email(
+        creds=get_google_credentials(),
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        attachments=attachments,
+    )
+    if missing:
+        delivered["missingDesigns"] = missing
+    if delivered.get("ok"):
+        try:
+            mark_needlepoint_orders_ordered(get_sheets_service(), SPREADSHEET_ID, normalized)
+        except Exception:
+            logger.exception("[Needlepoint] mark ordered failed")
+    return jsonify({"ok": True, **delivered, "subject": subject, "body": body, "to": to_email})
 
 
 @app.route("/api/reorder", methods=["POST"])
