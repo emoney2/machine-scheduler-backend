@@ -14,7 +14,7 @@ class NeedlepointHelpersTests(unittest.TestCase):
         self.assertFalse(npb.is_needlepoint_product("Golf Towel"))
 
     def test_parse_size_quantities_from_dict_and_json(self):
-        self.assertEqual(npb.parse_size_quantities({"34": "2", "36": 1, "99": 4}), {"34": 2, "36": 1})
+        self.assertEqual(npb.parse_size_quantities({"34": "2", "36": 1, "99": 4, "29": 1}), {"29": 1, "34": 2, "36": 1})
         self.assertEqual(
             npb.parse_size_quantities(json.dumps({"32": "1", "40": "3"})),
             {"32": 1, "40": 3},
@@ -23,6 +23,13 @@ class NeedlepointHelpersTests(unittest.TestCase):
         self.assertEqual(npb.parse_size_quantities(""), {})
         self.assertEqual(npb.total_quantity({"34": 2, "36": 1}), 3)
         self.assertEqual(npb.size_summary({"34": 2, "36": 1}), "34×2, 36×1")
+
+    def test_belt_sizes_include_odds_from_28_to_54(self):
+        self.assertEqual(npb.BELT_SIZES[0], "28")
+        self.assertEqual(npb.BELT_SIZES[-1], "54")
+        self.assertEqual(list(npb.BELT_SIZES), [str(n) for n in range(28, 55)])
+        self.assertIn("29", npb.BELT_SIZES)
+        self.assertIn("53", npb.BELT_SIZES)
 
     def test_pending_status_treats_blank_as_pending(self):
         self.assertTrue(npb.is_pending_status(""))

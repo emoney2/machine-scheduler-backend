@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 SHEET_TAB = "Needlepoint Belts"
-BELT_SIZES = ("28", "30", "32", "34", "36", "38", "40", "42", "44", "46", "48", "50", "52")
+BELT_SIZES = tuple(str(n) for n in range(28, 55))
 STATUS_PENDING = "Pending"
 STATUS_ORDERED = "Ordered"
 ORDERS_PARENT_FOLDER_ID = "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
@@ -176,22 +176,54 @@ def ensure_sheet(sheets_service, spreadsheet_id: str) -> bool:
         existing = (
             sheets_service.spreadsheets()
             .values()
-            .get(spreadsheetId=spreadsheet_id, range=f"'{SHEET_TAB}'!A1:AZ1")
+            .get(spreadsheetId=spreadsheet_id, range=f"'{SHEET_TAB}'!A1:CZ1")
             .execute()
             .get("values")
             or []
         )
-        if not existing:
+        old_headers = [str(h).strip() for h in (existing[0] if existing else [])]
+        if not old_headers:
             sheets_service.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range=f"'{SHEET_TAB}'!A1",
                 valueInputOption="RAW",
                 body={"values": [list(SHEET_HEADERS)]},
             ).execute()
+        elif old_headers != list(SHEET_HEADERS):
+            _rewrite_headers_preserving_rows(sheets_service, spreadsheet_id, old_headers)
         return True
     except Exception:
         logger.exception("ensure_sheet(%s) failed", SHEET_TAB)
         return False
+
+
+def _rewrite_headers_preserving_rows(sheets_service, spreadsheet_id: str, old_headers: list[str]) -> None:
+    """Map existing rows onto the current header layout (adds odd sizes 29–53 and 54)."""
+    values = (
+        sheets_service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"'{SHEET_TAB}'!A2:CZ")
+        .execute()
+        .get("values")
+        or []
+    )
+    mapped = []
+    for row in values:
+        padded = list(row) + [""] * max(0, len(old_headers) - len(row))
+        data = dict(zip(old_headers, padded))
+        mapped.append([data.get(h, "") for h in SHEET_HEADERS])
+    sheets_service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{SHEET_TAB}'!A1:CZ",
+    ).execute()
+    body_rows = [list(SHEET_HEADERS)] + mapped
+    sheets_service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{SHEET_TAB}'!A1",
+        valueInputOption="USER_ENTERED",
+        body={"values": body_rows},
+    ).execute()
+    logger.info("Updated Google Sheet tab %r headers to include sizes 28-54", SHEET_TAB)
 
 
 def _read_all_rows(sheets_service, spreadsheet_id: str) -> tuple[list[str], list[list[Any]]]:
@@ -200,7 +232,7 @@ def _read_all_rows(sheets_service, spreadsheet_id: str) -> tuple[list[str], list
     values = (
         sheets_service.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"'{SHEET_TAB}'!A1:AZ")
+        .get(spreadsheetId=spreadsheet_id, range=f"'{SHEET_TAB}'!A1:CZ")
         .execute()
         .get("values")
         or []
