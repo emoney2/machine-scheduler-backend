@@ -7955,6 +7955,52 @@ def update_sheet_cell(
             break
 
 
+def _find_qbo_customer_record(
+    company_name, quickbooks_headers, realm_id, env_override=None
+):
+    """Return the QBO Customer dict matching DisplayName, including inactive, or None."""
+    import requests
+
+    company_name = str(company_name or "").strip()
+    if not company_name:
+        return None
+    base = get_base_qbo_url(env_override)
+    query_url = f"{base}/v3/company/{realm_id}/query?minorversion={QBO_MINOR_VERSION}"
+    escaped_name = company_name.replace("\\", "\\\\").replace("'", "\\'")
+    queries = [
+        (
+            "SELECT * FROM Customer "
+            f"WHERE DisplayName = '{escaped_name}' "
+            "AND Active IN (true, false)"
+        ),
+        f"SELECT * FROM Customer WHERE DisplayName = '{escaped_name}'",
+    ]
+    wanted = " ".join(company_name.split()).casefold()
+    for query in queries:
+        response = requests.get(
+            query_url,
+            headers=quickbooks_headers,
+            params={"query": query},
+            timeout=QBO_HTTP_TIMEOUT,
+        )
+        if response.status_code != 200:
+            logging.warning(
+                "QBO customer lookup failed HTTP %s for %r: %s",
+                response.status_code,
+                company_name,
+                (response.text or "")[:800],
+            )
+            continue
+        rows = response.json().get("QueryResponse", {}).get("Customer", [])
+        if isinstance(rows, dict):
+            rows = [rows]
+        for customer in rows or []:
+            display_name = str(customer.get("DisplayName") or "")
+            if " ".join(display_name.split()).casefold() == wanted:
+                return customer
+    return None
+
+
 def get_or_create_customer_ref(
     company_name, sheet, quickbooks_headers, realm_id, env_override=None
 ):
@@ -7973,25 +8019,10 @@ def get_or_create_customer_ref(
     if not company_name:
         raise Exception("❌ Cannot look up a QuickBooks customer without a company name")
 
-    base = get_base_qbo_url(env_override)
-    query_url = f"{base}/v3/company/{realm_id}/query?minorversion={QBO_MINOR_VERSION}"
     customer_url = (
-        f"{base}/v3/company/{realm_id}/customer?minorversion={QBO_MINOR_VERSION}"
+        f"{get_base_qbo_url(env_override)}/v3/company/{realm_id}/customer"
+        f"?minorversion={QBO_MINOR_VERSION}"
     )
-
-    def _customer_rows(response):
-        if response.status_code != 200:
-            logging.warning(
-                "QBO customer lookup failed HTTP %s for %r: %s",
-                response.status_code,
-                company_name,
-                (response.text or "")[:800],
-            )
-            return []
-        rows = response.json().get("QueryResponse", {}).get("Customer", [])
-        if isinstance(rows, dict):
-            rows = [rows]
-        return rows or []
 
     def _customer_ref(customer):
         if customer.get("Active") is False:
@@ -8025,28 +8056,11 @@ def get_or_create_customer_ref(
         }
 
     def _find_existing_customer():
-        # QBO string literals escape apostrophes with a backslash.
-        escaped_name = company_name.replace("\\", "\\\\").replace("'", "\\'")
-        queries = [
-            (
-                "SELECT * FROM Customer "
-                f"WHERE DisplayName = '{escaped_name}' "
-                "AND Active IN (true, false)"
-            ),
-            f"SELECT * FROM Customer WHERE DisplayName = '{escaped_name}'",
-        ]
-        wanted = " ".join(company_name.split()).casefold()
-        for query in queries:
-            response = requests.get(
-                query_url,
-                headers=quickbooks_headers,
-                params={"query": query},
-                timeout=QBO_HTTP_TIMEOUT,
-            )
-            for customer in _customer_rows(response):
-                display_name = str(customer.get("DisplayName") or "")
-                if " ".join(display_name.split()).casefold() == wanted:
-                    return _customer_ref(customer)
+        customer = _find_qbo_customer_record(
+            company_name, quickbooks_headers, realm_id, env_override
+        )
+        if customer:
+            return _customer_ref(customer)
         return None
 
     existing_customer = _find_existing_customer()
@@ -8083,6 +8097,7 @@ def get_or_create_customer_ref(
     payload = {k: v for k, v in payload.items() if v is not None}
 
     # ── 4) Create customer in QuickBooks ──────────────────────────
+    base = get_base_qbo_url(env_override)
     create_url = f"{base}/v3/company/{realm_id}/customer"
     res = requests.post(
         create_url,
@@ -8131,6 +8146,80 @@ def get_or_create_customer_ref(
 
     # ── Final failure ──────────────────────────────────────────────
     raise Exception(f"❌ Failed to create customer in QuickBooks: {res.text}")
+
+
+def update_qbo_customer_from_directory_row(
+    company_name, directory_row, quickbooks_headers, realm_id, env_override=None
+):
+    """Update (or create) the QuickBooks customer from the current Directory row."""
+    import directory_customer as directory_customer_mod
+    import requests
+
+    company_name = str(company_name or "").strip()
+    if not company_name:
+        return {"updated": False, "error": "Missing company name"}
+
+    customer = _find_qbo_customer_record(
+        company_name, quickbooks_headers, realm_id, env_override
+    )
+    if not customer:
+        try:
+            ref = get_or_create_customer_ref(
+                company_name, None, quickbooks_headers, realm_id, env_override
+            )
+        except Exception as e:
+            return {"updated": False, "error": str(e)}
+        return {
+            "updated": True,
+            "created": True,
+            "id": ref.get("value"),
+            "name": ref.get("name") or company_name,
+        }
+
+    ship = _directory_shipping_snapshot(directory_row)
+    bill = _directory_billing_snapshot(directory_row)
+    emails = bill.get("emails") or []
+    payload = directory_customer_mod.build_qbo_customer_sparse_update(
+        customer.get("Id"),
+        customer.get("SyncToken"),
+        given_name=bill.get("first"),
+        family_name=bill.get("last"),
+        email=emails[0] if emails else "",
+        phone=bill.get("phone"),
+        bill_addr=_qbo_physical_addr_from_snapshot(bill),
+        ship_addr=_qbo_physical_addr_from_snapshot(ship),
+        active=True,
+    )
+    if not payload.get("SyncToken") or payload.get("SyncToken") == "None":
+        return {
+            "updated": False,
+            "error": "QuickBooks customer is missing SyncToken",
+        }
+
+    base = get_base_qbo_url(env_override)
+    url = f"{base}/v3/company/{realm_id}/customer?minorversion={QBO_MINOR_VERSION}"
+    res = requests.post(
+        url,
+        headers={**quickbooks_headers, "Content-Type": "application/json"},
+        json=payload,
+        timeout=QBO_HTTP_TIMEOUT,
+    )
+    if res.status_code not in (200, 201):
+        logging.warning(
+            "QBO customer update failed HTTP %s for %r: %s",
+            res.status_code,
+            company_name,
+            (res.text or "")[:800],
+        )
+        return {"updated": False, "error": (res.text or "QuickBooks update failed")[:800]}
+    data = res.json().get("Customer") or {}
+    logging.info("Updated QBO customer %r id=%s", company_name, data.get("Id"))
+    return {
+        "updated": True,
+        "created": False,
+        "id": str(data.get("Id") or customer.get("Id") or ""),
+        "name": data.get("DisplayName") or company_name,
+    }
 
 
 _qbo_sales_income_ref_cache = {}
@@ -22051,6 +22140,125 @@ def add_directory_entry():
         logger.exception("❌ Error adding new company")
         return jsonify({"error": "Failed to add company"}), 500
 
+
+@app.route("/api/directory-customer", methods=["GET"])
+@login_required_session
+def get_directory_customer():
+    import directory_customer as directory_customer_mod
+
+    company = (request.args.get("company") or "").strip()
+    if not company:
+        return jsonify({"error": "Missing company"}), 400
+    row = _fetch_directory_row_by_company(company)
+    if not row:
+        return jsonify({"error": f"Company not found: {company}"}), 404
+    form = directory_customer_mod.form_from_row(row)
+    form["companyName"] = form.get("companyName") or company
+    return jsonify({"company": form["companyName"], "form": form})
+
+
+@app.route("/api/directory-customer", methods=["PUT"])
+@login_required_session
+def update_directory_customer():
+    """Update an existing Directory customer and optionally sync QuickBooks."""
+    import directory_customer as directory_customer_mod
+
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    company = str(data.get("companyName") or data.get("company") or "").strip()
+    if not company:
+        return jsonify({"error": "Missing company name"}), 400
+
+    update_quickbooks = bool(data.get("updateQuickbooks") or data.get("updateQbo"))
+    if not SPREADSHEET_ID:
+        return jsonify({"error": "Spreadsheet is not configured"}), 500
+
+    try:
+        sheet = get_sheets_service().spreadsheets().values()
+        resp = sheet.get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Directory!A1:ZZ10000",
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+    except Exception:
+        logger.exception("Directory read failed for customer update")
+        return jsonify({"error": "Failed to read Directory"}), 500
+
+    found = directory_customer_mod.find_company_row(resp.get("values") or [], company)
+    if not found:
+        return jsonify({"error": f"Company not found: {company}"}), 404
+    sheet_row, headers, row_dict = found
+    canonical = str(row_dict.get("Company Name") or company).strip() or company
+
+    fields = directory_customer_mod.normalize_update_fields(data)
+    writes = directory_customer_mod.header_writes_from_fields(fields, headers)
+    if not writes:
+        return jsonify({"error": "No Directory columns matched the submitted fields"}), 400
+
+    ranges = directory_customer_mod.sheet_value_ranges(
+        "Directory", headers, sheet_row, writes
+    )
+    try:
+        sheet.batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": ranges},
+        ).execute()
+    except Exception:
+        logger.exception("Directory write failed for %s", canonical)
+        return jsonify({"error": "Failed to update Directory"}), 500
+
+    updated_row = directory_customer_mod.apply_writes_to_row(row_dict, writes)
+
+    supabase_ok = True
+    supabase_error = ""
+    if supabase:
+        try:
+            payload = directory_customer_mod.supabase_directory_payload(fields)
+            if payload:
+                supabase.table("Directory").update(payload).eq(
+                    "Company Name", canonical
+                ).execute()
+        except Exception as e:
+            supabase_ok = False
+            supabase_error = str(e)
+            logger.warning("Supabase Directory update failed for %s: %s", canonical, e)
+
+    qbo_result = {"updated": False, "skipped": True}
+    if update_quickbooks:
+        qbo_result = {"updated": False, "skipped": False}
+        try:
+            qbo_headers, realm_id = get_quickbooks_credentials()
+            qbo_result = update_qbo_customer_from_directory_row(
+                canonical, updated_row, qbo_headers, realm_id
+            )
+            qbo_result["skipped"] = False
+        except RedirectException as e:
+            qbo_result = {
+                "updated": False,
+                "skipped": False,
+                "error": "QuickBooks is not connected",
+                "redirect": e.redirect_url,
+            }
+        except Exception as e:
+            logger.exception("QuickBooks customer update failed for %s", canonical)
+            qbo_result = {"updated": False, "skipped": False, "error": str(e)}
+
+    form = directory_customer_mod.form_from_row(updated_row)
+    form["companyName"] = canonical
+    result = {
+        "status": "ok",
+        "company": canonical,
+        "form": form,
+        "directoryUpdated": True,
+        "supabaseUpdated": supabase_ok,
+        "quickbooks": qbo_result,
+    }
+    if supabase_error:
+        result["supabaseError"] = supabase_error
+    return jsonify(result), 200
 
 
 @app.route("/api/fur-colors", methods=["GET"])
