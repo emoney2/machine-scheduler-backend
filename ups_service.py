@@ -135,6 +135,25 @@ def _ups_rating_version() -> str:
     return ver or "v2409"
 
 
+def _rating_subversion() -> str:
+    """Rate Request SubVersion. 2409 matches current Rating API; 1707 omits newer negotiated fields."""
+    ver = (os.getenv("UPS_RATING_SUBVERSION") or "2409").strip()
+    return ver[:4] if ver else "2409"
+
+
+def _customer_classification_codes() -> List[str]:
+    """
+    UPS rate chart. 00 = rates for the shipper number; 05 = regional (what UPS.com often uses);
+    01 = daily. Wrong chart returns published/retail instead of the logged-in account rate.
+    """
+    raw = (os.getenv("UPS_CUSTOMER_CLASSIFICATION") or "00").strip() or "00"
+    codes = [raw]
+    for extra in ("00", "05", "01"):
+        if extra not in codes:
+            codes.append(extra)
+    return codes
+
+
 def _ups_rate_url(request_option: str, version: str | None = None) -> str:
     opt = (request_option or "Shop").strip() or "Shop"
     ver = (version or _ups_rating_version()).strip() or "v2409"
@@ -1371,42 +1390,10 @@ def _money_and_currency_from_rated(rated: Dict[str, Any]) -> Tuple[Any, str]:
     and NegotiatedRateCharges (account pricing). Prefer negotiated so the app matches
     UPS.com logged-in / account quotes; otherwise we would show list price only.
     """
-    if not rated:
-        return None, "USD"
-
-    def _from_block(blk: Any) -> Tuple[Any, str]:
-        if not isinstance(blk, dict):
-            return None, "USD"
-        inner = (
-            blk.get("TotalCharge")
-            or blk.get("TotalCharges")
-            or blk.get("totalCharge")
-            or blk.get("totalCharges")
-        )
-        if isinstance(inner, dict) and inner.get("MonetaryValue") not in (None, ""):
-            return inner.get("MonetaryValue"), (inner.get("CurrencyCode") or inner.get("currencyCode") or "USD")
-        if blk.get("MonetaryValue") not in (None, "") and blk.get("MonetaryValue") is not None:
-            return blk.get("MonetaryValue"), (blk.get("CurrencyCode") or blk.get("currencyCode") or "USD")
-        if blk.get("monetaryValue") not in (None, "") and blk.get("monetaryValue") is not None:
-            return blk.get("monetaryValue"), (blk.get("currencyCode") or "USD")
-        return None, "USD"
-
-    nrc = rated.get("NegotiatedRateCharges") or rated.get("negotiatedRateCharges")
-    money, curr = _from_block(nrc)
-    if money not in (None, ""):
-        return money, curr
-    tc = (
-        rated.get("TotalCharges")
-        or rated.get("totalCharges")
-        or rated.get("TotalCharge")
-        or rated.get("totalCharge")
-    )
-    money, curr = _from_block(tc if isinstance(tc, dict) else None)
-    if money not in (None, "") :
-        return money, curr
-    if not isinstance(tc, dict) and tc not in (None, ""):
-        return tc, "USD"
-    return None, "USD"
+    listed, negotiated, curr = _rated_charge_amounts(rated)
+    if negotiated is not None:
+        return negotiated, curr
+    return listed, curr
 
 
 def _package_weight_lb(p: Dict[str, Any]) -> float:
@@ -1430,11 +1417,8 @@ def _row_from_rated(
     if len(code) == 1 and code.isdigit():
         code = code.zfill(2)
     name = next((n for c, n in UPS_SERVICES if c == code), fallback_name or code)
-    money, curr = _money_and_currency_from_rated(rated)
-    try:
-        money_f = float(money) if money not in (None, "") else None
-    except (TypeError, ValueError):
-        money_f = None
+    listed, negotiated, curr = _rated_charge_amounts(rated)
+    money_f = negotiated if negotiated is not None else listed
     if money_f is None:
         return None
     eta, sched = _transit_and_schedule_from_rated(rated)
@@ -1444,7 +1428,10 @@ def _row_from_rated(
         "rate": money_f,
         "currency": curr or "USD",
         "delivery": f"{eta} business days" if eta is not None else None,
+        "rate_source": "negotiated" if negotiated is not None else "list",
     }
+    if listed is not None:
+        row["list_rate"] = listed
     try:
         if eta is not None:
             row["business_days"] = int(eta)
@@ -1566,6 +1553,7 @@ def get_rate(
         service_code: str | None,
         use_negotiated: bool,
         include_dti: bool,
+        classification: str = "00",
     ) -> Dict[str, Any]:
         shipment = dict(base_shipment)
         if not include_dti:
@@ -1573,15 +1561,41 @@ def get_rate(
         if service_code:
             shipment["Service"] = {"Code": service_code}
         if use_negotiated:
-            shipment["ShipmentRatingOptions"] = {"NegotiatedRatesIndicator": "Y"}
+            shipment["ShipmentRatingOptions"] = {
+                "NegotiatedRatesIndicator": "Y",
+                "RateChartIndicator": "Y",
+            }
         return {
             "RateRequest": {
-                "Request": {"SubVersion": "1707"},
+                "Request": {"SubVersion": _rating_subversion()},
                 "PickupType": {"Code": _pickup_type_code()},
-                "CustomerClassification": {"Code": "00"},
+                "CustomerClassification": {"Code": classification or "00"},
                 "Shipment": shipment,
             }
         }
+
+    def _rows_are_negotiated(rows: List[Dict[str, Any]]) -> bool:
+        return any((r or {}).get("rate_source") == "negotiated" for r in rows)
+
+    def _accept_rows(rows: List[Dict[str, Any]], class_code: str, use_neg: bool) -> bool:
+        if not rows:
+            return False
+        if use_neg and NEGOTIATED and not _rows_are_negotiated(rows):
+            logging.warning(
+                "UPS Rate: response had published/list charges only "
+                "(classification=%s). Will retry other rate charts before showing list.",
+                class_code,
+            )
+            return False
+        n_neg = sum(1 for r in rows if r.get("rate_source") == "negotiated")
+        logging.info(
+            "UPS Rate using classification=%s negotiated_flag=%s services=%s negotiated_count=%s",
+            class_code,
+            use_neg,
+            len(rows),
+            n_neg,
+        )
+        return True
 
     def _sort(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         rows.sort(key=lambda x: (x["rate"] is None, x["rate"] if x["rate"] is not None else 1e9))
@@ -1616,6 +1630,8 @@ def get_rate(
 
     current_ver = _ups_rating_version()
     negotiated_tries = [True, False] if NEGOTIATED else [False]
+    class_codes = _customer_classification_codes()
+    list_fallback: List[Dict[str, Any]] = []
     origin = _live_from()
     logging.info(
         "UPS Rate origin %s %s %s acct=%s packages=%s",
@@ -1654,20 +1670,28 @@ def get_rate(
             seen_attempts.add(key)
             url = _ups_rate_url(opt, ver)
             for use_neg in negotiated_tries:
-                data = _post(url, _rate_body(None, use_neg, include_dti), params)
-                if not data:
-                    continue
-                rows = _rows_from_rate_payload(data)
-                if rows:
-                    return _sort(rows)
-                rr = data.get("RateResponse") or data.get("rateResponse") or {}
-                rs = None
-                if isinstance(rr, dict):
-                    rs = rr.get("RatedShipment") or rr.get("ratedShipment")
-                _note(
-                    f"UPS Rate 200 {url}: no parseable rates "
-                    f"(keys={list(data.keys())[:8]} rated={type(rs).__name__})"
-                )
+                class_loop = class_codes if use_neg else class_codes[:1]
+                for class_code in class_loop:
+                    data = _post(
+                        url, _rate_body(None, use_neg, include_dti, class_code), params
+                    )
+                    if not data:
+                        continue
+                    rows = _rows_from_rate_payload(data)
+                    if not rows:
+                        rr = data.get("RateResponse") or data.get("rateResponse") or {}
+                        rs = None
+                        if isinstance(rr, dict):
+                            rs = rr.get("RatedShipment") or rr.get("ratedShipment")
+                        _note(
+                            f"UPS Rate 200 {url}: no parseable rates "
+                            f"(keys={list(data.keys())[:8]} rated={type(rs).__name__})"
+                        )
+                        continue
+                    if _accept_rows(rows, class_code, use_neg):
+                        return _sort(rows)
+                    if not list_fallback:
+                        list_fallback = rows
 
         # Per-service Rate with a real service code (Ground first). Shop 400 must
         # not skip this — that was swallowing working Ground quotes.
@@ -1681,15 +1705,32 @@ def get_rate(
         for ver, opt, params, include_dti in rate_attempts:
             url = _ups_rate_url(opt, ver)
             for use_neg in negotiated_tries:
-                results: List[Dict[str, Any]] = []
-                for code, name in services:
-                    data = _post(url, _rate_body(code, use_neg, include_dti), params)
-                    if not data:
+                class_loop = class_codes if use_neg else class_codes[:1]
+                for class_code in class_loop:
+                    results: List[Dict[str, Any]] = []
+                    for code, name in services:
+                        data = _post(
+                            url,
+                            _rate_body(code, use_neg, include_dti, class_code),
+                            params,
+                        )
+                        if not data:
+                            continue
+                        results.extend(_rows_from_rate_payload(data, code, name))
+                    if not results:
                         continue
-                    results.extend(_rows_from_rate_payload(data, code, name))
-                if results:
-                    return _sort(results)
+                    if _accept_rows(results, class_code, use_neg):
+                        return _sort(results)
+                    if not list_fallback:
+                        list_fallback = results
 
+        if list_fallback:
+            logging.warning(
+                "UPS Rate: falling back to published/list charges. "
+                "Confirm UPS_ACCOUNT_NUMBER matches the UPS.com shipper and that "
+                "account-based rates are enabled on the Rating API app."
+            )
+            return _sort(list_fallback)
         _fail()
 
     # Single service expected in ship_to["service_code"]
@@ -1703,12 +1744,25 @@ def get_rate(
     ):
         url = _ups_rate_url(opt, ver)
         for use_neg in negotiated_tries:
-            data = _post(url, _rate_body(code, use_neg, include_dti), params)
-            if not data:
-                continue
-            rows = _rows_from_rate_payload(data, code, name)
-            if rows:
-                return _sort(rows)
+            class_loop = class_codes if use_neg else class_codes[:1]
+            for class_code in class_loop:
+                data = _post(
+                    url, _rate_body(code, use_neg, include_dti, class_code), params
+                )
+                if not data:
+                    continue
+                rows = _rows_from_rate_payload(data, code, name)
+                if not rows:
+                    continue
+                if _accept_rows(rows, class_code, use_neg):
+                    return _sort(rows)
+                if not list_fallback:
+                    list_fallback = rows
+    if list_fallback:
+        logging.warning(
+            "UPS Rate: falling back to published/list charges for a single service."
+        )
+        return _sort(list_fallback)
     _fail()
 
 
@@ -1751,7 +1805,46 @@ def _charges_block_total_usd(blk: Any) -> float | None:
         m = _money_blob_to_float(blk.get(key))
         if m is not None and m > 0:
             return m
+    m = _money_blob_to_float(blk)
+    if m is not None and m > 0:
+        return m
     return None
+
+
+def _currency_from_charge_block(blk: Any) -> str:
+    if not isinstance(blk, dict):
+        return "USD"
+    inner = (
+        blk.get("TotalCharge")
+        or blk.get("TotalCharges")
+        or blk.get("totalCharge")
+        or blk.get("totalCharges")
+        or blk
+    )
+    if isinstance(inner, dict):
+        c = inner.get("CurrencyCode") or inner.get("currencyCode")
+        if c:
+            return str(c)
+    return "USD"
+
+
+def _rated_charge_amounts(rated: Dict[str, Any]) -> Tuple[float | None, float | None, str]:
+    """(list_total, negotiated_total, currency) from a RatedShipment."""
+    if not isinstance(rated, dict):
+        return None, None, "USD"
+    nrc = rated.get("NegotiatedRateCharges") or rated.get("negotiatedRateCharges")
+    negotiated = _charges_block_total_usd(nrc) if isinstance(nrc, dict) else None
+    tc = (
+        rated.get("TotalCharges")
+        or rated.get("totalCharges")
+        or rated.get("TotalCharge")
+        or rated.get("totalCharge")
+    )
+    listed = _charges_block_total_usd(tc) if isinstance(tc, dict) else _money_blob_to_float(tc)
+    curr = _currency_from_charge_block(nrc if isinstance(nrc, dict) else None)
+    if curr == "USD":
+        curr = _currency_from_charge_block(tc if isinstance(tc, dict) else None)
+    return listed, negotiated, curr or "USD"
 
 
 def extract_ups_ship_billed_amount_usd(data: Dict[str, Any]) -> float | None:
@@ -1884,7 +1977,7 @@ def create_shipment(
 
     shipment = {
         "ShipmentRequest": {
-            "Request": {"SubVersion": "1707"},
+            "Request": {"SubVersion": _rating_subversion()},
             "Shipment": {
                 "Description": "JRCO shipment",
                 "Shipper": _shipper(),
@@ -1900,7 +1993,7 @@ def create_shipment(
                 "PaymentInformation": {
                     "ShipmentCharge": [{
                         "Type": "01",
-                        "BillShipper": {"AccountNumber": SHIPPER_NUMBER}
+                        "BillShipper": {"AccountNumber": _live_shipper_number()}
                     }]
                 },
                 "Package": [
