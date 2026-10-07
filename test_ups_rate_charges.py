@@ -62,6 +62,12 @@ class RatedChargeParsingTests(unittest.TestCase):
         self.assertEqual(row["code"], "13")
         self.assertEqual(row["method"], "Next Day Air Saver")
 
+    def test_row_includes_ups_billing_weight(self):
+        rated = _camel_rated()
+        rated["billingWeight"] = {"unitOfMeasurement": {"code": "LBS"}, "weight": "8.0"}
+        row = _row_from_rated(rated)
+        self.assertEqual(row["billed_weight"], 8.0)
+
     def test_row_marks_list_when_negotiated_missing(self):
         row = _row_from_rated(
             {"Service": {"Code": "03"}, "TotalCharges": {"MonetaryValue": "37.44"}}

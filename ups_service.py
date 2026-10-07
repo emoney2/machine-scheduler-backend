@@ -23,7 +23,7 @@ _FROM_FALLBACK = {
     "addr2": "Suite 300",
     "city": "Buford",
     "state": "GA",
-    "zip": "30519",
+    "zip": "30518",
     "country": "US",
 }
 
@@ -1406,6 +1406,23 @@ def _package_weight_lb(p: Dict[str, Any]) -> float:
         return 1.0
 
 
+def _billing_weight_lb_from_rated(rated: Dict[str, Any]) -> float | None:
+    """UPS BillingWeight is the billed amount (greater of actual and DIM)."""
+    if not isinstance(rated, dict):
+        return None
+    bw = rated.get("BillingWeight") or rated.get("billingWeight")
+    if not isinstance(bw, dict):
+        return None
+    raw = bw.get("Weight") if bw.get("Weight") not in (None, "") else bw.get("weight")
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v) or v <= 0:
+        return None
+    return round(v, 1)
+
+
 def _row_from_rated(
     rated: Dict[str, Any],
     fallback_code: str = "",
@@ -1432,6 +1449,9 @@ def _row_from_rated(
     }
     if listed is not None:
         row["list_rate"] = listed
+    billed = _billing_weight_lb_from_rated(rated)
+    if billed is not None:
+        row["billed_weight"] = billed
     try:
         if eta is not None:
             row["business_days"] = int(eta)
