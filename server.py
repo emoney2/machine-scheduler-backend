@@ -820,6 +820,13 @@ def _get_ppy_lookup():
 # Table calculation of 160 / 14 = 11.4286. Apply only to yard-based cuts;
 # sqft keeps its separate conversion and Driver factor.
 DRIVER_YARD_CALIBRATION = 9.5 / (160.0 / 14.0)
+# Valuables pouches are a fixed leather take, not Table PPY × 13.5.
+POUCH_SQFT_PER_PIECE = 1.3
+
+
+def _is_valuables_pouch(product):
+    key = (product or "").strip().lower()
+    return "pouch" in key or "valuable" in key
 
 
 def _calibrate_material_yards(product, yards):
@@ -839,6 +846,7 @@ def _compute_usage_units(
       - else if W×L:       usage = (W×L in² × qty) / (36×54)
 
     Sqft:
+      - valuables pouches: usage = qty × 1.3
       - if Product present: usage = (qty / PPY) × 13.5
       - else if W×L:        usage = (W×L in² / 144) × qty
     """
@@ -862,6 +870,8 @@ def _compute_usage_units(
         return 0.0
 
     if unit == "Sqft":
+        if product and _is_valuables_pouch(product):
+            return float(qty) * POUCH_SQFT_PER_PIECE
         if product and ppy and ppy > 0:
             return (float(qty) / float(ppy)) * 13.5
         if area_in2:
@@ -18389,7 +18399,8 @@ def write_material_log_for_order(order_number):
                 return default
 
         ppy = float(tbl[5] or 0) if len(tbl) > 5 else 0.0
-        if ppy <= 0:
+        is_pouch = _is_valuables_pouch(product)
+        if not is_pouch and ppy <= 0:
             logger.error("[MATLOG] Product %s has invalid PPY in Table sheet", product)
             return
 
@@ -18411,7 +18422,7 @@ def write_material_log_for_order(order_number):
             return val if val > 0 else None
 
         key = product.lower()
-        if "long neck" in key:
+        if ppy > 0 and "long neck" in key:
             sibling = " ".join(product.replace("Long Neck", " ").replace("long neck", " ").split())
             sib_ppy = _table_ppy(sibling) if sibling else None
             if sib_ppy is None and "blade" in key:
@@ -18419,7 +18430,7 @@ def write_material_log_for_order(order_number):
             if sib_ppy and ppy > sib_ppy:
                 ppy = sib_ppy
 
-        yards_needed = qty / ppy
+        yards_needed = qty / ppy if ppy > 0 else 0.0
 
         # ───────────────────────────────────────────────────────────
         # 3) Build material unit lookup
@@ -18453,6 +18464,8 @@ def write_material_log_for_order(order_number):
         def compute_usage(mat, base, calibrate_driver_yards=False):
             unit = normalize_unit(inv_map.get(mat, ""))
             if unit in {"sqft", "squarefeet", "squarefoot"}:
+                if is_pouch:
+                    return qty * POUCH_SQFT_PER_PIECE
                 usage = base * 13.5
                 if "driver" in key:
                     usage *= 1.11
@@ -18528,7 +18541,7 @@ def write_material_log_for_order(order_number):
                 continue
 
             pct = float(str(pct_raw).replace("%", "") or (100 if i == 0 else 0))
-            if pct <= 0 or front_yards <= 0:
+            if pct <= 0 or (front_yards <= 0 and not is_pouch):
                 continue
 
             base = compute_usage(mat, front_yards, calibrate_driver_yards=True)
@@ -18537,7 +18550,8 @@ def write_material_log_for_order(order_number):
         # ───────────────────────────────────────────────────────────
         # 6) Back material
         back_mat = row[h.get("Back Material")] if "Back Material" in h else ""
-        if back_mat and back_yards > 0:
+        # Pouches are 1.3 sqft/piece total on FRONT; do not double that on BACK.
+        if back_mat and back_yards > 0 and not is_pouch:
             log(
                 back_mat,
                 compute_usage(back_mat, back_yards, calibrate_driver_yards=True),
@@ -18546,7 +18560,7 @@ def write_material_log_for_order(order_number):
         # ───────────────────────────────────────────────────────────
         # 7) Fur logic
         fur = row[h.get("Fur Color")] if "Fur Color" in h else ""
-        if fur:
+        if fur and ppy > 0:
             base = qty / ppy
             if "blade" in key or "mallet" in key:
                 fur_qty = base
@@ -18567,7 +18581,7 @@ def write_material_log_for_order(order_number):
         # 8) Foam, magnets, elastic, pouch items
         for mat in ["1/2\" Foam", "3/8\" Foam", "1/4\" Foam", "1/8\" Foam"]:
             v = tbl_float(mat)
-            if v > 0:
+            if v > 0 and ppy > 0:
                 log(
                     mat,
                     compute_usage(
