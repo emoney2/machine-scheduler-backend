@@ -18909,6 +18909,12 @@ def submit_order():
         reorder_from_raw = (data.get("reorderFrom") or "").strip()
         is_reorder = str(data.get("isReorder") or "").strip().lower() in ("true", "yes", "1")
         reorder_from = reorder_from_raw if (reorder_from_raw and is_reorder) else None
+        true_reorder = (
+            is_reorder
+            and reorder_from
+            and (not is_needlepoint)
+            and str(data.get("trueReorder") or "").strip().lower() in ("true", "yes", "1")
+        )
         order_folder_id = create_folder(
             new_order, parent_id="1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
         )
@@ -18939,6 +18945,28 @@ def submit_order():
                 drive_service=drive,
                 new_folder_id=order_folder_id
             )
+            if true_reorder:
+                source_back = None
+                if is_quilted_front and back_order:
+                    try:
+                        source_back = str(int(float(str(reorder_from).replace(",", ""))) + 1)
+                    except (TypeError, ValueError):
+                        source_back = None
+                try:
+                    _write_true_reorder_marker(
+                        drive,
+                        order_folder_id,
+                        new_order=new_order,
+                        source_order=reorder_from,
+                        back_order=back_order if is_quilted_front else None,
+                        source_back_order=source_back,
+                    )
+                except Exception as marker_err:
+                    logger.warning(
+                        "[submit] true-reorder marker failed for %s: %s",
+                        new_order,
+                        marker_err,
+                    )
 
         prod_links = []
         back_prod_links = []
@@ -19285,6 +19313,7 @@ def submit_order():
                         "order": new_order,
                         "back_order": back_order,
                         "primaryFileId": primary_file_id,
+                        "trueReorder": bool(true_reorder),
                     }
                 ),
                 200,
@@ -19296,6 +19325,7 @@ def submit_order():
                         "status": "ok",
                         "order": new_order,
                         "primaryFileId": primary_file_id,
+                        "trueReorder": bool(true_reorder),
                     }
                 ),
                 200,
@@ -26964,6 +26994,52 @@ def reset_start_time():
     except Exception as e:
         print("🔥 Server error:", str(e))
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
+
+def _write_true_reorder_marker(
+    drive,
+    folder_id,
+    new_order,
+    source_order,
+    back_order=None,
+    source_back_order=None,
+):
+    """Drop _true_reorder.json in the new order folder for the shop-PC stamper."""
+    if not folder_id or not new_order or not source_order:
+        return
+    payload = {
+        "newOrder": str(new_order).strip(),
+        "sourceOrder": str(source_order).strip(),
+        "copyStops": True,
+    }
+    if back_order:
+        payload["backOrder"] = str(back_order).strip()
+    if source_back_order:
+        payload["sourceBackOrder"] = str(source_back_order).strip()
+    raw = json.dumps(payload, indent=2).encode("utf-8")
+
+    def _create():
+        media = MediaIoBaseUpload(
+            BytesIO(raw), mimetype="application/json", resumable=False
+        )
+        return (
+            drive.files()
+            .create(
+                body={"name": "_true_reorder.json", "parents": [folder_id]},
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+
+    retry_google_api_call(_create)
+    logger.info(
+        "[submit] true-reorder marker for %s from %s (back=%s)",
+        new_order,
+        source_order,
+        back_order,
+    )
 
 
 def copy_emb_files(old_order_num, new_order_num, drive_service, new_folder_id):
