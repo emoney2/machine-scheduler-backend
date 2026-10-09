@@ -27004,7 +27004,13 @@ def _write_true_reorder_marker(
     back_order=None,
     source_back_order=None,
 ):
-    """Drop _true_reorder.json in the new order folder for the shop-PC stamper."""
+    """Tell the shop-PC stamper to restamp in the background.
+
+    Stamp logic lives only in the local OrderEntry file
+    (CreateStampedPDFandSubmitStitchCount11.py). This cloud path does not
+    reprint from Wilcom and must stay a marker-only handshake so local
+    stamp changes do not need a second copy here.
+    """
     if not folder_id or not new_order or not source_order:
         return
     payload = {
