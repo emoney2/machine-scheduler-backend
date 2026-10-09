@@ -19809,17 +19809,17 @@ def _write_reorder_followup_fields(
 
 
 def _create_reorder_from_existing_order(
-    source_row, due_date, date_type, extra_notes="", quantity=None
+    source_row, due_date, date_type, extra_notes="", quantity=None, true_reorder=False
 ):
     """Create one new Production Order (and paired back when submit would) from a past job."""
     with _REORDER_SERIAL_LOCK:
         return _create_reorder_from_existing_order_locked(
-            source_row, due_date, date_type, extra_notes, quantity
+            source_row, due_date, date_type, extra_notes, quantity, true_reorder
         )
 
 
 def _create_reorder_from_existing_order_locked(
-    source_row, due_date, date_type, extra_notes="", quantity=None
+    source_row, due_date, date_type, extra_notes="", quantity=None, true_reorder=False
 ):
     import reorder_batch as reorder_batch_mod
 
@@ -19963,6 +19963,29 @@ def _create_reorder_from_existing_order_locked(
                 back_order_folder_id,
                 back_order,
                 preferred_image_file_id=preferred_image_id,
+            )
+
+    if true_reorder and not is_needlepoint_product(product):
+        source_back = None
+        if is_quilted_front and back_order:
+            try:
+                source_back = str(int(float(str(reorder_from).replace(",", ""))) + 1)
+            except (TypeError, ValueError):
+                source_back = None
+        try:
+            _write_true_reorder_marker(
+                drive,
+                order_folder_id,
+                new_order=new_order,
+                source_order=reorder_from,
+                back_order=back_order if is_quilted_front else None,
+                source_back_order=source_back,
+            )
+        except Exception as marker_err:
+            logger.warning(
+                "[reorder-batch] true-reorder marker failed for %s: %s",
+                new_order,
+                marker_err,
             )
 
     _ensure_shipping_method_header_index(sheets)
@@ -20151,6 +20174,7 @@ def _run_reorder_batch(batch_id):
     due_date = stored.get("dueDate") or ""
     date_type = stored.get("dateType") or "Hard Date"
     company = stored.get("company") or ""
+    true_reorder = bool(stored.get("trueReorder"))
     company_key = str(company).strip().lower()
     try:
         items = list((reorder_batch_mod.get_reorder_batch(batch_id) or {}).get("items") or [])
@@ -20179,6 +20203,7 @@ def _run_reorder_batch(batch_id):
                     date_type=date_type,
                     extra_notes=extra_notes,
                     quantity=item.get("quantity") or None,
+                    true_reorder=true_reorder,
                 )
                 logger.info(
                     "[reorder-batch] finished source order %s -> new %s",
@@ -20216,6 +20241,11 @@ def start_reorder_batch():
     due_date = str(data.get("dueDate") or "").strip()
     date_type = str(data.get("dateType") or "Hard Date").strip() or "Hard Date"
     notes = str(data.get("notes") or "").strip()
+    true_reorder = str(data.get("trueReorder") or "").strip().lower() in (
+        "true",
+        "yes",
+        "1",
+    )
     job_requests = reorder_batch_mod.parse_reorder_job_requests(data, due_date)
     order_ids = [item["orderId"] for item in job_requests]
     if not company:
@@ -20242,7 +20272,13 @@ def start_reorder_batch():
             return jsonify({"error": "None of the selected jobs can be reordered."}), 400
         reorder_batch_mod.apply_overrides_to_jobs(to_process, job_requests)
         public = reorder_batch_mod.create_reorder_batch(
-            company, to_process, skipped, due_date, date_type, notes
+            company,
+            to_process,
+            skipped,
+            due_date,
+            date_type,
+            notes,
+            true_reorder=true_reorder,
         )
         eventlet.spawn_n(_run_reorder_batch, public["batchId"])
         logger.info(

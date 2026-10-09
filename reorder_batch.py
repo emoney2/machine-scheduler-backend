@@ -319,7 +319,9 @@ def _item_from_job(job, status="queued", error=""):
     }
 
 
-def create_reorder_batch(company, jobs, skipped, due_date, date_type, notes=""):
+def create_reorder_batch(
+    company, jobs, skipped, due_date, date_type, notes="", true_reorder=False
+):
     now = time.time()
     items = [_item_from_job(job) for job in jobs] + list(skipped or [])
     batch = {
@@ -328,6 +330,7 @@ def create_reorder_batch(company, jobs, skipped, due_date, date_type, notes=""):
         "dueDate": str(due_date or "").strip(),
         "dateType": str(date_type or "Hard Date").strip() or "Hard Date",
         "notes": str(notes or "").strip(),
+        "trueReorder": bool(true_reorder),
         "status": "queued",
         "createdAt": now,
         "updatedAt": now,
@@ -361,6 +364,7 @@ def public_reorder_batch(batch_id):
         "company": batch.get("company") or "",
         "dueDate": batch.get("dueDate") or "",
         "dateType": batch.get("dateType") or "",
+        "trueReorder": bool(batch.get("trueReorder")),
         "status": batch.get("status") or "queued",
         "total": len(items),
         "completed": counts["done"],
