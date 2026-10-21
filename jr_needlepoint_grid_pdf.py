@@ -93,13 +93,13 @@ def build_vendor_grid_pdf_from_document(document: dict[str, Any]) -> bytes | Non
                 py = band_bottom + (height - 1 - y) * cell
                 c.setFillColor(Color(r / 255.0, g / 255.0, b / 255.0))
                 c.rect(px, py, cell, cell, stroke=0, fill=1)
-                major = x % 10 == 0 or y % 10 == 0
-                c.setStrokeColorRGB(0.35 if major else 0.78, 0.35 if major else 0.78, 0.35 if major else 0.78)
-                c.setLineWidth(0.45 if major else 0.15)
+                # Same light-grey outline on every cell (no darker major lines).
+                c.setStrokeColorRGB(200 / 255.0, 200 / 255.0, 200 / 255.0)
+                c.setLineWidth(0.2)
                 c.rect(px, py, cell, cell, stroke=1, fill=0)
 
-        c.setStrokeColorRGB(0.15, 0.15, 0.15)
-        c.setLineWidth(0.8)
+        c.setStrokeColorRGB(200 / 255.0, 200 / 255.0, 200 / 255.0)
+        c.setLineWidth(0.35)
         c.rect(origin_x, band_bottom, band_w, height * cell, stroke=1, fill=0)
 
     top_y = margin_top
