@@ -1121,6 +1121,9 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
     # keep broader scope if you already had it:
     "https://www.googleapis.com/auth/drive",
+    # Needlepoint belt order drafts with PDF attachments (no Gmail password).
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.modify",
 ]
 
 # Google token file path (your choice)
@@ -1264,6 +1267,8 @@ from google.oauth2.credentials import Credentials as OAuthCredentials
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.modify",
 ]
 
 QBO_SCOPE = ["com.intuit.quickbooks.accounting"]
@@ -11584,6 +11589,9 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
     "https://www.googleapis.com/auth/drive",
+    # Needlepoint belt order drafts with PDF attachments (no Gmail password).
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.modify",
 ]
 
 # use the same path variable everywhere for Google token
@@ -29063,6 +29071,8 @@ if __name__ == "__main__":
         SCOPES = [
             "https://www.googleapis.com/auth/drive",
             "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/gmail.compose",
+            "https://www.googleapis.com/auth/gmail.modify",
         ]
         flow = InstalledAppFlow.from_client_secrets_file(
             "oauth-credentials.json", SCOPES
