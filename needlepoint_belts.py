@@ -71,6 +71,7 @@ SKIP_EXTS = {
     ".dxf",
     ".zip",
     ".cdr",
+    ".json",  # keep Studio .jrneedlepoint.json in Drive; do not email the raw package
 }
 
 

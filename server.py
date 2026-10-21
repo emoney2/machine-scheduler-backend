@@ -197,6 +197,10 @@ from needlepoint_belts import (
     supplier_email as needlepoint_supplier_email,
     total_quantity as needlepoint_total_quantity,
 )
+from jr_needlepoint_package import (
+    expand_studio_package_uploads,
+    prefer_grid_attachments,
+)
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
@@ -18970,44 +18974,60 @@ def submit_order():
 
         prod_links = []
         back_prod_links = []
+
+        def _upload_prod_payload(name, raw_bytes, mimetype, folder_id, order_label):
+            buf = BytesIO(raw_bytes)
+            media = MediaIoBaseUpload(buf, mimetype=mimetype or "application/octet-stream")
+            up = drive.files().create(
+                body={"name": name, "parents": [folder_id]},
+                media_body=media,
+                fields="id,webViewLink",
+            ).execute()
+            make_public(up["id"])
+            # Skip Corel queue for Studio package artifacts (PNG/PDF/JSON from Needlepoint Studio).
+            lower = str(name or "").lower()
+            if not (
+                lower.endswith("-customer-view.png")
+                or lower.endswith("-grid.pdf")
+                or lower.endswith(".jrneedlepoint.json")
+            ):
+                _queue_corel_vectorize_job(drive, folder_id, name, order_label)
+            return up
+
+        def _iter_prod_upload_items(file_storage):
+            """Yield (filename, bytes, mimetype) — expands Studio .jrneedlepoint.json packages."""
+            raw = file_storage.read()
+            name = file_storage.filename or "upload.bin"
+            mime = file_storage.mimetype or "application/octet-stream"
+            expanded = None
+            try:
+                expanded = expand_studio_package_uploads(raw, name, keep_json=True)
+            except Exception as exp_err:
+                logger.warning("[submit] Studio package expand failed for %s: %s", name, exp_err)
+            if expanded:
+                for item in expanded:
+                    yield item["filename"], item["bytes"], item["mimetype"]
+            else:
+                yield name, raw, mime
+
         if is_quilted_front:
-            # One file at a time to avoid loading all into memory; reuse one buffer for both uploads
             for f in prod_files:
-                buf = BytesIO(f.read())
-                m = MediaIoBaseUpload(buf, mimetype=f.mimetype)
-                up = drive.files().create(
-                    body={"name": f.filename, "parents": [order_folder_id]},
-                    media_body=m,
-                    fields="id,webViewLink",
-                ).execute()
-                make_public(up["id"])
-                prod_links.append(up["webViewLink"])
-                _queue_corel_vectorize_job(drive, order_folder_id, f.filename, new_order)
-                buf.seek(0)
-                m2 = MediaIoBaseUpload(buf, mimetype=f.mimetype)
-                up2 = drive.files().create(
-                    body={"name": f.filename, "parents": [back_order_folder_id]},
-                    media_body=m2,
-                    fields="id,webViewLink",
-                ).execute()
-                make_public(up2["id"])
-                back_prod_links.append(up2["webViewLink"])
-                _queue_corel_vectorize_job(drive, back_order_folder_id, f.filename, back_order)
-                del buf
+                for up_name, up_bytes, up_mime in _iter_prod_upload_items(f):
+                    up = _upload_prod_payload(
+                        up_name, up_bytes, up_mime, order_folder_id, new_order
+                    )
+                    prod_links.append(up["webViewLink"])
+                    up2 = _upload_prod_payload(
+                        up_name, up_bytes, up_mime, back_order_folder_id, back_order
+                    )
+                    back_prod_links.append(up2["webViewLink"])
         else:
-            # One prod file at a time to avoid holding multiple large files in memory
             for f in prod_files:
-                buf = BytesIO(f.read())
-                m = MediaIoBaseUpload(buf, mimetype=f.mimetype)
-                up = drive.files().create(
-                    body={"name": f.filename, "parents": [order_folder_id]},
-                    media_body=m,
-                    fields="id,webViewLink",
-                ).execute()
-                make_public(up["id"])
-                prod_links.append(up["webViewLink"])
-                _queue_corel_vectorize_job(drive, order_folder_id, f.filename, new_order)
-                del buf
+                for up_name, up_bytes, up_mime in _iter_prod_upload_items(f):
+                    up = _upload_prod_payload(
+                        up_name, up_bytes, up_mime, order_folder_id, new_order
+                    )
+                    prod_links.append(up["webViewLink"])
 
         # Create Print Files subfolder if user uploaded print files OR checked the Print checkbox
         print_val = (data.get("print") or "").strip().upper()
@@ -19416,7 +19436,9 @@ def needlepoint_order_belts():
     attachments = []
     missing = []
     for item in normalized:
-        atts = collect_needlepoint_attachments(drive, item.get("orderNumber"))
+        atts = prefer_grid_attachments(
+            collect_needlepoint_attachments(drive, item.get("orderNumber"))
+        )
         if not atts:
             missing.append(str(item.get("orderNumber")))
         attachments.extend(atts)
