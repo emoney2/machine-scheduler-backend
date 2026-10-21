@@ -4,6 +4,7 @@ Layout matches Studio grid / customer-proof bands:
   - Top strip: columns [0, split)
   - Bottom strip: columns [split, width)
   - No leather tabs
+  - Faint single-pass light-grey guides (not heavy per-cell strokes)
 """
 
 from __future__ import annotations
@@ -15,6 +16,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 BELT_ROWS = 24
+GRID_RGB = (210 / 255.0, 210 / 255.0, 210 / 255.0)
+GRID_LINE = 0.12
+FRAME_LINE = 0.25
 
 
 def _hex_rgb(hex_color: str | None) -> tuple[int, int, int]:
@@ -54,7 +58,7 @@ def build_vendor_grid_pdf_from_document(document: dict[str, Any]) -> bytes | Non
         split = width // 2
     split = max(1, min(width - 1, split))
 
-    cell = 4.0
+    cell = 5.0
     margin_x = 24.0
     margin_top = 24.0
     margin_bottom = 24.0
@@ -69,10 +73,11 @@ def build_vendor_grid_pdf_from_document(document: dict[str, Any]) -> bytes | Non
     def draw_band(start_col: int, end_col: int, origin_y_top: float) -> None:
         cols = max(1, end_col - start_col)
         band_w = cols * cell
+        band_h = height * cell
         origin_x = margin_x + (max_cols * cell - band_w) / 2
-        # PDF y grows upward; origin_y_top is distance from top of page.
-        band_bottom = page_h - origin_y_top - height * cell
+        band_bottom = page_h - origin_y_top - band_h
 
+        # 1) Stitch fills only.
         for y in range(height):
             row = cells[y] if y < len(cells) else None
             if not isinstance(row, list):
@@ -84,23 +89,27 @@ def build_vendor_grid_pdf_from_document(document: dict[str, Any]) -> bytes | Non
                 entry = None
                 if isinstance(idx, int) and 0 <= idx < len(palette):
                     entry = palette[idx] if isinstance(palette[idx], dict) else None
-                hex_color = (entry or {}).get("hex") if entry else None
                 if isinstance(idx, int) and idx >= 0:
-                    r, g, b = _hex_rgb(hex_color)
+                    r, g, b = _hex_rgb((entry or {}).get("hex"))
                 else:
                     r, g, b = (255, 255, 255)
                 px = origin_x + (x - start_col) * cell
                 py = band_bottom + (height - 1 - y) * cell
                 c.setFillColor(Color(r / 255.0, g / 255.0, b / 255.0))
                 c.rect(px, py, cell, cell, stroke=0, fill=1)
-                # Same light-grey outline on every cell (no darker major lines).
-                c.setStrokeColorRGB(200 / 255.0, 200 / 255.0, 200 / 255.0)
-                c.setLineWidth(0.2)
-                c.rect(px, py, cell, cell, stroke=1, fill=0)
 
-        c.setStrokeColorRGB(200 / 255.0, 200 / 255.0, 200 / 255.0)
-        c.setLineWidth(0.35)
-        c.rect(origin_x, band_bottom, band_w, height * cell, stroke=1, fill=0)
+        # 2) Single-pass faint guides.
+        c.setStrokeColorRGB(*GRID_RGB)
+        c.setLineWidth(GRID_LINE)
+        for i in range(cols + 1):
+            x = origin_x + i * cell
+            c.line(x, band_bottom, x, band_bottom + band_h)
+        for j in range(height + 1):
+            y = band_bottom + j * cell
+            c.line(origin_x, y, origin_x + band_w, y)
+
+        c.setLineWidth(FRAME_LINE)
+        c.rect(origin_x, band_bottom, band_w, band_h, stroke=1, fill=0)
 
     top_y = margin_top
     bottom_y = top_y + height * cell + gap
