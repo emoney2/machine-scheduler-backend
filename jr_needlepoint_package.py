@@ -158,31 +158,48 @@ def expand_studio_package_uploads(
     return uploads
 
 
+def _attachment_label(att: dict[str, Any]) -> str:
+    return str(att.get("sourceName") or att.get("filename") or "").lower()
+
+
 def prefer_grid_attachments(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    For customer/supplier email: prefer clear grid PDFs over customer-view PNGs
-    when both came from a Studio package.
+    Vendor email should get stitch-grid PDFs only (no Drive links, no customer PNG).
+
+    Prefer Studio `-grid.pdf` / embedded grid PDFs; otherwise any PDF; never JSON.
     """
     if not attachments:
         return attachments
-    grids = [
+    usable = [
         a
         for a in attachments
-        if str(a.get("filename") or "").lower().endswith("-grid.pdf")
-        or (
-            str(a.get("mime") or "").endswith("pdf")
-            and "grid" in str(a.get("filename") or "").lower()
-        )
+        if a.get("bytes")
+        and not _attachment_label(a).endswith(".json")
+        and "jrneedlepoint" not in _attachment_label(a)
     ]
-    if not grids:
-        return attachments
-    # Drop customer-view PNGs when a grid PDF is present; keep other files.
-    out = []
-    for a in attachments:
-        name = str(a.get("filename") or "").lower()
-        if name.endswith("-customer-view.png") or "-customer-view." in name:
-            continue
-        if name.endswith(".jrneedlepoint.json") or name.endswith(".json"):
-            continue
-        out.append(a)
-    return out or grids
+    grids = [
+        a
+        for a in usable
+        if _attachment_label(a).endswith("-grid.pdf")
+        or (
+            "grid" in _attachment_label(a)
+            and (
+                _attachment_label(a).endswith(".pdf")
+                or "pdf" in str(a.get("mime") or "").lower()
+            )
+        )
+        or a.get("role") == "grid_view"
+    ]
+    if grids:
+        return grids
+    pdfs = [
+        a
+        for a in usable
+        if _attachment_label(a).endswith(".pdf")
+        or "pdf" in str(a.get("mime") or "").lower()
+        or (isinstance(a.get("bytes"), (bytes, bytearray)) and a["bytes"][:4] == b"%PDF")
+    ]
+    if pdfs:
+        return pdfs
+    # No PDF found — do not fall back to PNG/customer view for the vendor.
+    return []

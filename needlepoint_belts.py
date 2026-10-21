@@ -435,7 +435,14 @@ def build_email_text(
 ) -> tuple[str, str]:
     today = datetime.now(TZ)
     date_label = _format_mdy(today)
+    customers: list[str] = []
+    for item in orders or []:
+        company = str(item.get("company") or "").strip()
+        if company and company not in customers:
+            customers.append(company)
     subject = f"JR & Co. Needlepoint Belt Order — {date_label}"
+    if customers:
+        subject = f"{subject} — {' / '.join(customers)}"
     lines = [
         "Hello,",
         "",
@@ -466,7 +473,7 @@ def build_email_text(
         lines.extend(["Notes:", extra_notes.strip(), ""])
     lines.extend(
         [
-            "Design files are attached, named by order number.",
+            "Design PDFs are attached, named by order number.",
             "",
             "Thank you,",
             "Justin Eckard",
@@ -566,34 +573,155 @@ def download_drive_bytes(drive, file_id: str) -> bytes:
     return buf.getvalue()
 
 
+def _list_folder_files(drive, folder_id: str) -> list[dict[str, str]]:
+    if not folder_id:
+        return []
+    files: list[dict[str, str]] = []
+    page_token = None
+    while True:
+        res = (
+            drive.files()
+            .list(
+                q=f"'{folder_id}' in parents and trashed = false",
+                fields="nextPageToken, files(id, name, mimeType)",
+                pageSize=100,
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        files.extend(res.get("files") or [])
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
 def collect_renamed_attachments(drive, order_number: Any) -> list[dict[str, Any]]:
+    """
+    Build vendor email attachments for one order.
+
+    Prefers stitch-grid PDFs already extracted from Studio packages (`*-grid.pdf`).
+    If missing, pulls `order.gridViewPdf` directly out of any `.jrneedlepoint.json`
+    in the order folder so the vendor gets a real PDF attachment (not a Drive link).
+    """
+    from jr_needlepoint_package import parse_studio_package
+
     folder_id = find_order_folder_id(drive, order_number)
     if not folder_id:
         logger.warning("[Needlepoint] order folder not found for %s", order_number)
         return []
-    designs = list_design_files(drive, folder_id)
-    if not designs:
-        logger.warning("[Needlepoint] no design files in folder for %s", order_number)
-        return []
-    out = []
-    total = len(designs)
-    for i, meta in enumerate(designs, start=1):
+
+    all_files = _list_folder_files(drive, folder_id)
+    out: list[dict[str, Any]] = []
+    order = str(order_number or "").strip() or "design"
+
+    # 1) Explicit Studio grid PDFs uploaded at submit time.
+    grid_metas = [
+        f
+        for f in all_files
+        if str(f.get("name") or "").lower().endswith("-grid.pdf")
+        or (
+            str(f.get("mimeType") or "") == "application/pdf"
+            and "grid" in str(f.get("name") or "").lower()
+        )
+    ]
+    for meta in grid_metas:
         try:
             data = download_drive_bytes(drive, meta["id"])
         except Exception:
-            logger.exception("[Needlepoint] failed to download %s for order %s", meta.get("id"), order_number)
+            logger.exception(
+                "[Needlepoint] failed to download grid PDF %s for order %s",
+                meta.get("id"),
+                order_number,
+            )
             continue
-        filename = attachment_filename(order_number, meta.get("name") or "", i, total)
-        mime = meta.get("mimeType") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        if not data:
+            continue
+        out.append(
+            {
+                "filename": f"{order}.pdf",
+                "bytes": data,
+                "mime": "application/pdf",
+                "sourceId": meta.get("id"),
+                "sourceName": meta.get("name"),
+                "role": "grid_view",
+            }
+        )
+    if out:
+        return out
+
+    # 2) Extract grid PDF bytes from Studio JSON packages in the folder.
+    json_metas = [
+        f
+        for f in all_files
+        if str(f.get("name") or "").lower().endswith(".json")
+        or "jrneedlepoint" in str(f.get("name") or "").lower()
+    ]
+    for meta in json_metas:
+        try:
+            raw = download_drive_bytes(drive, meta["id"])
+        except Exception:
+            logger.exception(
+                "[Needlepoint] failed to download Studio JSON %s for order %s",
+                meta.get("id"),
+                order_number,
+            )
+            continue
+        pkg = parse_studio_package(raw)
+        if not pkg or not pkg.get("gridViewPdf"):
+            continue
+        _mime, pdf_bytes = pkg["gridViewPdf"]
+        if not pdf_bytes:
+            continue
+        out.append(
+            {
+                "filename": f"{order}.pdf",
+                "bytes": pdf_bytes,
+                "mime": "application/pdf",
+                "sourceId": meta.get("id"),
+                "sourceName": meta.get("name"),
+                "role": "grid_view",
+            }
+        )
+    if out:
+        return out
+
+    # 3) Fallback: any other design PDF in the folder (still a real attachment).
+    designs = [f for f in all_files if _is_design_file(f)]
+    pdf_designs = [
+        f
+        for f in designs
+        if str(f.get("name") or "").lower().endswith(".pdf")
+        or str(f.get("mimeType") or "") == "application/pdf"
+    ]
+    for i, meta in enumerate(pdf_designs, start=1):
+        try:
+            data = download_drive_bytes(drive, meta["id"])
+        except Exception:
+            logger.exception(
+                "[Needlepoint] failed to download PDF %s for order %s",
+                meta.get("id"),
+                order_number,
+            )
+            continue
+        filename = attachment_filename(order_number, meta.get("name") or "design.pdf", i, len(pdf_designs))
+        if not filename.lower().endswith(".pdf"):
+            filename = f"{order}.pdf" if len(pdf_designs) == 1 else f"{order}-{i}.pdf"
         out.append(
             {
                 "filename": filename,
                 "bytes": data,
-                "mime": mime,
+                "mime": "application/pdf",
                 "sourceId": meta.get("id"),
                 "sourceName": meta.get("name"),
             }
         )
+    if out:
+        return out
+
+    logger.warning("[Needlepoint] no PDF design file for order %s", order_number)
     return out
 
 
@@ -745,16 +873,23 @@ def deliver_belt_order_email(
         logger.warning("[Needlepoint] SMTP send failed: %s", exc)
         result["error"] = str(exc)
 
-    extra_lines = []
-    for att in attachments or []:
-        fid = att.get("sourceId")
-        fname = att.get("filename")
-        if fid and fname:
-            extra_lines.append(f"{fname}: https://drive.google.com/file/d/{fid}/view")
+    # Vendor cannot open Google Drive links — never put Drive URLs in the body.
+    # Compose URL is a last resort without attachments; warn in the body.
+    names = [str(a.get("filename") or "design.pdf") for a in (attachments or []) if a.get("bytes")]
     fallback_body = body
-    if extra_lines:
-        fallback_body = body + "\n\nDesign files:\n" + "\n".join(extra_lines)
+    if names:
+        fallback_body = (
+            body
+            + "\n\nNOTE: Attach these PDFs manually before sending "
+            + "(Gmail draft/SMTP could not attach them automatically):\n- "
+            + "\n- ".join(names)
+        )
+        result["error"] = (
+            result.get("error") or "Could not auto-attach PDFs; compose opened without Drive links."
+        )
+        result["ok"] = False
     result["composeUrl"] = gmail_compose_url(to_email, subject, fallback_body)
     result["method"] = "compose_url"
-    result["ok"] = True
+    if not names:
+        result["ok"] = True
     return result
