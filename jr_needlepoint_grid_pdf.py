@@ -98,7 +98,8 @@ def build_vendor_grid_pdf_from_document(document: dict[str, Any]) -> bytes | Non
                 px = origin_x + (x - start_col) * cell
                 py = band_bottom + (height - 1 - y) * cell
                 c.setFillColor(Color(r / 255.0, g / 255.0, b / 255.0))
-                c.rect(px, py, cell, cell, stroke=0, fill=1)
+                # Slight overlap kills PDF hairline gaps between same-color cells.
+                c.rect(px, py, cell + 0.2, cell + 0.2, stroke=0, fill=1)
 
         # 2) Faint count guides every GUIDE_EVERY stitches (not every cell).
         c.setStrokeColorRGB(*GRID_RGB)
