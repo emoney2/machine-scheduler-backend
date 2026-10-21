@@ -19456,12 +19456,13 @@ def needlepoint_order_belts():
     )
     if missing:
         delivered["missingDesigns"] = missing
-    if delivered.get("ok"):
+    # Only mark ordered when a real attached draft/send succeeded (not compose-only).
+    if delivered.get("ok") and delivered.get("method") in ("gmail_draft", "imap_draft", "smtp"):
         try:
             mark_needlepoint_orders_ordered(get_sheets_service(), SPREADSHEET_ID, normalized)
         except Exception:
             logger.exception("[Needlepoint] mark ordered failed")
-    return jsonify({"ok": True, **delivered, "subject": subject, "body": body, "to": to_email})
+    return jsonify({**delivered, "subject": subject, "body": body, "to": to_email})
 
 
 @app.route("/api/reorder", methods=["POST"])

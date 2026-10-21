@@ -745,6 +745,25 @@ def _mime_message(to_email: str, subject: str, body: str, attachments: list[dict
     return msg
 
 
+def _attachments_payload(attachments: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Base64 payloads so the browser can download PDFs if Gmail can't auto-attach."""
+    out: list[dict[str, str]] = []
+    for att in attachments or []:
+        data = att.get("bytes") or b""
+        if not data:
+            continue
+        filename = str(att.get("filename") or "design.pdf")
+        mime = str(att.get("mime") or "application/pdf")
+        out.append(
+            {
+                "filename": filename,
+                "mime": mime,
+                "contentBase64": base64.b64encode(data).decode("ascii"),
+            }
+        )
+    return out
+
+
 def create_gmail_draft(
     creds,
     *,
@@ -756,8 +775,15 @@ def create_gmail_draft(
 ) -> dict[str, Any] | None:
     from googleapiclient.discovery import build
 
-    msg = _mime_message(to_email, subject, body, attachments, from_email=from_email)
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    account = (os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT") or DEFAULT_GMAIL_ACCOUNT).strip()
+    msg = _mime_message(
+        to_email,
+        subject,
+        body,
+        attachments,
+        from_email=from_email or account,
+    )
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8").rstrip("=")
     gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
     created = (
         gmail.users()
@@ -767,15 +793,85 @@ def create_gmail_draft(
     )
     draft_id = created.get("id") or ""
     message_id = (created.get("message") or {}).get("id") or ""
-    account = (os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT") or DEFAULT_GMAIL_ACCOUNT).strip()
     params = {"authuser": account}
     compose = message_id or draft_id
     draft_url = (
         f"https://mail.google.com/mail/u/?{urlencode(params)}#drafts?compose={quote(str(compose))}"
         if compose
-        else ""
+        else f"https://mail.google.com/mail/u/?{urlencode(params)}#drafts"
     )
     return {"draftId": draft_id, "messageId": message_id, "draftUrl": draft_url}
+
+
+def create_imap_draft(
+    *,
+    to_email: str,
+    subject: str,
+    body: str,
+    attachments: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """
+    Save a real Draft (with PDF attachments) via Gmail IMAP.
+
+    Needs an app password:
+      NEEDLEPOINT_GMAIL_APP_PASSWORD (or NEEDLEPOINT_IMAP_PASSWORD)
+      NEEDLEPOINT_IMAP_USER / NEEDLEPOINT_GMAIL_ACCOUNT (default justin.eckard@jrcogolf.com)
+    """
+    import imaplib
+    import time
+
+    user = (
+        os.environ.get("NEEDLEPOINT_IMAP_USER")
+        or os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT")
+        or DEFAULT_GMAIL_ACCOUNT
+    ).strip()
+    password = (
+        os.environ.get("NEEDLEPOINT_GMAIL_APP_PASSWORD")
+        or os.environ.get("NEEDLEPOINT_IMAP_PASSWORD")
+        or ""
+    ).strip()
+    # Do not reuse generic SMTP_PASSWORD — that mailbox is often info@jrco.us, not Justin's Gmail.
+    if not user or not password:
+        logger.info("[Needlepoint] IMAP draft skipped (set NEEDLEPOINT_GMAIL_APP_PASSWORD)")
+        return None
+
+    msg = _mime_message(to_email, subject, body, attachments, from_email=user)
+    raw = msg.as_bytes()
+    imap = imaplib.IMAP4_SSL("imap.gmail.com")
+    try:
+        imap.login(user, password)
+        appended = False
+        last_err = ""
+        for mailbox in ('"[Gmail]/Drafts"', "Drafts", "[Gmail]/Drafts"):
+            try:
+                typ, data = imap.append(
+                    mailbox,
+                    "\\Draft",
+                    imaplib.Time2Internaldate(time.time()),
+                    raw,
+                )
+                if typ == "OK":
+                    appended = True
+                    logger.info("[Needlepoint] IMAP draft saved in %s for %s", mailbox, user)
+                    break
+                last_err = f"{typ} {data}"
+            except Exception as exc:
+                last_err = str(exc)
+                continue
+        if not appended:
+            logger.warning("[Needlepoint] IMAP append failed: %s", last_err)
+            return None
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+    params = {"authuser": user}
+    return {
+        "draftUrl": f"https://mail.google.com/mail/u/?{urlencode(params)}#drafts",
+        "mailbox": "Drafts",
+    }
 
 
 def send_smtp_email(
@@ -827,7 +923,17 @@ def deliver_belt_order_email(
     body: str,
     attachments: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Create a Gmail draft with attachments; fall back to SMTP, then compose URL."""
+    """
+    Put a reviewable email in Justin's Gmail with PDF attachments.
+
+    Order: Gmail API draft → IMAP draft (app password) → SMTP send →
+    browser downloads PDFs + compose (manual attach; never Drive links).
+
+    Note: Google token.json currently has Drive/Sheets only. Gmail API drafts
+    need gmail.compose scope (re-run authorize_oauth.py / generate_token.py).
+    Until then, set NEEDLEPOINT_GMAIL_APP_PASSWORD for IMAP drafts.
+    """
+    payload = _attachments_payload(attachments)
     result = {
         "ok": False,
         "method": "",
@@ -837,7 +943,13 @@ def deliver_belt_order_email(
         "error": "",
         "attachmentCount": len(attachments or []),
         "attachmentNames": [a.get("filename") for a in (attachments or [])],
+        "attachmentsBase64": payload,
     }
+    if not payload:
+        result["error"] = "No design PDF found to attach for the selected order(s)."
+        result["method"] = "none"
+        return result
+
     try:
         draft = create_gmail_draft(
             creds,
@@ -853,11 +965,33 @@ def deliver_belt_order_email(
                     "method": "gmail_draft",
                     "draftUrl": draft.get("draftUrl") or "",
                     "draftId": draft.get("draftId") or "",
+                    "error": "",
                 }
             )
             return result
     except Exception as exc:
-        logger.warning("[Needlepoint] Gmail draft failed: %s", exc)
+        logger.warning("[Needlepoint] Gmail API draft failed: %s", exc)
+        result["error"] = str(exc)
+
+    try:
+        imap_draft = create_imap_draft(
+            to_email=to_email,
+            subject=subject,
+            body=body,
+            attachments=attachments,
+        )
+        if imap_draft and imap_draft.get("draftUrl"):
+            result.update(
+                {
+                    "ok": True,
+                    "method": "imap_draft",
+                    "draftUrl": imap_draft["draftUrl"],
+                    "error": "",
+                }
+            )
+            return result
+    except Exception as exc:
+        logger.warning("[Needlepoint] IMAP draft failed: %s", exc)
         result["error"] = str(exc)
 
     try:
@@ -873,23 +1007,23 @@ def deliver_belt_order_email(
         logger.warning("[Needlepoint] SMTP send failed: %s", exc)
         result["error"] = str(exc)
 
-    # Vendor cannot open Google Drive links — never put Drive URLs in the body.
-    # Compose URL is a last resort without attachments; warn in the body.
-    names = [str(a.get("filename") or "design.pdf") for a in (attachments or []) if a.get("bytes")]
-    fallback_body = body
-    if names:
-        fallback_body = (
-            body
-            + "\n\nNOTE: Attach these PDFs manually before sending "
-            + "(Gmail draft/SMTP could not attach them automatically):\n- "
+    # Last resort: open compose (cannot carry files) + return PDFs for browser download.
+    names = [p["filename"] for p in payload]
+    fallback_body = body.replace(
+        "Design PDFs are attached, named by order number.",
+        "IMPORTANT: Attach the downloaded PDF file(s) before sending "
+        "(named by order number). Do not use Google Drive links.",
+    )
+    if "IMPORTANT: Attach the downloaded PDF" not in fallback_body:
+        fallback_body += (
+            "\n\nIMPORTANT: Attach these PDF file(s) before sending:\n- "
             + "\n- ".join(names)
         )
-        result["error"] = (
-            result.get("error") or "Could not auto-attach PDFs; compose opened without Drive links."
-        )
-        result["ok"] = False
     result["composeUrl"] = gmail_compose_url(to_email, subject, fallback_body)
-    result["method"] = "compose_url"
-    if not names:
-        result["ok"] = True
+    result["method"] = "compose_download"
+    result["ok"] = False
+    result["error"] = (
+        result.get("error")
+        or "Could not create a Gmail draft with attachments. PDFs were prepared for download — attach them in Gmail before sending."
+    )
     return result
