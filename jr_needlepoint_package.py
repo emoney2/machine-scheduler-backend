@@ -170,17 +170,27 @@ def prefer_grid_attachments(attachments: list[dict[str, Any]]) -> list[dict[str,
     """
     if not attachments:
         return attachments
-    usable = [
-        a
-        for a in attachments
-        if a.get("bytes")
-        and not _attachment_label(a).endswith(".json")
-        and "jrneedlepoint" not in _attachment_label(a)
-    ]
+    usable = []
+    for a in attachments:
+        if not a.get("bytes"):
+            continue
+        # Email filename wins — sourceName may be the Studio .jrneedlepoint.json
+        # the PDF was extracted from (must not discard those).
+        if a.get("role") == "grid_view":
+            usable.append(a)
+            continue
+        label = str(a.get("filename") or a.get("sourceName") or "").lower()
+        if label.endswith(".json") or (
+            "jrneedlepoint" in label and not label.endswith(".pdf")
+        ):
+            continue
+        usable.append(a)
     grids = [
         a
         for a in usable
-        if _attachment_label(a).endswith("-grid.pdf")
+        if a.get("role") == "grid_view"
+        or str(a.get("filename") or "").lower().endswith("-grid.pdf")
+        or _attachment_label(a).endswith("-grid.pdf")
         or (
             "grid" in _attachment_label(a)
             and (
@@ -188,7 +198,6 @@ def prefer_grid_attachments(attachments: list[dict[str, Any]]) -> list[dict[str,
                 or "pdf" in str(a.get("mime") or "").lower()
             )
         )
-        or a.get("role") == "grid_view"
     ]
     if grids:
         return grids
