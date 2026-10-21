@@ -617,7 +617,69 @@ def collect_renamed_attachments(drive, order_number: Any) -> list[dict[str, Any]
     out: list[dict[str, Any]] = []
     order = str(order_number or "").strip() or "design"
 
-    # 1) Explicit Studio grid PDFs uploaded at submit time.
+    # 1) Prefer regenerating the vendor grid from Studio JSON `document` cells:
+    #    two long strips (proof/grid layout, no leather) — not the old tiled chart.
+    from jr_needlepoint_grid_pdf import build_vendor_grid_pdf_from_package
+
+    json_metas = [
+        f
+        for f in all_files
+        if str(f.get("name") or "").lower().endswith(".json")
+        or "jrneedlepoint" in str(f.get("name") or "").lower()
+    ]
+    for meta in json_metas:
+        try:
+            raw = download_drive_bytes(drive, meta["id"])
+        except Exception:
+            logger.exception(
+                "[Needlepoint] failed to download Studio JSON %s for order %s",
+                meta.get("id"),
+                order_number,
+            )
+            continue
+        try:
+            rebuilt = build_vendor_grid_pdf_from_package(raw)
+        except Exception:
+            logger.exception(
+                "[Needlepoint] failed to rebuild vendor grid PDF from %s for order %s",
+                meta.get("name"),
+                order_number,
+            )
+            rebuilt = None
+        if rebuilt and rebuilt[:4] == b"%PDF":
+            out.append(
+                {
+                    "filename": f"{order}.pdf",
+                    "bytes": rebuilt,
+                    "mime": "application/pdf",
+                    "sourceId": meta.get("id"),
+                    "sourceName": meta.get("name"),
+                    "role": "grid_view",
+                }
+            )
+            return out
+
+        # Fall back to embedded order.gridViewPdf if rebuild is unavailable.
+        pkg = parse_studio_package(raw)
+        if not pkg or not pkg.get("gridViewPdf"):
+            continue
+        _mime, pdf_bytes = pkg["gridViewPdf"]
+        if not pdf_bytes:
+            continue
+        out.append(
+            {
+                "filename": f"{order}.pdf",
+                "bytes": pdf_bytes,
+                "mime": "application/pdf",
+                "sourceId": meta.get("id"),
+                "sourceName": meta.get("name"),
+                "role": "grid_view",
+            }
+        )
+    if out:
+        return out
+
+    # 2) Explicit Studio grid PDFs uploaded at submit time.
     grid_metas = [
         f
         for f in all_files
@@ -643,42 +705,6 @@ def collect_renamed_attachments(drive, order_number: Any) -> list[dict[str, Any]
             {
                 "filename": f"{order}.pdf",
                 "bytes": data,
-                "mime": "application/pdf",
-                "sourceId": meta.get("id"),
-                "sourceName": meta.get("name"),
-                "role": "grid_view",
-            }
-        )
-    if out:
-        return out
-
-    # 2) Extract grid PDF bytes from Studio JSON packages in the folder.
-    json_metas = [
-        f
-        for f in all_files
-        if str(f.get("name") or "").lower().endswith(".json")
-        or "jrneedlepoint" in str(f.get("name") or "").lower()
-    ]
-    for meta in json_metas:
-        try:
-            raw = download_drive_bytes(drive, meta["id"])
-        except Exception:
-            logger.exception(
-                "[Needlepoint] failed to download Studio JSON %s for order %s",
-                meta.get("id"),
-                order_number,
-            )
-            continue
-        pkg = parse_studio_package(raw)
-        if not pkg or not pkg.get("gridViewPdf"):
-            continue
-        _mime, pdf_bytes = pkg["gridViewPdf"]
-        if not pdf_bytes:
-            continue
-        out.append(
-            {
-                "filename": f"{order}.pdf",
-                "bytes": pdf_bytes,
                 "mime": "application/pdf",
                 "sourceId": meta.get("id"),
                 "sourceName": meta.get("name"),
