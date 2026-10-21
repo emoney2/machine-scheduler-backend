@@ -27,6 +27,10 @@ STATUS_PENDING = "Pending"
 STATUS_ORDERED = "Ordered"
 ORDERS_PARENT_FOLDER_ID = "1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz"
 DEFAULT_GMAIL_ACCOUNT = "justin.eckard@jrcogolf.com"
+DEFAULT_SUPPLIER_EMAILS = (
+    "sales05@eleganceneedlepoint.com",
+    "lingchoi@eleganceneedlepoint.com",
+)
 TZ = ZoneInfo("America/New_York")
 
 META_HEADERS = (
@@ -140,8 +144,18 @@ def is_pending_status(value: Any) -> bool:
     return status in ("", "pending")
 
 
+def parse_recipient_list(raw: Any) -> list[str]:
+    """Split a To field into individual addresses (comma/semicolon separated)."""
+    parts = re.split(r"[;,]+", str(raw or ""))
+    return [p.strip() for p in parts if p.strip()]
+
+
 def supplier_email() -> str:
-    return (os.environ.get("NEEDLEPOINT_SUPPLIER_EMAIL") or "").strip()
+    """Default Elegance Needlepoint order inbox (override with NEEDLEPOINT_SUPPLIER_EMAIL)."""
+    env = (os.environ.get("NEEDLEPOINT_SUPPLIER_EMAIL") or "").strip()
+    if env:
+        return env
+    return ", ".join(DEFAULT_SUPPLIER_EMAILS)
 
 
 def _header_index(headers: list[str]) -> dict[str, int]:
@@ -650,15 +664,17 @@ def send_smtp_email(
     smtp_port = int(os.environ.get("SMTP_PORT") or "587")
     smtp_user = (os.environ.get("SMTP_USER") or "").strip()
     smtp_password = (os.environ.get("SMTP_PASSWORD") or "").strip()
-    if not to_email or not smtp_host or not smtp_user or not smtp_password:
+    recipients = parse_recipient_list(to_email)
+    if not recipients or not smtp_host or not smtp_user or not smtp_password:
         logger.warning("[Needlepoint] SMTP not configured; email not sent")
         return False
-    msg = _mime_message(to_email, subject, body, attachments, from_email=from_email)
+    to_header = ", ".join(recipients)
+    msg = _mime_message(to_header, subject, body, attachments, from_email=from_email)
     with smtplib.SMTP(smtp_host, smtp_port) as server:
         server.starttls()
         server.login(smtp_user, smtp_password)
-        server.sendmail(from_email, [to_email], msg.as_string())
-    logger.info("[Needlepoint] SMTP belt order sent to %s", to_email)
+        server.sendmail(from_email, recipients, msg.as_string())
+    logger.info("[Needlepoint] SMTP belt order sent to %s", to_header)
     return True
 
 
