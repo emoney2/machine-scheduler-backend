@@ -4,7 +4,7 @@ Layout matches Studio grid / customer-proof bands:
   - Top strip: columns [0, split)
   - Bottom strip: columns [split, width)
   - No leather tabs
-  - Faint single-pass light-grey guides (not heavy per-cell strokes)
+  - Every stitch outlined in one muted steel color/weight (single-pass lines)
 """
 
 from __future__ import annotations
@@ -16,11 +16,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 BELT_ROWS = 24
-# Soft steel guide — every N stitches only (1-stitch grid becomes the focal point).
 GRID_RGB = (95 / 255.0, 105 / 255.0, 120 / 255.0)
-GRID_LINE = 0.15
-FRAME_LINE = 0.25
-GUIDE_EVERY = 5
+GRID_LINE = 0.12
+FRAME_LINE = 0.22
 
 
 def _hex_rgb(hex_color: str | None) -> tuple[int, int, int]:
@@ -79,7 +77,7 @@ def build_vendor_grid_pdf_from_document(document: dict[str, Any]) -> bytes | Non
         origin_x = margin_x + (max_cols * cell - band_w) / 2
         band_bottom = page_h - origin_y_top - band_h
 
-        # 1) Stitch fills only.
+        # 1) Stitch fills (slight overlap kills PDF hairline gaps).
         for y in range(height):
             row = cells[y] if y < len(cells) else None
             if not isinstance(row, list):
@@ -98,23 +96,16 @@ def build_vendor_grid_pdf_from_document(document: dict[str, Any]) -> bytes | Non
                 px = origin_x + (x - start_col) * cell
                 py = band_bottom + (height - 1 - y) * cell
                 c.setFillColor(Color(r / 255.0, g / 255.0, b / 255.0))
-                # Slight overlap kills PDF hairline gaps between same-color cells.
                 c.rect(px, py, cell + 0.2, cell + 0.2, stroke=0, fill=1)
 
-        # 2) Faint count guides every GUIDE_EVERY stitches (not every cell).
+        # 2) Every stitch outline — one pass, one color, one weight.
         c.setStrokeColorRGB(*GRID_RGB)
         c.setLineWidth(GRID_LINE)
-        for i in range(0, cols + 1, GUIDE_EVERY):
+        for i in range(cols + 1):
             x = origin_x + i * cell
             c.line(x, band_bottom, x, band_bottom + band_h)
-        if cols % GUIDE_EVERY != 0:
-            x = origin_x + cols * cell
-            c.line(x, band_bottom, x, band_bottom + band_h)
-        for j in range(0, height + 1, GUIDE_EVERY):
+        for j in range(height + 1):
             y = band_bottom + j * cell
-            c.line(origin_x, y, origin_x + band_w, y)
-        if height % GUIDE_EVERY != 0:
-            y = band_bottom + height * cell
             c.line(origin_x, y, origin_x + band_w, y)
 
         c.setLineWidth(FRAME_LINE)
