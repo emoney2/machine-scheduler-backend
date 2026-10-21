@@ -55,36 +55,23 @@ def build_vendor_grid_pdf_from_document(document: dict[str, Any]) -> bytes | Non
     split = max(1, min(width - 1, split))
 
     cell = 4.0
-    margin_x = 36.0
-    margin_top = 40.0
-    margin_bottom = 28.0
-    gap = 36.0
-    title_h = 18.0
+    margin_x = 24.0
+    margin_top = 24.0
+    margin_bottom = 24.0
+    gap = 28.0
     max_cols = max(split, width - split)
     page_w = margin_x * 2 + max_cols * cell
-    page_h = margin_top + title_h + height * cell + gap + height * cell + margin_bottom
+    page_h = margin_top + height * cell + gap + height * cell + margin_bottom
 
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_w, page_h))
-    name = str(document.get("name") or "Design").strip() or "Design"
-    c.setFont("Helvetica-Bold", 11)
-    c.setFillColorRGB(0.08, 0.08, 0.08)
-    c.drawString(margin_x, page_h - 24, f"{name} — vendor stitch grid (no leather)")
 
-    def draw_band(start_col: int, end_col: int, origin_y_top: float, label: str) -> None:
+    def draw_band(start_col: int, end_col: int, origin_y_top: float) -> None:
         cols = max(1, end_col - start_col)
         band_w = cols * cell
         origin_x = margin_x + (max_cols * cell - band_w) / 2
         # PDF y grows upward; origin_y_top is distance from top of page.
         band_bottom = page_h - origin_y_top - height * cell
-
-        c.setFont("Helvetica", 8)
-        c.setFillColorRGB(0.25, 0.25, 0.25)
-        c.drawString(
-            origin_x,
-            page_h - origin_y_top + 6,
-            f"{label}: columns {start_col + 1}–{end_col} · {height} rows",
-        )
 
         for y in range(height):
             row = cells[y] if y < len(cells) else None
@@ -98,8 +85,9 @@ def build_vendor_grid_pdf_from_document(document: dict[str, Any]) -> bytes | Non
                 if isinstance(idx, int) and 0 <= idx < len(palette):
                     entry = palette[idx] if isinstance(palette[idx], dict) else None
                 hex_color = (entry or {}).get("hex") if entry else None
-                r, g, b = _hex_rgb(hex_color if isinstance(idx, int) and idx >= 0 else "#ffffff")
-                if not (isinstance(idx, int) and idx >= 0):
+                if isinstance(idx, int) and idx >= 0:
+                    r, g, b = _hex_rgb(hex_color)
+                else:
                     r, g, b = (255, 255, 255)
                 px = origin_x + (x - start_col) * cell
                 py = band_bottom + (height - 1 - y) * cell
@@ -114,10 +102,10 @@ def build_vendor_grid_pdf_from_document(document: dict[str, Any]) -> bytes | Non
         c.setLineWidth(0.8)
         c.rect(origin_x, band_bottom, band_w, height * cell, stroke=1, fill=0)
 
-    top_y = margin_top + title_h
+    top_y = margin_top
     bottom_y = top_y + height * cell + gap
-    draw_band(0, split, top_y, "Top")
-    draw_band(split, width, bottom_y, "Bottom")
+    draw_band(0, split, top_y)
+    draw_band(split, width, bottom_y)
     c.save()
     return buf.getvalue()
 
