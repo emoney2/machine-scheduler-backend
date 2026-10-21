@@ -16,9 +16,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 BELT_ROWS = 24
-GRID_RGB = (210 / 255.0, 210 / 255.0, 210 / 255.0)
-GRID_LINE = 0.12
+# Soft steel guide — every N stitches only (1-stitch grid becomes the focal point).
+GRID_RGB = (95 / 255.0, 105 / 255.0, 120 / 255.0)
+GRID_LINE = 0.15
 FRAME_LINE = 0.25
+GUIDE_EVERY = 5
 
 
 def _hex_rgb(hex_color: str | None) -> tuple[int, int, int]:
@@ -98,14 +100,20 @@ def build_vendor_grid_pdf_from_document(document: dict[str, Any]) -> bytes | Non
                 c.setFillColor(Color(r / 255.0, g / 255.0, b / 255.0))
                 c.rect(px, py, cell, cell, stroke=0, fill=1)
 
-        # 2) Single-pass faint guides.
+        # 2) Faint count guides every GUIDE_EVERY stitches (not every cell).
         c.setStrokeColorRGB(*GRID_RGB)
         c.setLineWidth(GRID_LINE)
-        for i in range(cols + 1):
+        for i in range(0, cols + 1, GUIDE_EVERY):
             x = origin_x + i * cell
             c.line(x, band_bottom, x, band_bottom + band_h)
-        for j in range(height + 1):
+        if cols % GUIDE_EVERY != 0:
+            x = origin_x + cols * cell
+            c.line(x, band_bottom, x, band_bottom + band_h)
+        for j in range(0, height + 1, GUIDE_EVERY):
             y = band_bottom + j * cell
+            c.line(origin_x, y, origin_x + band_w, y)
+        if height % GUIDE_EVERY != 0:
+            y = band_bottom + height * cell
             c.line(origin_x, y, origin_x + band_w, y)
 
         c.setLineWidth(FRAME_LINE)
