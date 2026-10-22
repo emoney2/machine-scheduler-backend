@@ -75,10 +75,27 @@ def parse_studio_package(raw: bytes | str) -> dict[str, Any] | None:
     if not png and not pdf:
         # Package without embedded order artifacts (lean autosave) — not usable for submit preview.
         return None
+    document = parsed.get("document") if isinstance(parsed.get("document"), dict) else {}
+    preview = document.get("preview") if isinstance(document.get("preview"), dict) else {}
+    product_type = str(order.get("productType") or preview.get("productType") or "").strip().lower()
+    product = str(order.get("product") or "").strip()
+    if product_type not in ("belt", "key-fob"):
+        low_product = product.lower()
+        low_name = str(order.get("designName") or document.get("name") or "").lower()
+        if ("key" in low_product and "fob" in low_product) or "fob" in low_name:
+            product_type = "key-fob"
+        else:
+            product_type = "belt"
+    if not product:
+        product = (
+            "Needle Point Key Fob" if product_type == "key-fob" else "Needle Point Belt"
+        )
     return {
         "kind": STUDIO_PACKAGE_KIND,
-        "designName": str(order.get("designName") or (parsed.get("document") or {}).get("name") or "").strip(),
+        "designName": str(order.get("designName") or document.get("name") or "").strip(),
         "customerName": str(order.get("customerName") or "").strip(),
+        "productType": product_type,
+        "product": product,
         "leather": str(order.get("leather") or "").strip(),
         "buckle": str(order.get("buckle") or "").strip(),
         "materialComboId": str(order.get("materialComboId") or "").strip(),
