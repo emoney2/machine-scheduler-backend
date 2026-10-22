@@ -7205,55 +7205,65 @@ def _expand_boxes_for_packing_slips(
     return out or [{"label": "Box"}]
 
 
+def _drive_folder_usable(drive, folder_id: str) -> bool:
+    """True if folder_id exists, is a folder, and is not trashed (Shared Drives ok)."""
+    fid = (folder_id or "").strip()
+    if not fid:
+        return False
+    try:
+        meta = (
+            drive.files()
+            .get(
+                fileId=fid,
+                fields="id,mimeType,trashed",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        if meta.get("trashed"):
+            return False
+        return meta.get("mimeType") == "application/vnd.google-apps.folder"
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", None)
+        if status in (404, 403):
+            return False
+        raise
+    except Exception:
+        return False
+
+
 def _get_packing_slip_print_drive_folder_id(drive):
     """
-    Drive folder where packing-slip PDFs are uploaded for a local watcher + printer.
-    With Google Drive for desktop, a folder named PackingSlipPrinter under My Drive
-    typically syncs to: G:\\My Drive\\PackingSlipPrinter
+    Drive folder where packing-slip PDFs / stamped Fur sheets are uploaded for a
+    local watcher + printer. With Google Drive for desktop, PackingSlipPrinter
+    under My Drive typically syncs to: G:\\My Drive\\PackingSlipPrinter
 
-    - If PACKING_SLIP_PRINT_FOLDER_ID is set, use that folder id (from Drive URL).
-    - Else find or create PACKING_SLIP_PRINT_FOLDER_NAME (default PackingSlipPrinter) under My Drive root.
+    - If PACKING_SLIP_PRINT_FOLDER_ID is set and still reachable, use it.
+    - Else find or create PACKING_SLIP_PRINT_FOLDER_NAME (default PackingSlipPrinter).
     """
-    explicit = (os.environ.get("PACKING_SLIP_PRINT_FOLDER_ID") or "").strip()
-    if explicit:
-        return explicit
-    folder_name = (os.environ.get("PACKING_SLIP_PRINT_FOLDER_NAME") or "PackingSlipPrinter").strip()
-    if not folder_name:
-        folder_name = "PackingSlipPrinter"
-    safe_name = folder_name.replace("'", "\\'")
-    q = (
-        f"name = '{safe_name}' and mimeType = 'application/vnd.google-apps.folder' "
-        f"and trashed = false and 'root' in parents"
+    return _get_named_drive_folder_id(
+        drive,
+        folder_id_env="PACKING_SLIP_PRINT_FOLDER_ID",
+        folder_name_env="PACKING_SLIP_PRINT_FOLDER_NAME",
+        default_name="PackingSlipPrinter",
     )
-    res = drive.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
-    files = res.get("files", [])
-    if len(files) > 1:
-        logging.warning(
-            "Multiple Drive folders named %r under My Drive root; using first id=%s",
-            folder_name,
-            files[0]["id"],
-        )
-    if files:
-        return files[0]["id"]
-    meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
-    created = drive.files().create(body=meta, fields="id").execute()
-    fid = created["id"]
-    logging.info(
-        "Created packing slip print folder %r in My Drive (sync locally e.g. G:\\\\My Drive\\\\%s): %s",
-        folder_name,
-        folder_name,
-        fid,
-    )
-    return fid
 
 
 def _get_named_drive_folder_id(
     drive, *, folder_id_env: str, folder_name_env: str, default_name: str
 ):
-    """Find or create a My Drive folder. Explicit folder id env wins."""
+    """Find or create a Drive folder. Explicit folder id env wins if still usable."""
     explicit = (os.environ.get(folder_id_env) or "").strip()
     if explicit:
-        return explicit
+        if _drive_folder_usable(drive, explicit):
+            return explicit
+        logging.warning(
+            "Drive folder env %s=%s is missing/inaccessible; "
+            "falling back to find/create by name %r",
+            folder_id_env,
+            explicit,
+            (os.environ.get(folder_name_env) or default_name).strip() or default_name,
+        )
     folder_name = (os.environ.get(folder_name_env) or default_name).strip()
     if not folder_name:
         folder_name = default_name
@@ -7307,9 +7317,10 @@ def _get_named_drive_folder_id(
     ).execute()
     fid = created["id"]
     logging.info(
-        "Created Drive folder %r in My Drive (id=%s)",
+        "Created Drive folder %r in My Drive (id=%s); sync locally e.g. G:\\\\My Drive\\\\%s",
         folder_name,
         fid,
+        folder_name,
     )
     return fid
 
@@ -25920,6 +25931,7 @@ def process_shipment():
                             mimetype="application/pdf",
                             resumable=False,
                         ),
+                        supportsAllDrives=True,
                     ).execute()
                     _try_copy_packing_slip_to_local_sync_folder(
                         job["tmp_path"], job["print_name"]
@@ -28733,7 +28745,9 @@ def _download_drive_pdf_to_temp(drive, file_id, filename):
     """Download a Drive PDF to a temp path; returns path or None."""
     safe_name = os.path.basename(filename or "stamped.pdf")
     tmp_path = os.path.join(tempfile.gettempdir(), safe_name)
-    request_drive = drive.files().get_media(fileId=file_id)
+    request_drive = drive.files().get_media(
+        fileId=file_id, supportsAllDrives=True
+    )
     buf = BytesIO()
     downloader = MediaIoBaseDownload(buf, request_drive)
     done = False
@@ -28747,14 +28761,40 @@ def _download_drive_pdf_to_temp(drive, file_id, filename):
 def _copy_stamped_pdf_to_packing_slip_printer(drive, stamped_file):
     """
     Copy newest {order}_Stamped*.pdf into PackingSlipPrinter (Drive + local G:\\My Drive sync).
+    Retries once if the destination folder id is stale (404).
     """
-    packing_folder_id = _get_packing_slip_print_drive_folder_id(drive)
     pdf_name = stamped_file["name"]
-    drive.files().copy(
-        fileId=stamped_file["id"],
-        body={"name": pdf_name, "parents": [packing_folder_id]},
-        fields="id, name",
-    ).execute()
+    last_err = None
+    for attempt in range(2):
+        packing_folder_id = _get_packing_slip_print_drive_folder_id(drive)
+        try:
+            drive.files().copy(
+                fileId=stamped_file["id"],
+                body={"name": pdf_name, "parents": [packing_folder_id]},
+                fields="id, name",
+                supportsAllDrives=True,
+            ).execute()
+            last_err = None
+            break
+        except HttpError as e:
+            last_err = e
+            status = getattr(getattr(e, "resp", None), "status", None)
+            # Parent folder gone/inaccessible — clear env override for this process
+            # and resolve/create PackingSlipPrinter again on the next attempt.
+            if status == 404 and attempt == 0:
+                logging.warning(
+                    "PackingSlipPrinter folder %s not usable (%s); recreating and retrying",
+                    packing_folder_id,
+                    e,
+                )
+                if (os.environ.get("PACKING_SLIP_PRINT_FOLDER_ID") or "").strip() == (
+                    packing_folder_id or ""
+                ):
+                    os.environ.pop("PACKING_SLIP_PRINT_FOLDER_ID", None)
+                continue
+            raise
+    if last_err is not None:
+        raise last_err
     tmp_path = _download_drive_pdf_to_temp(drive, stamped_file["id"], pdf_name)
     if tmp_path:
         _try_copy_packing_slip_to_local_sync_folder(tmp_path, pdf_name)
@@ -28779,7 +28819,12 @@ def _process_single_order_print(drive, order, orders_parent_folder_id):
         )
         order_folders = (
             drive.files()
-            .list(q=order_folder_query, fields="files(id, name)")
+            .list(
+                q=order_folder_query,
+                fields="files(id, name)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
             .execute()
             .get("files", [])
         )
@@ -28799,6 +28844,8 @@ def _process_single_order_print(drive, order, orders_parent_folder_id):
                 fields="files(id, name, modifiedTime)",
                 orderBy="modifiedTime desc",
                 pageSize=200,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
             )
             .execute()
             .get("files", [])
