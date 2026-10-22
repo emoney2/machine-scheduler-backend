@@ -7232,15 +7232,36 @@ def _drive_folder_usable(drive, folder_id: str) -> bool:
         return False
 
 
+# Live PackingSlipPrinter owned by the scheduler OAuth account (justin.eckard@…).
+# Shop Google Drive Desktop syncs as info@jrco.us — that old folder id
+# 1BUWGhcBKuoHHAqI-Fo-vpO569jrOlgcf is gone; info@ must keep a My Drive shortcut
+# (or shared folder) named PackingSlipPrinter pointing at this id so G:\My Drive\
+# PackingSlipPrinter receives Fur List / packing-slip uploads.
+_DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID = "1XL3iG-Cq0zmlVFSNb9knmx4c_RZC_4hM"
+
+
 def _get_packing_slip_print_drive_folder_id(drive):
     """
     Drive folder where packing-slip PDFs / stamped Fur sheets are uploaded for a
     local watcher + printer. With Google Drive for desktop, PackingSlipPrinter
     under My Drive typically syncs to: G:\\My Drive\\PackingSlipPrinter
 
-    - If PACKING_SLIP_PRINT_FOLDER_ID is set and still reachable, use it.
-    - Else find or create PACKING_SLIP_PRINT_FOLDER_NAME (default PackingSlipPrinter).
+    - PACKING_SLIP_PRINT_FOLDER_ID env if still reachable
+    - Else the known live folder id (do not invent a second PackingSlipPrinter)
+    - Else find/create by PACKING_SLIP_PRINT_FOLDER_NAME
     """
+    explicit = (os.environ.get("PACKING_SLIP_PRINT_FOLDER_ID") or "").strip()
+    if explicit and _drive_folder_usable(drive, explicit):
+        return explicit
+    if explicit:
+        logging.warning(
+            "PACKING_SLIP_PRINT_FOLDER_ID=%s missing/inaccessible; "
+            "using known live PackingSlipPrinter %s",
+            explicit,
+            _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID,
+        )
+    if _drive_folder_usable(drive, _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID):
+        return _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID
     return _get_named_drive_folder_id(
         drive,
         folder_id_env="PACKING_SLIP_PRINT_FOLDER_ID",
