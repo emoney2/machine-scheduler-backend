@@ -19434,6 +19434,46 @@ def needlepoint_get_order_route(order_number):
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.route(
+    "/needlepoint/order/<order_number>/grid",
+    methods=["GET", "OPTIONS"],
+    endpoint="needlepoint_order_grid_plain",
+)
+@app.route(
+    "/api/needlepoint/order/<order_number>/grid",
+    methods=["GET", "OPTIONS"],
+    endpoint="needlepoint_order_grid_api",
+)
+@login_required_session
+def needlepoint_order_grid(order_number):
+    """Serve the same stitch-grid PDF the vendor email would attach (for color-picking UI)."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    order = str(order_number or "").strip()
+    if not order:
+        return jsonify({"ok": False, "error": "order number required"}), 400
+    try:
+        atts = prefer_grid_attachments(
+            collect_needlepoint_attachments(get_drive_service(), order)
+        )
+        att = next((a for a in atts if a.get("bytes")), None)
+        if not att:
+            return jsonify({"ok": False, "error": "No vendor grid PDF found for this order."}), 404
+        raw = att["bytes"]
+        filename = str(att.get("filename") or f"{order}.pdf")
+        mime = str(att.get("mime") or "application/pdf")
+        return send_file(
+            BytesIO(raw),
+            mimetype=mime,
+            as_attachment=False,
+            download_name=filename,
+            max_age=120,
+        )
+    except Exception as exc:
+        logger.exception("[Needlepoint] grid preview failed for %s", order)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/needlepoint/order-belts", methods=["POST", "OPTIONS"], endpoint="needlepoint_order_belts_plain")
 @app.route("/api/needlepoint/order-belts", methods=["POST", "OPTIONS"], endpoint="needlepoint_order_belts_api")
 @login_required_session
