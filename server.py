@@ -1454,6 +1454,28 @@ def _kanban_normalize_price(raw: str) -> str:
         return m.group(1).replace(",", "")
 
 
+def _kanban_shorten_title(title: str, max_len: int = 60) -> str:
+    """
+    Keep kanban card titles short. Amazon-style
+    "Short Name - long marketing blurb…" becomes "Short Name".
+    """
+    t = " ".join(str(title or "").split())
+    if not t:
+        return ""
+    for sep in (" - ", " – ", " — ", " | "):
+        if sep in t:
+            head = t.split(sep, 1)[0].strip()
+            if 6 <= len(head) <= max_len:
+                t = head
+                break
+    if len(t) > max_len:
+        cut = t[: max_len - 1]
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        t = cut.rstrip(" ,-–—|/") + "…"
+    return t
+
+
 def _kanban_parse_json_ld_product(soup):
     """Best-effort Product fields from application/ld+json."""
     title = image = price = ""
@@ -1618,7 +1640,7 @@ def _kanban_scrape_html(html: str, base_url: str):
             price = m.group(0).replace(" ", "")
 
     return {
-        "title": " ".join(str(title or "").split()),
+        "title": _kanban_shorten_title(" ".join(str(title or "").split())),
         "image": (image or "").strip(),
         "price": _kanban_normalize_price(price),
         "canonical": canonical or base_url,
