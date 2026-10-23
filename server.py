@@ -7233,12 +7233,51 @@ def _drive_folder_usable(drive, folder_id: str) -> bool:
         return False
 
 
-# Live PackingSlipPrinter owned by the scheduler OAuth account (justin.eckard@…).
-# Shop Google Drive Desktop syncs as info@jrco.us — that old folder id
-# 1BUWGhcBKuoHHAqI-Fo-vpO569jrOlgcf is gone; info@ must keep a My Drive shortcut
-# (or shared folder) named PackingSlipPrinter pointing at this id so G:\My Drive\
-# PackingSlipPrinter receives Fur List / packing-slip uploads.
+# Live print folders owned by the scheduler OAuth account (justin.eckard@…).
+# Shop Google Drive Desktop syncs as info@jrco.us — those folders must be shared
+# with info@ (writer) and pinned by id so uploads never land in a private
+# justin-only folder that the shop watcher cannot see.
+# Local sync paths (after "Add shortcut to Drive"):
+#   G:\My Drive\PackingSlipPrinter
+#   G:\My Drive\Label Printer
+#   G:\My Drive\Label Archive
+# or DriveFS shortcut-targets-by-id\<id>\...
 _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID = "1XL3iG-Cq0zmlVFSNb9knmx4c_RZC_4hM"
+_DEFAULT_LABEL_PRINT_FOLDER_ID = "1LXx8IOFiAsYb-zchGbZba515d5bip8OK"
+_DEFAULT_LABEL_ARCHIVE_FOLDER_ID = "18ROtltPSXZQSUvKox0eoTD2DbdRc1TDc"
+
+
+def _get_pinned_or_named_drive_folder_id(
+    drive,
+    *,
+    default_id: str,
+    folder_id_env: str,
+    folder_name_env: str,
+    default_name: str,
+):
+    """
+    Prefer env folder id, then the known live folder id, then find/create by name.
+    Keeps shop watchers and Render uploads on the same Drive folder.
+    """
+    explicit = (os.environ.get(folder_id_env) or "").strip()
+    if explicit and _drive_folder_usable(drive, explicit):
+        return explicit
+    if explicit:
+        logging.warning(
+            "%s=%s missing/inaccessible; using known live %s %s",
+            folder_id_env,
+            explicit,
+            default_name,
+            default_id,
+        )
+    if default_id and _drive_folder_usable(drive, default_id):
+        return default_id
+    return _get_named_drive_folder_id(
+        drive,
+        folder_id_env=folder_id_env,
+        folder_name_env=folder_name_env,
+        default_name=default_name,
+    )
 
 
 def _get_packing_slip_print_drive_folder_id(drive):
@@ -7246,25 +7285,10 @@ def _get_packing_slip_print_drive_folder_id(drive):
     Drive folder where packing-slip PDFs / stamped Fur sheets are uploaded for a
     local watcher + printer. With Google Drive for desktop, PackingSlipPrinter
     under My Drive typically syncs to: G:\\My Drive\\PackingSlipPrinter
-
-    - PACKING_SLIP_PRINT_FOLDER_ID env if still reachable
-    - Else the known live folder id (do not invent a second PackingSlipPrinter)
-    - Else find/create by PACKING_SLIP_PRINT_FOLDER_NAME
     """
-    explicit = (os.environ.get("PACKING_SLIP_PRINT_FOLDER_ID") or "").strip()
-    if explicit and _drive_folder_usable(drive, explicit):
-        return explicit
-    if explicit:
-        logging.warning(
-            "PACKING_SLIP_PRINT_FOLDER_ID=%s missing/inaccessible; "
-            "using known live PackingSlipPrinter %s",
-            explicit,
-            _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID,
-        )
-    if _drive_folder_usable(drive, _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID):
-        return _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID
-    return _get_named_drive_folder_id(
+    return _get_pinned_or_named_drive_folder_id(
         drive,
+        default_id=_DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID,
         folder_id_env="PACKING_SLIP_PRINT_FOLDER_ID",
         folder_name_env="PACKING_SLIP_PRINT_FOLDER_NAME",
         default_name="PackingSlipPrinter",
@@ -7351,12 +7375,12 @@ def _get_label_print_drive_folder_id(drive):
     """
     Drive folder where UPS label files are uploaded for the shop printer.
 
-    - If UPS_LABEL_PRINT_FOLDER_ID is set, use that folder id (from Drive URL).
-    - Else find or create UPS_LABEL_PRINT_FOLDER_NAME (default Label Printer) under My Drive root.
-    With Google Drive for desktop, that folder often syncs to G:\\My Drive\\Label Printer.
+    Pinned to the justin.eckard Label Printer that is shared with info@jrco.us
+    (shop Drive Desktop / watcher). Do not invent a second private Label Printer.
     """
-    return _get_named_drive_folder_id(
+    return _get_pinned_or_named_drive_folder_id(
         drive,
+        default_id=_DEFAULT_LABEL_PRINT_FOLDER_ID,
         folder_id_env="UPS_LABEL_PRINT_FOLDER_ID",
         folder_name_env="UPS_LABEL_PRINT_FOLDER_NAME",
         default_name="Label Printer",
@@ -7366,10 +7390,11 @@ def _get_label_print_drive_folder_id(drive):
 def _get_label_archive_drive_folder_id(drive):
     """
     Durable reprint copies. Separate from Label Printer so the watcher does not delete them.
-    Override with UPS_LABEL_ARCHIVE_FOLDER_ID or UPS_LABEL_ARCHIVE_FOLDER_NAME.
+    Pinned to the justin.eckard Label Archive shared with info@jrco.us.
     """
-    return _get_named_drive_folder_id(
+    return _get_pinned_or_named_drive_folder_id(
         drive,
+        default_id=_DEFAULT_LABEL_ARCHIVE_FOLDER_ID,
         folder_id_env="UPS_LABEL_ARCHIVE_FOLDER_ID",
         folder_name_env="UPS_LABEL_ARCHIVE_FOLDER_NAME",
         default_name=lblarch.archive_folder_name(),
@@ -7589,8 +7614,21 @@ def _packing_slip_local_sync_dir() -> str:
     """
     Local Google Drive Desktop path for packing-slip PDFs (Windows default).
     On Linux/cloud hosts this path is skipped; use Drive upload only.
+
+    Prefer the DriveFS shortcut-targets path for the live shared folder when the
+    My Drive name is a decoy / missing (info@ vs justin.eckard split).
     """
-    return (os.getenv("PACKING_SLIP_LOCAL_SYNC_DIR") or r"G:\My Drive\PackingSlipPrinter").strip()
+    explicit = (os.getenv("PACKING_SLIP_LOCAL_SYNC_DIR") or "").strip()
+    if explicit:
+        return explicit
+    shortcut = os.path.join(
+        r"G:\.shortcut-targets-by-id",
+        _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID,
+        "PackingSlipPrinter",
+    )
+    if os.path.isdir(shortcut):
+        return shortcut
+    return r"G:\My Drive\PackingSlipPrinter"
 
 
 def _try_copy_packing_slip_to_local_sync_folder(tmp_path: str, pdf_filename: str) -> None:
