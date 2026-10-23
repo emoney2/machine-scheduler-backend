@@ -1399,6 +1399,13 @@ def retry_google_api_call(func, max_retries=3, retry_delay=1):
 
 # === Kanban helpers ============================================================
 # ---- Kanban URL scrape helpers ----
+_KANBAN_SCRAPE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+
 def _kanban_safe_url(url: str) -> str:
     url = (url or "").strip()
     if not url:
@@ -1413,84 +1420,273 @@ def _kanban_safe_url(url: str) -> str:
     return url
 
 
-def _kanban_http_get(url: str, timeout=10):
+def _kanban_http_get(url: str, timeout=12):
     headers = {
-        "User-Agent": "JRCO-Kanban-Scraper/1.0 (+https://machineschedule.netlify.app)"
+        "User-Agent": _KANBAN_SCRAPE_UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
     return requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
 
 
-def _kanban_scrape_url(url: str):
-    """
-    Returns dict: { title, image, price, canonical }
-    - title: product/page title (og:title -> twitter:title -> <title>)
-    - image: main image URL (og:image or twitter:image)
-    - price: best-effort string like "$12.99" if found
-    - canonical: canonical URL if present
-    """
-    safe = _kanban_safe_url(url)
-    if not safe:
-        return {"ok": False, "error": "invalid url"}
+def _kanban_amazon_asin(url: str) -> str:
+    m = re.search(
+        r"/(?:dp|gp/product|gp/aw/d|product)/([A-Z0-9]{10})(?:[/?]|$)",
+        url or "",
+        re.I,
+    )
+    return (m.group(1).upper() if m else "")
 
+
+def _kanban_normalize_price(raw: str) -> str:
+    """Return a bare amount like 9.98 (no $) when possible."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    m = re.search(r"(\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+(?:\.\d{1,2})?)", s)
+    if not m:
+        return s
     try:
-        r = _kanban_http_get(safe, timeout=12)
-    except Exception as e:
-        return {"ok": False, "error": f"fetch failed: {e}"}
-    if r.status_code >= 400 or not r.text:
-        return {"ok": False, "error": f"http {r.status_code}"}
+        return f"{float(m.group(1).replace(',', '')):.2f}"
+    except Exception:
+        return m.group(1).replace(",", "")
 
-    html = r.text
-    soup = BeautifulSoup(html, "lxml")
 
-    # Prefer canonical (to normalize)
+def _kanban_parse_json_ld_product(soup):
+    """Best-effort Product fields from application/ld+json."""
+    title = image = price = ""
+    for tag in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+        raw = (tag.string or tag.get_text() or "").strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            node = stack.pop(0)
+            if isinstance(node, list):
+                stack.extend(node)
+                continue
+            if not isinstance(node, dict):
+                continue
+            types = node.get("@type") or ""
+            if isinstance(types, list):
+                types_l = " ".join(str(t).lower() for t in types)
+            else:
+                types_l = str(types).lower()
+            if "product" in types_l or node.get("name"):
+                if not title and node.get("name"):
+                    title = str(node.get("name") or "").strip()
+                img = node.get("image")
+                if not image and img:
+                    if isinstance(img, list) and img:
+                        img = img[0]
+                    if isinstance(img, dict):
+                        img = img.get("url") or img.get("contentUrl") or ""
+                    image = str(img or "").strip()
+                offers = node.get("offers")
+                if not price and offers:
+                    if isinstance(offers, list) and offers:
+                        offers = offers[0]
+                    if isinstance(offers, dict):
+                        price = str(
+                            offers.get("price")
+                            or offers.get("lowPrice")
+                            or ""
+                        ).strip()
+            for key in ("@graph", "mainEntity", "itemListElement"):
+                child = node.get(key)
+                if child:
+                    stack.append(child)
+    return title, image, price
+
+
+def _kanban_parse_amazon_product(soup, html: str):
+    title = ""
+    title_el = soup.select_one("#productTitle") or soup.select_one("#title")
+    if title_el:
+        title = " ".join(title_el.get_text(" ", strip=True).split())
+
+    image = ""
+    img = (
+        soup.select_one("#landingImage")
+        or soup.select_one("#imgTagWrapperId img")
+        or soup.select_one("#main-image")
+        or soup.select_one("#imgBlkFront")
+        or soup.select_one('img[data-a-image-name="landingImage"]')
+    )
+    if img:
+        dyn = (img.get("data-a-dynamic-image") or "").strip()
+        if dyn:
+            try:
+                variants = json.loads(dyn)
+                if isinstance(variants, dict) and variants:
+                    image = max(
+                        variants.items(),
+                        key=lambda kv: (
+                            (kv[1][0] * kv[1][1])
+                            if isinstance(kv[1], (list, tuple)) and len(kv[1]) >= 2
+                            else 0
+                        ),
+                    )[0]
+            except Exception:
+                pass
+        image = (
+            image
+            or (img.get("data-old-hires") or "").strip()
+            or (img.get("data-src") or "").strip()
+            or (img.get("src") or "").strip()
+        )
+
+    price = ""
+    for sel in (
+        "#corePrice_feature_div span.a-offscreen",
+        "#corePriceDisplay_desktop_feature_div span.a-offscreen",
+        "#apex_desktop span.a-offscreen",
+        "span.a-price.aok-align-center span.a-offscreen",
+        "span.a-price .a-offscreen",
+        "#priceblock_ourprice",
+        "#priceblock_dealprice",
+        "#price_inside_buybox",
+    ):
+        el = soup.select_one(sel)
+        if el:
+            price = el.get_text(strip=True)
+            if price:
+                break
+    if not price:
+        m = re.search(r'"priceAmount"\s*:\s*([0-9.]+)', html or "")
+        if m:
+            price = m.group(1)
+        else:
+            m2 = re.search(r'"displayPrice"\s*:\s*"([^"]+)"', html or "")
+            if m2:
+                price = m2.group(1)
+
+    return title, image, price
+
+
+def _kanban_scrape_html(html: str, base_url: str):
+    soup = BeautifulSoup(html or "", "lxml")
+
     canonical = ""
-    link_canon = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
+    link_canon = soup.find("link", rel=lambda v: v and "canonical" in str(v).lower())
     if link_canon and link_canon.get("href"):
-        canonical = urljoin(safe, link_canon.get("href"))
+        canonical = urljoin(base_url, link_canon.get("href"))
 
     def _meta(prop_name, attr="property"):
         tag = soup.find("meta", attrs={attr: prop_name})
         return (tag.get("content") or "").strip() if tag and tag.get("content") else ""
 
-    # Title candidates
+    host = (urlparse(base_url).netloc or "").lower()
+    is_amazon = "amazon." in host or host.endswith("amzn.to")
+
+    title = image = price = ""
+    if is_amazon:
+        title, image, price = _kanban_parse_amazon_product(soup, html)
+
+    ld_title, ld_image, ld_price = _kanban_parse_json_ld_product(soup)
+    title = title or ld_title
+    image = image or ld_image
+    price = price or ld_price
+
     title = (
-        _meta("og:title")
+        title
+        or _meta("og:title")
         or _meta("twitter:title", attr="name")
         or (soup.title.string.strip() if soup.title and soup.title.string else "")
     )
+    # Drop noisy Amazon suffix from <title> fallbacks
+    if title and is_amazon and title.lower().endswith(": amazon.com"):
+        title = title[: -len(": amazon.com")].strip()
+    if title and re.fullmatch(r"amazon\.com", title, re.I):
+        title = ""
 
-    # Image candidates
-    image = _meta("og:image") or _meta("twitter:image", attr="name")
+    image = image or _meta("og:image") or _meta("twitter:image", attr="name")
     if image:
-        image = urljoin(safe, image)
+        image = urljoin(base_url, image)
 
-    # Naive price sniff: look for $xx.xx or $x,xxx.xx near elements with price-ish classes
-    price = ""
-    # Try common meta
     price = price or _meta("product:price:amount") or _meta("og:price:amount")
-    if price and not price.startswith("$"):
-        # if they gave "12.99" as meta amount, make it $12.99
-        try:
-            float(price.replace(",", ""))
-            price = f"${price}"
-        except:
-            pass
-
     if not price:
-        # look in text for $X or $X.XX (take first reasonable)
-        import re
-
         text = soup.get_text(" ", strip=True)
         m = re.search(r"\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?", text)
         if m:
             price = m.group(0).replace(" ", "")
 
     return {
+        "title": " ".join(str(title or "").split()),
+        "image": (image or "").strip(),
+        "price": _kanban_normalize_price(price),
+        "canonical": canonical or base_url,
+    }
+
+
+def _kanban_scrape_url(url: str):
+    """
+    Returns dict: { ok, title, image, price, canonical }
+    - title: product/page title
+    - image: main image URL (Amazon landing image, og:image, JSON-LD, etc.)
+    - price: best-effort amount like "12.99" if found (blank if not)
+    - canonical: canonical URL if present
+    Leaves title/price blank when the site blocks scraping; still returns ok
+    when at least an image (or any field) can be recovered.
+    """
+    safe = _kanban_safe_url(url)
+    if not safe:
+        return {"ok": False, "error": "invalid url"}
+
+    host = (urlparse(safe).netloc or "").lower()
+    asin = _kanban_amazon_asin(safe)
+    fetch_urls = []
+    if asin and ("amazon." in host or "amzn.to" in host or not host):
+        # Mobile product page is much more reliable than /dp/ (bot wall).
+        fetch_urls.append(f"https://www.amazon.com/gp/aw/d/{asin}")
+        fetch_urls.append(f"https://www.amazon.com/dp/{asin}")
+    fetch_urls.append(safe)
+    # de-dupe while preserving order
+    seen = set()
+    ordered = []
+    for u in fetch_urls:
+        if u not in seen:
+            seen.add(u)
+            ordered.append(u)
+
+    best = {"title": "", "image": "", "price": "", "canonical": safe}
+    last_err = "fetch failed"
+    for candidate in ordered:
+        try:
+            r = _kanban_http_get(candidate, timeout=14)
+        except Exception as e:
+            last_err = f"fetch failed: {e}"
+            continue
+        if r.status_code >= 400 or not r.text:
+            last_err = f"http {r.status_code}"
+            continue
+        # Amazon bot-wall pages are tiny and only say "Amazon.com"
+        if len(r.text) < 8000 and "amazon." in (urlparse(candidate).netloc or "").lower():
+            last_err = "amazon blocked (short response)"
+            continue
+        parsed = _kanban_scrape_html(r.text, candidate)
+        for key in ("title", "image", "price", "canonical"):
+            if parsed.get(key) and not best.get(key):
+                best[key] = parsed[key]
+        # Prefer first solid image; stop early when we have image + (title or price)
+        if best["image"] and (best["title"] or best["price"]):
+            break
+
+    if not any(best.get(k) for k in ("title", "image", "price")):
+        return {"ok": False, "error": last_err}
+
+    return {
         "ok": True,
-        "title": title,
-        "image": image,
-        "price": price,
-        "canonical": canonical or safe,
+        "title": best.get("title") or "",
+        "image": best.get("image") or "",
+        "price": best.get("price") or "",
+        "canonical": best.get("canonical") or safe,
     }
 
 
@@ -1695,29 +1891,72 @@ def _drive_upload_image_jpeg(file_stream, filename, folder_id=None):
 
 def _kanban_photo_url_from_maybe_data(photo, kid):
     """
-    If photo is a data:image URL, upload to Drive and return a short absolute URL.
-    Google Sheets cells max out at 50k chars, so base64 photos cannot be stored.
+    If photo is a data:image URL or an external http(s) image, upload to Drive
+    and return a short absolute URL. Google Sheets cells max out at 50k chars,
+    so base64 photos cannot be stored; vendor CDN links also go stale.
     """
     photo = (photo or "").strip()
     if not photo:
         return photo
-    if not photo.startswith("data:image"):
-        # Guard against accidentally storing huge strings
-        if len(photo) > 45000:
-            raise ValueError(
-                "Photo URL is too long for Google Sheets. Upload the image instead of pasting base64."
-            )
-        return photo
-    if "," not in photo:
-        raise ValueError("Invalid data URL for photo")
-    b64 = photo.split(",", 1)[1]
-    raw = base64.b64decode(b64)
-    stream = io.BytesIO(raw)
-    stream.seek(0)
-    _fid, photo_url = _drive_upload_image_jpeg(
-        stream, f"{(kid or 'KANBAN').strip() or 'KANBAN'}.jpg", KANBAN_PHOTOS_FOLDER_ID
+
+    kid_name = f"{(kid or 'KANBAN').strip() or 'KANBAN'}.jpg"
+
+    if photo.startswith("data:image"):
+        if "," not in photo:
+            raise ValueError("Invalid data URL for photo")
+        b64 = photo.split(",", 1)[1]
+        raw = base64.b64decode(b64)
+        stream = io.BytesIO(raw)
+        stream.seek(0)
+        _fid, photo_url = _drive_upload_image_jpeg(
+            stream, kid_name, KANBAN_PHOTOS_FOLDER_ID
+        )
+        return photo_url
+
+    # Guard against accidentally storing huge strings
+    if len(photo) > 45000:
+        raise ValueError(
+            "Photo URL is too long for Google Sheets. Upload the image instead of pasting base64."
+        )
+
+    # Re-host scraped vendor images (Amazon CDN, etc.) so cards stay stable.
+    lower = photo.lower()
+    already_ours = (
+        "drive.google.com" in lower
+        or "googleusercontent.com" in lower
+        or "machine-scheduler-backend.onrender.com" in lower
+        or lower.startswith("/")
     )
-    return photo_url
+    if photo.startswith(("http://", "https://")) and not already_ours:
+        try:
+            r = _kanban_http_get(photo, timeout=20)
+            if r.status_code < 400 and r.content:
+                raw = r.content
+                # Normalize to JPEG via Pillow when available
+                try:
+                    from PIL import Image as PILImage
+
+                    im = PILImage.open(io.BytesIO(raw))
+                    if im.mode not in ("RGB", "L"):
+                        im = im.convert("RGB")
+                    buf = io.BytesIO()
+                    im.save(buf, format="JPEG", quality=90)
+                    raw = buf.getvalue()
+                except Exception:
+                    pass
+                stream = io.BytesIO(raw)
+                stream.seek(0)
+                _fid, photo_url = _drive_upload_image_jpeg(
+                    stream, kid_name, KANBAN_PHOTOS_FOLDER_ID
+                )
+                return photo_url
+        except Exception as e:
+            logger.warning(
+                "[Kanban] remote photo rehost failed for %s: %s", kid_name, e
+            )
+            # Fall through and store the original URL
+
+    return photo
 
 
 def _now_iso_utc():
