@@ -7411,16 +7411,16 @@ def _print_packing_slip_pdf(pdf_path: str) -> None:
 
 def _packing_slip_open_in_browser_fallback() -> bool:
     """
-    Server-side printing only works on Windows (local). On Render/Linux, open the slip PDF
-    in the browser so the user can print or save locally.
-    Override: PACKING_SLIP_OPEN_IN_BROWSER_FALLBACK=0|false|no to disable.
+    Whether the Ship UI should open packing-slip PDF tabs after ship.
+
+    Default is off: slips are uploaded to PackingSlipPrinter for a folder watcher.
+    Opening them in the browser as well prints a second copy when a watcher is
+    already printing. Opt in with PACKING_SLIP_OPEN_IN_BROWSER_FALLBACK=1.
     """
     v = (os.getenv("PACKING_SLIP_OPEN_IN_BROWSER_FALLBACK") or "").strip().lower()
-    if v in ("0", "false", "no"):
-        return False
     if v in ("1", "true", "yes"):
         return True
-    return sys.platform != "win32"
+    return False
 
 
 def _packing_slip_num_copies(boxes_summary, boxes_legacy) -> int:
