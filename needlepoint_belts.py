@@ -573,6 +573,128 @@ def download_drive_bytes(drive, file_id: str) -> bytes:
     return buf.getvalue()
 
 
+def extract_palette_colors_from_package(raw: bytes | str) -> list[dict[str, Any]]:
+    """
+    Pull used stitch colors from a Studio package (document.palette + cells).
+
+    Returns [{id, hex, name, stitchCount, suggestions}] sorted by stitch count desc.
+    """
+    from dmc_colors import suggest_dmc_for_hex
+    from jr_needlepoint_package import STUDIO_PACKAGE_KIND, parse_studio_package
+    from suggest_materials import parse_hex_color
+
+    document = None
+    order_meta: dict[str, Any] = {}
+    try:
+        text = raw.decode("utf-8-sig") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and parsed.get("kind") == STUDIO_PACKAGE_KIND:
+            if isinstance(parsed.get("document"), dict):
+                document = parsed["document"]
+            if isinstance(parsed.get("order"), dict):
+                order_meta = parsed["order"]
+    except Exception:
+        document = None
+
+    if document is None:
+        pkg = parse_studio_package(raw)
+        if not pkg:
+            return []
+        raw_pkg = pkg.get("rawPackage") if isinstance(pkg.get("rawPackage"), dict) else {}
+        document = raw_pkg.get("document") if isinstance(raw_pkg.get("document"), dict) else None
+        order_meta = raw_pkg.get("order") if isinstance(raw_pkg.get("order"), dict) else {}
+        if document is None:
+            return []
+
+    palette = document.get("palette") if isinstance(document.get("palette"), list) else []
+    if not palette and isinstance(order_meta.get("palette"), list):
+        palette = order_meta.get("palette") or []
+    cells = document.get("cells") if isinstance(document.get("cells"), list) else []
+
+    usage: dict[int, int] = {}
+    for row in cells:
+        if not isinstance(row, list):
+            continue
+        for cell in row:
+            if isinstance(cell, bool) or not isinstance(cell, int):
+                continue
+            if cell < 0:
+                continue
+            usage[cell] = usage.get(cell, 0) + 1
+
+    # If cells are missing, still surface every palette entry that has a hex.
+    indices = sorted(usage.keys()) if usage else list(range(len(palette)))
+
+    out: list[dict[str, Any]] = []
+    for idx in indices:
+        if idx < 0 or idx >= len(palette):
+            continue
+        entry = palette[idx]
+        if not isinstance(entry, dict):
+            continue
+        hex_raw = entry.get("hex") or entry.get("color") or entry.get("value")
+        rgb = parse_hex_color(hex_raw)
+        if not rgb:
+            continue
+        hex_norm = f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
+        name = str(
+            entry.get("name")
+            or entry.get("label")
+            or entry.get("title")
+            or ""
+        ).strip()
+        stitch_count = int(usage.get(idx) or 0)
+        out.append(
+            {
+                "id": f"p{idx}",
+                "paletteIndex": idx,
+                "hex": hex_norm,
+                "name": name,
+                "stitchCount": stitch_count,
+                "suggestions": suggest_dmc_for_hex(hex_norm, limit=3),
+            }
+        )
+
+    out.sort(key=lambda c: (-int(c.get("stitchCount") or 0), int(c.get("paletteIndex") or 0)))
+    return out
+
+
+def load_order_design_colors(drive, order_number: Any) -> list[dict[str, Any]]:
+    """Load palette colors (+ DMC suggestions) from the Studio JSON in an order folder."""
+    folder_id = find_order_folder_id(drive, order_number)
+    if not folder_id:
+        return []
+    all_files = _list_folder_files(drive, folder_id)
+    json_metas = [
+        f
+        for f in all_files
+        if str(f.get("name") or "").lower().endswith(".json")
+        or "jrneedlepoint" in str(f.get("name") or "").lower()
+    ]
+    for meta in json_metas:
+        try:
+            raw = download_drive_bytes(drive, meta["id"])
+        except Exception:
+            logger.exception(
+                "[Needlepoint] failed to download Studio JSON %s for color extract order %s",
+                meta.get("id"),
+                order_number,
+            )
+            continue
+        try:
+            colors = extract_palette_colors_from_package(raw)
+        except Exception:
+            logger.exception(
+                "[Needlepoint] palette extract failed for %s order %s",
+                meta.get("name"),
+                order_number,
+            )
+            colors = []
+        if colors:
+            return colors
+    return []
+
+
 def _list_folder_files(drive, folder_id: str) -> list[dict[str, str]]:
     if not folder_id:
         return []

@@ -192,6 +192,7 @@ from needlepoint_belts import (
     get_order as get_needlepoint_order,
     is_needlepoint_product,
     list_pending_orders as list_pending_needlepoint_orders,
+    load_order_design_colors as load_needlepoint_design_colors,
     mark_orders_ordered as mark_needlepoint_orders_ordered,
     parse_size_quantities as parse_needlepoint_sizes,
     supplier_email as needlepoint_supplier_email,
@@ -19472,6 +19473,32 @@ def needlepoint_order_grid(order_number):
     except Exception as exc:
         logger.exception("[Needlepoint] grid preview failed for %s", order)
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route(
+    "/needlepoint/order/<order_number>/colors",
+    methods=["GET", "OPTIONS"],
+    endpoint="needlepoint_order_colors_plain",
+)
+@app.route(
+    "/api/needlepoint/order/<order_number>/colors",
+    methods=["GET", "OPTIONS"],
+    endpoint="needlepoint_order_colors_api",
+)
+@login_required_session
+def needlepoint_order_colors(order_number):
+    """Design palette colors + nearest DMC suggestions for color-picking UI."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    order = str(order_number or "").strip()
+    if not order:
+        return jsonify({"ok": False, "error": "order number required"}), 400
+    try:
+        colors = load_needlepoint_design_colors(get_drive_service(), order)
+        return jsonify({"ok": True, "orderNumber": order, "colors": colors})
+    except Exception as exc:
+        logger.exception("[Needlepoint] color extract failed for %s", order)
+        return jsonify({"ok": False, "error": str(exc), "colors": []}), 500
 
 
 @app.route("/needlepoint/order-belts", methods=["POST", "OPTIONS"], endpoint="needlepoint_order_belts_plain")
