@@ -16563,6 +16563,55 @@ def _truthy_query_flag(name: str) -> bool:
     )
 
 
+_ORDER_CONFIRMATION_REP_HEADERS = frozenset({"rep", "referral", "sales rep"})
+
+
+def _sales_rep_from_production_row(row, headers, padded) -> str:
+    """Sales rep on a Production Orders row (named REP / Sales Rep, else column AQ)."""
+    for key in ("REP", "Rep", "Referral", "Sales Rep", "rep"):
+        val = str((row or {}).get(key) or "").strip()
+        if val:
+            return val
+    rep_idx = None
+    for i, header in enumerate(headers or []):
+        if str(header or "").strip().lower() in _ORDER_CONFIRMATION_REP_HEADERS:
+            rep_idx = i
+            break
+    if rep_idx is None and headers and len(headers) > 42:
+        rep_idx = 42
+    if rep_idx is not None and padded and rep_idx < len(padded):
+        return str(padded[rep_idx] or "").strip()
+    return ""
+
+
+def _order_confirmation_file_part(value: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n]+', " ", str(value or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned
+
+
+def order_confirmation_pdf_filename(company_name: str, jobs: list) -> str:
+    """Company Name_SalesRepName_M-D-YYYY.pdf (Eastern date, same as the PDF header)."""
+    company_part = _order_confirmation_file_part(company_name) or "Customer"
+    reps = []
+    seen = set()
+    for job in jobs or []:
+        rep = _order_confirmation_file_part((job or {}).get("Sales Rep") or "")
+        key = rep.casefold()
+        if rep and key not in seen:
+            seen.add(key)
+            reps.append(rep)
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    date_part = f"{now_et.month}-{now_et.day}-{now_et.year}"
+    pieces = [company_part]
+    if len(reps) == 1:
+        pieces.append(reps[0])
+    elif reps:
+        pieces.append("-".join(reps))
+    pieces.append(date_part)
+    return "_".join(pieces) + ".pdf"
+
+
 def _outstanding_orders_for_company_rows(company_lower: str, include_completed: bool = False):
     prod_data = fetch_sheet(SPREADSHEET_ID, JOBS_FOR_COMPANY_RANGE)
     if not prod_data or not prod_data[0]:
@@ -16608,6 +16657,7 @@ def _outstanding_orders_for_company_rows(company_lower: str, include_completed: 
                 "Stage": str(row.get("Stage", "")).strip(),
                 "Due Date": row.get("Due Date", ""),
                 "PO #": _po_number_from_row(row),
+                "Sales Rep": _sales_rep_from_production_row(row, headers, padded),
                 "image": preview_url,
                 "orderId": order_num,
                 "jobKey": str(sheet_row),
@@ -16873,8 +16923,7 @@ def order_confirmation_pdf():
                 return jsonify({"error": "No matching orders for selection"}), 400
 
         pdf_bytes = build_order_confirmation_pdf(company, jobs)
-        safe_name = re.sub(r"[^\w\-]+", "_", company).strip("_") or "customer"
-        filename = f"order_confirmation_{safe_name}.pdf"
+        filename = order_confirmation_pdf_filename(company, jobs)
         resp = make_response(pdf_bytes)
         resp.headers["Content-Type"] = "application/pdf"
         resp.headers["Content-Disposition"] = f'inline; filename="{filename}"'
