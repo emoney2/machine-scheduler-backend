@@ -12361,6 +12361,10 @@ _materials_needed_ts = 0.0
 _OVERVIEW_METRICS_CACHE = {"data": None, "ts": 0}
 OVERVIEW_METRICS_TTL = int(os.environ.get("OVERVIEW_METRICS_TTL", "60"))  # seconds
 
+# Rep-level sales breakdown for the overview popup. Sheet read is heavy, so cache briefly.
+_SALES_BREAKDOWN_CACHE = {"data": None, "ts": 0.0}
+SALES_BREAKDOWN_TTL = int(os.environ.get("SALES_BREAKDOWN_TTL", "120"))
+
 
 def _safe_pb_orders_table_sql_ident(table_name: str) -> str:
     """Validate and escape production-orders table name for use inside SQL double-quotes."""
@@ -15009,6 +15013,141 @@ def overview_metrics():
     except Exception as e:
         app.logger.exception("❌ Failed to fetch overview metrics")
         return jsonify({"error": str(e)}), 500
+
+
+def compute_sales_rep_breakdown(log=None):
+    """
+    Pieces and revenue by sales rep from Production Orders.
+
+    Same lines as Sold This Week: an order number, a date, and a product whose
+    name does not contain "back". Blank rep becomes House Account.
+    Revenue is Price × Quantity.
+    """
+    from sales_breakdown import build_sales_breakdown, parse_number
+
+    logger = log or app.logger
+    tz = ZoneInfo("America/New_York")
+    now = datetime.now(tz)
+    today = now.date()
+
+    try:
+        with acquire_sheet_lock():
+            svc = get_sheets_service().spreadsheets().values()
+            resp = svc.get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=OVERVIEW_PRODUCTION_ORDERS_RANGE,
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+    except Exception as e:
+        logger.warning("sales breakdown sheet read failed: %s", e)
+        return None
+
+    values = resp.get("values") or []
+    if len(values) < 2:
+        payload = build_sales_breakdown([], today)
+        payload["generatedAt"] = now.isoformat(timespec="seconds")
+        return payload
+
+    headers = [str(h).strip() for h in values[0]]
+    lower_h = {h.lower(): h for h in headers}
+
+    def _col(*names):
+        for n in names:
+            if n in headers:
+                return n
+            ln = n.lower()
+            if ln in lower_h:
+                return lower_h[ln]
+        return None
+
+    date_col = _col("Date", "Order Date")
+    prod_col = _col("Product")
+    qty_col = _col("Quantity", "Qty")
+    price_col = _col("Price", "Unit Price")
+    order_col = _col("Order #", "Order#", "Order Number")
+    design_col = _col("Design")
+    if not date_col or not prod_col or not qty_col:
+        logger.warning(
+            "sales breakdown: missing column Date=%s Product=%s Quantity=%s",
+            date_col,
+            prod_col,
+            qty_col,
+        )
+        return None
+    if not price_col:
+        logger.warning("sales breakdown: no Price column; revenue will be 0")
+
+    lines = []
+    for raw in values[1:]:
+        row = list(raw or [])
+        if len(row) < len(headers):
+            row.extend([""] * (len(headers) - len(row)))
+        rec = dict(zip(headers, row))
+        order_id = str(rec.get(order_col) or "").strip() if order_col else ""
+        if order_col and not order_id:
+            continue
+        sold_on = _ship_queue_parse_due(rec.get(date_col))
+        if sold_on is None:
+            continue
+        rep = _sales_rep_from_production_row(rec, headers, row)
+        named_rep = any(
+            str(header or "").strip().lower() in {"rep", "referral", "sales rep"}
+            for header in headers
+        )
+        # Column AQ holds the rep when the header row stops before it.
+        if not rep and not named_rep and len(row) > 42:
+            rep = str(row[42] or "").strip()
+        product = str(rec.get(prod_col) or "").strip()
+        design = str(rec.get(design_col) or "").strip() if design_col else ""
+        if design and product and design.lower() not in product.lower():
+            label = f"{design} · {product}"
+        else:
+            label = product or design or "Untitled"
+        if not order_id:
+            order_id = f"row-{len(lines) + 2}"
+        lines.append(
+            {
+                "date": sold_on,
+                "qty": parse_number(rec.get(qty_col)),
+                "unit_price": parse_number(rec.get(price_col)) if price_col else 0.0,
+                "rep": rep,
+                "product": product,
+                "product_label": label,
+                "order_id": order_id,
+            }
+        )
+
+    payload = build_sales_breakdown(lines, today)
+    payload["generatedAt"] = now.isoformat(timespec="seconds")
+    logger.info(
+        "sales breakdown: lines=%s days=%s week_pieces=%s reps=%s",
+        len(lines),
+        len(payload.get("days") or []),
+        payload.get("weekPieces"),
+        len(payload.get("reps") or []),
+    )
+    return payload
+
+
+@app.route("/overview/sales-breakdown", methods=["GET"], endpoint="overview_sales_breakdown_plain")
+@app.route("/api/overview/sales-breakdown", methods=["GET"], endpoint="overview_sales_breakdown_api")
+@login_required_session
+def overview_sales_breakdown():
+    """Pieces, revenue, and orders by sales rep for the overview sales popup."""
+    now = time.time()
+    cached = _SALES_BREAKDOWN_CACHE
+    if cached["data"] is not None and now - cached["ts"] < SALES_BREAKDOWN_TTL:
+        return jsonify(cached["data"])
+    try:
+        payload = compute_sales_rep_breakdown(log=app.logger)
+    except Exception as e:
+        app.logger.exception("sales breakdown failed")
+        return jsonify({"error": str(e)}), 500
+    if not payload:
+        return jsonify({"error": "Sales breakdown unavailable"}), 503
+    _SALES_BREAKDOWN_CACHE["data"] = payload
+    _SALES_BREAKDOWN_CACHE["ts"] = now
+    return jsonify(payload)
 
 
 @app.route("/api/fur/complete", methods=["POST", "OPTIONS"])
