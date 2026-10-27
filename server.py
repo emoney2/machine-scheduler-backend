@@ -2226,12 +2226,11 @@ def _orders_list_for_changes():
     range_name = production_orders_values_range(
         os.environ.get("OVERVIEW_PRODUCTION_ORDERS_RANGE") or ORDERS_RANGE
     )
-    rows = fetch_sheet(
+    return fetch_sheet(
         SPREADSHEET_ID,
         range_name,
         value_render_option="FORMATTED_VALUE",
-    )
-    return _rows_to_dicts(rows)
+    ) or []
 
 
 # Fields that define a "meaningful change" for the Scheduler
@@ -2256,21 +2255,54 @@ _HASH_FIELDS = [
 ]
 
 
-def _order_hash(obj: dict) -> str:
+def _order_hash(obj: dict, embroidery_completed=None) -> str:
     """Stable SHA1 over selected fields (missing keys treated as empty)."""
     payload = {k: str(obj.get(k, "")) for k in _HASH_FIELDS}
+    if embroidery_completed is not None:
+        payload["Embroidery Completed Qty"] = str(int(embroidery_completed or 0))
     s = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     import hashlib  # local import ok; hashlib is already imported elsewhere too
 
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 
+def _cell_hash(row, col_index, embroidery_completed=None) -> str:
+    """Hash a raw sheet row without building a dict for every order."""
+    payload = {}
+    for key in _HASH_FIELDS:
+        if key == "Embroidery Completed Qty":
+            continue
+        idx = col_index.get(key)
+        val = ""
+        if idx is not None and idx < len(row or []):
+            val = row[idx]
+        payload[key] = "" if val is None else str(val)
+    payload["Embroidery Completed Qty"] = str(int(embroidery_completed or 0))
+    s = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+
+def _rss_mb() -> float:
+    try:
+        return _process.memory_info().rss / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
 # ------------------------------------------------------------------------------
-# Cached snapshot of Production Orders (rows + by_id) with short TTL
+# Cached snapshot of Production Orders. Raw rows only — a dict per order
+# kept a second full copy alive and pushed the worker over Render's memory limit.
 # ------------------------------------------------------------------------------
 import threading
 
-_orders_rows_cache = {"ts": 0.0, "ttl": 45.0, "rows": None, "by_id": {}}
+_orders_rows_cache = {
+    "ts": 0.0,
+    "ttl": float(os.environ.get("ORDERS_ROWS_TTL", "180")),
+    "values": None,
+    "headers": [],
+    "col_index": {},
+    "by_index": {},
+}
 _orders_rows_inflight = False
 _orders_rows_inflight_lock = threading.Lock()
 # When Sheets is slow, return this from /api/changes so Render does not 502 (browser shows fake CORS).
@@ -2298,20 +2330,48 @@ def _bump_embroidery_scheduler_signal():
     _changes_last_ok["ts"] = 0.0
 
 
-def _orders_rows_apply(rows):
-    by = {}
-    for r in rows or []:
-        try:
-            oid = str(r.get("Order #", "")).strip()
+def _orders_header_index(headers):
+    index = {}
+    for i, header in enumerate(headers or []):
+        name = str(header or "").strip()
+        if name and name not in index:
+            index[name] = i
+    return index
+
+
+def _orders_rows_apply(values):
+    values = values or []
+    headers = [str(h).strip() for h in (values[0] if values else [])]
+    col_index = _orders_header_index(headers)
+    order_i = col_index.get("Order #")
+    by_index = {}
+    if order_i is not None:
+        for i, row in enumerate(values[1:], start=1):
+            if not row or order_i >= len(row):
+                continue
+            oid = str(row[order_i] or "").strip()
             if oid:
-                by[oid] = r
-        except Exception:
-            continue
+                by_index[oid] = i
     c = _orders_rows_cache
-    c["rows"] = rows or []
-    c["by_id"] = by
+    c["values"] = values
+    c["headers"] = headers
+    c["col_index"] = col_index
+    c["by_index"] = by_index
     c["ts"] = time.time()
-    return c["rows"], c["by_id"]
+    return c["values"], c["by_index"]
+
+
+def _order_dict_at(index):
+    """Build one order dict on demand. Callers must not keep the whole sheet this way."""
+    c = _orders_rows_cache
+    values = c.get("values") or []
+    headers = c.get("headers") or []
+    if index is None or index >= len(values):
+        return None
+    row = values[index] or []
+    if len(row) < len(headers):
+        row = list(row) + [""] * (len(headers) - len(row))
+    return dict(zip(headers, row))
 
 
 def _orders_rows_refresh_worker():
@@ -2330,6 +2390,16 @@ def _orders_rows_refresh_worker():
 
 def _orders_rows_try_start_refresh():
     global _orders_rows_inflight
+    limit = float(os.environ.get("ORDERS_REFRESH_RSS_LIMIT_MB", "400"))
+    rss = _rss_mb()
+    if rss > limit:
+        logging.getLogger(__name__).warning(
+            "skipping Production Orders refresh at %.0fMB (limit %.0fMB)",
+            rss,
+            limit,
+        )
+        _orders_rows_cache["ts"] = time.time()
+        return False
     with _orders_rows_inflight_lock:
         if _orders_rows_inflight:
             return False
@@ -2347,24 +2417,24 @@ def _orders_rows_snapshot():
     global _orders_rows_inflight
     now = time.time()
     c = _orders_rows_cache
-    # ts>0 means we have successfully populated at least once (rows may be [])
-    has_data = c["ts"] > 0 and c.get("rows") is not None
+    # ts>0 means we have successfully populated at least once (values may be [])
+    has_data = c["ts"] > 0 and c.get("values") is not None
 
     if has_data and (now - c["ts"]) <= c["ttl"]:
-        return c["rows"], c["by_id"]
+        return c["values"], c["by_index"]
 
     if has_data:
         if _orders_rows_try_start_refresh():
             eventlet.spawn_n(_orders_rows_refresh_worker)
-        return c["rows"], c["by_id"]
+        return c["values"], c["by_index"]
 
     # Cold miss — one builder; others wait briefly for rows
     if not _orders_rows_try_start_refresh():
         deadline = now + 22
         while time.time() < deadline:
             eventlet.sleep(0.25)
-            if c["ts"] > 0 and c.get("rows") is not None:
-                return c["rows"], c["by_id"]
+            if c["ts"] > 0 and c.get("values") is not None:
+                return c["values"], c["by_index"]
         raise TimeoutError("orders snapshot still cold after wait")
 
     try:
@@ -2377,10 +2447,11 @@ def _orders_rows_snapshot():
 
 def _orders_get_by_id_cached(order_number: str):
     """
-    O(1) lookup from the cached snapshot.
+    One order dict from the raw snapshot. Does not materialize the rest of the sheet.
     """
-    _, by = _orders_rows_snapshot()
-    return by.get(order_number)
+    _, by_index = _orders_rows_snapshot()
+    idx = (by_index or {}).get(str(order_number or "").strip())
+    return _order_dict_at(idx)
 
 
 # ─── Logger ─────────────────────────────────────────────────────────────────
@@ -3970,7 +4041,7 @@ def api_changes():
 
     now = time.time()
     key = "changes-v1"
-    ttl = int(os.environ.get("CHANGES_CACHE_TTL", "40"))
+    ttl = int(os.environ.get("CHANGES_CACHE_TTL", "90"))
     wait_sec = int(os.environ.get("CHANGES_SHEET_WAIT_SEC", "22"))
 
     # Serve from cache if fresh
@@ -4020,15 +4091,21 @@ def api_changes():
             prog = emb_progress.load_all(None, None) or {}
         except Exception:
             prog = {}
-        for o in rows:
-            oid = str(o.get("Order #", "")).strip()
+        values = rows or []
+        headers = [str(h).strip() for h in (values[0] if values else [])]
+        col_index = _orders_header_index(headers)
+        order_i = col_index.get("Order #")
+        for n, row in enumerate(values[1:], start=1):
+            if n % 500 == 0:
+                eventlet.sleep(0)
+            if not row or order_i is None or order_i >= len(row):
+                continue
+            oid = str(row[order_i] or "").strip()
             if not oid:
                 continue
             nk = _overview_normalize_order_key(oid)
             prow = prog.get(nk) or prog.get(oid) or {}
-            hashed = dict(o)
-            hashed["Embroidery Completed Qty"] = int(prow.get("completedQty") or 0)
-            mapping[oid] = _order_hash(hashed)
+            mapping[oid] = _cell_hash(row, col_index, prow.get("completedQty") or 0)
 
         payload = {
             "hashes": mapping,
@@ -4071,11 +4148,10 @@ def api_order_single():
         if not order_number:
             return jsonify({"error": "orderNumber required"}), 400
 
-        orders = _orders_list_for_changes()
-        for o in orders:
-            if str(o.get("Order #", "")).strip() == order_number:
-                return jsonify({"order": o})
-        return jsonify({"error": f"Order {order_number} not found"}), 404
+        order = _orders_get_by_id_cached(order_number)
+        if not order:
+            return jsonify({"error": f"Order {order_number} not found"}), 404
+        return jsonify({"order": order})
     except Exception as e:
         current_app.logger.exception("api_order failed: %s", e)
         return jsonify({"error": "order fetch failed"}), 500
@@ -15917,7 +15993,7 @@ def cut_complete_batch():
 @app.route("/api/orders", methods=["GET"])
 @login_required_session
 def get_orders():
-    TTL = 15  # seconds
+    TTL = 120  # seconds — this route reads the whole orders tab
 
     # Base fields MaterialLog needs
     KEEP_BASE = {
@@ -16032,35 +16108,9 @@ def get_orders():
         return out
 
 
-    # --- NEW WRAPPER: populate fast lookup after cache returns ---
-    result = send_cached_json("combined", TTL, build_payload)
-
-    try:
-        # parse JSON (result.data may be bytes or str depending on environment)
-        data = json.loads(result.get_data(as_text=True))
-
-        orders = data.get("orders", [])
-        by_id = {}
-
-        for row in orders:
-            oid = str(row.get("Order #", "")).strip()
-            if oid:
-                by_id[oid] = row
-
-        # Store to global cache for /order_fast
-        global _orders_index
-        if not isinstance(_orders_index, dict):
-            _orders_index = {}
-
-        _orders_index["by_id"] = by_id
-        _orders_index["ts"] = time.time()
-        # Enforce size limit
-        _cleanup_orders_index()
-
-    except Exception as e:
-        current_app.logger.warning("Failed to build fast order cache: %s", e)
-
-    return result
+    # Do not parse this payload back into _orders_index. That kept a second
+    # full copy of every order in RAM after each scheduler load.
+    return send_cached_json("combined", TTL, build_payload)
 
 
 @app.route("/api/material-log/original-usage", methods=["GET"])  # ?order=123
@@ -18525,18 +18575,6 @@ def get_combined():
         fur_full = rows_to_dicts(fur_rows)
         cut_full = rows_to_dicts(cut_rows)
 
-        try:
-            _orders_index["by_id"] = {
-                str(o.get("Order #", "")).strip(): o
-                for o in orders_full
-                if str(o.get("Order #", "")).strip()
-            }
-            _orders_index["ts"] = time.time()
-            # Enforce size limit
-            _cleanup_orders_index()
-        except Exception as e:
-            current_app.logger.warning(f"[FAST] Failed to build order index: {e}")
-
         fur_map = {
             str(r.get("Order #", "")).strip(): r
             for r in fur_full
@@ -18660,7 +18698,7 @@ def get_combined():
         }
 
     # Use caching to reduce Google Sheets API calls (stale-while-revalidate on expiry)
-    TTL = int(os.environ.get("COMBINED_CACHE_TTL", "45"))
+    TTL = int(os.environ.get("COMBINED_CACHE_TTL", "120"))
     try:
         result = send_cached_json("combined-v7", TTL, build_payload)
         if result is None:
