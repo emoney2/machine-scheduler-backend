@@ -14,3 +14,17 @@ workers = 1
 # without the worker being "broken"; low value caused WORKER TIMEOUT + SIGKILL loops.
 timeout = int(os.environ.get("GUNICORN_TIMEOUT", "300"))
 graceful_timeout = int(os.environ.get("GUNICORN_GRACEFUL_TIMEOUT", "120"))
+
+
+def post_worker_init(worker):
+    """Watch the Directory sheet for new wholesale applications and email Justin."""
+    try:
+        import wholesale_signup_notify
+
+        wholesale_signup_notify.start_background_poller()
+    except Exception:
+        import logging
+
+        logging.getLogger("gunicorn.error").exception(
+            "wholesale signup notifier failed to start"
+        )
