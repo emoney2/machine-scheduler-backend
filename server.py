@@ -12515,7 +12515,7 @@ _materials_needed_ts = 0.0
 
 # overview metrics (sales + embroidery): in-memory cache
 _OVERVIEW_METRICS_CACHE = {"data": None, "ts": 0}
-OVERVIEW_METRICS_TTL = int(os.environ.get("OVERVIEW_METRICS_TTL", "60"))  # seconds
+OVERVIEW_METRICS_TTL = int(os.environ.get("OVERVIEW_METRICS_TTL", "300"))  # seconds
 _OVERVIEW_METRICS_COMPUTE_LOCK = Semaphore(1)
 _OVERVIEW_METRICS_REFRESH_LOCK = Semaphore(1)
 
@@ -12526,7 +12526,11 @@ _PO_VALUES_TTL = int(os.environ.get("PO_VALUES_TTL", "90"))
 
 # Rep-level sales breakdown for the overview popup. Sheet read is heavy, so cache briefly.
 _SALES_BREAKDOWN_CACHE = {"data": None, "ts": 0.0}
-SALES_BREAKDOWN_TTL = int(os.environ.get("SALES_BREAKDOWN_TTL", "120"))
+SALES_BREAKDOWN_TTL = int(os.environ.get("SALES_BREAKDOWN_TTL", "300"))
+# Sold-this-week / YTD / 6-week rate. Kept apart from the jobs snapshot so a
+# metrics refresh does not re-download Production Orders every couple of minutes.
+_PO_SALES_SUMMARY = {"ts": 0.0, "data": None}
+_SALES_SUMMARY_TTL = int(os.environ.get("SALES_SUMMARY_TTL", "300"))
 
 
 def _safe_pb_orders_table_sql_ident(table_name: str) -> str:
@@ -12746,6 +12750,106 @@ def get_overview_production_orders_values(log=None):
         return None
 
 
+def _production_order_col(headers, *names):
+    exact = {str(h).strip(): i for i, h in enumerate(headers)}
+    lower = {str(h).strip().lower(): i for i, h in enumerate(headers)}
+    for name in names:
+        if name in exact:
+            return exact[name]
+        found = lower.get(str(name).lower())
+        if found is not None:
+            return found
+    return None
+
+
+def _production_order_qty(row, idx):
+    if idx is None or idx >= len(row):
+        return 0.0
+    raw = row[idx]
+    try:
+        qty = float(raw) if raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+    if qty != qty:
+        return 0.0
+    return qty
+
+
+def summarize_production_order_sales(values, today=None, log=None):
+    """
+    One pass over Production Orders for the three Overview sales figures.
+
+    Does not build a dict per row. Yields every few hundred rows so the single
+    worker can still serve the rest of the app.
+    """
+    logger = log or app.logger
+    if values is None:
+        return None
+    if today is None:
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+    if len(values) < 2:
+        return {"ytd": 0.0, "week": 0.0, "six_week": 0.0}
+
+    headers = [str(h).strip() for h in values[0]]
+    date_i = _production_order_col(headers, "Date", "Order Date")
+    prod_i = _production_order_col(headers, "Product")
+    qty_i = _production_order_col(headers, "Quantity", "Qty")
+    order_i = _production_order_col(headers, "Order #", "Order#")
+    if date_i is None or prod_i is None or qty_i is None:
+        logger.warning(
+            "sales summary: missing column (Date=%s Product=%s Quantity=%s)",
+            date_i,
+            prod_i,
+            qty_i,
+        )
+        return None
+
+    week_monday = today - timedelta(days=today.isoweekday() - 1)
+    week_end = min(today, week_monday + timedelta(days=6))
+    six_start = today - timedelta(days=6 * 7 - 1)
+    ytd = week = six_week = 0.0
+    for n, raw in enumerate(values[1:], start=1):
+        if n % 400 == 0:
+            eventlet.sleep(0)
+        row = raw or []
+        if order_i is not None:
+            order_id = row[order_i] if order_i < len(row) else ""
+            if not str(order_id or "").strip():
+                continue
+        sold_on = _ship_queue_parse_due(row[date_i] if date_i < len(row) else None)
+        if sold_on is None:
+            continue
+        product = row[prod_i] if prod_i < len(row) else None
+        qty = _production_order_qty(row, qty_i)
+        if qty == 0.0:
+            continue
+        product_text = str(product or "")
+        is_back = "back" in product_text.lower()
+        if sold_on.year == today.year and not is_back:
+            ytd += qty
+        if week_monday <= sold_on <= week_end and not is_back:
+            week += qty
+        if six_start <= sold_on <= today and not _exclude_from_sold_avg_product(product):
+            six_week += qty
+    return {"ytd": ytd, "week": week, "six_week": six_week}
+
+
+def sales_summary_from_sheets(log=None):
+    """Cached sales totals. Avoids a fresh Production Orders download on every metrics hit."""
+    now = time.time()
+    cached = _PO_SALES_SUMMARY.get("data")
+    if cached is not None and now - float(_PO_SALES_SUMMARY.get("ts") or 0) < _SALES_SUMMARY_TTL:
+        return cached
+    values = get_overview_production_orders_values(log=log)
+    if values is None:
+        return None
+    summary = summarize_production_order_sales(values, log=log)
+    if summary is not None:
+        _PO_SALES_SUMMARY["data"] = summary
+        _PO_SALES_SUMMARY["ts"] = time.time()
+    return summary
+
+
 def compute_products_sold_ytd_qty_from_sheets(sales_year=None, log=None):
     """
     Sum Quantity on Production Orders (Google Sheet) for rows dated in sales_year.
@@ -12755,59 +12859,12 @@ def compute_products_sold_ytd_qty_from_sheets(sales_year=None, log=None):
     if sales_year is None:
         sales_year = datetime.now(ZoneInfo("America/New_York")).year
     try:
-        values = get_overview_production_orders_values(log=logger)
-        if values is None:
+        if sales_year != datetime.now(ZoneInfo("America/New_York")).year:
             return None
-        if len(values) < 2:
-            return 0.0
-
-        headers = [str(h).strip() for h in values[0]]
-        lower_h = {h.lower(): h for h in headers}
-
-        def _col(*names):
-            for n in names:
-                if n in headers:
-                    return n
-                ln = n.lower()
-                if ln in lower_h:
-                    return lower_h[ln]
+        summary = sales_summary_from_sheets(log=logger)
+        if summary is None:
             return None
-
-        date_col = _col("Date", "Order Date")
-        prod_col = _col("Product")
-        qty_col = _col("Quantity", "Qty")
-        order_col = _col("Order #", "Order#")
-        if not date_col or not prod_col or not qty_col:
-            logger.warning(
-                "products_sold_ytd sheets: missing column (Date=%s Product=%s Quantity=%s)",
-                date_col,
-                prod_col,
-                qty_col,
-            )
-            return None
-
-        total = 0.0
-        for raw in values[1:]:
-            row = raw or []
-            if len(row) < len(headers):
-                row = row + [""] * (len(headers) - len(row))
-            rec = dict(zip(headers, row))
-            if order_col and not str(rec.get(order_col) or "").strip():
-                continue
-            d = _ship_queue_parse_due(rec.get(date_col))
-            if d is None or d.year != sales_year:
-                continue
-            prod = rec.get(prod_col)
-            if prod is not None and "back" in str(prod).lower():
-                continue
-            qraw = rec.get(qty_col)
-            try:
-                q = float(qraw) if qraw not in (None, "") else 0.0
-            except (TypeError, ValueError):
-                q = 0.0
-            if q == q:
-                total += q
-        return total
+        return summary["ytd"]
     except Exception as e:
         logger.warning("products_sold_ytd sheets: %s", e)
         return None
@@ -12987,66 +13044,10 @@ def compute_headcovers_sold_this_week_from_sheets(log=None):
     """
     logger = log or app.logger
     try:
-        tz = ZoneInfo("America/New_York")
-        today = datetime.now(tz).date()
-        week_monday = today - timedelta(days=today.isoweekday() - 1)
-        week_sunday = week_monday + timedelta(days=6)
-        range_end = min(today, week_sunday)
-
-        values = get_overview_production_orders_values(log=logger)
-        if values is None:
+        summary = sales_summary_from_sheets(log=logger)
+        if summary is None:
             return None
-        if len(values) < 2:
-            return 0.0
-
-        headers = [str(h).strip() for h in values[0]]
-        lower_h = {h.lower(): h for h in headers}
-
-        def _col(*names):
-            for n in names:
-                if n in headers:
-                    return n
-                ln = n.lower()
-                if ln in lower_h:
-                    return lower_h[ln]
-            return None
-
-        date_col = _col("Date", "Order Date")
-        prod_col = _col("Product")
-        qty_col = _col("Quantity", "Qty")
-        order_col = _col("Order #", "Order#")
-        if not date_col or not prod_col or not qty_col:
-            logger.warning(
-                "headcovers_sold_this_week sheets: missing column (Date=%s Product=%s Quantity=%s) headers_sample=%s",
-                date_col,
-                prod_col,
-                qty_col,
-                headers[:25],
-            )
-            return None
-
-        total = 0.0
-        for raw in values[1:]:
-            row = raw or []
-            if len(row) < len(headers):
-                row = row + [""] * (len(headers) - len(row))
-            rec = dict(zip(headers, row))
-            if order_col and not str(rec.get(order_col) or "").strip():
-                continue
-            d = _ship_queue_parse_due(rec.get(date_col))
-            if d is None or d < week_monday or d > range_end:
-                continue
-            prod = rec.get(prod_col)
-            if prod is not None and "back" in str(prod).lower():
-                continue
-            qraw = rec.get(qty_col)
-            try:
-                q = float(qraw) if qraw not in (None, "") else 0.0
-            except (TypeError, ValueError):
-                q = 0.0
-            if q == q:
-                total += q
-        return total
+        return summary["week"]
     except Exception as e:
         logger.warning("headcovers_sold_this_week sheets: %s", e)
         return None
@@ -13064,63 +13065,13 @@ def compute_products_sold_qty_last_n_weeks_from_sheets(weeks=6, log=None):
     logger = log or app.logger
     weeks = max(int(weeks or 6), 1)
     try:
-        tz = ZoneInfo("America/New_York")
-        today = datetime.now(tz).date()
-        range_start = today - timedelta(days=weeks * 7 - 1)
-
-        values = get_overview_production_orders_values(log=logger)
-        if values is None:
+        if weeks != 6:
+            logger.warning("products_sold_last_%sw sheets: only the 6-week summary is cached", weeks)
             return None
-        if len(values) < 2:
-            return 0.0
-
-        headers = [str(h).strip() for h in values[0]]
-        lower_h = {h.lower(): h for h in headers}
-
-        def _col(*names):
-            for n in names:
-                if n in headers:
-                    return n
-                ln = n.lower()
-                if ln in lower_h:
-                    return lower_h[ln]
+        summary = sales_summary_from_sheets(log=logger)
+        if summary is None:
             return None
-
-        date_col = _col("Date", "Order Date")
-        prod_col = _col("Product")
-        qty_col = _col("Quantity", "Qty")
-        order_col = _col("Order #", "Order#")
-        if not date_col or not prod_col or not qty_col:
-            logger.warning(
-                "products_sold_last_%sw sheets: missing column (Date=%s Product=%s Quantity=%s)",
-                weeks,
-                date_col,
-                prod_col,
-                qty_col,
-            )
-            return None
-
-        total = 0.0
-        for raw in values[1:]:
-            row = raw or []
-            if len(row) < len(headers):
-                row = row + [""] * (len(headers) - len(row))
-            rec = dict(zip(headers, row))
-            if order_col and not str(rec.get(order_col) or "").strip():
-                continue
-            d = _ship_queue_parse_due(rec.get(date_col))
-            if d is None or d < range_start or d > today:
-                continue
-            if _exclude_from_sold_avg_product(rec.get(prod_col)):
-                continue
-            qraw = rec.get(qty_col)
-            try:
-                q = float(qraw) if qraw not in (None, "") else 0.0
-            except (TypeError, ValueError):
-                q = 0.0
-            if q == q:
-                total += q
-        return total
+        return summary["six_week"]
     except Exception as e:
         logger.warning("products_sold_last_%sw sheets: %s", weeks, e)
         return None
@@ -15258,67 +15209,60 @@ def compute_sales_rep_breakdown(log=None):
         return payload
 
     headers = [str(h).strip() for h in values[0]]
-    lower_h = {h.lower(): h for h in headers}
-
-    def _col(*names):
-        for n in names:
-            if n in headers:
-                return n
-            ln = n.lower()
-            if ln in lower_h:
-                return lower_h[ln]
-        return None
-
-    date_col = _col("Date", "Order Date")
-    prod_col = _col("Product")
-    qty_col = _col("Quantity", "Qty")
-    price_col = _col("Price", "Unit Price")
-    order_col = _col("Order #", "Order#", "Order Number")
-    design_col = _col("Design")
-    if not date_col or not prod_col or not qty_col:
+    date_i = _production_order_col(headers, "Date", "Order Date")
+    prod_i = _production_order_col(headers, "Product")
+    qty_i = _production_order_col(headers, "Quantity", "Qty")
+    price_i = _production_order_col(headers, "Price", "Unit Price")
+    order_i = _production_order_col(headers, "Order #", "Order#", "Order Number")
+    design_i = _production_order_col(headers, "Design")
+    rep_i = _production_order_col(headers, "REP", "Rep", "Referral", "Sales Rep", "rep")
+    named_rep = rep_i is not None
+    if date_i is None or prod_i is None or qty_i is None:
         logger.warning(
             "sales breakdown: missing column Date=%s Product=%s Quantity=%s",
-            date_col,
-            prod_col,
-            qty_col,
+            date_i,
+            prod_i,
+            qty_i,
         )
         return None
-    if not price_col:
+    if price_i is None:
         logger.warning("sales breakdown: no Price column; revenue will be 0")
 
+    window_start = date(today.year - 1, 1, 1)
     lines = []
-    for raw in values[1:]:
-        row = list(raw or [])
-        if len(row) < len(headers):
-            row.extend([""] * (len(headers) - len(row)))
-        rec = dict(zip(headers, row))
-        order_id = str(rec.get(order_col) or "").strip() if order_col else ""
-        if order_col and not order_id:
+    for n, raw in enumerate(values[1:], start=2):
+        if n % 400 == 0:
+            eventlet.sleep(0)
+        row = raw or []
+        order_id = ""
+        if order_i is not None:
+            order_id = str(row[order_i] if order_i < len(row) else "").strip()
+            if not order_id:
+                continue
+        sold_on = _ship_queue_parse_due(row[date_i] if date_i < len(row) else None)
+        if sold_on is None or sold_on < window_start or sold_on > today:
             continue
-        sold_on = _ship_queue_parse_due(rec.get(date_col))
-        if sold_on is None:
-            continue
-        rep = _sales_rep_from_production_row(rec, headers, row)
-        named_rep = any(
-            str(header or "").strip().lower() in {"rep", "referral", "sales rep"}
-            for header in headers
-        )
-        # Column AQ holds the rep when the header row stops before it.
+        if rep_i is not None and rep_i < len(row):
+            rep = str(row[rep_i] or "").strip()
+        else:
+            rep = ""
         if not rep and not named_rep and len(row) > 42:
             rep = str(row[42] or "").strip()
-        product = str(rec.get(prod_col) or "").strip()
-        design = str(rec.get(design_col) or "").strip() if design_col else ""
+        product = str(row[prod_i] if prod_i < len(row) else "").strip()
+        design = str(row[design_i] if design_i is not None and design_i < len(row) else "").strip()
         if design and product and design.lower() not in product.lower():
             label = f"{design} · {product}"
         else:
             label = product or design or "Untitled"
         if not order_id:
-            order_id = f"row-{len(lines) + 2}"
+            order_id = f"row-{n}"
+        qty_raw = row[qty_i] if qty_i < len(row) else None
+        price_raw = row[price_i] if price_i is not None and price_i < len(row) else None
         lines.append(
             {
                 "date": sold_on,
-                "qty": parse_number(rec.get(qty_col)),
-                "unit_price": parse_number(rec.get(price_col)) if price_col else 0.0,
+                "qty": parse_number(qty_raw),
+                "unit_price": parse_number(price_raw) if price_i is not None else 0.0,
                 "rep": rep,
                 "product": product,
                 "product_label": label,
