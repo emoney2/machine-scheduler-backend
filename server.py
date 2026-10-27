@@ -195,6 +195,7 @@ from needlepoint_belts import (
     load_order_design_colors as load_needlepoint_design_colors,
     mark_orders_ordered as mark_needlepoint_orders_ordered,
     parse_size_quantities as parse_needlepoint_sizes,
+    sheet_is_ready as needlepoint_sheet_is_ready,
     supplier_email as needlepoint_supplier_email,
     total_quantity as needlepoint_total_quantity,
 )
@@ -646,45 +647,90 @@ THUMB_CACHE_DIR = os.environ.get("THUMB_CACHE_DIR", "/opt/render/project/.thumb_
 os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
 # --- Tiny in-process cache for Drive thumbnails ---
-_drive_thumb_cache = {}  # key: f"{file_id}:{modified_time}" -> {'bytes': b, 'ts': float}
+_drive_thumb_cache = {}  # key -> {'bytes'| 'data': b, 'ts': float}
 _drive_thumb_ttl = int(os.environ.get("DRIVE_THUMB_TTL_SEC", "300"))
-_drive_thumb_cache_max_size = int(
-    os.environ.get("DRIVE_THUMB_CACHE_MAX", "120")
-)  # In-memory image bytes
-_drive_thumb_cache_last_cleanup = 0
-_drive_thumb_cache_cleanup_interval = 120  # Clean up every 2 minutes - more frequent
+_drive_thumb_cache_max_size = int(os.environ.get("DRIVE_THUMB_CACHE_MAX", "40"))
+_drive_thumb_cache_max_bytes = int(
+    os.environ.get("DRIVE_THUMB_CACHE_MAX_BYTES", str(12 * 1024 * 1024))
+)
+# Never decode or keep a full Drive original in this process.
+_THUMB_SAFE_BYTES = 350_000
+_THUMB_HARD_BYTES = 2_000_000
+_THUMB_MAX_PIXELS = 2_000_000
+
+
+def _drive_thumb_entry_len(entry) -> int:
+    if not isinstance(entry, dict):
+        return 0
+    blob = entry.get("bytes")
+    if blob is None:
+        blob = entry.get("data")
+    return len(blob) if isinstance(blob, (bytes, bytearray)) else 0
+
+
+def _cap_thumb_bytes(raw, max_edge: int = 640):
+    """Return small image bytes, or None when the file is too large to decode safely."""
+    if not raw or len(raw) > _THUMB_HARD_BYTES:
+        return None
+    try:
+        from io import BytesIO
+        from PIL import Image as PILImage
+
+        prev_limit = PILImage.MAX_IMAGE_PIXELS
+        PILImage.MAX_IMAGE_PIXELS = _THUMB_MAX_PIXELS
+        try:
+            im = PILImage.open(BytesIO(raw))
+            width, height = im.size
+            if width * height > _THUMB_MAX_PIXELS:
+                return None
+            if (
+                len(raw) <= _THUMB_SAFE_BYTES
+                and max(width, height) <= max_edge + 80
+                and raw[:3] == b"\xff\xd8\xff"
+            ):
+                return raw
+            im.thumbnail((max_edge, max_edge))
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=80)
+            return buf.getvalue()
+        finally:
+            PILImage.MAX_IMAGE_PIXELS = prev_limit
+    except Exception:
+        return None
 
 
 def _drive_thumb_cache_cleanup():
-    """Remove expired entries and enforce size limit on _drive_thumb_cache."""
-    global _drive_thumb_cache_last_cleanup
+    """Drop expired thumbnails and enforce the entry-count and byte budget."""
     now = time.time()
-    
-    # Only cleanup periodically to avoid overhead
-    if now - _drive_thumb_cache_last_cleanup < _drive_thumb_cache_cleanup_interval:
-        return
-    
-    _drive_thumb_cache_last_cleanup = now
-    
-    # Remove expired entries
     expired_keys = [
-        k for k, v in _drive_thumb_cache.items()
+        k
+        for k, v in _drive_thumb_cache.items()
         if isinstance(v, dict) and (now - v.get("ts", 0)) >= _drive_thumb_ttl
     ]
     for k in expired_keys:
         _drive_thumb_cache.pop(k, None)
-    
-    # If still too large, remove oldest entries
-    if len(_drive_thumb_cache) > _drive_thumb_cache_max_size:
-        # Sort by timestamp (oldest first)
-        entries_with_ts = [
-            (k, v.get("ts", 0) if isinstance(v, dict) else 0)
-            for k, v in _drive_thumb_cache.items()
-        ]
-        sorted_entries = sorted(entries_with_ts, key=lambda kv: kv[1])
-        to_remove = len(_drive_thumb_cache) - _drive_thumb_cache_max_size
-        for k, _ in sorted_entries[:to_remove]:
-            _drive_thumb_cache.pop(k, None)
+
+    total = sum(_drive_thumb_entry_len(v) for v in _drive_thumb_cache.values())
+    if (
+        len(_drive_thumb_cache) <= _drive_thumb_cache_max_size
+        and total <= _drive_thumb_cache_max_bytes
+    ):
+        return
+
+    oldest = sorted(
+        _drive_thumb_cache.items(),
+        key=lambda kv: kv[1].get("ts", 0) if isinstance(kv[1], dict) else 0,
+    )
+    for key, entry in oldest:
+        if (
+            len(_drive_thumb_cache) <= _drive_thumb_cache_max_size
+            and total <= _drive_thumb_cache_max_bytes
+        ):
+            break
+        total -= _drive_thumb_entry_len(entry)
+        _drive_thumb_cache.pop(key, None)
 
 
 # Cap parallel upstream thumbnail work (Overview loads many images at once → OOM/restarts).
@@ -1712,18 +1758,87 @@ def _kanban_scrape_url(url: str):
     }
 
 
+_kanban_sheet_cache = {"ts": 0.0, "values": None, "gen": 0}
+_kanban_sheet_gen = 0
+_KANBAN_SHEET_CACHE_TTL = 30
+_kanban_read_lock = Semaphore(1)
+
+
+def _kanban_mark_dirty():
+    global _kanban_sheet_gen
+    _kanban_sheet_gen += 1
+    _kanban_sheet_cache["values"] = None
+    _kanban_sheet_cache["ts"] = 0.0
+
+
+class _InvalidateKanbanAfterExecute:
+    def __init__(self, request):
+        self._request = request
+
+    def execute(self, *args, **kwargs):
+        try:
+            return self._request.execute(*args, **kwargs)
+        finally:
+            _kanban_mark_dirty()
+
+
+class _KanbanValuesApi:
+    """Sheet writes drop the short-lived Kanban read cache after they finish."""
+
+    def __init__(self, api):
+        self._api = api
+
+    def get(self, **kwargs):
+        return self._api.get(**kwargs)
+
+    def __getattr__(self, name):
+        fn = getattr(self._api, name)
+
+        def wrapped(**kwargs):
+            return _InvalidateKanbanAfterExecute(fn(**kwargs))
+
+        return wrapped
+
+
 def _kanban_values_api():
-    return get_sheets_service().spreadsheets().values()
+    return _KanbanValuesApi(get_sheets_service().spreadsheets().values())
 
 
 def _kanban_read_all():
-    v = _kanban_values_api()
-    resp = v.get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{KANBAN_SHEET_TAB}!A1:ZZ",
-        valueRenderOption="UNFORMATTED_VALUE",
-    ).execute()
-    return resp.get("values", []) or []
+    """Read the Kanban tab, sharing one copy across overlapping Overview calls."""
+    global _kanban_sheet_cache
+    now = time.time()
+    cached = _kanban_sheet_cache.get("values")
+    if (
+        cached is not None
+        and now - float(_kanban_sheet_cache.get("ts") or 0) < _KANBAN_SHEET_CACHE_TTL
+    ):
+        return [list(row) for row in cached]
+
+    with _kanban_read_lock:
+        now = time.time()
+        cached = _kanban_sheet_cache.get("values")
+        if (
+            cached is not None
+            and now - float(_kanban_sheet_cache.get("ts") or 0) < _KANBAN_SHEET_CACHE_TTL
+        ):
+            return [list(row) for row in cached]
+        gen = _kanban_sheet_gen
+        resp = (
+            get_sheets_service()
+            .spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{KANBAN_SHEET_TAB}!A1:ZZ",
+                valueRenderOption="UNFORMATTED_VALUE",
+            )
+            .execute()
+        )
+        values = resp.get("values", []) or []
+        if _kanban_sheet_gen == gen:
+            _kanban_sheet_cache = {"ts": time.time(), "values": values, "gen": gen}
+        return [list(row) for row in values]
 
 
 def _kanban_headers_index(headers):
@@ -4337,8 +4452,10 @@ def drive_thumbnail():
                 return None
         
         r = _classic(file_id)
-        if r:
-            raw_bytes = r.content
+        raw_bytes = (
+            _cap_thumb_bytes(r.content, max_edge=int(size_num or 640)) if r else None
+        )
+        if raw_bytes:
             if hex_clean:
                 # tint and cache tinted+raw
                 try:
@@ -4480,8 +4597,10 @@ def drive_thumbnail():
                 return None
         
         lr = _lh3(thumb_url)
-        if lr:
-            raw_bytes = lr.content
+        raw_bytes = (
+            _cap_thumb_bytes(lr.content, max_edge=int(size_num or 640)) if lr else None
+        )
+        if raw_bytes:
             if hex_clean:
                 # tint and cache
                 try:
@@ -4559,72 +4678,98 @@ def drive_thumbnail():
                 media = asess.get(
                     f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
                     timeout=(3, 6),
+                    stream=True,
                 )
                 app.logger.debug(
                     "📸 raw media → %s %s",
                     media.status_code,
                     media.headers.get("Content-Type", ""),
                 )
+                try:
+                    content_length = int(media.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    content_length = 0
+                if content_length > _THUMB_HARD_BYTES:
+                    media.close()
+                    app.logger.info(
+                        "📸 raw media skipped %s (%s bytes)", file_id, content_length
+                    )
+                    return Response(status=204)
+                chunks = []
+                total = 0
+                too_big = False
+                if media.status_code == 200:
+                    for chunk in media.iter_content(65536):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > _THUMB_HARD_BYTES:
+                            too_big = True
+                            break
+                        chunks.append(chunk)
+                media.close()
+                downloaded = b"".join(chunks)
                 if (
-                    media.status_code == 200
-                    and media.content
-                    and _looks_like_image(media.content)
+                    too_big
+                    or media.status_code != 200
+                    or not downloaded
+                    or not _looks_like_image(downloaded)
                 ):
-                    raw_bytes = media.content
-                    if hex_clean:
-                        try:
-                            from io import BytesIO
-                            from PIL import Image, ImageChops
-        
-                            base = Image.open(BytesIO(raw_bytes)).convert("RGBA")
-                            cr, cg, cb, ca = base.split()
-                            thr = 255 - tol
-        
-                            def _mask_band(band):
-                                return band.point(
-                                    lambda v: 255 if v >= thr else 0, mode="L"
-                                )
-        
-                            mask = ImageChops.multiply(
-                                ImageChops.multiply(_mask_band(cr), _mask_band(cg)),
-                                _mask_band(cb),
+                    if too_big:
+                        app.logger.info(
+                            "📸 raw media skipped %s (>%s bytes)",
+                            file_id,
+                            _THUMB_HARD_BYTES,
+                        )
+                    return Response(status=204)
+                raw_bytes = _cap_thumb_bytes(
+                    downloaded, max_edge=int(size_num or 640)
+                )
+                if not raw_bytes:
+                    return Response(status=204)
+                if hex_clean:
+                    try:
+                        from io import BytesIO
+                        from PIL import Image, ImageChops
+
+                        base = Image.open(BytesIO(raw_bytes)).convert("RGBA")
+                        cr, cg, cb, ca = base.split()
+                        thr = 255 - tol
+
+                        def _mask_band(band):
+                            return band.point(
+                                lambda v: 255 if v >= thr else 0, mode="L"
                             )
-                            tgt = tuple(int(hex_clean[i : i + 2], 16) for i in (0, 2, 4))
-                            fill = Image.new("RGBA", base.size, (*tgt, 255))
-                            out_img = Image.composite(fill, base, mask)
-                            out_img.putalpha(ca)
-                            from io import BytesIO
-        
-                            buf = BytesIO()
-                            out_img.save(buf, format="PNG", optimize=True)
-                            out = buf.getvalue()
-                            _drive_thumb_cache_cleanup()  # Cleanup before adding
-                            _drive_thumb_cache[base_key] = {
-                                "bytes": raw_bytes,
-                                "ts": time.time(),
-                            }
-                            _drive_thumb_cache[tinted_key] = {
-                                "bytes": out,
-                                "ts": time.time(),
-                            }
-                            return Response(
-                                out,
-                                mimetype="image/png",
-                                headers={"Cache-Control": "public, max-age=86400"},
-                            )
-                        except Exception as e:
-                            app.logger.info("🎨 tint(raw) failed: %s", e)
-                            _drive_thumb_cache_cleanup()  # Cleanup before adding
-                            _drive_thumb_cache[base_key] = {
-                                "bytes": raw_bytes,
-                                "ts": time.time(),
-                            }
-                            return Response(
-                                raw_bytes,
-                                mimetype=mime,
-                                headers={"Cache-Control": "public, max-age=86400"},
-                            )
-                    else:
+
+                        mask = ImageChops.multiply(
+                            ImageChops.multiply(_mask_band(cr), _mask_band(cg)),
+                            _mask_band(cb),
+                        )
+                        tgt = tuple(int(hex_clean[i : i + 2], 16) for i in (0, 2, 4))
+                        fill = Image.new("RGBA", base.size, (*tgt, 255))
+                        out_img = Image.composite(fill, base, mask)
+                        out_img.putalpha(ca)
+                        from io import BytesIO
+
+                        buf = BytesIO()
+                        out_img.save(buf, format="PNG", optimize=True)
+                        out = buf.getvalue()
+                        _drive_thumb_cache_cleanup()  # Cleanup before adding
+                        _drive_thumb_cache[base_key] = {
+                            "bytes": raw_bytes,
+                            "ts": time.time(),
+                        }
+                        _drive_thumb_cache[tinted_key] = {
+                            "bytes": out,
+                            "ts": time.time(),
+                        }
+                        return Response(
+                            out,
+                            mimetype="image/png",
+                            headers={"Cache-Control": "public, max-age=86400"},
+                        )
+                    except Exception as e:
+                        app.logger.info("🎨 tint(raw) failed: %s", e)
                         _drive_thumb_cache_cleanup()  # Cleanup before adding
                         _drive_thumb_cache[base_key] = {
                             "bytes": raw_bytes,
@@ -4635,6 +4780,16 @@ def drive_thumbnail():
                             mimetype=mime,
                             headers={"Cache-Control": "public, max-age=86400"},
                         )
+                _drive_thumb_cache_cleanup()  # Cleanup before adding
+                _drive_thumb_cache[base_key] = {
+                    "bytes": raw_bytes,
+                    "ts": time.time(),
+                }
+                return Response(
+                    raw_bytes,
+                    mimetype=mime,
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
             except requests.RequestException as e:
                 app.logger.warning("📸 raw media error %s: %s", file_id, e)
         
@@ -5228,32 +5383,27 @@ def _magnet_rows_to_dicts(values):
 
 
 def _magnet_load_source_rows():
-    ranges = [
-        OVERVIEW_PRODUCTION_ORDERS_RANGE,
-        FUR_RANGE,
-        f"{KANBAN_SHEET_TAB}!A1:ZZ",
-    ]
+    """Reuse the shared Production Orders and Kanban snapshots; fetch Fur only."""
+    production_values = get_overview_production_orders_values() or []
+    kanban_values = _kanban_read_all()
     with acquire_sheet_lock(timeout=45):
-        response = (
+        fur_resp = (
             get_sheets_service()
             .spreadsheets()
             .values()
-            .batchGet(
+            .get(
                 spreadsheetId=SPREADSHEET_ID,
-                ranges=ranges,
+                range=FUR_RANGE,
                 valueRenderOption="UNFORMATTED_VALUE",
             )
             .execute()
         )
-    value_ranges = response.get("valueRanges", [])
-    while len(value_ranges) < 3:
-        value_ranges.append({})
-    values = [entry.get("values", []) or [] for entry in value_ranges[:3]]
+    fur_values = fur_resp.get("values") or []
     return (
-        _magnet_rows_to_dicts(values[0]),
-        _magnet_rows_to_dicts(values[1]),
-        _magnet_rows_to_dicts(values[2]),
-        values[2],
+        _magnet_rows_to_dicts(production_values),
+        _magnet_rows_to_dicts(fur_values),
+        _magnet_rows_to_dicts(kanban_values),
+        kanban_values,
     )
 
 
@@ -5536,11 +5686,12 @@ def magnet_kanban_record_count():
 
 
 def _material_load_source_rows():
+    """Reuse Production Orders and Kanban; batch the smaller material ranges."""
+    production_values = get_overview_production_orders_values() or []
+    kanban_values = _kanban_read_all()
     ranges = [
-        OVERVIEW_PRODUCTION_ORDERS_RANGE,
         CUT_RANGE,
         TABLE_RANGE,
-        f"{KANBAN_SHEET_TAB}!A1:ZZ",
         MATERIAL_LOG_RANGE,
         MATERIAL_INVENTORY_RANGE,
     ]
@@ -5557,17 +5708,17 @@ def _material_load_source_rows():
             .execute()
         )
     value_ranges = response.get("valueRanges", [])
-    while len(value_ranges) < 6:
+    while len(value_ranges) < 4:
         value_ranges.append({})
-    values = [entry.get("values", []) or [] for entry in value_ranges[:6]]
+    values = [entry.get("values", []) or [] for entry in value_ranges[:4]]
     return (
+        _magnet_rows_to_dicts(production_values),
         _magnet_rows_to_dicts(values[0]),
-        _magnet_rows_to_dicts(values[1]),
+        values[1],
+        _magnet_rows_to_dicts(kanban_values),
+        kanban_values,
         values[2],
-        _magnet_rows_to_dicts(values[3]),
         values[3],
-        values[4],
-        values[5],
     )
 
 
@@ -6216,8 +6367,13 @@ def drive_proxy(file_id):
     try:
         r = requests.get(g_url, timeout=5)  # no stream=True
         r.raise_for_status()
-        data = r.content
-        ct = r.headers.get("Content-Type", "image/jpeg")
+        size_match = re.search(r"(\d+)", sz or "")
+        data = _cap_thumb_bytes(
+            r.content, max_edge=int(size_match.group(1)) if size_match else 160
+        )
+        if not data:
+            return Response(status=204)
+        ct = "image/jpeg"
         etag = '"' + hashlib.sha1(data).hexdigest() + '"'  # weak-ish ETag
 
         # Save to cache
@@ -13996,10 +14152,11 @@ def build_overview_payload():
     orders_full_for_pairing = []
     try:
         svc = get_sheets_service().spreadsheets().values()
+        orders_rows = get_overview_production_orders_values() or []
         with acquire_sheet_lock(timeout=45):
             resp = svc.batchGet(
                 spreadsheetId=SPREADSHEET_ID,
-                ranges=[OVERVIEW_PRODUCTION_ORDERS_RANGE, FUR_RANGE, CUT_RANGE],
+                ranges=[FUR_RANGE, CUT_RANGE],
                 valueRenderOption="UNFORMATTED_VALUE",
             ).execute()
 
@@ -14017,10 +14174,8 @@ def build_overview_payload():
                 sewing_by_order = {}
 
         vrs = resp.get("valueRanges", [])
-        orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
-        remember_overview_production_orders_values(orders_rows)
-        fur_rows = (vrs[1].get("values") if len(vrs) > 1 else []) or []
-        cut_rows = (vrs[2].get("values") if len(vrs) > 2 else []) or []
+        fur_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
+        cut_rows = (vrs[1].get("values") if len(vrs) > 1 else []) or []
 
         def _rows_to_dicts_local(rws):
             if not rws:
@@ -14028,7 +14183,7 @@ def build_overview_payload():
             headers = _normalize_order_number_headers(rws[0])
             out = []
             for r in rws[1:]:
-                r = r or []
+                r = list(r or [])
                 if len(r) < len(headers):
                     r += [""] * (len(headers) - len(r))
                 out.append(dict(zip(headers, r)))
@@ -16641,6 +16796,7 @@ def _drive_thumbnail_url(image_link: str) -> str:
 def _fetch_drive_image_bytes(file_id: str):
     if not file_id:
         return None
+    limit = _THUMB_HARD_BYTES
     try:
         import urllib.request
 
@@ -16652,9 +16808,12 @@ def _fetch_drive_image_bytes(file_id: str):
             },
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read()
-            if data and len(data) >= 100:
+            data = resp.read(limit + 1)
+            if data and limit >= len(data) >= 100:
                 return data
+            if data and len(data) > limit:
+                logger.info("_fetch_drive_image_bytes skipped %s (over %s bytes)", file_id, limit)
+                return None
     except Exception as e:
         logger.warning("_fetch_drive_image_bytes urlopen failed for %s: %s", file_id, e)
     try:
@@ -16669,6 +16828,9 @@ def _fetch_drive_image_bytes(file_id: str):
         done = False
         while not done:
             _, done = downloader.next_chunk()
+            if buf.tell() > limit:
+                logger.info("_fetch_drive_image_bytes skipped %s (over %s bytes)", file_id, limit)
+                return None
         data = buf.getvalue()
         return data if data and len(data) >= 100 else None
     except Exception as e:
@@ -16692,7 +16854,9 @@ def _fetch_drive_thumbnail_bytes(file_id: str, sz: str = "w400"):
             },
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read()
+            data = resp.read(_THUMB_HARD_BYTES + 1)
+            if data and len(data) > _THUMB_HARD_BYTES:
+                return None
             if data and len(data) >= 100:
                 return data
     except Exception as e:
@@ -16703,8 +16867,7 @@ def _fetch_drive_thumbnail_bytes(file_id: str, sz: str = "w400"):
 def _prepare_pdf_preview_image(img_bytes: bytes, max_px: int = 400):
     """
     Downsample image bytes for reportlab PDF embedding.
-    Temporarily disables Pillow's decompression-bomb limit so huge Drive originals
-    can be opened, then immediately shrunk for the PDF thumbnail slot.
+    Skips files whose pixel count would expand into a multi-hundred-megabyte bitmap.
     Returns (BytesIO jpeg, width_px, height_px) or None.
     """
     if not img_bytes:
@@ -16712,13 +16875,15 @@ def _prepare_pdf_preview_image(img_bytes: bytes, max_px: int = 400):
     try:
         from PIL import Image as PILImage
 
-        prev_limit = PILImage.MAX_IMAGE_PIXELS
-        PILImage.MAX_IMAGE_PIXELS = None
-        try:
-            img = PILImage.open(io.BytesIO(img_bytes))
-            img.load()
-        finally:
-            PILImage.MAX_IMAGE_PIXELS = prev_limit
+        img = PILImage.open(io.BytesIO(img_bytes))
+        width, height = img.size
+        if width * height > 8_000_000:
+            logger.warning(
+                "preview image too large (%sx%s); skipping", width, height
+            )
+            return None
+        img.draft("RGB", (max_px, max_px))
+        img.load()
 
         if img.mode in ("RGBA", "LA"):
             background = PILImage.new("RGB", img.size, (255, 255, 255))
@@ -19897,6 +20062,7 @@ def submit_order():
                     notes=data.get("notes") or "",
                     preview_file_id=primary_file_id or "",
                 )
+                _invalidate_needlepoint_pending_cache()
             except Exception as e:
                 logger.error(
                     "[Needlepoint] Failed to save size chart for order %s: %s",
@@ -19943,20 +20109,49 @@ def add_submit_cors_headers(resp):
     return _attach_cors_headers(resp)
 
 
+_needlepoint_pending_cache = {"ts": 0.0, "body": None}
+_needlepoint_pending_lock = Semaphore(1)
+_NEEDLEPOINT_PENDING_TTL = 45
+
+
+def _invalidate_needlepoint_pending_cache():
+    _needlepoint_pending_cache["ts"] = 0.0
+    _needlepoint_pending_cache["body"] = None
+
+
 @app.route("/needlepoint/pending", methods=["GET"], endpoint="needlepoint_pending_plain")
 @app.route("/api/needlepoint/pending", methods=["GET"], endpoint="needlepoint_pending_api")
 @login_required_session
 def needlepoint_pending():
     try:
-        rows = list_pending_needlepoint_orders(get_sheets_service(), SPREADSHEET_ID)
-        return jsonify(
-            {
+        now = time.time()
+        cached = _needlepoint_pending_cache.get("body")
+        if (
+            cached is not None
+            and now - float(_needlepoint_pending_cache.get("ts") or 0)
+            < _NEEDLEPOINT_PENDING_TTL
+        ):
+            return jsonify(cached)
+        with _needlepoint_pending_lock:
+            now = time.time()
+            cached = _needlepoint_pending_cache.get("body")
+            if (
+                cached is not None
+                and now - float(_needlepoint_pending_cache.get("ts") or 0)
+                < _NEEDLEPOINT_PENDING_TTL
+            ):
+                return jsonify(cached)
+            rows = list_pending_needlepoint_orders(get_sheets_service(), SPREADSHEET_ID)
+            body = {
                 "ok": True,
                 "orders": rows,
                 "sizes": list(NEEDLEPOINT_BELT_SIZES),
                 "supplierEmail": needlepoint_supplier_email(),
             }
-        )
+            if needlepoint_sheet_is_ready():
+                _needlepoint_pending_cache["body"] = body
+                _needlepoint_pending_cache["ts"] = time.time()
+            return jsonify(body)
     except Exception as exc:
         logger.exception("[Needlepoint] pending list failed")
         return jsonify({"ok": False, "error": str(exc), "orders": []}), 500
@@ -20108,6 +20303,7 @@ def needlepoint_order_belts():
     if delivered.get("ok") and delivered.get("method") in ("gmail_draft", "imap_draft", "smtp"):
         try:
             mark_needlepoint_orders_ordered(get_sheets_service(), SPREADSHEET_ID, normalized)
+            _invalidate_needlepoint_pending_cache()
         except Exception:
             logger.exception("[Needlepoint] mark ordered failed")
     return jsonify({**delivered, "subject": subject, "body": body, "to": to_email})

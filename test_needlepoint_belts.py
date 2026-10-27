@@ -79,6 +79,34 @@ class NeedlepointHelpersTests(unittest.TestCase):
         self.assertEqual(npb.attachment_filename(4401, "a.jpg", 1, 2), "4401-1.jpg")
         self.assertEqual(npb.attachment_filename(4401, "b.jpg", 2, 2), "4401-2.jpg")
 
+    def test_ensure_sheet_reuses_a_successful_check(self):
+        npb._sheet_ready_until = 0
+        npb._sheet_backoff_until = 0
+        sheets = MagicMock()
+        meta = sheets.spreadsheets.return_value
+        meta.get.return_value.execute.return_value = {
+            "sheets": [{"properties": {"title": npb.SHEET_TAB}}]
+        }
+        meta.values.return_value.get.return_value.execute.return_value = {
+            "values": [list(npb.SHEET_HEADERS)]
+        }
+        self.assertTrue(npb.ensure_sheet(sheets, "sheet-id"))
+        self.assertTrue(npb.ensure_sheet(sheets, "sheet-id"))
+        self.assertEqual(meta.get.call_count, 1)
+        npb._sheet_ready_until = 0
+
+    def test_ensure_sheet_backs_off_after_read_quota(self):
+        npb._sheet_ready_until = 0
+        npb._sheet_backoff_until = 0
+        sheets = MagicMock()
+        err = Exception("quota")
+        err.resp = MagicMock(status=429)
+        sheets.spreadsheets.return_value.get.return_value.execute.side_effect = err
+        self.assertFalse(npb.ensure_sheet(sheets, "sheet-id"))
+        self.assertFalse(npb.ensure_sheet(sheets, "sheet-id"))
+        self.assertEqual(sheets.spreadsheets.return_value.get.call_count, 1)
+        npb._sheet_backoff_until = 0
+
     def test_list_pending_skips_ordered_rows(self):
         values_svc = MagicMock()
         values_svc.get.return_value.execute.return_value = {

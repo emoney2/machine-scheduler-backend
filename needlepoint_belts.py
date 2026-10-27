@@ -9,6 +9,7 @@ import mimetypes
 import os
 import re
 import smtplib
+import time
 from datetime import datetime
 from email import encoders
 from email.mime.base import MIMEBase
@@ -162,10 +163,26 @@ def _header_index(headers: list[str]) -> dict[str, int]:
     return {str(h).strip(): i for i, h in enumerate(headers or [])}
 
 
+_sheet_ready_until = 0.0
+_sheet_backoff_until = 0.0
+_SHEET_READY_TTL = 600
+_SHEET_BACKOFF_SEC = 60
+
+
+def sheet_is_ready() -> bool:
+    return time.time() < _sheet_ready_until
+
+
 def ensure_sheet(sheets_service, spreadsheet_id: str) -> bool:
     """Create the Needlepoint Belts tab with headers if missing."""
+    global _sheet_ready_until, _sheet_backoff_until
     if not sheets_service or not spreadsheet_id:
         return False
+    now = time.time()
+    if now < _sheet_backoff_until:
+        return False
+    if now < _sheet_ready_until:
+        return True
     try:
         meta = (
             sheets_service.spreadsheets()
@@ -187,6 +204,7 @@ def ensure_sheet(sheets_service, spreadsheet_id: str) -> bool:
                 body={"values": [list(SHEET_HEADERS)]},
             ).execute()
             logger.info("Created Google Sheet tab %r", SHEET_TAB)
+            _sheet_ready_until = time.time() + _SHEET_READY_TTL
             return True
         existing = (
             sheets_service.spreadsheets()
@@ -206,9 +224,18 @@ def ensure_sheet(sheets_service, spreadsheet_id: str) -> bool:
             ).execute()
         elif old_headers != list(SHEET_HEADERS):
             _rewrite_headers_preserving_rows(sheets_service, spreadsheet_id, old_headers)
+        _sheet_ready_until = time.time() + _SHEET_READY_TTL
         return True
-    except Exception:
-        logger.exception("ensure_sheet(%s) failed", SHEET_TAB)
+    except Exception as exc:
+        _sheet_ready_until = 0.0
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status == 429:
+            _sheet_backoff_until = time.time() + _SHEET_BACKOFF_SEC
+            logger.warning(
+                "ensure_sheet(%s) skipped: Sheets read quota exceeded", SHEET_TAB
+            )
+        else:
+            logger.exception("ensure_sheet(%s) failed", SHEET_TAB)
         return False
 
 
