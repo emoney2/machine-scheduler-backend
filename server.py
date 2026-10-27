@@ -12360,6 +12360,13 @@ _materials_needed_ts = 0.0
 # overview metrics (sales + embroidery): in-memory cache
 _OVERVIEW_METRICS_CACHE = {"data": None, "ts": 0}
 OVERVIEW_METRICS_TTL = int(os.environ.get("OVERVIEW_METRICS_TTL", "60"))  # seconds
+_OVERVIEW_METRICS_COMPUTE_LOCK = Semaphore(1)
+_OVERVIEW_METRICS_REFRESH_LOCK = Semaphore(1)
+
+# One Production Orders download shared by Sold This Week, YTD, and the rep breakdown.
+_PO_VALUES_CACHE = {"values": None, "ts": 0.0}
+_PO_VALUES_LOCK = Semaphore(1)
+_PO_VALUES_TTL = int(os.environ.get("PO_VALUES_TTL", "90"))
 
 # Rep-level sales breakdown for the overview popup. Sheet read is heavy, so cache briefly.
 _SALES_BREAKDOWN_CACHE = {"data": None, "ts": 0.0}
@@ -12545,6 +12552,44 @@ def _overview_sql_coalesce_total_qty(rows):
         return None
 
 
+def remember_overview_production_orders_values(values):
+    """Keep a sheet snapshot so the next metrics pass does not download it again."""
+    if not values:
+        return
+    _PO_VALUES_CACHE["values"] = values
+    _PO_VALUES_CACHE["ts"] = time.time()
+
+
+def get_overview_production_orders_values(log=None):
+    """Production Orders rows, reused for about 90s across overview metrics."""
+    logger = log or app.logger
+    now = time.time()
+    cached = _PO_VALUES_CACHE
+    if cached["values"] is not None and now - cached["ts"] < _PO_VALUES_TTL:
+        return cached["values"]
+    try:
+        with _PO_VALUES_LOCK:
+            now = time.time()
+            if cached["values"] is not None and now - cached["ts"] < _PO_VALUES_TTL:
+                return cached["values"]
+            with acquire_sheet_lock():
+                svc = get_sheets_service().spreadsheets().values()
+                resp = svc.get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=OVERVIEW_PRODUCTION_ORDERS_RANGE,
+                    valueRenderOption="UNFORMATTED_VALUE",
+                ).execute()
+            values = resp.get("values") or []
+            cached["values"] = values
+            cached["ts"] = time.time()
+            return values
+    except Exception as e:
+        logger.warning("production orders values read failed: %s", e)
+        if cached["values"] is not None:
+            return cached["values"]
+        return None
+
+
 def compute_products_sold_ytd_qty_from_sheets(sales_year=None, log=None):
     """
     Sum Quantity on Production Orders (Google Sheet) for rows dated in sales_year.
@@ -12554,14 +12599,9 @@ def compute_products_sold_ytd_qty_from_sheets(sales_year=None, log=None):
     if sales_year is None:
         sales_year = datetime.now(ZoneInfo("America/New_York")).year
     try:
-        with acquire_sheet_lock():
-            svc = get_sheets_service().spreadsheets().values()
-            resp = svc.get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=OVERVIEW_PRODUCTION_ORDERS_RANGE,
-                valueRenderOption="UNFORMATTED_VALUE",
-            ).execute()
-        values = resp.get("values") or []
+        values = get_overview_production_orders_values(log=logger)
+        if values is None:
+            return None
         if len(values) < 2:
             return 0.0
 
@@ -12797,14 +12837,9 @@ def compute_headcovers_sold_this_week_from_sheets(log=None):
         week_sunday = week_monday + timedelta(days=6)
         range_end = min(today, week_sunday)
 
-        with acquire_sheet_lock():
-            svc = get_sheets_service().spreadsheets().values()
-            resp = svc.get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=OVERVIEW_PRODUCTION_ORDERS_RANGE,
-                valueRenderOption="UNFORMATTED_VALUE",
-            ).execute()
-        values = resp.get("values") or []
+        values = get_overview_production_orders_values(log=logger)
+        if values is None:
+            return None
         if len(values) < 2:
             return 0.0
 
@@ -12877,14 +12912,9 @@ def compute_products_sold_qty_last_n_weeks_from_sheets(weeks=6, log=None):
         today = datetime.now(tz).date()
         range_start = today - timedelta(days=weeks * 7 - 1)
 
-        with acquire_sheet_lock():
-            svc = get_sheets_service().spreadsheets().values()
-            resp = svc.get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=OVERVIEW_PRODUCTION_ORDERS_RANGE,
-                valueRenderOption="UNFORMATTED_VALUE",
-            ).execute()
-        values = resp.get("values") or []
+        values = get_overview_production_orders_values(log=logger)
+        if values is None:
+            return None
         if len(values) < 2:
             return 0.0
 
@@ -13988,6 +14018,7 @@ def build_overview_payload():
 
         vrs = resp.get("valueRanges", [])
         orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
+        remember_overview_production_orders_values(orders_rows)
         fur_rows = (vrs[1].get("values") if len(vrs) > 1 else []) or []
         cut_rows = (vrs[2].get("values") if len(vrs) > 2 else []) or []
 
@@ -14878,26 +14909,58 @@ def overview_materials_needed():
         return jsonify({"error": "materials-needed failed"}), 500
 
 
+def _schedule_overview_metrics_refresh():
+    """Rebuild metrics off the request so a stale number can return immediately."""
+    if not _OVERVIEW_METRICS_REFRESH_LOCK.acquire(blocking=False):
+        return
+
+    def _bg():
+        try:
+            with _OVERVIEW_METRICS_COMPUTE_LOCK:
+                now = time.time()
+                cached = _OVERVIEW_METRICS_CACHE["data"]
+                if cached and now - _OVERVIEW_METRICS_CACHE["ts"] < OVERVIEW_METRICS_TTL:
+                    return
+                _overview_metrics_uncached()
+        except Exception:
+            app.logger.exception("overview metrics background refresh failed")
+        finally:
+            _OVERVIEW_METRICS_REFRESH_LOCK.release()
+
+    eventlet.spawn_n(_bg)
+
+
 @app.route("/overview/metrics", methods=["GET"], endpoint="overview_metrics_plain")
 @app.route("/api/overview/metrics", methods=["GET"], endpoint="overview_metrics_api")
 @login_required_session
 def overview_metrics():
     """Fetch performance metrics: sales from Supabase, embroidery backlog from Overview sheet cells (or Supabase fallback)."""
     now = time.time()
+    cached = _OVERVIEW_METRICS_CACHE["data"]
+    if cached and now - _OVERVIEW_METRICS_CACHE["ts"] < OVERVIEW_METRICS_TTL:
+        return jsonify(cached)
+    # Same idea as the jobs payload: show the last good numbers, refresh behind them.
+    if cached:
+        _schedule_overview_metrics_refresh()
+        return jsonify(cached)
 
-    # ✅ Return cached copy if still fresh
-    if (
-        _OVERVIEW_METRICS_CACHE["data"]
-        and now - _OVERVIEW_METRICS_CACHE["ts"] < OVERVIEW_METRICS_TTL
-    ):
-        return jsonify(_OVERVIEW_METRICS_CACHE["data"])
+    with _OVERVIEW_METRICS_COMPUTE_LOCK:
+        now = time.time()
+        cached = _OVERVIEW_METRICS_CACHE["data"]
+        if cached and now - _OVERVIEW_METRICS_CACHE["ts"] < OVERVIEW_METRICS_TTL:
+            return jsonify(cached)
+        payload, status = _overview_metrics_uncached()
+        return jsonify(payload), status
 
+
+def _overview_metrics_uncached():
+    """Compute overview metrics. Caller holds the compute lock on a cold cache."""
     try:
         # ─── 1️⃣ SALES METRICS ─────────────────────────────
         metrics_resp = supabase.table("metrics").select("*").execute()
         metrics_data = metrics_resp.data or []
         if not metrics_data:
-            return jsonify({"error": "No metrics found"}), 404
+            return {"error": "No metrics found"}, 404
 
         metrics_row = metrics_data[0]
 
@@ -15006,13 +15069,13 @@ def overview_metrics():
 
         # ─── Cache ─────────────────────────────────────────
         _OVERVIEW_METRICS_CACHE["data"] = metrics
-        _OVERVIEW_METRICS_CACHE["ts"] = now
+        _OVERVIEW_METRICS_CACHE["ts"] = time.time()
 
-        return jsonify(metrics)
+        return metrics, 200
 
     except Exception as e:
         app.logger.exception("❌ Failed to fetch overview metrics")
-        return jsonify({"error": str(e)}), 500
+        return {"error": str(e)}, 500
 
 
 def compute_sales_rep_breakdown(log=None):
@@ -15030,19 +15093,10 @@ def compute_sales_rep_breakdown(log=None):
     now = datetime.now(tz)
     today = now.date()
 
-    try:
-        with acquire_sheet_lock():
-            svc = get_sheets_service().spreadsheets().values()
-            resp = svc.get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=OVERVIEW_PRODUCTION_ORDERS_RANGE,
-                valueRenderOption="UNFORMATTED_VALUE",
-            ).execute()
-    except Exception as e:
-        logger.warning("sales breakdown sheet read failed: %s", e)
+    values = get_overview_production_orders_values(log=logger)
+    if values is None:
+        logger.warning("sales breakdown sheet read failed")
         return None
-
-    values = resp.get("values") or []
     if len(values) < 2:
         payload = build_sales_breakdown([], today)
         payload["generatedAt"] = now.isoformat(timespec="seconds")
