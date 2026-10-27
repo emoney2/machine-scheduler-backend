@@ -12991,7 +12991,7 @@ def sales_summary_from_sheets(log=None):
     """
     global _sales_dirty
     cached = _PO_SALES_SUMMARY.get("data")
-    if cached is not None and _PO_SALES_SUMMARY.get("fresh") and _sales_summary_is_current():
+    if cached is not None and _PO_SALES_SUMMARY.get("fresh"):
         _PO_SALES_SUMMARY["fresh"] = False
         _sales_dirty = False
         return cached
