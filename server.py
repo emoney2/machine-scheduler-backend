@@ -4112,6 +4112,34 @@ def api_changes():
             "ts": time.time(),
             "embRev": int(_embroidery_scheduler_rev),
         }
+        global _sales_rows_fingerprint
+        sales_fp = hashlib.sha1()
+        date_i = col_index.get("Date")
+        if date_i is None:
+            date_i = col_index.get("Order Date")
+        prod_i = col_index.get("Product")
+        qty_i = col_index.get("Quantity")
+        if qty_i is None:
+            qty_i = col_index.get("Qty")
+
+        def _fp_cell(row, idx):
+            if idx is None or idx >= len(row) or row[idx] is None:
+                return ""
+            return str(row[idx])
+
+        for row in values[1:]:
+            if not row or order_i is None or order_i >= len(row):
+                continue
+            oid = str(row[order_i] or "").strip()
+            if not oid:
+                continue
+            sales_fp.update(
+                f"{oid}|{_fp_cell(row, date_i)}|{_fp_cell(row, prod_i)}|{_fp_cell(row, qty_i)}\n".encode()
+            )
+        digest = sales_fp.hexdigest()
+        if _sales_rows_fingerprint is not None and digest != _sales_rows_fingerprint:
+            _mark_sales_sheet_changed(values)
+        _sales_rows_fingerprint = digest
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         etag = _cache_set(key, data, ttl)
 
@@ -7726,16 +7754,16 @@ def _drive_folder_usable(drive, folder_id: str) -> bool:
         return False
 
 
-# Packing slips and Label Archive are folders owned by the scheduler OAuth
-# account (justin.eckard@…) and shared with info@jrco.us.
-# Label Printer is owned by info@jrco.us. The scheduler account needs Editor
-# access on that folder. Do not fall back to a same-named folder in Justin's
-# My Drive — the shop watcher syncs info@'s folder:
-#   https://drive.google.com/drive/folders/1nvSfxOKeBJSLuDddX0dkgHRIaTeMVRDf
+# Label Printer and PackingSlipPrinter are owned by info@jrco.us. The scheduler
+# account (justin.eckard@…) needs Editor access. Do not fall back to a
+# same-named folder in Justin's My Drive — the shop watcher syncs info@'s folders.
+#   Label Printer:       1nvSfxOKeBJSLuDddX0dkgHRIaTeMVRDf
+#   PackingSlipPrinter:  1J6QqPQ9XOdvoSzYWwaAb1TSTa223oBcG
 # Local sync (Drive Desktop on the info@ machine):
 #   G:\My Drive\Label Printer
-#   G:\.shortcut-targets-by-id\1nvSfxOKeBJSLuDddX0dkgHRIaTeMVRDf\Label Printer
-_DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID = "1XL3iG-Cq0zmlVFSNb9knmx4c_RZC_4hM"
+#   G:\My Drive\PackingSlipPrinter
+# Label Archive stays on the justin.eckard folder shared with info@.
+_DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID = "1J6QqPQ9XOdvoSzYWwaAb1TSTa223oBcG"
 _DEFAULT_LABEL_PRINT_FOLDER_ID = "1nvSfxOKeBJSLuDddX0dkgHRIaTeMVRDf"
 _DEFAULT_LABEL_ARCHIVE_FOLDER_ID = "18ROtltPSXZQSUvKox0eoTD2DbdRc1TDc"
 
@@ -7775,17 +7803,24 @@ def _get_pinned_or_named_drive_folder_id(
 
 def _get_packing_slip_print_drive_folder_id(drive):
     """
-    Drive folder where packing-slip PDFs / stamped Fur sheets are uploaded for a
-    local watcher + printer. With Google Drive for desktop, PackingSlipPrinter
-    under My Drive typically syncs to: G:\\My Drive\\PackingSlipPrinter
+    Drive folder where packing-slip PDFs / stamped Fur sheets are uploaded.
+
+    This is info@jrco.us My Drive / PackingSlipPrinter. PACKING_SLIP_PRINT_FOLDER_ID
+    overrides the pinned id. If that folder is not visible to the scheduler
+    Google account, keep the id anyway — do not create or reuse a different
+    PackingSlipPrinter folder.
     """
-    return _get_pinned_or_named_drive_folder_id(
-        drive,
-        default_id=_DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID,
-        folder_id_env="PACKING_SLIP_PRINT_FOLDER_ID",
-        folder_name_env="PACKING_SLIP_PRINT_FOLDER_NAME",
-        default_name="PackingSlipPrinter",
+    explicit = (os.environ.get("PACKING_SLIP_PRINT_FOLDER_ID") or "").strip()
+    folder_id = explicit or _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID
+    if folder_id and _drive_folder_usable(drive, folder_id):
+        return folder_id
+    logging.error(
+        "PackingSlipPrinter folder %s is not accessible to the scheduler Drive account. "
+        "Share info@jrco.us PackingSlipPrinter with that account as Editor. "
+        "Not using a different folder.",
+        folder_id or "(unset)",
     )
+    return folder_id
 
 
 def _get_named_drive_folder_id(
@@ -8116,12 +8151,14 @@ def _packing_slip_local_sync_dir() -> str:
     Local Google Drive Desktop path for packing-slip PDFs (Windows default).
     On Linux/cloud hosts this path is skipped; use Drive upload only.
 
-    Prefer the DriveFS shortcut-targets path for the live shared folder when the
-    My Drive name is a decoy / missing (info@ vs justin.eckard split).
+    The shop watcher reads info@jrco.us My Drive\\PackingSlipPrinter.
     """
     explicit = (os.getenv("PACKING_SLIP_LOCAL_SYNC_DIR") or "").strip()
     if explicit:
         return explicit
+    owned = r"G:\My Drive\PackingSlipPrinter"
+    if os.path.isdir(owned):
+        return owned
     shortcut = os.path.join(
         r"G:\.shortcut-targets-by-id",
         _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID,
@@ -8129,7 +8166,7 @@ def _packing_slip_local_sync_dir() -> str:
     )
     if os.path.isdir(shortcut):
         return shortcut
-    return r"G:\My Drive\PackingSlipPrinter"
+    return owned
 
 
 def _try_copy_packing_slip_to_local_sync_folder(tmp_path: str, pdf_filename: str) -> None:
@@ -12613,8 +12650,9 @@ _SALES_BREAKDOWN_CACHE = {"data": None, "ts": 0.0}
 SALES_BREAKDOWN_TTL = int(os.environ.get("SALES_BREAKDOWN_TTL", "300"))
 # Sold-this-week / YTD / 6-week rate. Kept apart from the jobs snapshot so a
 # metrics refresh does not re-download Production Orders every couple of minutes.
-_PO_SALES_SUMMARY = {"ts": 0.0, "data": None}
-_SALES_SUMMARY_TTL = int(os.environ.get("SALES_SUMMARY_TTL", "300"))
+_PO_SALES_SUMMARY = {"ts": 0.0, "data": None, "fresh": False}
+_sales_dirty = False
+_sales_rows_fingerprint = None
 
 
 def _safe_pb_orders_table_sql_ident(table_name: str) -> str:
@@ -12918,20 +12956,57 @@ def summarize_production_order_sales(values, today=None, log=None):
     return {"ytd": ytd, "week": week, "six_week": six_week}
 
 
-def sales_summary_from_sheets(log=None):
-    """Cached sales totals. Avoids a fresh Production Orders download on every metrics hit."""
-    now = time.time()
+def _mark_sales_sheet_changed(values=None):
+    """Remember that Production Orders changed. Does not download the sheet."""
+    global _sales_dirty
+    _sales_dirty = True
+    if values:
+        summary = summarize_production_order_sales(values)
+        if summary is not None:
+            _PO_SALES_SUMMARY["data"] = summary
+            _PO_SALES_SUMMARY["ts"] = time.time()
+            _PO_SALES_SUMMARY["fresh"] = True
+    try:
+        socketio.emit("salesUpdated", {"reason": "sheet"})
+    except Exception:
+        app.logger.warning("salesUpdated emit failed", exc_info=True)
+
+
+def _sales_summary_is_current():
+    if _sales_dirty:
+        return False
     cached = _PO_SALES_SUMMARY.get("data")
-    if cached is not None and now - float(_PO_SALES_SUMMARY.get("ts") or 0) < _SALES_SUMMARY_TTL:
+    ts = float(_PO_SALES_SUMMARY.get("ts") or 0)
+    if cached is None or not ts:
+        return False
+    cached_day = datetime.fromtimestamp(ts, ZoneInfo("America/New_York")).date()
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    return cached_day == today
+
+
+def sales_summary_from_sheets(log=None):
+    """
+    Last sales totals. Recomputed only after Production Orders actually changes,
+    or on the first request of a new day. Not on a timer.
+    """
+    global _sales_dirty
+    cached = _PO_SALES_SUMMARY.get("data")
+    if cached is not None and _PO_SALES_SUMMARY.get("fresh") and _sales_summary_is_current():
+        _PO_SALES_SUMMARY["fresh"] = False
+        _sales_dirty = False
+        return cached
+    if _sales_summary_is_current():
         return cached
     values = get_overview_production_orders_values(log=log)
     if values is None:
-        return None
+        return cached
     summary = summarize_production_order_sales(values, log=log)
     if summary is not None:
         _PO_SALES_SUMMARY["data"] = summary
         _PO_SALES_SUMMARY["ts"] = time.time()
-    return summary
+        _PO_SALES_SUMMARY["fresh"] = False
+        _sales_dirty = False
+    return summary if summary is not None else cached
 
 
 def compute_products_sold_ytd_qty_from_sheets(sales_year=None, log=None):
@@ -15123,22 +15198,26 @@ def _schedule_overview_metrics_refresh():
 @app.route("/overview/metrics", methods=["GET"], endpoint="overview_metrics_plain")
 @app.route("/api/overview/metrics", methods=["GET"], endpoint="overview_metrics_api")
 @login_required_session
+def _sales_metrics_are_current():
+    """True when the saved sales figures still match the sheet and the calendar day."""
+    if _sales_dirty or not _OVERVIEW_METRICS_CACHE.get("data"):
+        return False
+    ts = float(_OVERVIEW_METRICS_CACHE.get("ts") or 0)
+    if not ts:
+        return False
+    cached_day = datetime.fromtimestamp(ts, ZoneInfo("America/New_York")).date()
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    return cached_day == today
+
+
 def overview_metrics():
-    """Fetch performance metrics: sales from Supabase, embroidery backlog from Overview sheet cells (or Supabase fallback)."""
-    now = time.time()
-    cached = _OVERVIEW_METRICS_CACHE["data"]
-    if cached and now - _OVERVIEW_METRICS_CACHE["ts"] < OVERVIEW_METRICS_TTL:
-        return jsonify(cached)
-    # Same idea as the jobs payload: show the last good numbers, refresh behind them.
-    if cached:
-        _schedule_overview_metrics_refresh()
-        return jsonify(cached)
+    """Sales stay cached until Production Orders changes. No timed rescan."""
+    if _sales_metrics_are_current():
+        return jsonify(_OVERVIEW_METRICS_CACHE["data"])
 
     with _OVERVIEW_METRICS_COMPUTE_LOCK:
-        now = time.time()
-        cached = _OVERVIEW_METRICS_CACHE["data"]
-        if cached and now - _OVERVIEW_METRICS_CACHE["ts"] < OVERVIEW_METRICS_TTL:
-            return jsonify(cached)
+        if _sales_metrics_are_current():
+            return jsonify(_OVERVIEW_METRICS_CACHE["data"])
         payload, status = _overview_metrics_uncached()
         return jsonify(payload), status
 
@@ -26752,8 +26831,9 @@ def process_shipment():
                         job["tmp_path"], job["print_name"]
                     )
                 logging.info(
-                    "%s packing slip(s) uploaded to watcher folder",
+                    "%s packing slip(s) uploaded to PackingSlipPrinter %s",
                     len(slip_jobs),
+                    packing_slip_parent_id,
                 )
                 _archive_shipment_files_to_order_folders(archive_drive)
             except Exception:
@@ -29575,41 +29655,21 @@ def _download_drive_pdf_to_temp(drive, file_id, filename):
 
 def _copy_stamped_pdf_to_packing_slip_printer(drive, stamped_file):
     """
-    Copy newest {order}_Stamped*.pdf into PackingSlipPrinter (Drive + local G:\\My Drive sync).
-    Retries once if the destination folder id is stale (404).
+    Copy newest {order}_Stamped*.pdf into info@jrco.us PackingSlipPrinter.
     """
     pdf_name = stamped_file["name"]
-    last_err = None
-    for attempt in range(2):
-        packing_folder_id = _get_packing_slip_print_drive_folder_id(drive)
-        try:
-            drive.files().copy(
-                fileId=stamped_file["id"],
-                body={"name": pdf_name, "parents": [packing_folder_id]},
-                fields="id, name",
-                supportsAllDrives=True,
-            ).execute()
-            last_err = None
-            break
-        except HttpError as e:
-            last_err = e
-            status = getattr(getattr(e, "resp", None), "status", None)
-            # Parent folder gone/inaccessible — clear env override for this process
-            # and resolve/create PackingSlipPrinter again on the next attempt.
-            if status == 404 and attempt == 0:
-                logging.warning(
-                    "PackingSlipPrinter folder %s not usable (%s); recreating and retrying",
-                    packing_folder_id,
-                    e,
-                )
-                if (os.environ.get("PACKING_SLIP_PRINT_FOLDER_ID") or "").strip() == (
-                    packing_folder_id or ""
-                ):
-                    os.environ.pop("PACKING_SLIP_PRINT_FOLDER_ID", None)
-                continue
-            raise
-    if last_err is not None:
-        raise last_err
+    packing_folder_id = _get_packing_slip_print_drive_folder_id(drive)
+    drive.files().copy(
+        fileId=stamped_file["id"],
+        body={"name": pdf_name, "parents": [packing_folder_id]},
+        fields="id, name",
+        supportsAllDrives=True,
+    ).execute()
+    logging.info(
+        "Stamped PDF copied to PackingSlipPrinter %s: %s",
+        packing_folder_id,
+        pdf_name,
+    )
     tmp_path = _download_drive_pdf_to_temp(drive, stamped_file["id"], pdf_name)
     if tmp_path:
         _try_copy_packing_slip_to_local_sync_folder(tmp_path, pdf_name)
