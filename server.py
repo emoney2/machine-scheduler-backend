@@ -7726,17 +7726,17 @@ def _drive_folder_usable(drive, folder_id: str) -> bool:
         return False
 
 
-# Live print folders owned by the scheduler OAuth account (justin.eckard@…).
-# Shop Google Drive Desktop syncs as info@jrco.us — those folders must be shared
-# with info@ (writer) and pinned by id so uploads never land in a private
-# justin-only folder that the shop watcher cannot see.
-# Local sync paths (after "Add shortcut to Drive"):
-#   G:\My Drive\PackingSlipPrinter
+# Packing slips and Label Archive are folders owned by the scheduler OAuth
+# account (justin.eckard@…) and shared with info@jrco.us.
+# Label Printer is owned by info@jrco.us. The scheduler account needs Editor
+# access on that folder. Do not fall back to a same-named folder in Justin's
+# My Drive — the shop watcher syncs info@'s folder:
+#   https://drive.google.com/drive/folders/1nvSfxOKeBJSLuDddX0dkgHRIaTeMVRDf
+# Local sync (Drive Desktop on the info@ machine):
 #   G:\My Drive\Label Printer
-#   G:\My Drive\Label Archive
-# or DriveFS shortcut-targets-by-id\<id>\...
+#   G:\.shortcut-targets-by-id\1nvSfxOKeBJSLuDddX0dkgHRIaTeMVRDf\Label Printer
 _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID = "1XL3iG-Cq0zmlVFSNb9knmx4c_RZC_4hM"
-_DEFAULT_LABEL_PRINT_FOLDER_ID = "1LXx8IOFiAsYb-zchGbZba515d5bip8OK"
+_DEFAULT_LABEL_PRINT_FOLDER_ID = "1nvSfxOKeBJSLuDddX0dkgHRIaTeMVRDf"
 _DEFAULT_LABEL_ARCHIVE_FOLDER_ID = "18ROtltPSXZQSUvKox0eoTD2DbdRc1TDc"
 
 
@@ -7868,16 +7868,22 @@ def _get_label_print_drive_folder_id(drive):
     """
     Drive folder where UPS label files are uploaded for the shop printer.
 
-    Pinned to the justin.eckard Label Printer that is shared with info@jrco.us
-    (shop Drive Desktop / watcher). Do not invent a second private Label Printer.
+    This is info@jrco.us My Drive / Label Printer. UPS_LABEL_PRINT_FOLDER_ID
+    overrides the pinned id. If that folder is not visible to the scheduler
+    Google account, keep the id anyway — do not create or reuse a different
+    Label Printer folder.
     """
-    return _get_pinned_or_named_drive_folder_id(
-        drive,
-        default_id=_DEFAULT_LABEL_PRINT_FOLDER_ID,
-        folder_id_env="UPS_LABEL_PRINT_FOLDER_ID",
-        folder_name_env="UPS_LABEL_PRINT_FOLDER_NAME",
-        default_name="Label Printer",
+    explicit = (os.environ.get("UPS_LABEL_PRINT_FOLDER_ID") or "").strip()
+    folder_id = explicit or _DEFAULT_LABEL_PRINT_FOLDER_ID
+    if folder_id and _drive_folder_usable(drive, folder_id):
+        return folder_id
+    logging.error(
+        "UPS label folder %s is not accessible to the scheduler Drive account. "
+        "Share info@jrco.us Label Printer with that account as Editor. "
+        "Not using a different folder.",
+        folder_id or "(unset)",
     )
+    return folder_id
 
 
 def _get_label_archive_drive_folder_id(drive):
@@ -8053,7 +8059,9 @@ def _upload_ups_labels_to_drive_folder(label_relative_urls) -> bool:
             with open(fpath, "rb") as f:
                 body = f.read()
             _upsert_drive_file_bytes(drive, parent_id, fname, body, mime)
-            logging.info("UPS label uploaded to Drive print folder: %s", fname)
+            logging.info(
+                "UPS label uploaded to Drive print folder %s: %s", parent_id, fname
+            )
         except Exception as e:
             logging.warning("UPS label Drive upload failed for %s: %s", fname, e)
             all_ok = False
