@@ -2267,7 +2267,11 @@ def _order_hash(obj: dict, embroidery_completed=None) -> str:
 
 
 def _cell_hash(row, col_index, embroidery_completed=None) -> str:
-    """Hash a raw sheet row without building a dict for every order."""
+    """Hash a raw sheet row without building a dict for every order.
+
+    Piece counts are reported separately as ``progress`` so a +1 does not
+    look like a full sheet change.
+    """
     payload = {}
     for key in _HASH_FIELDS:
         if key == "Embroidery Completed Qty":
@@ -2277,7 +2281,6 @@ def _cell_hash(row, col_index, embroidery_completed=None) -> str:
         if idx is not None and idx < len(row or []):
             val = row[idx]
         payload[key] = "" if val is None else str(val)
-    payload["Embroidery Completed Qty"] = str(int(embroidery_completed or 0))
     s = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
@@ -2308,6 +2311,8 @@ _orders_rows_inflight_lock = threading.Lock()
 # When Sheets is slow, return this from /api/changes so Render does not 502 (browser shows fake CORS).
 _changes_last_ok = {"data": None, "etag": "", "ts": 0.0}
 _embroidery_scheduler_rev = 0
+# Short memo so scheduler and full /combined views share one Sheets read.
+_combined_full_memo = {"ts": 0.0, "obj": None}
 
 
 def _bump_embroidery_scheduler_signal():
@@ -2316,6 +2321,8 @@ def _bump_embroidery_scheduler_signal():
     _embroidery_scheduler_rev += 1
     try:
         _json_cache.pop("changes-v1", None)
+        _json_cache.pop("changes-v2", None)
+        _json_cache.pop("combined-scheduler-v1", None)
         _json_cache.pop("combined-v7", None)
         _json_cache.pop("combined-v6", None)
         _json_cache.pop("combined-v5", None)
@@ -4040,7 +4047,7 @@ def api_changes():
     from eventlet import Timeout
 
     now = time.time()
-    key = "changes-v1"
+    key = "changes-v2"
     ttl = int(os.environ.get("CHANGES_CACHE_TTL", "90"))
     wait_sec = int(os.environ.get("CHANGES_SHEET_WAIT_SEC", "22"))
 
@@ -4086,6 +4093,7 @@ def api_changes():
 
     try:
         mapping = {}
+        progress = {}
         prog = {}
         try:
             prog = emb_progress.load_all(None, None) or {}
@@ -4105,10 +4113,17 @@ def api_changes():
                 continue
             nk = _overview_normalize_order_key(oid)
             prow = prog.get(nk) or prog.get(oid) or {}
-            mapping[oid] = _cell_hash(row, col_index, prow.get("completedQty") or 0)
+            mapping[oid] = _cell_hash(row, col_index)
+            try:
+                done_n = int(prow.get("completedQty") or 0)
+            except (TypeError, ValueError):
+                done_n = 0
+            if done_n > 0:
+                progress[oid] = done_n
 
         payload = {
             "hashes": mapping,
+            "progress": progress,
             "ts": time.time(),
             "embRev": int(_embroidery_scheduler_rev),
         }
@@ -13418,8 +13433,22 @@ def invalidate_material_inventory_status_cache():
 def _invalidate_combined_orders_cache():
     """Clear `/api/combined` caches so Fur List sees sheet updates on all clients."""
     global _json_cache
-    for key in ("combined-v7", "combined-v6", "combined-v5", "combined-v4", "combined-v3", "combined-v2", "combined"):
+    for key in (
+        "combined-scheduler-v1",
+        "combined-v7",
+        "combined-v6",
+        "combined-v5",
+        "combined-v4",
+        "combined-v3",
+        "combined-v2",
+        "combined",
+    ):
         _json_cache.pop(key, None)
+    try:
+        _combined_full_memo["obj"] = None
+        _combined_full_memo["ts"] = 0.0
+    except Exception:
+        pass
 
 
 def _material_on_order_qty_from_log(log_rows):
@@ -18031,9 +18060,13 @@ def _emb_floor_write_list_progress(order_id: str, completed_qty: int, mark_compl
     )
     _emb_cache = None
     _emb_ts = 0
-    _invalidate_combined_orders_cache()
-    invalidate_overview_combined_cache()
-    _bump_embroidery_scheduler_signal()
+    # A piece count is already broadcast on the socket. Reloading /combined
+    # and Overview on every +1 stalls the board. Do that only when the job
+    # actually finishes and leaves the scheduler.
+    if mark_complete:
+        _invalidate_combined_orders_cache()
+        invalidate_overview_combined_cache()
+        _bump_embroidery_scheduler_signal()
     return True
 
 
@@ -18307,13 +18340,16 @@ def embroidery_floor_progress():
             head_count=heads,
             hoop_ended_at=str(data.get("hoopEndedAt") or data.get("lastVibrationAt") or ""),
         )
-        _bump_embroidery_scheduler_signal()
         done = qty > 0 and completed >= qty
         marked = False
         try:
             marked = _emb_floor_write_list_progress(oid, completed, done)
         except Exception:
             logger.exception("embroidery progress: Embroidery List write failed")
+        if done:
+            _invalidate_combined_orders_cache()
+            invalidate_overview_combined_cache()
+            _bump_embroidery_scheduler_signal()
         updated = _emb_floor_job_payload(oid, sheets_svc, head_count=heads) or {}
         updated.update(result)
         updated["listMarked"] = marked
@@ -18582,6 +18618,57 @@ def save_links():
 
 
 # KEEP this handler
+_SCHEDULER_ORDER_KEYS = (
+    "Order #",
+    "Company Name",
+    "Product",
+    "Design",
+    "Quantity",
+    "Stitch Count",
+    "Due Date",
+    "Hard Date/Soft Date",
+    "Embroidery Start Time",
+    "Stage",
+    "Cut Status",
+    "Threads",
+    "Image",
+    "Material1",
+    "Material2",
+    "Material3",
+    "Material4",
+    "Material5",
+    "Back Material",
+    "Fur Color",
+    "Embroidery List Status",
+    "Embroidery Completed Qty",
+    "Embroidery Avg Cycle Ms",
+    "Embroidery Last Run At",
+    "Embroidery Recent Runs",
+    "Embroidery Expected Run Ms",
+    "Status",
+    "Fur Status",
+)
+
+
+def _scheduler_combined_view(full):
+    """Active scheduler rows only. Fur, Cut, and Queue keep the full payload."""
+    skip = {"sewing", "complete", "completed"}
+    orders = []
+    for o in (full or {}).get("orders") or []:
+        stage = str(o.get("Stage") or "").strip().lower()
+        if stage in skip:
+            continue
+        if str(o.get("Embroidery List Status") or "").strip().upper() == "COMPLETE":
+            continue
+        orders.append({k: o[k] for k in _SCHEDULER_ORDER_KEYS if k in o})
+    links = (full or {}).get("links")
+    return {
+        "orders": orders,
+        "links": links if isinstance(links, dict) else {},
+        "embRev": int((full or {}).get("embRev") or 0),
+    }
+
+
 @app.route("/api/combined", methods=["GET"], endpoint="api_combined")
 @login_required_session
 def get_combined():
@@ -18602,7 +18689,7 @@ def get_combined():
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
-    def build_payload():
+    def _build_combined_uncached():
         svc = get_sheets_service().spreadsheets().values()
         # Use acquire_sheet_lock (bounded wait) — raw sheet_lock can wait behind
         # slow batchGets and contribute to Gunicorn worker timeout + restarts.
@@ -18778,16 +18865,39 @@ def get_combined():
                 o["Embroidery Recent Runs"] = timing.get("recentRuns") or []
                 o["Embroidery Expected Run Ms"] = int(timing.get("expectedRunMs") or 0)
 
-        return {
+        full = {
             "orders": orders_full,
             "links": _links_store if isinstance(_links_store, dict) else {},
             "embRev": int(_embroidery_scheduler_rev),
         }
+        _combined_full_memo["obj"] = full
+        _combined_full_memo["ts"] = time.time()
+        if scheduler_view:
+            return _scheduler_combined_view(full)
+        return full
+
+    scheduler_view = (request.args.get("scope") or "").strip().lower() == "scheduler"
+
+    def _recent_full():
+        obj = _combined_full_memo.get("obj")
+        ts = float(_combined_full_memo.get("ts") or 0)
+        if obj is not None and (time.time() - ts) < 20:
+            return obj
+        if obj is not None:
+            _combined_full_memo["obj"] = None
+        return None
+
+    def build_payload():
+        recent = _recent_full()
+        if recent is not None:
+            return _scheduler_combined_view(recent) if scheduler_view else recent
+        return _build_combined_uncached()
 
     # Use caching to reduce Google Sheets API calls (stale-while-revalidate on expiry)
     TTL = int(os.environ.get("COMBINED_CACHE_TTL", "120"))
+    cache_key = "combined-scheduler-v1" if scheduler_view else "combined-v7"
     try:
-        result = send_cached_json("combined-v7", TTL, build_payload)
+        result = send_cached_json(cache_key, TTL, build_payload)
         if result is None:
             # If send_cached_json failed, fall through to exception handler
             raise Exception("send_cached_json returned None")
