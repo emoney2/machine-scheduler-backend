@@ -15175,9 +15175,6 @@ def _schedule_overview_metrics_refresh():
     eventlet.spawn_n(_bg)
 
 
-@app.route("/overview/metrics", methods=["GET"], endpoint="overview_metrics_plain")
-@app.route("/api/overview/metrics", methods=["GET"], endpoint="overview_metrics_api")
-@login_required_session
 def _sales_metrics_are_current():
     """True when the overview totals are still fresh for today."""
     if _sales_dirty or not _OVERVIEW_METRICS_CACHE.get("data"):
@@ -15190,6 +15187,9 @@ def _sales_metrics_are_current():
     return cached_day == today
 
 
+@app.route("/overview/metrics", methods=["GET"], endpoint="overview_metrics_plain")
+@app.route("/api/overview/metrics", methods=["GET"], endpoint="overview_metrics_api")
+@login_required_session
 def overview_metrics():
     """Overview totals. Cached briefly, then recomputed on the next Overview load."""
     if _sales_metrics_are_current():
