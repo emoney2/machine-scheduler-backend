@@ -12581,11 +12581,8 @@ def update_start_time():
                 emb_progress.mark_manual_start(order_number, iso_start)
             except Exception:
                 logger.exception("mark_manual_start failed for %s", order_number)
-        try:
-            _invalidate_combined_orders_cache()
-            _bump_embroidery_scheduler_signal()
-        except Exception:
-            pass
+    # The start is already on the socket payload. Do not drop the orders
+    # cache or every open screen will re-read the whole sheet.
 
     # Nudge clients
     try:
@@ -18612,7 +18609,6 @@ def save_links():
         # Keep only the most recent entries (simple truncation)
         items = list(_links_store.items())[-_links_store_max_size:]
         _links_store = dict(items)
-    _bump_embroidery_scheduler_signal()
     socketio.emit("linksUpdated", _links_store)
     return jsonify({"status": "ok"}), 200
 
@@ -18698,40 +18694,61 @@ def get_combined():
         ranges_main = [ORDERS_RANGE, FUR_RANGE, CUT_RANGE, EMBROIDERY_RANGE]
         ranges_with_prog = ranges_main + [progress_range]
         ranges_all = ranges_with_prog + [log_range]
+        # The board does not render fur status or the run log. Skip those tabs.
+        scheduler_ranges = [ORDERS_RANGE, CUT_RANGE, EMBROIDERY_RANGE, progress_range]
+        scheduler_core = [ORDERS_RANGE, CUT_RANGE, EMBROIDERY_RANGE]
         with acquire_sheet_lock():
             try:
                 resp = svc.batchGet(
                     spreadsheetId=SPREADSHEET_ID,
-                    ranges=ranges_all,
+                    ranges=scheduler_ranges if scheduler_view else ranges_all,
                     valueRenderOption="UNFORMATTED_VALUE",
                 ).execute()
             except Exception:
-                current_app.logger.warning(
-                    "combined: Embroidery Run Log unread; retrying without it"
-                )
-                try:
-                    resp = svc.batchGet(
-                        spreadsheetId=SPREADSHEET_ID,
-                        ranges=ranges_with_prog,
-                        valueRenderOption="UNFORMATTED_VALUE",
-                    ).execute()
-                except Exception:
+                if scheduler_view:
                     current_app.logger.warning(
-                        "combined: Embroidery Progress tab missing or unread; retrying without it"
+                        "combined: scheduler progress tab unread; retrying without it"
                     )
                     resp = svc.batchGet(
                         spreadsheetId=SPREADSHEET_ID,
-                        ranges=ranges_main,
+                        ranges=scheduler_core,
                         valueRenderOption="UNFORMATTED_VALUE",
                     ).execute()
+                else:
+                    current_app.logger.warning(
+                        "combined: Embroidery Run Log unread; retrying without it"
+                    )
+                    try:
+                        resp = svc.batchGet(
+                            spreadsheetId=SPREADSHEET_ID,
+                            ranges=ranges_with_prog,
+                            valueRenderOption="UNFORMATTED_VALUE",
+                        ).execute()
+                    except Exception:
+                        current_app.logger.warning(
+                            "combined: Embroidery Progress tab missing or unread; retrying without it"
+                        )
+                        resp = svc.batchGet(
+                            spreadsheetId=SPREADSHEET_ID,
+                            ranges=ranges_main,
+                            valueRenderOption="UNFORMATTED_VALUE",
+                        ).execute()
 
         vrs = resp.get("valueRanges", [])
-        orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
-        fur_rows = (vrs[1].get("values") if len(vrs) > 1 else []) or []
-        cut_rows = (vrs[2].get("values") if len(vrs) > 2 else []) or []
-        emb_rows = (vrs[3].get("values") if len(vrs) > 3 else []) or []
-        prog_tab_rows = (vrs[4].get("values") if len(vrs) > 4 else []) or []
-        log_tab_rows = (vrs[5].get("values") if len(vrs) > 5 else []) or []
+        if scheduler_view:
+            orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
+            fur_rows = []
+            cut_rows = (vrs[1].get("values") if len(vrs) > 1 else []) or []
+            emb_rows = (vrs[2].get("values") if len(vrs) > 2 else []) or []
+            prog_tab_rows = (vrs[3].get("values") if len(vrs) > 3 else []) or []
+            log_tab_rows = []
+        else:
+            orders_rows = (vrs[0].get("values") if len(vrs) > 0 else []) or []
+            fur_rows = (vrs[1].get("values") if len(vrs) > 1 else []) or []
+            cut_rows = (vrs[2].get("values") if len(vrs) > 2 else []) or []
+            emb_rows = (vrs[3].get("values") if len(vrs) > 3 else []) or []
+            prog_tab_rows = (vrs[4].get("values") if len(vrs) > 4 else []) or []
+            log_tab_rows = (vrs[5].get("values") if len(vrs) > 5 else []) or []
 
         def rows_to_dicts(rows):
             if not rows:
@@ -18870,8 +18887,9 @@ def get_combined():
             "links": _links_store if isinstance(_links_store, dict) else {},
             "embRev": int(_embroidery_scheduler_rev),
         }
-        _combined_full_memo["obj"] = full
-        _combined_full_memo["ts"] = time.time()
+        if not scheduler_view:
+            _combined_full_memo["obj"] = full
+            _combined_full_memo["ts"] = time.time()
         if scheduler_view:
             return _scheduler_combined_view(full)
         return full
@@ -19070,7 +19088,6 @@ def save_manual_state():
         global _manual_state_cache, _manual_state_ts
         _manual_state_cache = None
         _manual_state_ts = 0
-        _bump_embroidery_scheduler_signal()
         socketio.emit("manualStateUpdated", {"source": "manualState"})
 
         return (
