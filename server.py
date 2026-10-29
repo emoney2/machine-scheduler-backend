@@ -24457,8 +24457,10 @@ def _physical_cones_on_hand(remaining_eq, cones_received):
     cones_received is whole cones from purchase logs.
 
     A machine pulls evenly from 6 cones; unused cones sit full. Whole 6-packs
-    drop off only after that set's length is used up. If there is no purchase
-    history, leftover length is spread across 6-cone sets.
+    drop off only after that set's length is used up. Leftover length is also
+    spread across 6-cone sets. Return the higher of purchase-based vs
+    length-spread counts so incomplete Thread Data cannot undercount and
+    falsely flag multi-machine conflicts.
     """
     try:
         remaining = float(remaining_eq or 0)
@@ -24470,11 +24472,13 @@ def _physical_cones_on_hand(remaining_eq, cones_received):
         received = int(cones_received or 0)
     except (TypeError, ValueError):
         received = 0
+    from_length = int(ceil(remaining / float(_THREAD_HEADS) - 1e-9) * _THREAD_HEADS)
     if received <= 0:
-        return int(ceil(remaining / float(_THREAD_HEADS) - 1e-9) * _THREAD_HEADS)
+        return from_length
     used = max(0.0, received - remaining)
     emptied = int(used // _THREAD_HEADS) * _THREAD_HEADS
-    return max(0, received - emptied)
+    from_purchases = max(0, received - emptied)
+    return max(from_purchases, from_length)
 
 @app.route("/api/thread-inventory-status", methods=["GET"])
 @login_required_session

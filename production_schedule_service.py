@@ -120,11 +120,14 @@ def _physical_cones_on_hand(remaining_eq: float, cones_received: int) -> int:
     if remaining <= 0:
         return 0
     received = max(0, int(_number(cones_received)))
+    from_length = int(((remaining + 5.999999) // 6) * 6)
     if received <= 0:
-        return int(((remaining + 5.999999) // 6) * 6)
+        return from_length
     used = max(0.0, received - remaining)
     emptied = int(used // 6) * 6
-    return max(0, received - emptied)
+    from_purchases = max(0, received - emptied)
+    # Prefer higher count so incomplete purchase logs cannot undercount.
+    return max(from_purchases, from_length)
 
 
 def _parse_embroidery_progress(values: Sequence[Sequence[Any]]) -> Dict[str, dict]:

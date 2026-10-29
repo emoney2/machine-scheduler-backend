@@ -291,6 +291,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(_thread_data_received_cones(values), {"1800": 6})
         self.assertEqual(_physical_cones_on_hand(5.5, 6), 6)
         self.assertEqual(_physical_cones_on_hand(0, 6), 0)
+        # Incomplete purchase log (6 received) must not undercount when leftover
+        # length still implies a second 6-cone set (7.8 → 12 loadable).
+        self.assertEqual(_physical_cones_on_hand(7.8, 6), 12)
+        self.assertEqual(_physical_cones_on_hand(5.2, 6), 6)
 
     def test_sewing_summary_without_timestamps_does_not_invent_averages(self):
         metrics = sewing_output_metrics([
