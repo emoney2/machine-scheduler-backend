@@ -4127,34 +4127,6 @@ def api_changes():
             "ts": time.time(),
             "embRev": int(_embroidery_scheduler_rev),
         }
-        global _sales_rows_fingerprint
-        sales_fp = hashlib.sha1()
-        date_i = col_index.get("Date")
-        if date_i is None:
-            date_i = col_index.get("Order Date")
-        prod_i = col_index.get("Product")
-        qty_i = col_index.get("Quantity")
-        if qty_i is None:
-            qty_i = col_index.get("Qty")
-
-        def _fp_cell(row, idx):
-            if idx is None or idx >= len(row) or row[idx] is None:
-                return ""
-            return str(row[idx])
-
-        for row in values[1:]:
-            if not row or order_i is None or order_i >= len(row):
-                continue
-            oid = str(row[order_i] or "").strip()
-            if not oid:
-                continue
-            sales_fp.update(
-                f"{oid}|{_fp_cell(row, date_i)}|{_fp_cell(row, prod_i)}|{_fp_cell(row, qty_i)}\n".encode()
-            )
-        digest = sales_fp.hexdigest()
-        if _sales_rows_fingerprint is not None and digest != _sales_rows_fingerprint:
-            _mark_sales_sheet_changed(values)
-        _sales_rows_fingerprint = digest
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         etag = _cache_set(key, data, ttl)
 
@@ -12652,19 +12624,15 @@ OVERVIEW_METRICS_TTL = int(os.environ.get("OVERVIEW_METRICS_TTL", "300"))  # sec
 _OVERVIEW_METRICS_COMPUTE_LOCK = Semaphore(1)
 _OVERVIEW_METRICS_REFRESH_LOCK = Semaphore(1)
 
-# One Production Orders download shared by Sold This Week, YTD, and the rep breakdown.
+# One Production Orders download shared by Sold This Week and YTD.
 _PO_VALUES_CACHE = {"values": None, "ts": 0.0}
 _PO_VALUES_LOCK = Semaphore(1)
 _PO_VALUES_TTL = int(os.environ.get("PO_VALUES_TTL", "90"))
 
-# Rep-level sales breakdown for the overview popup. Sheet read is heavy, so cache briefly.
-_SALES_BREAKDOWN_CACHE = {"data": None, "ts": 0.0}
-SALES_BREAKDOWN_TTL = int(os.environ.get("SALES_BREAKDOWN_TTL", "300"))
 # Sold-this-week / YTD / 6-week rate. Kept apart from the jobs snapshot so a
 # metrics refresh does not re-download Production Orders every couple of minutes.
 _PO_SALES_SUMMARY = {"ts": 0.0, "data": None, "fresh": False}
 _sales_dirty = False
-_sales_rows_fingerprint = None
 
 
 def _safe_pb_orders_table_sql_ident(table_name: str) -> str:
@@ -12968,28 +12936,14 @@ def summarize_production_order_sales(values, today=None, log=None):
     return {"ytd": ytd, "week": week, "six_week": six_week}
 
 
-def _mark_sales_sheet_changed(values=None):
-    """Remember that Production Orders changed. Does not download the sheet."""
-    global _sales_dirty
-    _sales_dirty = True
-    if values:
-        summary = summarize_production_order_sales(values)
-        if summary is not None:
-            _PO_SALES_SUMMARY["data"] = summary
-            _PO_SALES_SUMMARY["ts"] = time.time()
-            _PO_SALES_SUMMARY["fresh"] = True
-    try:
-        socketio.emit("salesUpdated", {"reason": "sheet"})
-    except Exception:
-        app.logger.warning("salesUpdated emit failed", exc_info=True)
-
-
 def _sales_summary_is_current():
     if _sales_dirty:
         return False
     cached = _PO_SALES_SUMMARY.get("data")
     ts = float(_PO_SALES_SUMMARY.get("ts") or 0)
     if cached is None or not ts:
+        return False
+    if time.time() - ts >= OVERVIEW_METRICS_TTL:
         return False
     cached_day = datetime.fromtimestamp(ts, ZoneInfo("America/New_York")).date()
     today = datetime.now(ZoneInfo("America/New_York")).date()
@@ -12998,8 +12952,8 @@ def _sales_summary_is_current():
 
 def sales_summary_from_sheets(log=None):
     """
-    Last sales totals. Recomputed only after Production Orders actually changes,
-    or on the first request of a new day. Not on a timer.
+    Last sales totals for the overview boxes. Reused until the metrics cache
+    expires, then rebuilt on the next Overview load.
     """
     global _sales_dirty
     cached = _PO_SALES_SUMMARY.get("data")
@@ -15225,11 +15179,11 @@ def _schedule_overview_metrics_refresh():
 @app.route("/api/overview/metrics", methods=["GET"], endpoint="overview_metrics_api")
 @login_required_session
 def _sales_metrics_are_current():
-    """True when the saved sales figures still match the sheet and the calendar day."""
+    """True when the overview totals are still fresh for today."""
     if _sales_dirty or not _OVERVIEW_METRICS_CACHE.get("data"):
         return False
     ts = float(_OVERVIEW_METRICS_CACHE.get("ts") or 0)
-    if not ts:
+    if not ts or time.time() - ts >= OVERVIEW_METRICS_TTL:
         return False
     cached_day = datetime.fromtimestamp(ts, ZoneInfo("America/New_York")).date()
     today = datetime.now(ZoneInfo("America/New_York")).date()
@@ -15237,7 +15191,7 @@ def _sales_metrics_are_current():
 
 
 def overview_metrics():
-    """Sales stay cached until Production Orders changes. No timed rescan."""
+    """Overview totals. Cached briefly, then recomputed on the next Overview load."""
     if _sales_metrics_are_current():
         return jsonify(_OVERVIEW_METRICS_CACHE["data"])
 
@@ -15371,125 +15325,6 @@ def _overview_metrics_uncached():
     except Exception as e:
         app.logger.exception("❌ Failed to fetch overview metrics")
         return {"error": str(e)}, 500
-
-
-def compute_sales_rep_breakdown(log=None):
-    """
-    Pieces and revenue by sales rep from Production Orders.
-
-    Same lines as Sold This Week: an order number, a date, and a product whose
-    name does not contain "back". Blank rep becomes House Account.
-    Revenue is Price × Quantity.
-    """
-    from sales_breakdown import build_sales_breakdown, parse_number
-
-    logger = log or app.logger
-    tz = ZoneInfo("America/New_York")
-    now = datetime.now(tz)
-    today = now.date()
-
-    values = get_overview_production_orders_values(log=logger)
-    if values is None:
-        logger.warning("sales breakdown sheet read failed")
-        return None
-    if len(values) < 2:
-        payload = build_sales_breakdown([], today)
-        payload["generatedAt"] = now.isoformat(timespec="seconds")
-        return payload
-
-    headers = [str(h).strip() for h in values[0]]
-    date_i = _production_order_col(headers, "Date", "Order Date")
-    prod_i = _production_order_col(headers, "Product")
-    qty_i = _production_order_col(headers, "Quantity", "Qty")
-    price_i = _production_order_col(headers, "Price", "Unit Price")
-    order_i = _production_order_col(headers, "Order #", "Order#", "Order Number")
-    design_i = _production_order_col(headers, "Design")
-    rep_i = _production_order_col(headers, "REP", "Rep", "Referral", "Sales Rep", "rep")
-    named_rep = rep_i is not None
-    if date_i is None or prod_i is None or qty_i is None:
-        logger.warning(
-            "sales breakdown: missing column Date=%s Product=%s Quantity=%s",
-            date_i,
-            prod_i,
-            qty_i,
-        )
-        return None
-    if price_i is None:
-        logger.warning("sales breakdown: no Price column; revenue will be 0")
-
-    window_start = date(today.year - 1, 1, 1)
-    lines = []
-    for n, raw in enumerate(values[1:], start=2):
-        if n % 400 == 0:
-            eventlet.sleep(0)
-        row = raw or []
-        order_id = ""
-        if order_i is not None:
-            order_id = str(row[order_i] if order_i < len(row) else "").strip()
-            if not order_id:
-                continue
-        sold_on = _ship_queue_parse_due(row[date_i] if date_i < len(row) else None)
-        if sold_on is None or sold_on < window_start or sold_on > today:
-            continue
-        if rep_i is not None and rep_i < len(row):
-            rep = str(row[rep_i] or "").strip()
-        else:
-            rep = ""
-        if not rep and not named_rep and len(row) > 42:
-            rep = str(row[42] or "").strip()
-        product = str(row[prod_i] if prod_i < len(row) else "").strip()
-        design = str(row[design_i] if design_i is not None and design_i < len(row) else "").strip()
-        if design and product and design.lower() not in product.lower():
-            label = f"{design} · {product}"
-        else:
-            label = product or design or "Untitled"
-        if not order_id:
-            order_id = f"row-{n}"
-        qty_raw = row[qty_i] if qty_i < len(row) else None
-        price_raw = row[price_i] if price_i is not None and price_i < len(row) else None
-        lines.append(
-            {
-                "date": sold_on,
-                "qty": parse_number(qty_raw),
-                "unit_price": parse_number(price_raw) if price_i is not None else 0.0,
-                "rep": rep,
-                "product": product,
-                "product_label": label,
-                "order_id": order_id,
-            }
-        )
-
-    payload = build_sales_breakdown(lines, today)
-    payload["generatedAt"] = now.isoformat(timespec="seconds")
-    logger.info(
-        "sales breakdown: lines=%s days=%s week_pieces=%s reps=%s",
-        len(lines),
-        len(payload.get("days") or []),
-        payload.get("weekPieces"),
-        len(payload.get("reps") or []),
-    )
-    return payload
-
-
-@app.route("/overview/sales-breakdown", methods=["GET"], endpoint="overview_sales_breakdown_plain")
-@app.route("/api/overview/sales-breakdown", methods=["GET"], endpoint="overview_sales_breakdown_api")
-@login_required_session
-def overview_sales_breakdown():
-    """Pieces, revenue, and orders by sales rep for the overview sales popup."""
-    now = time.time()
-    cached = _SALES_BREAKDOWN_CACHE
-    if cached["data"] is not None and now - cached["ts"] < SALES_BREAKDOWN_TTL:
-        return jsonify(cached["data"])
-    try:
-        payload = compute_sales_rep_breakdown(log=app.logger)
-    except Exception as e:
-        app.logger.exception("sales breakdown failed")
-        return jsonify({"error": str(e)}), 500
-    if not payload:
-        return jsonify({"error": "Sales breakdown unavailable"}), 503
-    _SALES_BREAKDOWN_CACHE["data"] = payload
-    _SALES_BREAKDOWN_CACHE["ts"] = now
-    return jsonify(payload)
 
 
 @app.route("/api/fur/complete", methods=["POST", "OPTIONS"])
