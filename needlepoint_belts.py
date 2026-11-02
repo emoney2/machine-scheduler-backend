@@ -939,6 +939,86 @@ def _attachments_payload(attachments: list[dict[str, Any]]) -> list[dict[str, st
     return out
 
 
+_GMAIL_FULL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+_GMAIL_RESTRICTED_ALPHABET = "BCDFGHJKLMNPQRSTVWXZbcdfghjklmnpqrstvwxz"
+
+
+def _gmail_transliterate(subject: str, input_alphabet: str, output_alphabet: str) -> str:
+    """Port of Gmail's restricted-alphabet transliteration used in compose deep links."""
+    input_alphabet_size = len(input_alphabet)
+    output_alphabet_size = len(output_alphabet)
+    if subject and all(ch == input_alphabet[0] for ch in subject):
+        return output_alphabet[0]
+    input_map = {ch: idx for idx, ch in enumerate(input_alphabet)}
+    input_indices = [input_map[ch] for ch in reversed(subject)]
+    output_indices: list[int] = []
+    for i in range(len(input_indices) - 1, -1, -1):
+        offset = 0
+        for j in range(len(output_indices)):
+            index = output_indices[j] * input_alphabet_size + offset
+            if index >= output_alphabet_size:
+                remainder = index % output_alphabet_size
+                offset = (index - remainder) // output_alphabet_size
+                index = remainder
+            else:
+                offset = 0
+            output_indices[j] = index
+        while offset:
+            remainder = offset % output_alphabet_size
+            output_indices.append(remainder)
+            offset = (offset - remainder) // output_alphabet_size
+        offset = input_indices[i]
+        j = 0
+        while offset:
+            if j >= len(output_indices):
+                output_indices.append(0)
+            index = output_indices[j] + offset
+            if index >= output_alphabet_size:
+                remainder = index % output_alphabet_size
+                offset = (index - remainder) // output_alphabet_size
+                index = remainder
+            else:
+                offset = 0
+            output_indices[j] = index
+            j += 1
+    return "".join(output_alphabet[idx] for idx in reversed(output_indices))
+
+
+def _gmail_encode_compose_token(value: str) -> str:
+    stripped = value[len("thread-") :] if value.startswith("thread-") else value
+    b64 = base64.b64encode(stripped.encode("utf-8")).decode("ascii").rstrip("=")
+    return _gmail_transliterate(b64, _GMAIL_FULL_ALPHABET, _GMAIL_RESTRICTED_ALPHABET)
+
+
+def gmail_draft_compose_url(account: str, thread_id: str, message_id: str) -> str:
+    """
+    Build a Gmail UI URL that opens an API-created draft in the compose window.
+
+    Raw API message ids only land on the Drafts list in the current Gmail UI.
+    The compose deep-link needs the restricted-alphabet token derived from
+    thread-f:<decimal thread id>+msg-a:<message id>.
+    """
+    account = (account or DEFAULT_GMAIL_ACCOUNT).strip() or DEFAULT_GMAIL_ACCOUNT
+    # Keep @ unescaped — Gmail account switching breaks on /u/user%40domain/.
+    account_path = quote(account, safe="@._+-")
+    tid = str(thread_id or "").strip()
+    mid = str(message_id or "").strip()
+    if tid and mid:
+        try:
+            token = _gmail_encode_compose_token(f"thread-f:{int(tid, 16)}+msg-a:{mid}")
+            return f"https://mail.google.com/mail/u/{account_path}/#inbox?compose={token}"
+        except Exception:
+            logger.warning(
+                "[Gmail] failed to encode compose token for thread=%s message=%s",
+                tid,
+                mid,
+            )
+    # Fallbacks that sometimes still open the draft editor.
+    if mid:
+        return f"https://mail.google.com/mail/u/{account_path}/#inbox?compose={quote(mid)}"
+    return f"https://mail.google.com/mail/u/{account_path}/#drafts"
+
+
 def create_gmail_draft(
     creds,
     *,
@@ -967,15 +1047,16 @@ def create_gmail_draft(
         .execute()
     )
     draft_id = created.get("id") or ""
-    message_id = (created.get("message") or {}).get("id") or ""
-    params = {"authuser": account}
-    compose = message_id or draft_id
-    draft_url = (
-        f"https://mail.google.com/mail/u/?{urlencode(params)}#drafts?compose={quote(str(compose))}"
-        if compose
-        else f"https://mail.google.com/mail/u/?{urlencode(params)}#drafts"
-    )
-    return {"draftId": draft_id, "messageId": message_id, "draftUrl": draft_url}
+    message = created.get("message") or {}
+    message_id = message.get("id") or ""
+    thread_id = message.get("threadId") or ""
+    draft_url = gmail_draft_compose_url(account, thread_id, message_id)
+    return {
+        "draftId": draft_id,
+        "messageId": message_id,
+        "threadId": thread_id,
+        "draftUrl": draft_url,
+    }
 
 
 def creds_have_gmail_scope(creds) -> bool:
@@ -1019,9 +1100,10 @@ def gmail_compose_url(to_email: str, subject: str, body: str) -> str:
         "to": to_email or "",
         "su": subject or "",
         "body": body or "",
-        "authuser": account,
     }
-    return f"https://mail.google.com/mail/u/?{urlencode(p)}"
+    # Put the work account in /u/<email>/ so Gmail opens the right mailbox
+    # and actually lands on the compose window (authuser-only URLs often miss it).
+    return f"https://mail.google.com/mail/u/{quote(account, safe='@._+-')}/?{urlencode(p)}"
 
 
 def deliver_belt_order_email(
