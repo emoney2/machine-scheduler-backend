@@ -20340,6 +20340,185 @@ def needlepoint_order_belts():
     return jsonify({**delivered, "subject": subject, "body": body, "to": to_email})
 
 
+DIGITIZING_VENDOR_EMAIL = "classicdigitizers@gmail.com"
+DIGITIZING_EMAIL_SUBJECT = "Hi William — hope you're having a great day!"
+
+
+def _extract_drive_file_id_any(raw):
+    """Resolve a Drive file id from a bare id, Drive URL, or IMAGE() formula."""
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            hit = _extract_drive_file_id_any(item)
+            if hit:
+                return hit
+        return None
+    if isinstance(raw, dict):
+        for key in ("fileId", "id", "imageUrl", "url", "href", "link", "src", "image", "thumbnail"):
+            hit = _extract_drive_file_id_any(raw.get(key))
+            if hit:
+                return hit
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    m = re.search(r'IMAGE\("([^"]+)"', s, re.I)
+    if m:
+        return _extract_drive_file_id_any(m.group(1))
+    if re.fullmatch(r"[A-Za-z0-9_-]{12,}", s):
+        return s
+    return _file_id_from_drive_url(s)
+
+
+def _digitizing_attachment_from_file_id(drive, file_id, order_number=""):
+    """Download a Drive design image for the digitizing vendor email."""
+    fid = str(file_id or "").strip()
+    if not fid:
+        return None
+    try:
+        meta = (
+            drive.files()
+            .get(
+                fileId=fid,
+                fields="id,name,mimeType",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except Exception:
+        logger.exception("[Digitizing] failed to load Drive metadata for %s", fid)
+        meta = {}
+    try:
+        data = _download_drive_file_bytes(drive, fid)
+    except Exception:
+        logger.exception("[Digitizing] failed to download Drive file %s", fid)
+        return None
+    if not data:
+        return None
+
+    name = str(meta.get("name") or "").strip()
+    mime = str(meta.get("mimeType") or "").strip() or "application/octet-stream"
+    order = str(order_number or "").strip() or "design"
+    ext = ""
+    if "." in name:
+        ext = "." + name.rsplit(".", 1)[-1].lower()
+    if not ext or len(ext) > 6:
+        if "png" in mime:
+            ext = ".png"
+        elif "jpeg" in mime or "jpg" in mime:
+            ext = ".jpg"
+        elif "gif" in mime:
+            ext = ".gif"
+        elif "webp" in mime:
+            ext = ".webp"
+        elif "pdf" in mime:
+            ext = ".pdf"
+        else:
+            ext = ".jpg"
+            if mime.startswith("application/") and "pdf" not in mime:
+                mime = "image/jpeg"
+    if mime.startswith("application/octet-stream"):
+        if ext == ".png":
+            mime = "image/png"
+        elif ext in (".jpg", ".jpeg"):
+            mime = "image/jpeg"
+        elif ext == ".pdf":
+            mime = "application/pdf"
+    filename = f"{order}{ext}"
+    return {"filename": filename, "bytes": data, "mime": mime, "sourceId": fid, "sourceName": name}
+
+
+def _build_digitizing_email_text(*, product="", order_number="", design="", company=""):
+    product_name = str(product or "").strip() or "(product not specified)"
+    lines = [
+        "Hi William,",
+        "",
+        "Could you please digitize the attached design for us?",
+        "",
+        f"Product: {product_name}",
+    ]
+    order = str(order_number or "").strip()
+    if order:
+        lines.append(f"Order #: {order}")
+    design_name = str(design or "").strip()
+    if design_name:
+        lines.append(f"Design: {design_name}")
+    company_name = str(company or "").strip()
+    if company_name:
+        lines.append(f"Company: {company_name}")
+    lines.extend(["", "Thank you!", "", "— JR & Co."])
+    return DIGITIZING_EMAIL_SUBJECT, "\n".join(lines)
+
+
+@app.route("/digitizing/order-email", methods=["POST", "OPTIONS"], endpoint="digitizing_order_email_plain")
+@app.route("/api/digitizing/order-email", methods=["POST", "OPTIONS"], endpoint="digitizing_order_email_api")
+@login_required_session
+def digitizing_order_email():
+    """
+    Create a Gmail draft to William (classicdigitizers@gmail.com) with the
+    design image attached and the product name in the body.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = request.get_json(silent=True) or {}
+    order_number = str(
+        data.get("orderNumber") or data.get("order") or data.get("Order #") or ""
+    ).strip()
+    product = str(data.get("product") or data.get("Product") or "").strip()
+    design = str(data.get("design") or data.get("Design") or "").strip()
+    company = str(
+        data.get("company") or data.get("Company Name") or data.get("companyName") or ""
+    ).strip()
+    file_id = _extract_drive_file_id_any(
+        data.get("fileId")
+        or data.get("imageFileId")
+        or data.get("imageUrl")
+        or data.get("image")
+        or data.get("preview")
+        or data.get("Preview")
+    )
+    to_email = str(data.get("to") or DIGITIZING_VENDOR_EMAIL).strip() or DIGITIZING_VENDOR_EMAIL
+    if "@" not in to_email:
+        return jsonify({"ok": False, "error": "Invalid digitizing vendor email."}), 400
+    if not file_id:
+        return jsonify(
+            {"ok": False, "error": "No design image found to attach for this order."}
+        ), 400
+
+    drive = get_drive_service()
+    attachment = _digitizing_attachment_from_file_id(drive, file_id, order_number)
+    if not attachment:
+        return jsonify(
+            {"ok": False, "error": "Could not download the design image from Drive."}
+        ), 502
+
+    subject, body = _build_digitizing_email_text(
+        product=product,
+        order_number=order_number,
+        design=design,
+        company=company,
+    )
+    delivered = deliver_belt_order_email(
+        creds=get_google_credentials(),
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        attachments=[attachment],
+    )
+    return jsonify(
+        {
+            **delivered,
+            "subject": subject,
+            "body": body,
+            "to": to_email,
+            "orderNumber": order_number,
+            "product": product,
+        }
+    )
+
+
 @app.route("/api/reorder", methods=["POST"])
 @login_required_session
 def reorder():
