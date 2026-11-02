@@ -990,6 +990,23 @@ def _gmail_encode_compose_token(value: str) -> str:
     return _gmail_transliterate(b64, _GMAIL_FULL_ALPHABET, _GMAIL_RESTRICTED_ALPHABET)
 
 
+def _gmail_account_base_url(account: str = "") -> str:
+    """
+    Gmail mailbox URL that selects the work account without using /u/email@…/.
+
+    Google broke /u/email@domain/ deep links (Temporary Error 404). Use numeric
+    /u/<index>/ plus authuser= — same pattern as Overview buildGmailCompose.
+    """
+    account = (account or os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT") or DEFAULT_GMAIL_ACCOUNT).strip()
+    raw_index = (os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT_INDEX") or "0").strip()
+    index = raw_index if raw_index.isdigit() else "0"
+    params = {}
+    if account:
+        params["authuser"] = account
+    qs = f"?{urlencode(params)}" if params else ""
+    return f"https://mail.google.com/mail/u/{index}/{qs}"
+
+
 def gmail_draft_compose_url(account: str, thread_id: str, message_id: str) -> str:
     """
     Build a Gmail UI URL that opens an API-created draft in the compose window.
@@ -999,14 +1016,13 @@ def gmail_draft_compose_url(account: str, thread_id: str, message_id: str) -> st
     thread-f:<decimal thread id>+msg-a:<message id>.
     """
     account = (account or DEFAULT_GMAIL_ACCOUNT).strip() or DEFAULT_GMAIL_ACCOUNT
-    # Keep @ unescaped — Gmail account switching breaks on /u/user%40domain/.
-    account_path = quote(account, safe="@._+-")
+    base = _gmail_account_base_url(account)
     tid = str(thread_id or "").strip()
     mid = str(message_id or "").strip()
     if tid and mid:
         try:
             token = _gmail_encode_compose_token(f"thread-f:{int(tid, 16)}+msg-a:{mid}")
-            return f"https://mail.google.com/mail/u/{account_path}/#inbox?compose={token}"
+            return f"{base}#inbox?compose={token}"
         except Exception:
             logger.warning(
                 "[Gmail] failed to encode compose token for thread=%s message=%s",
@@ -1015,8 +1031,8 @@ def gmail_draft_compose_url(account: str, thread_id: str, message_id: str) -> st
             )
     # Fallbacks that sometimes still open the draft editor.
     if mid:
-        return f"https://mail.google.com/mail/u/{account_path}/#inbox?compose={quote(mid)}"
-    return f"https://mail.google.com/mail/u/{account_path}/#drafts"
+        return f"{base}#inbox?compose={quote(mid)}"
+    return f"{base}#drafts"
 
 
 def create_gmail_draft(
@@ -1094,6 +1110,8 @@ def send_smtp_email(
 
 def gmail_compose_url(to_email: str, subject: str, body: str) -> str:
     account = (os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT") or DEFAULT_GMAIL_ACCOUNT).strip()
+    raw_index = (os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT_INDEX") or "0").strip()
+    index = raw_index if raw_index.isdigit() else "0"
     p = {
         "view": "cm",
         "fs": "1",
@@ -1101,9 +1119,10 @@ def gmail_compose_url(to_email: str, subject: str, body: str) -> str:
         "su": subject or "",
         "body": body or "",
     }
-    # Put the work account in /u/<email>/ so Gmail opens the right mailbox
-    # and actually lands on the compose window (authuser-only URLs often miss it).
-    return f"https://mail.google.com/mail/u/{quote(account, safe='@._+-')}/?{urlencode(p)}"
+    if account:
+        p["authuser"] = account
+    # Numeric /u/<index>/ + authuser — /u/email@domain/ returns Temporary Error 404.
+    return f"https://mail.google.com/mail/u/{index}/?{urlencode(p)}"
 
 
 def deliver_belt_order_email(
