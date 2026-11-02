@@ -1074,6 +1074,73 @@ def create_gmail_draft(
     }
 
 
+def send_gmail_message(
+    creds,
+    *,
+    to_email: str,
+    subject: str,
+    body: str,
+    attachments: list[dict[str, Any]],
+    from_email: str = "",
+) -> dict[str, Any]:
+    """
+    Send email with attachments via Gmail API.
+
+    Uses drafts.create + drafts.send so gmail.compose / gmail.modify scopes work
+    (messages.send alone often requires gmail.send).
+    """
+    from googleapiclient.discovery import build
+
+    account = (os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT") or DEFAULT_GMAIL_ACCOUNT).strip()
+    if not creds_have_gmail_scope(creds):
+        return {
+            "ok": False,
+            "method": "none",
+            "error": "Google login is missing Gmail permission.",
+            "needsGmailAuth": True,
+        }
+    draft = create_gmail_draft(
+        creds,
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        attachments=attachments,
+        from_email=from_email or account,
+    )
+    if not draft or not draft.get("draftId"):
+        return {"ok": False, "method": "none", "error": "Could not create Gmail draft to send."}
+    try:
+        gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        sent = (
+            gmail.users()
+            .drafts()
+            .send(userId="me", body={"id": draft["draftId"]})
+            .execute()
+        )
+        return {
+            "ok": True,
+            "method": "gmail_send",
+            "sent": True,
+            "draftId": draft.get("draftId") or "",
+            "messageId": (sent or {}).get("id") or draft.get("messageId") or "",
+            "error": "",
+            "needsGmailAuth": False,
+            "attachmentCount": len(attachments or []),
+            "attachmentNames": [a.get("filename") for a in (attachments or [])],
+        }
+    except Exception as exc:
+        logger.exception("[Gmail] drafts.send failed")
+        err = str(exc)
+        return {
+            "ok": False,
+            "method": "none",
+            "error": err,
+            "needsGmailAuth": "insufficientPermissions" in err or "ACCESS_TOKEN_SCOPE" in err,
+            "draftId": draft.get("draftId") or "",
+            "draftUrl": draft.get("draftUrl") or "",
+        }
+
+
 def creds_have_gmail_scope(creds) -> bool:
     scopes = {str(s) for s in (getattr(creds, "scopes", None) or [])}
     return any("gmail" in s for s in scopes)
