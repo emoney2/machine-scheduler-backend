@@ -6352,6 +6352,19 @@ def token_status():
     except Exception as e:
         refresh_error = str(e)[:200]
 
+    gmail_email = ""
+    try:
+        if live:
+            from googleapiclient.discovery import build as _build_google
+
+            gmail = _build_google("gmail", "v1", credentials=live, cache_discovery=False)
+            gmail_email = str(
+                (gmail.users().getProfile(userId="me").execute() or {}).get("emailAddress")
+                or ""
+            ).strip()
+    except Exception as e:
+        logger.warning("[token-status] could not read Gmail profile: %s", e)
+
     info = {
         "ok": bool(live and live.valid),
         "expired": bool(stored and stored.expired),
@@ -6360,6 +6373,10 @@ def token_status():
         "env_present": env_present,
         "file_exists": file_exists,
         "cwd": cwd,
+        "gmailEmail": gmail_email,
+        "expectedGmailEmail": (
+            os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT") or "justin.eckard@jrcogolf.com"
+        ).strip(),
     }
     if refresh_error:
         info["reason"] = refresh_error
