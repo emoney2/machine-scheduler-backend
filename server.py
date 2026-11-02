@@ -20609,11 +20609,17 @@ def digitizing_order_email():
                 "design": design,
                 "attachmentName": filename,
                 "attachmentCount": len(all_attachments),
+                "fromEmail": sent.get("fromEmail") or "",
             }
         )
 
     # SMTP fallback when Gmail API send is unavailable.
     try:
+        smtp_from = (
+            os.environ.get("DESIGN_CONFIRMATION_FROM_EMAIL")
+            or os.environ.get("SMTP_USER")
+            or "info@jrco.us"
+        ).strip()
         if send_needlepoint_smtp_email(
             to_email=to_email,
             subject=subject,
@@ -20633,6 +20639,7 @@ def digitizing_order_email():
                     "design": design,
                     "attachmentName": filename,
                     "attachmentCount": len(all_attachments),
+                    "fromEmail": smtp_from,
                 }
             )
     except Exception as exc:

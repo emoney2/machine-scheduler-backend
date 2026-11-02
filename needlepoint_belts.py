@@ -1074,6 +1074,20 @@ def create_gmail_draft(
     }
 
 
+def _gmail_authenticated_email(creds, gmail=None) -> str:
+    """Return the mailbox email for these OAuth creds (where Sent will appear)."""
+    try:
+        if gmail is None:
+            from googleapiclient.discovery import build
+
+            gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        profile = gmail.users().getProfile(userId="me").execute() or {}
+        return str(profile.get("emailAddress") or "").strip()
+    except Exception:
+        logger.warning("[Gmail] could not read authenticated profile email")
+        return ""
+
+
 def send_gmail_message(
     creds,
     *,
@@ -1088,6 +1102,8 @@ def send_gmail_message(
 
     Uses drafts.create + drafts.send so gmail.compose / gmail.modify scopes work
     (messages.send alone often requires gmail.send).
+    Sent copies appear in the OAuth mailbox (often info@jrco.us), not necessarily
+    justin.eckard@jrcogolf.com.
     """
     from googleapiclient.discovery import build
 
@@ -1099,30 +1115,52 @@ def send_gmail_message(
             "error": "Google login is missing Gmail permission.",
             "needsGmailAuth": True,
         }
+    gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    auth_email = _gmail_authenticated_email(creds, gmail=gmail) or account
     draft = create_gmail_draft(
         creds,
         to_email=to_email,
         subject=subject,
         body=body,
         attachments=attachments,
-        from_email=from_email or account,
+        from_email=from_email or auth_email or account,
     )
     if not draft or not draft.get("draftId"):
-        return {"ok": False, "method": "none", "error": "Could not create Gmail draft to send."}
+        return {
+            "ok": False,
+            "method": "none",
+            "error": "Could not create Gmail draft to send.",
+            "fromEmail": auth_email,
+        }
     try:
-        gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
         sent = (
             gmail.users()
             .drafts()
             .send(userId="me", body={"id": draft["draftId"]})
             .execute()
         )
+        message_id = (sent or {}).get("id") or draft.get("messageId") or ""
+        # Confirm it landed in SENT for the authenticated mailbox.
+        in_sent = False
+        if message_id:
+            try:
+                meta = (
+                    gmail.users()
+                    .messages()
+                    .get(userId="me", id=message_id, format="minimal")
+                    .execute()
+                )
+                in_sent = "SENT" in (meta.get("labelIds") or [])
+            except Exception:
+                logger.warning("[Gmail] could not verify SENT label for %s", message_id)
         return {
             "ok": True,
             "method": "gmail_send",
             "sent": True,
             "draftId": draft.get("draftId") or "",
-            "messageId": (sent or {}).get("id") or draft.get("messageId") or "",
+            "messageId": message_id,
+            "fromEmail": auth_email,
+            "inSent": in_sent,
             "error": "",
             "needsGmailAuth": False,
             "attachmentCount": len(attachments or []),
@@ -1135,6 +1173,7 @@ def send_gmail_message(
             "ok": False,
             "method": "none",
             "error": err,
+            "fromEmail": auth_email,
             "needsGmailAuth": "insufficientPermissions" in err or "ACCESS_TOKEN_SCOPE" in err,
             "draftId": draft.get("draftId") or "",
             "draftUrl": draft.get("draftUrl") or "",
