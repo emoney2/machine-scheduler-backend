@@ -20464,8 +20464,11 @@ def _build_digitizing_email_text(*, product="", order_number="", design=""):
 @login_required_session
 def digitizing_order_email():
     """
-    Create a Gmail draft to William with the design image attached.
-    Subject: JR & Co Digitize Order - #{order} - {design}
+    Prepare digitizing email content + design image bytes.
+
+    composeOnly (default): do not create Gmail drafts / open the mailbox. The
+    frontend opens a standalone view=cm compose window (same as material orders)
+    and downloads the image for paperclip attach.
     """
     if request.method == "OPTIONS":
         return ("", 204)
@@ -20485,6 +20488,7 @@ def digitizing_order_email():
         or data.get("Preview")
     )
     to_email = str(data.get("to") or DIGITIZING_VENDOR_EMAIL).strip() or DIGITIZING_VENDOR_EMAIL
+    compose_only = bool(data["composeOnly"]) if "composeOnly" in data else True
     if "@" not in to_email:
         return jsonify({"ok": False, "error": "Invalid digitizing vendor email."}), 400
     if not file_id:
@@ -20504,6 +20508,28 @@ def digitizing_order_email():
         order_number=order_number,
         design=design,
     )
+    payload = [
+        {
+            "filename": attachment.get("filename") or f"{order_number or 'design'}.jpg",
+            "mime": attachment.get("mime") or "image/jpeg",
+            "contentBase64": base64.b64encode(attachment.get("bytes") or b"").decode("ascii"),
+        }
+    ]
+    if compose_only:
+        return jsonify(
+            {
+                "ok": True,
+                "method": "compose_download",
+                "attachmentsBase64": payload,
+                "subject": subject,
+                "body": body,
+                "to": to_email,
+                "orderNumber": order_number,
+                "product": product,
+                "design": design,
+            }
+        )
+
     delivered = deliver_belt_order_email(
         creds=get_google_credentials(),
         to_email=to_email,
