@@ -1107,21 +1107,32 @@ def send_smtp_email(
     return True
 
 
-def gmail_compose_url(to_email: str, subject: str, body: str) -> str:
+def gmail_compose_url(to_email: str, subject: str, body: str, message_id: str = "") -> str:
+    """
+    Standalone Gmail compose popup (view=cm), not the full mailbox.
+
+    When message_id is set (API draft), open that draft inside the compose-only
+    window so attachments come along. Do not also pass to/su/body in that case —
+    those query fields force a blank new message and drop the draft attachment.
+    """
     account = (os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT") or DEFAULT_GMAIL_ACCOUNT).strip()
-    raw_index = (os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT_INDEX") or "0").strip()
-    index = raw_index if raw_index.isdigit() else "0"
+    mid = str(message_id or "").strip()
+    if mid:
+        p = {"view": "cm", "fs": "1", "tf": "cm"}
+        if account:
+            p["authuser"] = account
+        return f"https://mail.google.com/mail/?{urlencode(p)}#inbox?compose={quote(mid, safe='')}"
     p = {
         "view": "cm",
         "fs": "1",
+        "tf": "cm",
         "to": to_email or "",
         "su": subject or "",
         "body": body or "",
     }
     if account:
         p["authuser"] = account
-    # Numeric /u/<index>/ + authuser — /u/email@domain/ returns Temporary Error 404.
-    return f"https://mail.google.com/mail/u/{index}/?{urlencode(p)}"
+    return f"https://mail.google.com/mail/?{urlencode(p)}"
 
 
 def deliver_belt_order_email(
@@ -1184,6 +1195,8 @@ def deliver_belt_order_email(
                         "method": "gmail_draft",
                         "draftUrl": draft.get("draftUrl") or "",
                         "draftId": draft.get("draftId") or "",
+                        "messageId": draft.get("messageId") or "",
+                        "threadId": draft.get("threadId") or "",
                         "error": "",
                         "needsGmailAuth": False,
                     }
