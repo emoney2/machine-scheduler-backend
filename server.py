@@ -20341,7 +20341,6 @@ def needlepoint_order_belts():
 
 
 DIGITIZING_VENDOR_EMAIL = "classicdigitizers@gmail.com"
-DIGITIZING_EMAIL_SUBJECT = "Hi William — hope you're having a great day!"
 
 
 def _extract_drive_file_id_any(raw):
@@ -20425,11 +20424,23 @@ def _digitizing_attachment_from_file_id(drive, file_id, order_number=""):
             mime = "image/jpeg"
         elif ext == ".pdf":
             mime = "application/pdf"
-    filename = f"{order}{ext}"
+    safe_order = re.sub(r"[^\w.-]+", "_", order).strip("._") or "design"
+    filename = f"{safe_order}{ext}"
     return {"filename": filename, "bytes": data, "mime": mime, "sourceId": fid, "sourceName": name}
 
 
-def _build_digitizing_email_text(*, product="", order_number="", design="", company=""):
+def _build_digitizing_email_subject(*, order_number="", design=""):
+    order = str(order_number or "").strip()
+    design_name = str(design or "").strip()
+    parts = ["JR & Co Digitize Order"]
+    if order:
+        parts.append(f"#{order}")
+    if design_name:
+        parts.append(design_name)
+    return " - ".join(parts)
+
+
+def _build_digitizing_email_text(*, product="", order_number="", design=""):
     product_name = str(product or "").strip() or "(product not specified)"
     lines = [
         "Hi William,",
@@ -20444,11 +20455,8 @@ def _build_digitizing_email_text(*, product="", order_number="", design="", comp
     design_name = str(design or "").strip()
     if design_name:
         lines.append(f"Design: {design_name}")
-    company_name = str(company or "").strip()
-    if company_name:
-        lines.append(f"Company: {company_name}")
-    lines.extend(["", "Thank you!", "", "— JR & Co."])
-    return DIGITIZING_EMAIL_SUBJECT, "\n".join(lines)
+    lines.extend(["", "Thank you!"])
+    return _build_digitizing_email_subject(order_number=order_number, design=design), "\n".join(lines)
 
 
 @app.route("/digitizing/order-email", methods=["POST", "OPTIONS"], endpoint="digitizing_order_email_plain")
@@ -20456,11 +20464,8 @@ def _build_digitizing_email_text(*, product="", order_number="", design="", comp
 @login_required_session
 def digitizing_order_email():
     """
-    Prepare a digitizing email for William (classicdigitizers@gmail.com).
-
-    Default / composeOnly=true: return the design image as base64 so the browser
-    can download it for paperclip attach. The frontend opens Gmail compose itself
-    (same view=cm flow as material orders).
+    Create a Gmail draft to William with the design image attached.
+    Subject: JR & Co Digitize Order - #{order} - {design}
     """
     if request.method == "OPTIONS":
         return ("", 204)
@@ -20471,9 +20476,6 @@ def digitizing_order_email():
     ).strip()
     product = str(data.get("product") or data.get("Product") or "").strip()
     design = str(data.get("design") or data.get("Design") or "").strip()
-    company = str(
-        data.get("company") or data.get("Company Name") or data.get("companyName") or ""
-    ).strip()
     file_id = _extract_drive_file_id_any(
         data.get("fileId")
         or data.get("imageFileId")
@@ -20483,11 +20485,6 @@ def digitizing_order_email():
         or data.get("Preview")
     )
     to_email = str(data.get("to") or DIGITIZING_VENDOR_EMAIL).strip() or DIGITIZING_VENDOR_EMAIL
-    compose_only = bool(
-        data.get("composeOnly")
-        if "composeOnly" in data
-        else True
-    )
     if "@" not in to_email:
         return jsonify({"ok": False, "error": "Invalid digitizing vendor email."}), 400
     if not file_id:
@@ -20506,29 +20503,7 @@ def digitizing_order_email():
         product=product,
         order_number=order_number,
         design=design,
-        company=company,
     )
-    payload = [
-        {
-            "filename": attachment.get("filename") or f"{order_number or 'design'}.jpg",
-            "mime": attachment.get("mime") or "image/jpeg",
-            "contentBase64": base64.b64encode(attachment.get("bytes") or b"").decode("ascii"),
-        }
-    ]
-    if compose_only:
-        return jsonify(
-            {
-                "ok": True,
-                "method": "compose_download",
-                "attachmentsBase64": payload,
-                "subject": subject,
-                "body": body,
-                "to": to_email,
-                "orderNumber": order_number,
-                "product": product,
-            }
-        )
-
     delivered = deliver_belt_order_email(
         creds=get_google_credentials(),
         to_email=to_email,
@@ -20544,6 +20519,7 @@ def digitizing_order_email():
             "to": to_email,
             "orderNumber": order_number,
             "product": product,
+            "design": design,
         }
     )
 

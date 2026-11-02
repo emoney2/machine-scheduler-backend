@@ -1009,11 +1009,10 @@ def _gmail_account_base_url(account: str = "") -> str:
 
 def gmail_draft_compose_url(account: str, thread_id: str, message_id: str) -> str:
     """
-    Build a Gmail UI URL that opens an API-created draft in the compose window.
+    Build a Gmail UI URL that opens an API-created draft for editing.
 
-    Raw API message ids only land on the Drafts list in the current Gmail UI.
-    The compose deep-link needs the restricted-alphabet token derived from
-    thread-f:<decimal thread id>+msg-a:<message id>.
+    Prefer the encoded compose token; fall back to #drafts/<messageId>, which
+    opens the draft itself (with attachments) instead of a blank compose=new.
     """
     account = (account or DEFAULT_GMAIL_ACCOUNT).strip() or DEFAULT_GMAIL_ACCOUNT
     base = _gmail_account_base_url(account)
@@ -1022,16 +1021,16 @@ def gmail_draft_compose_url(account: str, thread_id: str, message_id: str) -> st
     if tid and mid:
         try:
             token = _gmail_encode_compose_token(f"thread-f:{int(tid, 16)}+msg-a:{mid}")
-            return f"{base}#inbox?compose={token}"
+            return f"{base}#drafts?compose={token}"
         except Exception:
             logger.warning(
                 "[Gmail] failed to encode compose token for thread=%s message=%s",
                 tid,
                 mid,
             )
-    # Fallbacks that sometimes still open the draft editor.
     if mid:
-        return f"{base}#inbox?compose={quote(mid)}"
+        # Opens the saved draft (attachment included) rather than a blank compose.
+        return f"{base}#drafts/{quote(mid)}"
     return f"{base}#drafts"
 
 
