@@ -1178,6 +1178,7 @@ GOOGLE_SCOPES = [
 
 # Google token file path (your choice)
 GOOGLE_TOKEN_PATH = os.path.join(os.getcwd(), "token.json")
+GOOGLE_GMAIL_TOKEN_PATH = os.path.join(os.getcwd(), "gmail_token.json")
 
 # --- Google auth: unify credential loading for Sheets/Drive -------------------
 from google.oauth2.credentials import Credentials as OAuthCredentials
@@ -1187,26 +1188,28 @@ from google.auth.transport.requests import Request as GoogleRequest
 _google_creds_cache = None
 _google_creds_cache_ts = 0
 _google_creds_cache_ttl = 300  # Cache for 5 minutes
+_gmail_creds_cache = None
+_gmail_creds_cache_ts = 0
 
 
-def _persist_google_creds(creds):
+def _persist_google_creds(creds, path=None):
     """Write a refreshed access token to disk so the next worker isn't expired."""
     if not creds:
         return
     try:
-        with open(GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
+        with open(path or GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
             f.write(creds.to_json())
     except Exception:
         logger.warning("Could not persist refreshed Google token", exc_info=True)
 
 
-def _refresh_google_creds(creds):
+def _refresh_google_creds(creds, persist_path=None):
     if creds.valid:
         return creds
     if not getattr(creds, "refresh_token", None):
         raise RuntimeError("Google token expired and no refresh_token is present")
     creds.refresh(GoogleRequest())
-    _persist_google_creds(creds)
+    _persist_google_creds(creds, path=persist_path)
     return creds
 
 
@@ -1243,6 +1246,73 @@ def get_google_credentials():
 
     _google_creds_cache = creds
     _google_creds_cache_ts = now
+    return creds
+
+
+def _load_gmail_creds():
+    """
+    Load Justin's Gmail OAuth token (for auto-attach sends), without replacing Drive.
+      1) GOOGLE_GMAIL_TOKEN_JSON env
+      2) gmail_token.json on disk
+    """
+    env_val = os.environ.get("GOOGLE_GMAIL_TOKEN_JSON", "").strip()
+    if env_val:
+        try:
+            info = json.loads(env_val)
+            token_scopes = info.get("scopes")
+            return (
+                OAuthCredentials.from_authorized_user_info(info)
+                if token_scopes
+                else OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            )
+        except Exception as e:
+            logger.warning("GOOGLE_GMAIL_TOKEN_JSON could not build OAuthCredentials: %r", e)
+    try:
+        if os.path.exists(GOOGLE_GMAIL_TOKEN_PATH):
+            with open(GOOGLE_GMAIL_TOKEN_PATH, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            token_scopes = info.get("scopes")
+            return (
+                OAuthCredentials.from_authorized_user_info(info)
+                if token_scopes
+                else OAuthCredentials.from_authorized_user_info(info, scopes=GOOGLE_SCOPES)
+            )
+    except Exception as e:
+        logger.warning("gmail_token.json could not build OAuthCredentials: %r", e)
+    return None
+
+
+def get_gmail_credentials():
+    """
+    Credentials used to send digitizing / attached emails.
+    Prefers Justin's dedicated Gmail token so Drive can stay on info@.
+    Falls back to the main Google token.
+    """
+    global _gmail_creds_cache, _gmail_creds_cache_ts
+    now = time.time()
+    if _gmail_creds_cache and (now - _gmail_creds_cache_ts) < _google_creds_cache_ttl:
+        try:
+            return _refresh_google_creds(
+                _gmail_creds_cache, persist_path=GOOGLE_GMAIL_TOKEN_PATH
+            )
+        except Exception:
+            logger.exception("Cached Gmail credential refresh failed")
+            _gmail_creds_cache = None
+
+    creds = _load_gmail_creds()
+    persist_path = GOOGLE_GMAIL_TOKEN_PATH if creds else GOOGLE_TOKEN_PATH
+    if not creds:
+        creds = get_google_credentials()
+        persist_path = GOOGLE_TOKEN_PATH
+    else:
+        try:
+            creds = _refresh_google_creds(creds, persist_path=persist_path)
+        except Exception:
+            logger.exception("Gmail credential refresh failed")
+            raise RuntimeError("Gmail token refresh failed") from None
+
+    _gmail_creds_cache = creds
+    _gmail_creds_cache_ts = now
     return creds
 
 
@@ -6353,15 +6423,18 @@ def token_status():
         refresh_error = str(e)[:200]
 
     gmail_email = ""
+    gmail_token_present = bool(os.environ.get("GOOGLE_GMAIL_TOKEN_JSON", "").strip()) or os.path.exists(
+        GOOGLE_GMAIL_TOKEN_PATH
+    )
     try:
-        if live:
-            from googleapiclient.discovery import build as _build_google
+        gmail_creds = get_gmail_credentials()
+        from googleapiclient.discovery import build as _build_google
 
-            gmail = _build_google("gmail", "v1", credentials=live, cache_discovery=False)
-            gmail_email = str(
-                (gmail.users().getProfile(userId="me").execute() or {}).get("emailAddress")
-                or ""
-            ).strip()
+        gmail = _build_google("gmail", "v1", credentials=gmail_creds, cache_discovery=False)
+        gmail_email = str(
+            (gmail.users().getProfile(userId="me").execute() or {}).get("emailAddress")
+            or ""
+        ).strip()
     except Exception as e:
         logger.warning("[token-status] could not read Gmail profile: %s", e)
 
@@ -6374,6 +6447,7 @@ def token_status():
         "file_exists": file_exists,
         "cwd": cwd,
         "gmailEmail": gmail_email,
+        "gmailTokenPresent": gmail_token_present,
         "expectedGmailEmail": (
             os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT") or "justin.eckard@jrcogolf.com"
         ).strip(),
@@ -20606,14 +20680,35 @@ def digitizing_order_email():
             }
         )
 
-    creds = get_google_credentials()
+    # Prefer Justin's dedicated Gmail token so attachments send from his mailbox.
+    creds = get_gmail_credentials()
+    required_from = (
+        os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT") or "justin.eckard@jrcogolf.com"
+    ).strip().lower()
     sent = send_gmail_message(
         creds,
         to_email=to_email,
         subject=subject,
         body=body,
         attachments=all_attachments,
+        from_email=required_from,
     )
+    from_email = str(sent.get("fromEmail") or "").strip().lower()
+    if sent.get("ok") and required_from and from_email and from_email != required_from:
+        # Refuse silently sending from info@ when Justin is required.
+        return jsonify(
+            {
+                "ok": False,
+                "method": "none",
+                "error": (
+                    f"Digitizing emails must send from {required_from}, but the server "
+                    f"Gmail token is {from_email}. Run: python generate_token.py --gmail "
+                    "then powershell ./deploy_gmail_token.ps1"
+                ),
+                "fromEmail": from_email,
+                "needsGmailAuth": True,
+            }
+        ), 502
     if sent.get("ok"):
         return jsonify(
             {

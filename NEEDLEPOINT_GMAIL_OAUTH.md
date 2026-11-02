@@ -1,27 +1,35 @@
-# Needlepoint belt emails — Gmail OAuth (no password)
+# Gmail OAuth for attached emails (digitizing + needlepoint)
 
-Vendor emails need a **Gmail draft with PDF attachments**.  
-Gmail’s compose URL cannot attach files. Storing a Gmail password is not required.
+Gmail’s browser compose URL **cannot auto-attach files**.
+Attached sends use the Gmail API as `justin.eckard@jrcogolf.com`.
 
-## One-time setup
+Drive/Sheets can stay on `info@jrco.us` via `GOOGLE_TOKEN_JSON`.
+Digitizing uses a **separate** Justin Gmail token: `GOOGLE_GMAIL_TOKEN_JSON`.
+
+## One-time setup (Justin Gmail token)
 
 1. On a machine with the backend OAuth client file (`new.json` / `credentials.json`):
 
    ```bash
    cd backend
-   python generate_token.py
+   python generate_token.py --gmail
    ```
 
-2. Sign in as `justin.eckard@jrcogolf.com` and allow **Drive, Sheets, and Gmail**.
+2. Sign in as **`justin.eckard@jrcogolf.com`** (not info@) and allow Gmail.
 
-3. Copy the new `token.json` into production:
-   - Set env `GOOGLE_TOKEN_JSON` to the file contents, **or**
-   - Replace the server’s `token.json`
+3. Deploy:
 
-4. Restart the backend.
+   ```powershell
+   powershell ./deploy_gmail_token.ps1
+   ```
 
-5. Remove `NEEDLEPOINT_GMAIL_APP_PASSWORD` / `NEEDLEPOINT_IMAP_PASSWORD` if present.
+   This sets Render `GOOGLE_GMAIL_TOKEN_JSON` + `NEEDLEPOINT_GMAIL_ACCOUNT`.
 
-## After that
+4. Confirm:
 
-**Create email** opens a real Gmail **draft** with `1621.pdf` (etc.) already attached. Review and Send.
+   `GET /api/drive/token-status` → `gmailEmail` should be `justin.eckard@jrcogolf.com`.
+
+## Notes
+
+- Overview material orders still open browser compose as Justin (no attachments).
+- Digitizing **Send Email** API-sends with designs auto-attached from Justin’s mailbox.
