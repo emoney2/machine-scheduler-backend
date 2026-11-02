@@ -20443,6 +20443,15 @@ def _build_digitizing_email_subject(*, order_number="", design=""):
     return " - ".join(parts)
 
 
+DIGITIZING_EMAIL_SIGNATURE = (
+    "Thanks,\n"
+    "Justin Eckard\n"
+    "JR & Co.\n"
+    "678.294.5350\n"
+    "www.jrcogolf.com"
+)
+
+
 def _build_digitizing_email_text(*, product="", order_number="", design=""):
     product_name = str(product or "").strip() or "(product not specified)"
     lines = [
@@ -20458,8 +20467,41 @@ def _build_digitizing_email_text(*, product="", order_number="", design=""):
     design_name = str(design or "").strip()
     if design_name:
         lines.append(f"Design: {design_name}")
-    lines.extend(["", "Thank you!"])
+    lines.extend(["", DIGITIZING_EMAIL_SIGNATURE])
     return _build_digitizing_email_subject(order_number=order_number, design=design), "\n".join(lines)
+
+
+def _digitizing_extra_attachments_from_payload(raw_list):
+    """Parse extra browser-uploaded attachments: [{filename, mime, contentBase64}]."""
+    out = []
+    if not isinstance(raw_list, list):
+        return out
+    for raw in raw_list:
+        if not isinstance(raw, dict):
+            continue
+        b64 = str(raw.get("contentBase64") or raw.get("data") or "").strip()
+        if not b64:
+            continue
+        # Allow data-URL prefix if present.
+        if "," in b64 and b64.lower().startswith("data:"):
+            b64 = b64.split(",", 1)[1]
+        try:
+            data = base64.b64decode(b64, validate=False)
+        except Exception:
+            logger.warning("[Digitizing] skipping invalid extra attachment base64")
+            continue
+        if not data:
+            continue
+        if len(data) > 12 * 1024 * 1024:
+            logger.warning("[Digitizing] skipping oversized extra attachment")
+            continue
+        filename = str(raw.get("filename") or raw.get("name") or "attachment").strip() or "attachment"
+        filename = re.sub(r"[\\/]+", "_", filename)[:180]
+        mime = str(raw.get("mime") or raw.get("type") or "application/octet-stream").strip()
+        if not mime:
+            mime = "application/octet-stream"
+        out.append({"filename": filename, "bytes": data, "mime": mime})
+    return out
 
 
 @app.route("/digitizing/order-email", methods=["POST", "OPTIONS"], endpoint="digitizing_order_email_plain")
@@ -20517,9 +20559,16 @@ def digitizing_order_email():
     # Allow the in-app composer to override subject/body before send.
     subject = str(data.get("subject") or subject).strip() or subject
     body = str(data.get("body") or body)
+    # Ensure signature is present even if the composer cleared the ending.
+    if "Justin Eckard" not in body:
+        body = body.rstrip() + "\n\n" + DIGITIZING_EMAIL_SIGNATURE
     filename = attachment.get("filename") or f"{order_number or 'design'}.jpg"
     mime = attachment.get("mime") or "image/jpeg"
     content_b64 = base64.b64encode(attachment.get("bytes") or b"").decode("ascii")
+    extra_attachments = _digitizing_extra_attachments_from_payload(
+        data.get("extraAttachments") or data.get("attachments") or []
+    )
+    all_attachments = [attachment] + extra_attachments
 
     if action != "send":
         return jsonify(
@@ -20546,7 +20595,7 @@ def digitizing_order_email():
         to_email=to_email,
         subject=subject,
         body=body,
-        attachments=[attachment],
+        attachments=all_attachments,
     )
     if sent.get("ok"):
         return jsonify(
@@ -20559,6 +20608,7 @@ def digitizing_order_email():
                 "product": product,
                 "design": design,
                 "attachmentName": filename,
+                "attachmentCount": len(all_attachments),
             }
         )
 
@@ -20568,7 +20618,7 @@ def digitizing_order_email():
             to_email=to_email,
             subject=subject,
             body=body,
-            attachments=[attachment],
+            attachments=all_attachments,
         ):
             return jsonify(
                 {
@@ -20582,6 +20632,7 @@ def digitizing_order_email():
                     "product": product,
                     "design": design,
                     "attachmentName": filename,
+                    "attachmentCount": len(all_attachments),
                 }
             )
     except Exception as exc:
