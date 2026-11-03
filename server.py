@@ -876,7 +876,7 @@ def _get_ppy_lookup():
 # sqft keeps its separate conversion and Driver factor.
 DRIVER_YARD_CALIBRATION = 9.5 / (160.0 / 14.0)
 # Valuables pouches are a fixed leather take, not Table PPY × 13.5.
-POUCH_SQFT_PER_PIECE = 1.3
+POUCH_SQFT_PER_PIECE = 1.2
 
 
 def _is_valuables_pouch(product):
@@ -901,7 +901,7 @@ def _compute_usage_units(
       - else if W×L:       usage = (W×L in² × qty) / (36×54)
 
     Sqft:
-      - valuables pouches: usage = qty × 1.3
+      - valuables pouches: usage = qty × 1.2
       - if Product present: usage = (qty / PPY) × 13.5
       - else if W×L:        usage = (W×L in² / 144) × qty
     """
@@ -19427,7 +19427,7 @@ def write_material_log_for_order(order_number):
         # ───────────────────────────────────────────────────────────
         # 6) Back material
         back_mat = row[h.get("Back Material")] if "Back Material" in h else ""
-        # Pouches are 1.3 sqft/piece total on FRONT; do not double that on BACK.
+        # Pouches are 1.2 sqft/piece total on FRONT; do not double that on BACK.
         if back_mat and back_yards > 0 and not is_pouch:
             log(
                 back_mat,
