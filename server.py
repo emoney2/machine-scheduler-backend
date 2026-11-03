@@ -167,6 +167,7 @@ import packing_history as packhist
 import label_archive as lblarch
 import sewing_priority_waiting as sew_waiting
 import embroidery_progress as emb_progress
+import digitizing_ordered as dig_ordered
 from wilcom_dispatch import MACHINE_IDS as WILCOM_MACHINE_IDS
 from wilcom_dispatch import dispatch as wilcom_dispatch
 from magnet_kanban import (
@@ -20437,6 +20438,22 @@ def needlepoint_order_belts():
 DIGITIZING_VENDOR_EMAIL = "classicdigitizers@gmail.com"
 
 
+def _mark_digitize_ordered(order_number):
+    """Persist Digitize Ordered so every client sees the greyed button."""
+    oid = str(order_number or "").strip()
+    if not oid:
+        return []
+    try:
+        sheets_svc = get_sheets_service()
+    except Exception:
+        sheets_svc = None
+    try:
+        return dig_ordered.mark_ordered([oid], sheets_svc, SPREADSHEET_ID)
+    except Exception:
+        logger.exception("[Digitizing] failed to mark ordered for %s", oid)
+        return []
+
+
 def _extract_drive_file_id_any(raw):
     """Resolve a Drive file id from a bare id, Drive URL, or IMAGE() formula."""
     if raw is None:
@@ -20710,6 +20727,7 @@ def digitizing_order_email():
             }
         ), 502
     if sent.get("ok"):
+        ordered_ids = _mark_digitize_ordered(order_number)
         return jsonify(
             {
                 **sent,
@@ -20722,6 +20740,8 @@ def digitizing_order_email():
                 "attachmentName": filename,
                 "attachmentCount": len(all_attachments),
                 "fromEmail": sent.get("fromEmail") or "",
+                "digitizeOrdered": True,
+                "orderedOrderNumbers": ordered_ids,
             }
         )
 
@@ -20738,6 +20758,7 @@ def digitizing_order_email():
             body=body,
             attachments=all_attachments,
         ):
+            ordered_ids = _mark_digitize_ordered(order_number)
             return jsonify(
                 {
                     "ok": True,
@@ -20752,6 +20773,8 @@ def digitizing_order_email():
                     "attachmentName": filename,
                     "attachmentCount": len(all_attachments),
                     "fromEmail": smtp_from,
+                    "digitizeOrdered": True,
+                    "orderedOrderNumbers": ordered_ids,
                 }
             )
     except Exception as exc:
@@ -20768,6 +20791,49 @@ def digitizing_order_email():
             "error": sent.get("error") or "Could not send digitizing email.",
         }
     ), 502
+
+
+@app.route(
+    "/digitizing/ordered",
+    methods=["GET", "POST", "OPTIONS"],
+    endpoint="digitizing_ordered_plain",
+)
+@app.route(
+    "/api/digitizing/ordered",
+    methods=["GET", "POST", "OPTIONS"],
+    endpoint="digitizing_ordered_api",
+)
+@login_required_session
+def digitizing_ordered():
+    """
+    Shared Digitize Ordered ids — visible on every computer.
+    GET: list order numbers.
+    POST: mark order number(s) (syncs prior local-only marks).
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    try:
+        sheets_svc = get_sheets_service()
+    except Exception:
+        sheets_svc = None
+    if request.method == "GET":
+        ids = dig_ordered.list_ordered(sheets_svc, SPREADSHEET_ID)
+        return jsonify({"ok": True, "orderNumbers": ids})
+
+    data = request.get_json(silent=True) or {}
+    raw = data.get("orderNumbers")
+    if raw is None:
+        raw = data.get("orderNumber") or data.get("order") or data.get("Order #")
+    if isinstance(raw, (list, tuple, set)):
+        ids = list(raw)
+    else:
+        ids = [raw] if raw else []
+    try:
+        ordered = dig_ordered.mark_ordered(ids, sheets_svc, SPREADSHEET_ID)
+    except Exception as exc:
+        logger.exception("[Digitizing] mark ordered API failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "orderNumbers": ordered})
 
 
 @app.route("/api/reorder", methods=["POST"])
