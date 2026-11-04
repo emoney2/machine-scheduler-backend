@@ -17,7 +17,9 @@ Thread model (Min Inv / Reorder from Thread Inventory):
   Ordered cones come from Thread Data rows with IN/OUT=IN and O/R=Ordered
   (feet / 16500). Sheet On Order alone often stays 0 after /threadInventory logs
   because Color is the 4-digit code while inventory labels include color names.
-  When Min Inv > 0 and Reorder > 0 and position < Min Inv → order Reorder cones.
+  When Min Inv > 0 and Reorder > 0 and position < Min Inv:
+    order ceil((Min Inv - position) / Reorder) * Reorder cones
+    (enough packs of Reorder to get back to Min Inv).
   On-order cones count toward position so an open order is not re-queued.
 """
 
@@ -764,7 +766,11 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
         position = on_hand + on_ord
         if position >= min_inv:
             continue
-        total_cones = int(math.ceil(reorder_qty - 1e-9))
+        # Enough packs of Reorder to cover the hole back to Min Inv.
+        # e.g. Inv 5.09, Min 12, Reorder 6 → deficit 6.91 → 2 packs → 12 cones.
+        deficit = min_inv - position
+        packs = int(math.ceil(deficit / reorder_qty - 1e-9))
+        total_cones = packs * int(math.ceil(reorder_qty - 1e-9))
         if total_cones <= 0:
             continue
         remaining_pct = (position / min_inv) * 100 if min_inv > 0 else 0.0
