@@ -38,6 +38,8 @@ START_ROW = 3
 # Madeira Polyneon: cones logged to Thread Data as feet (qty × 5500 yd × 3 ft/yd)
 FEET_PER_CONE = 5500 * 3
 ALLOWED_THREAD_STAGES = frozenset({"ordered", "fur", "cut", "print", "embroidery"})
+# Returned in /overview/rebuild-materials stats so we can confirm Render is live.
+THREAD_ORDER_LOGIC = "min-inv-packs-v2"
 
 
 def _as_text(v: Any) -> str:
@@ -765,6 +767,7 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
             usage_by_code.setdefault(m.group(1), {})[td_order] = True
 
     # Monitor every Thread Inventory color that has Min Inv + Reorder configured.
+    thread_debug: List[Dict[str, Any]] = []
     for code_key in sorted(inv_by_code.keys(), key=lambda x: (len(x), x)):
         min_inv = float(min_by_code.get(code_key, 0) or 0)
         reorder_qty = float(reorder_by_code.get(code_key, 0) or 0)
@@ -779,11 +782,26 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
         # e.g. Inv 5.09, Min 12, Reorder 6 → deficit 6.91 → 2 packs → 12 cones.
         deficit = min_inv - position
         packs = int(math.ceil(deficit / reorder_qty - 1e-9))
-        total_cones = packs * int(math.ceil(reorder_qty - 1e-9))
+        pack_size = int(math.ceil(reorder_qty - 1e-9))
+        total_cones = packs * pack_size
         if total_cones <= 0:
             continue
         remaining_pct = (position / min_inv) * 100 if min_inv > 0 else 0.0
         pct_rounded = int(round(remaining_pct))
+        if code_key in {"1825", "1800", "1643", "1801"} or len(thread_debug) < 5:
+            thread_debug.append(
+                {
+                    "code": code_key,
+                    "onHand": on_hand,
+                    "onOrd": on_ord,
+                    "minInv": min_inv,
+                    "reorder": reorder_qty,
+                    "deficit": deficit,
+                    "packs": packs,
+                    "qty": total_cones,
+                    "pct": pct_rounded,
+                }
+            )
         usage_map = usage_by_code.get(code_key) or {}
         bucket = (
             _bucket_for_thread(
@@ -844,6 +862,8 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
     stats = {
         "mRows": len(rows_now),
         "nRows": len(rows_fut),
+        "threadOrderLogic": THREAD_ORDER_LOGIC,
+        "threadDebug": thread_debug,
         "idxPoDue": idx_po_due,
         "idxPoShip": idx_po_ship,
         "idxPoHs": idx_po_hs,

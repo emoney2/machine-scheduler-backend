@@ -14921,11 +14921,15 @@ def overview_rebuild_materials():
     except Exception as emit_err:
         app.logger.warning("overview_rebuild_materials: socket emit failed: %s", emit_err)
 
+    logic = stats.get("threadOrderLogic") or "?"
     return (
         jsonify(
             {
                 "success": True,
-                "message": f"Materials to order rebuilt (M={stats.get('mRows', 0)}, N={stats.get('nRows', 0)}).",
+                "message": (
+                    f"Materials to order rebuilt (M={stats.get('mRows', 0)}, "
+                    f"N={stats.get('nRows', 0)}, threads={logic})."
+                ),
                 "stats": stats,
             }
         ),
