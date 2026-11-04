@@ -12,12 +12,13 @@ Material model (ledger hole + later-first list split):
   Assign toBuy to rawLater FIRST, remainder to Now.
   Example Leaf Green: Inv -87, On Order 74 → toBuy 14 → Now 0, Later 14.
 
-Thread model:
-  currentCones = Thread Inventory + max(sheet On Order, Thread Data Ordered cones)
+Thread model (Min Inv / Reorder from Thread Inventory):
+  position = Inventory + max(sheet On Order, Thread Data Ordered cones)
   Ordered cones come from Thread Data rows with IN/OUT=IN and O/R=Ordered
   (feet / 16500). Sheet On Order alone often stays 0 after /threadInventory logs
   because Color is the 4-digit code while inventory labels include color names.
-  Zero stock with inbound Ordered cones does NOT re-queue a pod.
+  When Min Inv > 0 and Reorder > 0 and position < Min Inv → order Reorder cones.
+  On-order cones count toward position so an open order is not re-queued.
 """
 
 from __future__ import annotations
@@ -31,7 +32,6 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 FUTURE_DUE_DAYS = 60
-HEADS = 6
 START_ROW = 3
 # Madeira Polyneon: cones logged to Thread Data as feet (qty × 5500 yd × 3 ft/yd)
 FEET_PER_CONE = 5500 * 3
@@ -410,21 +410,27 @@ def _first_four_digits(s: Any) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _thread_inv_columns(headers: List[Any]) -> Tuple[int, int, int]:
+def _thread_inv_columns(headers: List[Any]) -> Tuple[int, int, int, int, int]:
     """
-    Thread Inventory: Thread Colors / Inventory / On Order (header-flexible).
-    Falls back to A/B/C when headers are missing.
+    Thread Inventory: Thread Colors / Inventory / On Order / Min Inv / Reorder.
+    Falls back to A–E when headers are missing.
     """
     col_thread = _header_index(headers, ["thread colors", "thread color", "color", "colors"])
     col_inv = _header_index(headers, ["inventory..", "inventory"])
     col_oo = _header_index(headers, ["on order..", "on order"])
+    col_min = _header_index(headers, ["min inv..", "min inv", "min inventory", "minimum"])
+    col_reorder = _header_index(headers, ["reorder..", "reorder", "order amount", "order qty"])
     if col_thread < 0:
         col_thread = 0
     if col_inv < 0:
         col_inv = 1
     if col_oo < 0:
         col_oo = col_inv + 1 if col_inv >= 0 else 2
-    return col_thread, col_inv, col_oo
+    if col_min < 0:
+        col_min = 3
+    if col_reorder < 0:
+        col_reorder = 4
+    return col_thread, col_inv, col_oo, col_min, col_reorder
 
 
 def _thread_data_columns(headers: List[Any]) -> Dict[str, int]:
@@ -676,10 +682,14 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
             )
 
     ti_hdr = ti[0] if ti else []
-    col_ti_thread, col_ti_inv, col_ti_oo = _thread_inv_columns(ti_hdr)
+    col_ti_thread, col_ti_inv, col_ti_oo, col_ti_min, col_ti_reorder = _thread_inv_columns(
+        ti_hdr
+    )
 
     inv_by_code: Dict[str, float] = {}
     sheet_ord_by_code: Dict[str, float] = {}
+    min_by_code: Dict[str, float] = {}
+    reorder_by_code: Dict[str, float] = {}
     for row in ti[1:]:
         code = _first_four_digits(_cell(row, col_ti_thread))
         if not code:
@@ -687,6 +697,11 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
         inv_by_code[code] = inv_by_code.get(code, 0) + _as_num(_cell(row, col_ti_inv))
         sheet_ord_by_code[code] = sheet_ord_by_code.get(code, 0) + _as_num(
             _cell(row, col_ti_oo)
+        )
+        # Prefer the highest Min Inv / Reorder if a code appears on multiple rows.
+        min_by_code[code] = max(min_by_code.get(code, 0.0), _as_num(_cell(row, col_ti_min)))
+        reorder_by_code[code] = max(
+            reorder_by_code.get(code, 0.0), _as_num(_cell(row, col_ti_reorder))
         )
 
     td_hdr = td[0] if td else []
@@ -710,11 +725,13 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
         )
 
     logger.info(
-        "Thread cols: TI thread=%s inv=%s oo=%s | TD order=%s color=%s len=%s inout=%s or=%s | "
-        "tdOrderedCodes=%s",
+        "Thread cols: TI thread=%s inv=%s oo=%s min=%s reorder=%s | "
+        "TD order=%s color=%s len=%s inout=%s or=%s | tdOrderedCodes=%s",
         col_ti_thread,
         col_ti_inv,
         col_ti_oo,
+        col_ti_min,
+        col_ti_reorder,
         idx_td_order,
         idx_td_color,
         idx_td_len,
@@ -723,7 +740,6 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
         len(td_ord_by_code),
     )
 
-    active_codes: Dict[str, bool] = {}
     usage_by_code: Dict[str, Dict[str, bool]] = {}
     for row in td[1:]:
         td_order = _as_text(_cell(row, idx_td_order)).strip()
@@ -735,34 +751,31 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
         if st not in ALLOWED_THREAD_STAGES:
             continue
         for m in re.finditer(r"(\d{4})", td_color):
-            code_found = m.group(1)
-            active_codes[code_found] = True
-            usage_by_code.setdefault(code_found, {})[td_order] = True
+            usage_by_code.setdefault(m.group(1), {})[td_order] = True
 
-    for code_key in sorted(active_codes.keys(), key=lambda x: (len(x), x)):
+    # Monitor every Thread Inventory color that has Min Inv + Reorder configured.
+    for code_key in sorted(inv_by_code.keys(), key=lambda x: (len(x), x)):
+        min_inv = float(min_by_code.get(code_key, 0) or 0)
+        reorder_qty = float(reorder_by_code.get(code_key, 0) or 0)
+        if min_inv <= 0 or reorder_qty <= 0:
+            continue
         on_hand = inv_by_code.get(code_key, 0)
         on_ord = ord_by_code.get(code_key, 0)
-        current_cones = on_hand + on_ord
-        remaining_pct = (current_cones / HEADS) * 100
-        usage_map = usage_by_code.get(code_key) or {}
-        usage_count = len(usage_map)
-        pods_to_order = 0
-        if current_cones < 0:
-            pods_to_order = int(math.ceil((-current_cones) / HEADS))
-        elif current_cones == 0 and on_ord <= 0:
-            # Truly empty (nothing on hand, nothing inbound) → one pod
-            pods_to_order = 1
-        elif remaining_pct > 0:
-            if usage_count > 30 and remaining_pct < 25:
-                pods_to_order = 1
-            elif usage_count > 10 and remaining_pct < 10:
-                pods_to_order = 1
-        if pods_to_order <= 0:
+        position = on_hand + on_ord
+        if position >= min_inv:
             continue
+        total_cones = int(math.ceil(reorder_qty - 1e-9))
+        if total_cones <= 0:
+            continue
+        remaining_pct = (position / min_inv) * 100 if min_inv > 0 else 0.0
         pct_rounded = int(round(remaining_pct))
-        total_cones = pods_to_order * HEADS
-        bucket = _bucket_for_thread(
-            usage_map, stg_by_order, due_by_order, ship_by_order, hs_by_order
+        usage_map = usage_by_code.get(code_key) or {}
+        bucket = (
+            _bucket_for_thread(
+                usage_map, stg_by_order, due_by_order, ship_by_order, hs_by_order
+            )
+            if usage_map
+            else "now"
         )
         future_cones = total_cones if bucket == "future" else 0
         now_cones = max(0, total_cones - future_cones)
