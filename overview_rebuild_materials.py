@@ -625,6 +625,15 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
         on_hand = _as_num(_cell(row, 1))
         on_ord = _as_num(_cell(row, 2))
         unit = _as_text(_cell(row, 3))
+        # Thread cones are owned by Thread Inventory (Min Inv / Reorder).
+        # Skip Cone rows (and header junk like "Thread Colors Auto Order…") here
+        # so they are not double-listed as materials: "1025 6 Cones - Madeira USA".
+        unit_l = unit.strip().lower()
+        name_l = name.lower()
+        if unit_l.startswith("cone") or "auto order" in name_l or name_l.startswith(
+            "thread colors"
+        ):
+            continue
         reorder = _as_num(_cell(row, 5))
         vendor = _as_text(_cell(row, 8)).strip() or "Misc."
 
