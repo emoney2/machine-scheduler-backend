@@ -1,0 +1,302 @@
+"""JR Local Presentation PDF → production flat PNG handoff (schemaVersion 1).
+
+Presentation PDFs embed ``jrco-manifest.json`` as a file attachment. Pages are
+customer proofs only; immutable flat PNGs live on Google Drive (or ``local:<sha>``
+placeholders when desktop Drive upload was not configured).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+from io import BytesIO
+from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
+
+MANIFEST_NAME = "jrco-manifest.json"
+SCHEMA_VERSION = 1
+LOCAL_ID_PREFIX = "local:"
+
+
+class JrcoPresentationError(ValueError):
+    """User-facing / API error for invalid or unresolvable presentation PDFs."""
+
+
+def _safe_stem(name: str) -> str:
+    base = (name or "design").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+    base = re.sub(r"\.pdf$", "", base, flags=re.I)
+    base = re.sub(r"[^\w\-]+", "-", base).strip("-") or "design"
+    return base[:80]
+
+
+def is_pdf_filename(filename: str = "") -> bool:
+    name = (filename or "").lower()
+    return name.endswith(".pdf")
+
+
+def looks_like_pdf(raw: bytes | None) -> bool:
+    return bool(raw) and raw[:5] == b"%PDF-"
+
+
+def extract_embedded_file(pdf_bytes: bytes, name: str) -> bytes | None:
+    """Return the first embedded attachment with the given name, or None."""
+    try:
+        from pypdf import PdfReader
+    except ImportError as e:
+        raise JrcoPresentationError(
+            "pypdf is required to read JR presentation PDFs"
+        ) from e
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        attachments = reader.attachments or {}
+        contents = attachments.get(name)
+        if not contents:
+            # Case-insensitive fallback
+            for key, vals in attachments.items():
+                if str(key).lower() == name.lower() and vals:
+                    return vals[0]
+            return None
+        return contents[0]
+    except JrcoPresentationError:
+        raise
+    except Exception as e:
+        raise JrcoPresentationError(f"Could not read PDF attachments: {e}") from e
+
+
+def read_jrco_manifest(pdf_bytes: bytes) -> dict[str, Any]:
+    """Parse and validate ``jrco-manifest.json`` from a presentation PDF."""
+    if not looks_like_pdf(pdf_bytes):
+        raise JrcoPresentationError("Not a PDF file")
+    raw = extract_embedded_file(pdf_bytes, MANIFEST_NAME)
+    if raw is None:
+        raise JrcoPresentationError(
+            "Not a JR presentation PDF (missing jrco-manifest.json attachment)"
+        )
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise JrcoPresentationError(f"Invalid jrco-manifest.json: {e}") from e
+    if not isinstance(data, dict):
+        raise JrcoPresentationError("jrco-manifest.json must be a JSON object")
+    if data.get("schemaVersion") != SCHEMA_VERSION:
+        raise JrcoPresentationError(
+            f"Unsupported schemaVersion: {data.get('schemaVersion')}"
+        )
+    designs = data.get("designs")
+    if not isinstance(designs, list) or not designs:
+        raise JrcoPresentationError("jrco-manifest.json designs[] must be non-empty")
+    for i, d in enumerate(designs):
+        if not isinstance(d, dict):
+            raise JrcoPresentationError(f"designs[{i}] must be an object")
+        for key in ("page", "designId", "flatPngDriveFileId", "flatPngSha256"):
+            if d.get(key) in (None, ""):
+                raise JrcoPresentationError(f"designs[{i}] missing required field: {key}")
+    return data
+
+
+def is_jrco_presentation_pdf(raw: bytes | None, filename: str = "") -> bool:
+    if not raw or not looks_like_pdf(raw):
+        return False
+    if filename and not is_pdf_filename(filename):
+        return False
+    try:
+        read_jrco_manifest(raw)
+        return True
+    except JrcoPresentationError:
+        return False
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def design_flat_filename(design: dict[str, Any], pdf_filename: str = "") -> str:
+    """Build a stable local filename for a resolved flat PNG."""
+    artwork = str(design.get("artworkVersion") or "").strip()
+    product = str(design.get("productType") or "design").strip() or "design"
+    design_id = str(design.get("designId") or "")[:8]
+    stem = _safe_stem(f"{product}-{design_id}" if design_id else product)
+    if artwork:
+        return f"{stem}__{artwork}.png"
+    pdf_stem = _safe_stem(pdf_filename) if pdf_filename else "presentation"
+    page = design.get("page") or 1
+    return f"{pdf_stem}-p{page}-flat.png"
+
+
+def classify_flat_png_id(file_id: str) -> str:
+    """Return ``local``, ``drive``, or ``empty``."""
+    fid = (file_id or "").strip()
+    if not fid:
+        return "empty"
+    if fid.lower().startswith(LOCAL_ID_PREFIX):
+        return "local"
+    return "drive"
+
+
+def inspect_presentation(
+    pdf_bytes: bytes,
+    filename: str = "",
+) -> dict[str, Any]:
+    """
+    Extract manifest and classify each design (no Drive download).
+
+    Returns a JSON-serializable summary for the order UI.
+    """
+    manifest = read_jrco_manifest(pdf_bytes)
+    designs_out: list[dict[str, Any]] = []
+    blocking_errors: list[str] = []
+    for d in manifest["designs"]:
+        fid = str(d.get("flatPngDriveFileId") or "").strip()
+        kind = classify_flat_png_id(fid)
+        err = None
+        if kind == "local":
+            err = (
+                "This PDF was produced without Drive upload — re-export after "
+                "Drive is configured (paths.presentationExportsFolderId), "
+                "or attach the flat PNG manually."
+            )
+            blocking_errors.append(
+                f"Page {d.get('page')}: {err}"
+            )
+        elif kind == "empty":
+            err = "Missing flatPngDriveFileId"
+            blocking_errors.append(f"Page {d.get('page')}: {err}")
+        designs_out.append(
+            {
+                "page": d.get("page"),
+                "designId": d.get("designId"),
+                "productType": d.get("productType") or "",
+                "artworkVersion": d.get("artworkVersion") or "",
+                "flatPngDriveFileId": fid,
+                "flatPngSha256": d.get("flatPngSha256") or "",
+                "sourcePsdDriveFileId": d.get("sourcePsdDriveFileId") or "",
+                "idKind": kind,
+                "suggestedFilename": design_flat_filename(d, filename),
+                "error": err,
+            }
+        )
+    return {
+        "ok": not blocking_errors,
+        "schemaVersion": manifest.get("schemaVersion"),
+        "presentationId": manifest.get("presentationId"),
+        "designs": designs_out,
+        "blockingErrors": blocking_errors,
+        "filename": filename or "",
+    }
+
+
+def resolve_flat_pngs(
+    pdf_bytes: bytes,
+    filename: str,
+    download_bytes: Callable[[str], bytes],
+) -> list[dict[str, Any]]:
+    """
+    Download and verify each design's flat PNG.
+
+    ``download_bytes(file_id)`` must return raw file bytes from Drive.
+    Raises ``JrcoPresentationError`` on local: ids or integrity failure.
+    """
+    inspect = inspect_presentation(pdf_bytes, filename)
+    if not inspect["ok"]:
+        raise JrcoPresentationError(
+            "; ".join(inspect["blockingErrors"])
+            or "Presentation PDF cannot be resolved"
+        )
+    resolved: list[dict[str, Any]] = []
+    for d in inspect["designs"]:
+        fid = d["flatPngDriveFileId"]
+        try:
+            png_bytes = download_bytes(fid)
+        except Exception as e:
+            raise JrcoPresentationError(
+                f"Failed to download flat PNG for page {d.get('page')} "
+                f"(Drive id {fid}): {e}"
+            ) from e
+        if not png_bytes:
+            raise JrcoPresentationError(
+                f"Empty download for flat PNG page {d.get('page')} (Drive id {fid})"
+            )
+        actual = _sha256_hex(png_bytes)
+        expected = str(d.get("flatPngSha256") or "").strip().lower()
+        if expected and actual.lower() != expected:
+            raise JrcoPresentationError(
+                f"SHA-256 mismatch for page {d.get('page')}: "
+                f"expected {expected}, got {actual}"
+            )
+        resolved.append(
+            {
+                "page": d.get("page"),
+                "designId": d.get("designId"),
+                "productType": d.get("productType") or "",
+                "artworkVersion": d.get("artworkVersion") or "",
+                "flatPngDriveFileId": fid,
+                "flatPngSha256": actual,
+                "filename": d["suggestedFilename"],
+                "bytes": png_bytes,
+                "mimetype": "image/png",
+                "role": "flat_production",
+            }
+        )
+    return resolved
+
+
+def expand_presentation_uploads(
+    raw: bytes,
+    filename: str,
+    download_bytes: Callable[[str], bytes],
+    *,
+    keep_proof_pdf: bool = True,
+) -> list[dict[str, Any]] | None:
+    """
+    Turn a JR presentation PDF into Drive upload payloads (flat PNGs + optional proof PDF).
+
+    Returns None if the file is not a JR presentation PDF (so callers can fall through).
+    Raises ``JrcoPresentationError`` if it is a presentation but cannot be resolved.
+    """
+    if not looks_like_pdf(raw):
+        return None
+    if not is_pdf_filename(filename) and not looks_like_pdf(raw):
+        return None
+    # Detect without raising for ordinary PDFs
+    try:
+        if extract_embedded_file(raw, MANIFEST_NAME) is None:
+            return None
+    except JrcoPresentationError:
+        return None
+
+    flats = resolve_flat_pngs(raw, filename, download_bytes)
+    uploads: list[dict[str, Any]] = []
+    for item in flats:
+        uploads.append(
+            {
+                "filename": item["filename"],
+                "bytes": item["bytes"],
+                "mimetype": "image/png",
+                "role": "flat_production",
+                "designId": item.get("designId"),
+                "page": item.get("page"),
+                "flatPngDriveFileId": item.get("flatPngDriveFileId"),
+                "flatPngSha256": item.get("flatPngSha256"),
+                "productType": item.get("productType"),
+                "artworkVersion": item.get("artworkVersion"),
+            }
+        )
+    if keep_proof_pdf:
+        stem = _safe_stem(filename)
+        uploads.append(
+            {
+                "filename": f"{stem}-jr-presentation-proof.pdf",
+                "bytes": raw,
+                "mimetype": "application/pdf",
+                "role": "presentation_proof",
+            }
+        )
+    logger.info(
+        "[JR Presentation] expanded %s → %s",
+        filename,
+        ", ".join(u["filename"] for u in uploads),
+    )
+    return uploads

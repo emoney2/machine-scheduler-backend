@@ -207,6 +207,11 @@ from jr_needlepoint_package import (
     expand_studio_package_uploads,
     prefer_grid_attachments,
 )
+from jrco_presentation import (
+    JrcoPresentationError,
+    expand_presentation_uploads,
+    inspect_presentation,
+)
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
@@ -6593,6 +6598,32 @@ def drive_proxy(file_id):
 def api_ping():
     # Hitting this endpoint updates session["last_activity"] via the decorator
     return jsonify({"ok": True}), 200
+
+
+@app.route("/api/jrco-presentation/inspect", methods=["POST", "OPTIONS"])
+def api_jrco_presentation_inspect():
+    """
+    Inspect a JR Local Presentation PDF: read embedded jrco-manifest.json and
+    classify each design's flatPngDriveFileId (Drive vs local: placeholder).
+
+    Multipart field: ``pdf`` (or ``file``). Does not download Drive flats —
+    submit-time expansion resolves + verifies SHA-256.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    f = request.files.get("pdf") or request.files.get("file")
+    if not f:
+        return jsonify({"ok": False, "error": "Upload a PDF as form field 'pdf'."}), 400
+    raw = f.read()
+    name = f.filename or "presentation.pdf"
+    try:
+        summary = inspect_presentation(raw, name)
+        return jsonify(summary)
+    except JrcoPresentationError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        logger.exception("[jrco-presentation/inspect] failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/upload-email-preview", methods=["POST", "OPTIONS"])
@@ -19873,12 +19904,19 @@ def submit_order():
                 lower.endswith("-customer-view.png")
                 or lower.endswith("-grid.pdf")
                 or lower.endswith(".jrneedlepoint.json")
+                or lower.endswith("-jr-presentation-proof.pdf")
             ):
                 _queue_corel_vectorize_job(drive, folder_id, name, order_label)
             return up
 
+        # Flat PNGs resolved from JR presentation PDFs — also land in Print Files.
+        presentation_flat_uploads: list[tuple[str, bytes, str]] = []
+
+        def _download_presentation_flat(file_id: str) -> bytes:
+            return _download_drive_file_bytes(drive, file_id)
+
         def _iter_prod_upload_items(file_storage):
-            """Yield (filename, bytes, mimetype) — expands Studio .jrneedlepoint.json packages."""
+            """Yield (filename, bytes, mimetype) — expands Studio packages + JR presentation PDFs."""
             raw = file_storage.read()
             name = file_storage.filename or "upload.bin"
             mime = file_storage.mimetype or "application/octet-stream"
@@ -19890,63 +19928,134 @@ def submit_order():
             if expanded:
                 for item in expanded:
                     yield item["filename"], item["bytes"], item["mimetype"]
-            else:
-                yield name, raw, mime
+                return
 
-        if is_quilted_front:
-            for f in prod_files:
-                for up_name, up_bytes, up_mime in _iter_prod_upload_items(f):
-                    up = _upload_prod_payload(
-                        up_name, up_bytes, up_mime, order_folder_id, new_order
-                    )
-                    prod_links.append(up["webViewLink"])
-                    up2 = _upload_prod_payload(
-                        up_name, up_bytes, up_mime, back_order_folder_id, back_order
-                    )
-                    back_prod_links.append(up2["webViewLink"])
-        else:
-            for f in prod_files:
-                for up_name, up_bytes, up_mime in _iter_prod_upload_items(f):
-                    up = _upload_prod_payload(
-                        up_name, up_bytes, up_mime, order_folder_id, new_order
-                    )
-                    prod_links.append(up["webViewLink"])
+            try:
+                expanded = expand_presentation_uploads(
+                    raw,
+                    name,
+                    _download_presentation_flat,
+                    keep_proof_pdf=True,
+                )
+            except JrcoPresentationError:
+                raise
+            except Exception as exp_err:
+                logger.warning(
+                    "[submit] JR presentation expand failed for %s: %s", name, exp_err
+                )
+                expanded = None
+            if expanded:
+                for item in expanded:
+                    up_name = item["filename"]
+                    up_bytes = item["bytes"]
+                    up_mime = item["mimetype"]
+                    if item.get("role") == "flat_production":
+                        presentation_flat_uploads.append((up_name, up_bytes, up_mime))
+                    yield up_name, up_bytes, up_mime
+                return
+
+            yield name, raw, mime
+
+        try:
+            if is_quilted_front:
+                for f in prod_files:
+                    for up_name, up_bytes, up_mime in _iter_prod_upload_items(f):
+                        up = _upload_prod_payload(
+                            up_name, up_bytes, up_mime, order_folder_id, new_order
+                        )
+                        prod_links.append(up["webViewLink"])
+                        up2 = _upload_prod_payload(
+                            up_name, up_bytes, up_mime, back_order_folder_id, back_order
+                        )
+                        back_prod_links.append(up2["webViewLink"])
+            else:
+                for f in prod_files:
+                    for up_name, up_bytes, up_mime in _iter_prod_upload_items(f):
+                        up = _upload_prod_payload(
+                            up_name, up_bytes, up_mime, order_folder_id, new_order
+                        )
+                        prod_links.append(up["webViewLink"])
+        except JrcoPresentationError as pres_err:
+            return jsonify({"error": str(pres_err)}), 400
+
+        def _iter_print_upload_items(file_storage):
+            """Yield print payloads; expand JR presentation PDFs to flat PNGs only (no proof PDF)."""
+            raw = file_storage.read()
+            name = file_storage.filename or "upload.bin"
+            mime = file_storage.mimetype or "application/octet-stream"
+            try:
+                expanded = expand_presentation_uploads(
+                    raw,
+                    name,
+                    _download_presentation_flat,
+                    keep_proof_pdf=False,
+                )
+            except JrcoPresentationError:
+                raise
+            except Exception as exp_err:
+                logger.warning(
+                    "[submit] JR presentation print expand failed for %s: %s",
+                    name,
+                    exp_err,
+                )
+                expanded = None
+            if expanded:
+                for item in expanded:
+                    if item.get("role") == "flat_production":
+                        yield item["filename"], item["bytes"], item["mimetype"]
+                return
+            yield name, raw, mime
 
         # Create Print Files subfolder if user uploaded print files OR checked the Print checkbox
+        # OR a JR presentation PDF resolved flat PNG(s) onto the order.
         print_val = (data.get("print") or "").strip().upper()
+        if presentation_flat_uploads:
+            print_val = "YES"
         print_cell = "YES" if print_val == "YES" else "NO"
         print_links = ""
         back_print_links = ""
-        if print_files or print_val == "YES":
+        if print_files or print_val == "YES" or presentation_flat_uploads:
             pf_id = create_folder("Print Files", parent_id=order_folder_id)
             make_public(pf_id)
+            try:
+                print_payloads: list[tuple[str, bytes, str]] = []
+                for f in print_files:
+                    for up_name, up_bytes, up_mime in _iter_print_upload_items(f):
+                        print_payloads.append((up_name, up_bytes, up_mime))
+                # Deduplicate by filename — presentation flats already staged from prod expand.
+                seen_print_names = {n for n, _, _ in print_payloads}
+                for up_name, up_bytes, up_mime in presentation_flat_uploads:
+                    if up_name not in seen_print_names:
+                        print_payloads.append((up_name, up_bytes, up_mime))
+                        seen_print_names.add(up_name)
+            except JrcoPresentationError as pres_err:
+                return jsonify({"error": str(pres_err)}), 400
+
             if is_quilted_front and back_order_folder_id:
                 back_pf_id = create_folder("Print Files", parent_id=back_order_folder_id)
                 make_public(back_pf_id)
-                for f in print_files:
-                    buf = BytesIO(f.read())
-                    m = MediaIoBaseUpload(buf, mimetype=f.mimetype)
+                for up_name, up_bytes, up_mime in print_payloads:
+                    buf = BytesIO(up_bytes)
+                    m = MediaIoBaseUpload(buf, mimetype=up_mime or "application/octet-stream")
                     drive.files().create(
-                        body={"name": f.filename, "parents": [pf_id]},
+                        body={"name": up_name, "parents": [pf_id]},
                         media_body=m,
                         fields="id",
                     ).execute()
-                    buf.seek(0)
-                    m2 = MediaIoBaseUpload(buf, mimetype=f.mimetype)
+                    buf = BytesIO(up_bytes)
+                    m2 = MediaIoBaseUpload(buf, mimetype=up_mime or "application/octet-stream")
                     drive.files().create(
-                        body={"name": f.filename, "parents": [back_pf_id]},
+                        body={"name": up_name, "parents": [back_pf_id]},
                         media_body=m2,
                         fields="id",
                     ).execute()
-                    del buf
                 back_print_links = f"https://drive.google.com/drive/folders/{back_pf_id}"
             else:
-                # Process one print file at a time to avoid holding multiple large files in memory
-                for f in print_files:
-                    buf = BytesIO(f.read())
-                    m = MediaIoBaseUpload(buf, mimetype=f.mimetype)
+                for up_name, up_bytes, up_mime in print_payloads:
+                    buf = BytesIO(up_bytes)
+                    m = MediaIoBaseUpload(buf, mimetype=up_mime or "application/octet-stream")
                     drive.files().create(
-                        body={"name": f.filename, "parents": [pf_id]},
+                        body={"name": up_name, "parents": [pf_id]},
                         media_body=m,
                         fields="id",
                     ).execute()
