@@ -199,6 +199,7 @@ from needlepoint_belts import (
     parse_size_quantities as parse_needlepoint_sizes,
     send_gmail_message,
     send_smtp_email as send_needlepoint_smtp_email,
+    creds_have_gmail_scope as needlepoint_creds_have_gmail_scope,
     sheet_is_ready as needlepoint_sheet_is_ready,
     supplier_email as needlepoint_supplier_email,
     total_quantity as needlepoint_total_quantity,
@@ -20819,35 +20820,63 @@ def digitizing_order_email():
             }
         )
 
-    # Prefer Justin's dedicated Gmail token so attachments send from his mailbox.
-    creds = get_gmail_credentials()
+    # Send from info@jrco.us (company mailbox). Do not use Justin's dedicated
+    # GOOGLE_GMAIL_TOKEN_JSON — that would send as justin.eckard@jrcogolf.com.
     required_from = (
-        os.environ.get("NEEDLEPOINT_GMAIL_ACCOUNT") or "justin.eckard@jrcogolf.com"
+        os.environ.get("DIGITIZING_FROM_EMAIL")
+        or os.environ.get("DESIGN_CONFIRMATION_FROM_EMAIL")
+        or os.environ.get("SMTP_USER")
+        or "info@jrco.us"
     ).strip().lower()
-    sent = send_gmail_message(
-        creds,
-        to_email=to_email,
-        subject=subject,
-        body=body,
-        attachments=all_attachments,
-        from_email=required_from,
-    )
-    from_email = str(sent.get("fromEmail") or "").strip().lower()
-    if sent.get("ok") and required_from and from_email and from_email != required_from:
-        # Refuse silently sending from info@ when Justin is required.
-        return jsonify(
-            {
+    sent = {
+        "ok": False,
+        "method": "none",
+        "error": "",
+        "fromEmail": "",
+    }
+    try:
+        creds = get_google_credentials()
+        if needlepoint_creds_have_gmail_scope(creds):
+            sent = send_gmail_message(
+                creds,
+                to_email=to_email,
+                subject=subject,
+                body=body,
+                attachments=all_attachments,
+                from_email=required_from,
+            )
+            from_email = str(sent.get("fromEmail") or "").strip().lower()
+            if sent.get("ok") and from_email and from_email != required_from:
+                # Wrong mailbox — fall through to SMTP as info@.
+                logger.warning(
+                    "[Digitizing] Gmail API authenticated as %s (want %s); trying SMTP",
+                    from_email,
+                    required_from,
+                )
+                sent = {
+                    "ok": False,
+                    "method": "none",
+                    "error": (
+                        f"Gmail token is {from_email}, need {required_from}"
+                    ),
+                    "fromEmail": from_email,
+                }
+        else:
+            sent = {
                 "ok": False,
                 "method": "none",
-                "error": (
-                    f"Digitizing emails must send from {required_from}, but the server "
-                    f"Gmail token is {from_email}. Run: python generate_token.py --gmail "
-                    "then powershell ./deploy_gmail_token.ps1"
-                ),
-                "fromEmail": from_email,
-                "needsGmailAuth": True,
+                "error": "Main Google login is missing Gmail permission; using SMTP.",
+                "fromEmail": "",
             }
-        ), 502
+    except Exception as exc:
+        logger.warning("[Digitizing] Gmail API send failed: %s", exc)
+        sent = {
+            "ok": False,
+            "method": "none",
+            "error": str(exc),
+            "fromEmail": "",
+        }
+
     if sent.get("ok"):
         ordered_ids = _mark_digitize_ordered(order_number)
         return jsonify(
@@ -20861,19 +20890,15 @@ def digitizing_order_email():
                 "design": design,
                 "attachmentName": filename,
                 "attachmentCount": len(all_attachments),
-                "fromEmail": sent.get("fromEmail") or "",
+                "fromEmail": sent.get("fromEmail") or required_from,
                 "digitizeOrdered": True,
                 "orderedOrderNumbers": ordered_ids,
             }
         )
 
-    # SMTP fallback when Gmail API send is unavailable.
+    # SMTP fallback — same info@ path as design confirmation emails.
     try:
-        smtp_from = (
-            os.environ.get("DESIGN_CONFIRMATION_FROM_EMAIL")
-            or os.environ.get("SMTP_USER")
-            or "info@jrco.us"
-        ).strip()
+        smtp_from = required_from
         if send_needlepoint_smtp_email(
             to_email=to_email,
             subject=subject,

@@ -1,10 +1,13 @@
-# Gmail OAuth for attached emails (digitizing + needlepoint)
+# Gmail OAuth for attached emails (needlepoint)
 
 Gmail’s browser compose URL **cannot auto-attach files**.
-Attached sends use the Gmail API as `justin.eckard@jrcogolf.com`.
+Needlepoint attached sends use the Gmail API as `justin.eckard@jrcogolf.com`
+via `GOOGLE_GMAIL_TOKEN_JSON`.
 
-Drive/Sheets can stay on `info@jrco.us` via `GOOGLE_TOKEN_JSON`.
-Digitizing uses a **separate** Justin Gmail token: `GOOGLE_GMAIL_TOKEN_JSON`.
+**Digitizing** emails send from **`info@jrco.us`** (main `GOOGLE_TOKEN_JSON`
+Gmail if scoped, otherwise SMTP / `DESIGN_CONFIRMATION_FROM_EMAIL`).
+
+Drive/Sheets stay on `info@jrco.us` via `GOOGLE_TOKEN_JSON`.
 
 ## One-time setup (Justin Gmail token)
 
@@ -32,4 +35,4 @@ Digitizing uses a **separate** Justin Gmail token: `GOOGLE_GMAIL_TOKEN_JSON`.
 ## Notes
 
 - Overview material orders still open browser compose as Justin (no attachments).
-- Digitizing **Send Email** API-sends with designs auto-attached from Justin’s mailbox.
+- Digitizing **Send Email** API-sends with designs auto-attached from `info@jrco.us`.

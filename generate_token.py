@@ -1,6 +1,7 @@
 """Re-authorize Google OAuth (no password stored).
 
-Digitizing auto-attach must send from justin.eckard@jrcogolf.com.
+Needlepoint attached sends use justin.eckard@jrcogolf.com (GOOGLE_GMAIL_TOKEN_JSON).
+Digitizing sends from info@jrco.us instead.
 Drive/Sheets can stay on info@ via the main token.json.
 
 Gmail-only token (recommended for digitizing):
