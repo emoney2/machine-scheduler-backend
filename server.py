@@ -19657,11 +19657,16 @@ def submit_order():
         product_lower = (data.get("product") or "").strip().lower()
         product = data.get("product") or ""
         is_needlepoint = is_needlepoint_product(product)
+        is_towel = "towel" in product_lower
+        skips_materials = is_needlepoint or is_towel
         needlepoint_sizes = {}
         if is_needlepoint:
             needlepoint_sizes = parse_needlepoint_sizes(data.get("needlepointSizes") or "")
             if not needlepoint_sizes:
                 return jsonify({"error": "Enter at least one needlepoint belt size quantity."}), 400
+            materials[:] = [""] * 5
+            material_percents[:] = [""] * 5
+        elif is_towel:
             materials[:] = [""] * 5
             material_percents[:] = [""] * 5
         elif not materials[0].strip():
@@ -19670,16 +19675,17 @@ def submit_order():
         # Front products that auto-create a paired back order (N+1)
         is_quilted_front = _product_creates_paired_back_order(product)
         logger.info(
-            "[submit] product=%r creates_paired_back=%s needlepoint=%s",
+            "[submit] product=%r creates_paired_back=%s needlepoint=%s towel=%s",
             product,
             is_quilted_front,
             is_needlepoint,
+            is_towel,
         )
         
-        if (not is_needlepoint) and "full" in product_lower and not data.get("backMaterial", "").strip():
+        if (not skips_materials) and "full" in product_lower and not data.get("backMaterial", "").strip():
             return jsonify({"error": 'Back Material is required for "Full" products.'}), 400
 
-        if not is_needlepoint:
+        if not skips_materials:
             for idx, mat in enumerate(materials):
                 if mat.strip():
                     pct = material_percents[idx].strip()
@@ -19949,14 +19955,17 @@ def submit_order():
 
         # ─── WRITE TO GOOGLE SHEETS ──────────────────────────────────────────
         _ensure_shipping_method_header_index(sheets)
+        back_mat = "" if skips_materials else (data.get("backMaterial") or "")
+        fur_col = "" if skips_materials else (data.get("furColor") or "")
+        emb_back = "" if skips_materials else (data.get("embBacking") or "")
         row = [
             new_order, ts, preview, data.get("company"),
             data.get("designName"), qty_db, "",
             data.get("product"), stage, data.get("price"),
             data.get("dueDate"), print_cell,  # Print column: YES when checkbox checked
             *materials,
-            data.get("backMaterial"), data.get("furColor"),
-            data.get("embBacking", ""), "",
+            back_mat, fur_col,
+            emb_back, "",
             ship_date, stitch_count, data.get("notes"),
             ",".join(prod_links), print_links, "",
             data.get("dateType"), schedule_str, "", "", "",
@@ -20042,7 +20051,7 @@ def submit_order():
         # ─────────────────────────────────────────────────────────────────────
         # ✅ NEW: WRITE MATERIAL LOG ROWS TO SUPABASE (OPTION B)
         # ─────────────────────────────────────────────────────────────────────
-        if not is_needlepoint:
+        if not skips_materials:
             try:
                 write_material_log_for_order(new_order)
             except Exception as e:
