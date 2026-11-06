@@ -206,6 +206,16 @@ from needlepoint_belts import (
     total_quantity as needlepoint_total_quantity,
     update_order as update_needlepoint_order,
 )
+from towel_orders import (
+    append_order as append_towel_order,
+    build_email_text as build_towel_email_text,
+    collect_renamed_attachments as collect_towel_attachments,
+    list_pending_orders as list_pending_towel_orders,
+    mark_orders_ordered as mark_towel_orders_ordered,
+    sheet_is_ready as towel_sheet_is_ready,
+    supplier_email as towel_supplier_email,
+    sync_open_towels_from_production,
+)
 from jr_needlepoint_package import (
     expand_studio_package_uploads,
     prefer_grid_attachments,
@@ -21074,6 +21084,28 @@ def submit_order():
                     e,
                 )
 
+        if is_towel:
+            try:
+                append_towel_order(
+                    get_sheets_service(),
+                    SPREADSHEET_ID,
+                    order_number=new_order,
+                    company=data.get("company") or "",
+                    design=data.get("designName") or "",
+                    product=product,
+                    due_date=data.get("dueDate") or "",
+                    qty=qty_db,
+                    notes=data.get("notes") or "",
+                    preview_file_id=primary_file_id or "",
+                )
+                _invalidate_towel_pending_cache()
+            except Exception as e:
+                logger.error(
+                    "[Towels] Failed to save towel order row for %s: %s",
+                    new_order,
+                    e,
+                )
+
         invalidate_upcoming_cache()
 
         notify_ids = [new_order]
@@ -21244,6 +21276,141 @@ def needlepoint_order_colors(order_number):
     except Exception as exc:
         logger.exception("[Needlepoint] color extract failed for %s", order)
         return jsonify({"ok": False, "error": str(exc), "colors": []}), 500
+
+
+_towel_pending_cache = {"ts": 0.0, "body": None}
+_towel_pending_lock = Semaphore(1)
+_TOWEL_PENDING_TTL = 45
+
+
+def _invalidate_towel_pending_cache():
+    _towel_pending_cache["ts"] = 0.0
+    _towel_pending_cache["body"] = None
+
+
+def _production_order_dicts_for_towel_sync():
+    """Lightweight Production Orders dicts for towel pending sync."""
+    try:
+        values, by_index = _orders_rows_snapshot()
+    except Exception:
+        logger.exception("[Towels] production snapshot failed")
+        return []
+    headers = (_orders_rows_cache.get("headers") or [])
+    if not values or not headers:
+        return []
+    out = []
+    for idx in (by_index or {}).values():
+        try:
+            row = _order_dict_at(idx)
+        except Exception:
+            row = None
+        if row:
+            out.append(row)
+    return out
+
+
+@app.route("/towels/pending", methods=["GET"], endpoint="towels_pending_plain")
+@app.route("/api/towels/pending", methods=["GET"], endpoint="towels_pending_api")
+@login_required_session
+def towels_pending():
+    try:
+        now = time.time()
+        cached = _towel_pending_cache.get("body")
+        if (
+            cached is not None
+            and now - float(_towel_pending_cache.get("ts") or 0) < _TOWEL_PENDING_TTL
+        ):
+            return jsonify(cached)
+        with _towel_pending_lock:
+            now = time.time()
+            cached = _towel_pending_cache.get("body")
+            if (
+                cached is not None
+                and now - float(_towel_pending_cache.get("ts") or 0) < _TOWEL_PENDING_TTL
+            ):
+                return jsonify(cached)
+            sheets = get_sheets_service()
+            try:
+                sync_open_towels_from_production(
+                    sheets, SPREADSHEET_ID, _production_order_dicts_for_towel_sync()
+                )
+            except Exception:
+                logger.exception("[Towels] sync from production failed")
+            rows = list_pending_towel_orders(sheets, SPREADSHEET_ID)
+            body = {
+                "ok": True,
+                "orders": rows,
+                "supplierEmail": towel_supplier_email(),
+            }
+            if towel_sheet_is_ready():
+                _towel_pending_cache["body"] = body
+                _towel_pending_cache["ts"] = time.time()
+            return jsonify(body)
+    except Exception as exc:
+        logger.exception("[Towels] pending list failed")
+        return jsonify({"ok": False, "error": str(exc), "orders": []}), 500
+
+
+@app.route("/towels/order-towels", methods=["POST", "OPTIONS"], endpoint="towels_order_towels_plain")
+@app.route("/api/towels/order-towels", methods=["POST", "OPTIONS"], endpoint="towels_order_towels_api")
+@login_required_session
+def towels_order_towels():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    selected = data.get("orders") or []
+    to_email = str(
+        data.get("to") or data.get("supplierEmail") or towel_supplier_email() or ""
+    ).strip()
+    extra_notes = str(data.get("notes") or "").strip()
+    if not selected:
+        return jsonify({"ok": False, "error": "Select at least one towel order."}), 400
+    if "@" not in to_email:
+        return jsonify({"ok": False, "error": "Enter a supplier email address."}), 400
+    normalized = []
+    for raw in selected:
+        order_num = str(raw.get("orderNumber") or raw.get("order") or "").strip()
+        if not order_num:
+            return jsonify({"ok": False, "error": "Each selected towel needs an order number."}), 400
+        item = dict(raw)
+        item["orderNumber"] = order_num
+        normalized.append(item)
+
+    drive = get_drive_service()
+    attachments = []
+    missing = []
+    for item in normalized:
+        atts = collect_towel_attachments(drive, item.get("orderNumber"))
+        if not atts:
+            missing.append(str(item.get("orderNumber")))
+        attachments.extend(atts)
+
+    subject, body = build_towel_email_text(normalized, extra_notes=extra_notes)
+    if missing:
+        body += "\n\nNote: no design file was found to attach for order(s): " + ", ".join(
+            missing
+        )
+
+    delivered = deliver_belt_order_email(
+        creds=get_google_credentials(),
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        attachments=attachments,
+    )
+    if missing:
+        delivered["missingDesigns"] = missing
+    if delivered.get("ok") and delivered.get("method") in (
+        "gmail_draft",
+        "imap_draft",
+        "smtp",
+    ):
+        try:
+            mark_towel_orders_ordered(get_sheets_service(), SPREADSHEET_ID, normalized)
+            _invalidate_towel_pending_cache()
+        except Exception:
+            logger.exception("[Towels] mark ordered failed")
+    return jsonify({**delivered, "subject": subject, "body": body, "to": to_email})
 
 
 @app.route("/needlepoint/order-belts", methods=["POST", "OPTIONS"], endpoint="needlepoint_order_belts_plain")
