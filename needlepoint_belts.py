@@ -397,6 +397,52 @@ def get_order(sheets_service, spreadsheet_id: str, order_number: Any) -> dict[st
     return None
 
 
+def update_order(sheets_service, spreadsheet_id: str, order_number: Any, **kwargs) -> bool:
+    """Overwrite an existing Needlepoint Belts row for order_number (keeps Status/Ordered At)."""
+    target = str(order_number or "").strip()
+    if not target:
+        return False
+    if not ensure_sheet(sheets_service, spreadsheet_id):
+        return False
+    headers, rows = _read_all_rows(sheets_service, spreadsheet_id)
+    if not headers:
+        return False
+    hix = _header_index(headers)
+    order_i = hix.get("Order #")
+    if order_i is None:
+        return False
+    for idx, row in enumerate(rows):
+        padded = list(row) + [""] * max(0, len(headers) - len(row))
+        if str(padded[order_i] or "").strip() != target:
+            continue
+        existing = _row_to_dict(headers, padded)
+        kwargs.setdefault("status", existing.get("status") or STATUS_PENDING)
+        kwargs.setdefault("ordered_at", existing.get("orderedAt") or "")
+        kwargs.setdefault(
+            "thread_colors",
+            existing.get("threadColors") or "",
+        )
+        kwargs.setdefault(
+            "submitted_at",
+            existing.get("submittedAt") or _now_str(),
+        )
+        if not kwargs.get("preview_file_id"):
+            kwargs["preview_file_id"] = existing.get("previewFileId") or ""
+        new_row = build_sheet_row(order_number=target, **kwargs)
+        if len(new_row) < len(headers):
+            new_row = new_row + [""] * (len(headers) - len(new_row))
+        end_col = _col_letter(len(headers))
+        sheet_row = idx + 2
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{SHEET_TAB}'!A{sheet_row}:{end_col}{sheet_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [new_row[: len(headers)]]},
+        ).execute()
+        return True
+    return False
+
+
 def mark_orders_ordered(
     sheets_service,
     spreadsheet_id: str,

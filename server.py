@@ -204,6 +204,7 @@ from needlepoint_belts import (
     sheet_is_ready as needlepoint_sheet_is_ready,
     supplier_email as needlepoint_supplier_email,
     total_quantity as needlepoint_total_quantity,
+    update_order as update_needlepoint_order,
 )
 from jr_needlepoint_package import (
     expand_studio_package_uploads,
@@ -18556,6 +18557,759 @@ def update_order(order_id):
         return jsonify({"error": "server error"}), 500
 
 
+def _production_order_row_num_by_number(sheets, order_number) -> int | None:
+    """1-based sheet row for Order #, or None."""
+    try:
+        order_num = str(order_number or "").strip()
+        if not order_num:
+            return None
+        want = _overview_normalize_order_key(order_num)
+        col_a = (
+            sheets.values()
+            .get(spreadsheetId=SPREADSHEET_ID, range="Production Orders!A:A")
+            .execute()
+            .get("values", [])
+        )
+        for i, cell in enumerate(col_a[1:], start=2):
+            raw = cell[0] if cell else ""
+            if _overview_normalize_order_key(raw) == want:
+                return i
+    except Exception as e:
+        logger.warning(
+            "Failed to find Production Orders row for order %s: %s",
+            order_number,
+            e,
+        )
+    return None
+
+
+def _sheet_cell_norm(val) -> str:
+    return str(val if val is not None else "").strip()
+
+
+def _sheet_values_equal(old, new) -> bool:
+    a = _sheet_cell_norm(old)
+    b = _sheet_cell_norm(new)
+    if a == b:
+        return True
+    try:
+        if float(a.replace(",", "").replace("$", "")) == float(
+            b.replace(",", "").replace("$", "")
+        ):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return a.casefold() == b.casefold()
+
+
+def _header_index_map(header_row) -> dict:
+    out = {}
+    for i, h in enumerate(header_row or []):
+        key = str(h or "").strip()
+        if key and key not in out:
+            out[key] = i
+    return out
+
+
+def _find_header_index(header_map: dict, *names) -> int | None:
+    if not header_map:
+        return None
+    lowered = {str(k).strip().casefold(): v for k, v in header_map.items()}
+    for name in names:
+        idx = lowered.get(str(name or "").strip().casefold())
+        if idx is not None:
+            return idx
+    return None
+
+
+def _batch_update_production_order_cells(sheets, row_num: int, cell_updates: list):
+    """cell_updates: list of (col_idx0, value)."""
+    if row_num < 2 or not cell_updates:
+        return
+    data = []
+    for col_idx, value in cell_updates:
+        data.append(
+            {
+                "range": f"Production Orders!{_col_letter_local(col_idx)}{row_num}",
+                "values": [[value]],
+            }
+        )
+    sheets.values().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={"valueInputOption": "USER_ENTERED", "data": data},
+    ).execute()
+
+
+def _broadcast_orders_changed(order_ids, source="order-edit"):
+    ids = []
+    for oid in order_ids or []:
+        s = str(oid or "").strip()
+        if s and s not in ids:
+            ids.append(s)
+    try:
+        _invalidate_combined_orders_cache()
+    except Exception:
+        pass
+    try:
+        invalidate_overview_combined_cache()
+    except Exception:
+        pass
+    try:
+        invalidate_upcoming_cache()
+    except Exception:
+        pass
+    try:
+        invalidate_materials_needed_cache()
+    except Exception:
+        pass
+    payload = {"orderIds": ids, "source": source}
+    try:
+        socketio.emit("ordersUpdated", payload)
+    except Exception as e:
+        logger.warning("ordersUpdated emit failed: %s", e)
+    for oid in ids:
+        try:
+            socketio.emit("orderUpdated", {"orderId": oid, "source": source})
+        except Exception as e:
+            logger.warning("orderUpdated emit failed for %s: %s", oid, e)
+
+
+def _resolve_order_drive_folder_id(drive, order_number) -> str | None:
+    resolved = _digitizing_inbox_resolve_order_folder(order_number)
+    if resolved.get("ok") and resolved.get("folderId"):
+        return resolved["folderId"]
+    parent = _orders_drive_parent_id()
+    return _find_folder_in_parent(drive, str(order_number).strip(), parent)
+
+
+def _upload_edit_files_to_order_folder(drive, folder_id, file_storages, order_label):
+    """Upload multipart FileStorage list; return (webViewLinks, primary_file_id)."""
+    from io import BytesIO
+
+    links = []
+    primary_file_id = None
+
+    def _make_public(file_id):
+        try:
+            drive.permissions().create(
+                fileId=file_id, body={"role": "reader", "type": "anyone"}
+            ).execute()
+        except Exception:
+            pass
+
+    def _upload_one(name, raw_bytes, mimetype):
+        nonlocal primary_file_id
+        buf = BytesIO(raw_bytes)
+        media = MediaIoBaseUpload(
+            buf, mimetype=mimetype or "application/octet-stream"
+        )
+        up = drive.files().create(
+            body={"name": name, "parents": [folder_id]},
+            media_body=media,
+            fields="id,webViewLink",
+        ).execute()
+        _make_public(up["id"])
+        links.append(up.get("webViewLink") or "")
+        if primary_file_id is None:
+            primary_file_id = up["id"]
+        lower = str(name or "").lower()
+        if not (
+            lower.endswith("-customer-view.png")
+            or lower.endswith("-grid.pdf")
+            or lower.endswith(".jrneedlepoint.json")
+            or lower.endswith("-jr-presentation-proof.pdf")
+        ):
+            try:
+                _queue_corel_vectorize_job(drive, folder_id, name, order_label)
+            except Exception:
+                logger.exception(
+                    "[order-edit] Corel queue failed for %s / %s", order_label, name
+                )
+
+    for f in file_storages or []:
+        if not f or not getattr(f, "filename", None):
+            continue
+        raw = f.read()
+        name = f.filename or "upload.bin"
+        mime = f.mimetype or "application/octet-stream"
+        expanded = None
+        try:
+            expanded = expand_studio_package_uploads(raw, name, keep_json=True)
+        except Exception as exp_err:
+            logger.warning(
+                "[order-edit] Studio package expand failed for %s: %s", name, exp_err
+            )
+        if expanded:
+            for item in expanded:
+                _upload_one(item["filename"], item["bytes"], item["mimetype"])
+            continue
+        try:
+            expanded = expand_presentation_uploads(
+                raw,
+                name,
+                lambda fid: _download_drive_file_bytes(drive, fid),
+                keep_proof_pdf=True,
+            )
+        except JrcoPresentationError:
+            raise
+        except Exception as exp_err:
+            logger.warning(
+                "[order-edit] JR presentation expand failed for %s: %s", name, exp_err
+            )
+            expanded = None
+        if expanded:
+            for item in expanded:
+                _upload_one(item["filename"], item["bytes"], item["mimetype"])
+            continue
+        _upload_one(name, raw, mime)
+
+    return [lnk for lnk in links if lnk], primary_file_id
+
+
+def _upload_edit_print_files(drive, order_folder_id, file_storages):
+    """Ensure Print Files subfolder, upload files, return folder web link."""
+    from io import BytesIO
+
+    pf_id = _find_folder_in_parent(drive, "Print Files", order_folder_id)
+    if not pf_id:
+        pf_id = _create_named_drive_folder(drive, "Print Files", order_folder_id)
+    try:
+        drive.permissions().create(
+            fileId=pf_id, body={"role": "reader", "type": "anyone"}
+        ).execute()
+    except Exception:
+        pass
+
+    for f in file_storages or []:
+        if not f or not getattr(f, "filename", None):
+            continue
+        raw = f.read()
+        name = f.filename or "print.bin"
+        mime = f.mimetype or "application/octet-stream"
+        payloads = [(name, raw, mime)]
+        try:
+            expanded = expand_presentation_uploads(
+                raw,
+                name,
+                lambda fid: _download_drive_file_bytes(drive, fid),
+                keep_proof_pdf=False,
+            )
+            if expanded:
+                payloads = [
+                    (item["filename"], item["bytes"], item["mimetype"])
+                    for item in expanded
+                    if item.get("role") == "flat_production"
+                ] or payloads
+        except JrcoPresentationError:
+            raise
+        except Exception:
+            pass
+        for up_name, up_bytes, up_mime in payloads:
+            buf = BytesIO(up_bytes)
+            media = MediaIoBaseUpload(
+                buf, mimetype=up_mime or "application/octet-stream"
+            )
+            drive.files().create(
+                body={"name": up_name, "parents": [pf_id]},
+                media_body=media,
+                fields="id",
+            ).execute()
+
+    return f"https://drive.google.com/drive/folders/{pf_id}"
+
+
+@app.route("/api/orders/<order_id>/edit", methods=["OPTIONS", "POST"])
+@app.route("/orders/<order_id>/edit", methods=["OPTIONS", "POST"], endpoint="edit_order_plain")
+@login_required_session
+def edit_order(order_id):
+    """
+    Patch an existing Production Orders row with only changed fields.
+    Multipart form matches /submit field names. New prodFiles / printFiles
+    replace Image / Print Files links when provided.
+    """
+    if request.method == "OPTIONS":
+        return _attach_cors_headers(make_response("", 204))
+
+    try:
+        data = request.form
+        prod_files = request.files.getlist("prodFiles")
+        print_files = request.files.getlist("printFiles")
+        oid = _overview_normalize_order_key(order_id)
+        if not oid:
+            return jsonify({"error": "Order # required"}), 400
+
+        sheets = get_sheets_service().spreadsheets()
+        with acquire_sheet_lock():
+            row_num = _production_order_row_num_by_number(sheets, oid)
+            if not row_num:
+                return jsonify({"error": f"Order {oid} not found"}), 404
+
+            header_row = _normalize_order_number_headers(
+                _production_orders_header_row(sheets)
+            )
+            header_map = _header_index_map(header_row)
+            current = _production_order_row_dict_by_row_num(sheets, row_num)
+
+            materials = list(data.getlist("materials") or [])
+            material_percents = list(data.getlist("materialPercents") or [])
+            materials = (materials + [""] * 5)[:5]
+            material_percents = (material_percents + [""] * 5)[:5]
+
+            product = (data.get("product") or current.get("Product") or "").strip()
+            product_lower = product.lower()
+            is_needlepoint = is_needlepoint_product(product)
+            is_towel = "towel" in product_lower
+            skips_materials = is_needlepoint or is_towel
+            needlepoint_sizes = {}
+            if is_needlepoint:
+                needlepoint_sizes = parse_needlepoint_sizes(
+                    data.get("needlepointSizes") or ""
+                )
+                if not needlepoint_sizes:
+                    return jsonify(
+                        {"error": "Enter at least one needlepoint belt size quantity."}
+                    ), 400
+                materials = [""] * 5
+                material_percents = [""] * 5
+            elif is_towel:
+                materials = [""] * 5
+                material_percents = [""] * 5
+
+            try:
+                qty_db = (
+                    needlepoint_total_quantity(needlepoint_sizes)
+                    if is_needlepoint
+                    else _form_quantity_for_db(
+                        data.get("quantity")
+                        if data.get("quantity") is not None
+                        else current.get("Quantity")
+                    )
+                )
+            except ValueError:
+                return jsonify({"error": "Quantity must be a valid number."}), 400
+            try:
+                price_raw = data.get("price")
+                price_db = _form_price_for_db(
+                    price_raw if price_raw is not None else current.get("Price")
+                )
+            except ValueError:
+                return jsonify({"error": "Price must be a valid number."}), 400
+
+            proposed = {
+                "Company Name": (data.get("company") or "").strip(),
+                "Design": (data.get("designName") or "").strip(),
+                "Quantity": qty_db,
+                "Product": product,
+                "Price": price_db,
+                "Due Date": (data.get("dueDate") or "").strip(),
+                "Hard Date/Soft Date": (data.get("dateType") or "").strip(),
+                "Notes": data.get("notes") if data.get("notes") is not None else "",
+                "Material1": "" if skips_materials else (materials[0] or "").strip(),
+                "Material2": "" if skips_materials else (materials[1] or "").strip(),
+                "Material3": "" if skips_materials else (materials[2] or "").strip(),
+                "Material4": "" if skips_materials else (materials[3] or "").strip(),
+                "Material5": "" if skips_materials else (materials[4] or "").strip(),
+                "Material1%": "" if skips_materials else (material_percents[0] or "").strip(),
+                "Material2%": "" if skips_materials else (material_percents[1] or "").strip(),
+                "Material3%": "" if skips_materials else (material_percents[2] or "").strip(),
+                "Material4%": "" if skips_materials else (material_percents[3] or "").strip(),
+                "Material5%": "" if skips_materials else (material_percents[4] or "").strip(),
+                "Back Material": ""
+                if skips_materials
+                else (data.get("backMaterial") or "").strip(),
+                "Fur Color": ""
+                if skips_materials
+                else (data.get("furColor") or "").strip(),
+                "EMB Backing": ""
+                if skips_materials
+                else (data.get("embBacking") or "").strip(),
+            }
+
+            print_val = (data.get("print") or "").strip().upper()
+            if print_val in ("YES", "NO"):
+                proposed["Print"] = print_val
+            elif print_files:
+                proposed["Print"] = "YES"
+
+            # Only include keys the client actually sent (so empty optional clears are intentional
+            # when the field is present on the form).
+            sent_keys = set(data.keys())
+            field_sent = {
+                "Company Name": "company" in sent_keys,
+                "Design": "designName" in sent_keys,
+                "Quantity": "quantity" in sent_keys or "needlepointSizes" in sent_keys,
+                "Product": "product" in sent_keys,
+                "Price": "price" in sent_keys,
+                "Due Date": "dueDate" in sent_keys,
+                "Hard Date/Soft Date": "dateType" in sent_keys,
+                "Notes": "notes" in sent_keys,
+                "Material1": "materials" in sent_keys,
+                "Material2": "materials" in sent_keys,
+                "Material3": "materials" in sent_keys,
+                "Material4": "materials" in sent_keys,
+                "Material5": "materials" in sent_keys,
+                "Material1%": "materialPercents" in sent_keys,
+                "Material2%": "materialPercents" in sent_keys,
+                "Material3%": "materialPercents" in sent_keys,
+                "Material4%": "materialPercents" in sent_keys,
+                "Material5%": "materialPercents" in sent_keys,
+                "Back Material": "backMaterial" in sent_keys,
+                "Fur Color": "furColor" in sent_keys,
+                "EMB Backing": "embBacking" in sent_keys,
+                "Print": "print" in sent_keys or bool(print_files),
+            }
+
+            percent_header_aliases = {
+                "Material1%": ("Material1%", "Material 1%", "Material1 Percent", "Material 1 Percent"),
+                "Material2%": ("Material2%", "Material 2%", "Material2 Percent", "Material 2 Percent"),
+                "Material3%": ("Material3%", "Material 3%", "Material3 Percent", "Material 3 Percent"),
+                "Material4%": ("Material4%", "Material 4%", "Material4 Percent", "Material 4 Percent"),
+                "Material5%": ("Material5%", "Material 5%", "Material5 Percent", "Material 5 Percent"),
+            }
+
+            cell_updates = []
+            changed = []
+
+            def _queue_change(header_names, new_val, label=None):
+                names = header_names if isinstance(header_names, (list, tuple)) else (header_names,)
+                idx = _find_header_index(header_map, *names)
+                if idx is None:
+                    return
+                primary = names[0]
+                old_val = current.get(primary)
+                if old_val in (None, "") and len(names) > 1:
+                    for n in names[1:]:
+                        if current.get(n) not in (None, ""):
+                            old_val = current.get(n)
+                            break
+                if _sheet_values_equal(old_val, new_val):
+                    return
+                cell_updates.append((idx, new_val))
+                changed.append(label or primary)
+
+            for header, new_val in proposed.items():
+                if not field_sent.get(header):
+                    continue
+                aliases = percent_header_aliases.get(header) or (header,)
+                _queue_change(aliases, new_val)
+
+            primary_file_id = None
+            drive = None
+            if any(getattr(f, "filename", None) for f in (prod_files or [])):
+                drive = get_drive_service()
+                folder_id = _resolve_order_drive_folder_id(drive, oid)
+                if not folder_id:
+                    return jsonify(
+                        {"error": f"Drive folder for order {oid} was not found."}
+                    ), 404
+                try:
+                    links, primary_file_id = _upload_edit_files_to_order_folder(
+                        drive, folder_id, prod_files, oid
+                    )
+                except JrcoPresentationError as pres_err:
+                    return jsonify({"error": str(pres_err)}), 400
+                if links:
+                    _queue_change(("Image", "Production Files"), ",".join(links), "Image")
+                    if primary_file_id:
+                        preview_formula = (
+                            f'=IFNA(IMAGE("https://drive.google.com/uc?export=view&id='
+                            f'{primary_file_id}"), "No preview available")'
+                        )
+                        _queue_change(("Preview",), preview_formula, "Preview")
+
+            if any(getattr(f, "filename", None) for f in (print_files or [])):
+                if drive is None:
+                    drive = get_drive_service()
+                folder_id = _resolve_order_drive_folder_id(drive, oid)
+                if not folder_id:
+                    return jsonify(
+                        {"error": f"Drive folder for order {oid} was not found."}
+                    ), 404
+                try:
+                    print_link = _upload_edit_print_files(drive, folder_id, print_files)
+                except JrcoPresentationError as pres_err:
+                    return jsonify({"error": str(pres_err)}), 400
+                _queue_change(("Print Files",), print_link, "Print Files")
+                _queue_change(("Print",), "YES", "Print")
+
+            if cell_updates:
+                _batch_update_production_order_cells(sheets, row_num, cell_updates)
+
+            # Sales rep / PO / shipping / ship address — only when sent & changed
+            if "salesRep" in sent_keys:
+                sales_rep = (data.get("salesRep") or "").strip()
+                rep_idx = _find_header_index(
+                    header_map, "REP", "Sales Rep", "Referral", "Rep"
+                )
+                old_rep = (
+                    current.get("REP")
+                    or current.get("Sales Rep")
+                    or current.get("Referral")
+                    or current.get("Rep")
+                    or ""
+                )
+                if not _sheet_values_equal(old_rep, sales_rep):
+                    if rep_idx is not None:
+                        sheets.values().update(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=f"Production Orders!{_col_letter_local(rep_idx)}{row_num}",
+                            valueInputOption="USER_ENTERED",
+                            body={"values": [[sales_rep]]},
+                        ).execute()
+                    else:
+                        sheets.values().update(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=f"Production Orders!AQ{row_num}",
+                            valueInputOption="USER_ENTERED",
+                            body={"values": [[sales_rep]]},
+                        ).execute()
+                    changed.append("Sales Rep")
+
+            if "poNumber" in sent_keys or "po" in sent_keys or "PO #" in sent_keys:
+                po_number = (
+                    data.get("poNumber") or data.get("po") or data.get("PO #") or ""
+                ).strip()
+                old_po = _po_number_from_row(current) if current else ""
+                if not _sheet_values_equal(old_po, po_number):
+                    _write_po_number(sheets, row_num, po_number)
+                    changed.append("PO #")
+
+            if "shippingType" in sent_keys or "shippingMethod" in sent_keys:
+                shipping_method = _shipping_method_from_submit(data)
+                old_ship = (
+                    current.get("Shipping Method")
+                    or current.get("Shipping Type")
+                    or current.get("Ship Via")
+                    or ""
+                )
+                if not _sheet_values_equal(old_ship, shipping_method):
+                    _write_shipping_method(sheets, row_num, shipping_method)
+                    changed.append("Shipping Method")
+
+            use_order_ship = (data.get("useOrderShipAddress") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            if use_order_ship or any(
+                k.startswith("orderShip") for k in sent_keys
+            ):
+                if use_order_ship:
+                    field_map = _order_ship_field_map_from_submit_data(data)
+                    old_map = _order_ship_field_map_from_row_dict(current)
+                    if any(
+                        not _sheet_values_equal(old_map.get(k), field_map.get(k))
+                        for k in field_map
+                    ):
+                        _write_order_ship_address_fields(sheets, row_num, field_map)
+                        changed.append("Order Ship Address")
+
+            # Keep paired quilted back row in sync for shared fields
+            back_order = None
+            back_changed = []
+            if _product_creates_paired_back_order(
+                current.get("Product") or product
+            ):
+                try:
+                    back_order = str(int(float(str(oid).replace(",", ""))) + 1)
+                except (TypeError, ValueError):
+                    back_order = None
+            if back_order:
+                back_row_num = _production_order_row_num_by_number(sheets, back_order)
+                if back_row_num:
+                    back_current = _production_order_row_dict_by_row_num(
+                        sheets, back_row_num
+                    )
+                    back_updates = []
+                    shared = [
+                        ("Company Name", proposed.get("Company Name")),
+                        ("Design", proposed.get("Design")),
+                        ("Quantity", proposed.get("Quantity")),
+                        ("Due Date", proposed.get("Due Date")),
+                        ("Hard Date/Soft Date", proposed.get("Hard Date/Soft Date")),
+                        ("Notes", proposed.get("Notes")),
+                        ("Material1", proposed.get("Material1")),
+                        ("Material2", proposed.get("Material2")),
+                        ("Material3", proposed.get("Material3")),
+                        ("Material4", proposed.get("Material4")),
+                        ("Material5", proposed.get("Material5")),
+                        ("Material1%", proposed.get("Material1%")),
+                        ("Material2%", proposed.get("Material2%")),
+                        ("Material3%", proposed.get("Material3%")),
+                        ("Material4%", proposed.get("Material4%")),
+                        ("Material5%", proposed.get("Material5%")),
+                        ("Back Material", proposed.get("Back Material")),
+                        ("Fur Color", proposed.get("Fur Color")),
+                        ("EMB Backing", proposed.get("EMB Backing")),
+                    ]
+                    if "Print" in proposed and field_sent.get("Print"):
+                        shared.append(("Print", proposed.get("Print")))
+                    for header, new_val in shared:
+                        if header.startswith("Material") and header.endswith("%"):
+                            aliases = percent_header_aliases.get(header) or (header,)
+                        else:
+                            aliases = (header,)
+                        if not field_sent.get(header) and header != "Print":
+                            continue
+                        idx = _find_header_index(header_map, *aliases)
+                        if idx is None:
+                            continue
+                        old_val = back_current.get(header)
+                        if _sheet_values_equal(old_val, new_val):
+                            continue
+                        back_updates.append((idx, new_val))
+                        back_changed.append(header)
+                    # Mirror new image / print folder links when uploaded
+                    for label, header_names in (
+                        ("Image", ("Image", "Production Files")),
+                        ("Print Files", ("Print Files",)),
+                        ("Preview", ("Preview",)),
+                    ):
+                        if label not in changed:
+                            continue
+                        # Re-read front row for the value we just wrote
+                        front_now = _production_order_row_dict_by_row_num(sheets, row_num)
+                        new_val = None
+                        for h in header_names:
+                            if front_now.get(h) not in (None, ""):
+                                new_val = front_now.get(h)
+                                break
+                        if new_val is None:
+                            continue
+                        idx = _find_header_index(header_map, *header_names)
+                        if idx is None:
+                            continue
+                        if _sheet_values_equal(back_current.get(header_names[0]), new_val):
+                            continue
+                        # For Image: upload copies into back folder when new prod files
+                        if label == "Image" and prod_files:
+                            if drive is None:
+                                drive = get_drive_service()
+                            back_folder = _resolve_order_drive_folder_id(drive, back_order)
+                            if back_folder:
+                                # Reset file pointers and re-upload into back folder
+                                for f in prod_files:
+                                    try:
+                                        f.stream.seek(0)
+                                    except Exception:
+                                        pass
+                                try:
+                                    back_links, back_pfid = _upload_edit_files_to_order_folder(
+                                        drive, back_folder, prod_files, back_order
+                                    )
+                                    if back_links:
+                                        new_val = ",".join(back_links)
+                                        if back_pfid:
+                                            preview_formula = (
+                                                f'=IFNA(IMAGE("https://drive.google.com/uc?export=view&id='
+                                                f'{back_pfid}"), "No preview available")'
+                                            )
+                                            pidx = _find_header_index(header_map, "Preview")
+                                            if pidx is not None:
+                                                back_updates.append((pidx, preview_formula))
+                                except Exception:
+                                    logger.exception(
+                                        "[order-edit] back-order file upload failed"
+                                    )
+                        if label == "Print Files" and print_files:
+                            if drive is None:
+                                drive = get_drive_service()
+                            back_folder = _resolve_order_drive_folder_id(drive, back_order)
+                            if back_folder:
+                                for f in print_files:
+                                    try:
+                                        f.stream.seek(0)
+                                    except Exception:
+                                        pass
+                                try:
+                                    new_val = _upload_edit_print_files(
+                                        drive, back_folder, print_files
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "[order-edit] back-order print upload failed"
+                                    )
+                        back_updates.append((idx, new_val))
+                        back_changed.append(label)
+                    if back_updates:
+                        _batch_update_production_order_cells(
+                            sheets, back_row_num, back_updates
+                        )
+                    if "salesRep" in changed:
+                        # copy sales rep / shipping / po onto back
+                        sales_rep = (data.get("salesRep") or "").strip()
+                        sheets.values().update(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=f"Production Orders!AQ{back_row_num}",
+                            valueInputOption="USER_ENTERED",
+                            body={"values": [[sales_rep]]},
+                        ).execute()
+                    if "PO #" in changed:
+                        _write_po_number(
+                            sheets,
+                            back_row_num,
+                            (
+                                data.get("poNumber")
+                                or data.get("po")
+                                or data.get("PO #")
+                                or ""
+                            ).strip(),
+                        )
+                    if "Shipping Method" in changed:
+                        _write_shipping_method(
+                            sheets, back_row_num, _shipping_method_from_submit(data)
+                        )
+                    if "Order Ship Address" in changed:
+                        _copy_order_ship_address_between_sheet_rows(
+                            sheets, row_num, back_row_num
+                        )
+
+            if is_needlepoint and needlepoint_sizes:
+                try:
+                    updated = update_needlepoint_order(
+                        get_sheets_service(),
+                        SPREADSHEET_ID,
+                        order_number=oid,
+                        company=proposed.get("Company Name") or "",
+                        design=proposed.get("Design") or "",
+                        product=product,
+                        due_date=proposed.get("Due Date") or "",
+                        sizes=needlepoint_sizes,
+                        notes=proposed.get("Notes") or "",
+                        preview_file_id=primary_file_id or "",
+                    )
+                    if updated:
+                        changed.append("Needlepoint Sizes")
+                        _invalidate_needlepoint_pending_cache()
+                except Exception as e:
+                    logger.error(
+                        "[order-edit] needlepoint update failed for %s: %s", oid, e
+                    )
+
+        notify_ids = [oid]
+        if back_order:
+            notify_ids.append(back_order)
+        _broadcast_orders_changed(notify_ids, source="order-edit")
+
+        return (
+            jsonify(
+                {
+                    "status": "ok",
+                    "order": oid,
+                    "back_order": back_order,
+                    "changed": changed,
+                    "backChanged": back_changed,
+                    "primaryFileId": primary_file_id,
+                }
+            ),
+            200,
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error("Error in /orders/<id>/edit:\n%s", tb)
+        return jsonify({"error": str(e), "trace": tb}), 500
+
+
 # In-memory links
 _links_store = {}
 
@@ -20321,6 +21075,11 @@ def submit_order():
                 )
 
         invalidate_upcoming_cache()
+
+        notify_ids = [new_order]
+        if is_quilted_front and back_order:
+            notify_ids.append(back_order)
+        _broadcast_orders_changed(notify_ids, source="order-submit")
 
         # Return both order numbers if quilted front, otherwise just the one
         if is_quilted_front and back_order:
