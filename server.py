@@ -21452,15 +21452,24 @@ def towels_order_towels():
                 "orders": normalized,
                 "missingDesigns": missing,
                 "attachmentCount": len(attachment_payload),
-                "attachments": attachment_payload,
+                "attachments": [
+                    {**att, "id": f"design-{i}", "isDesign": True}
+                    for i, att in enumerate(attachment_payload)
+                ],
             }
         )
 
-    if not attachments:
+    # Extra browser-uploaded files (same shape as digitizing).
+    extra_attachments = _digitizing_extra_attachments_from_payload(
+        data.get("extraAttachments") or []
+    )
+    all_attachments = list(attachments) + list(extra_attachments)
+
+    if not all_attachments:
         return jsonify(
             {
                 "ok": False,
-                "error": "No design files found to attach for the selected towel(s).",
+                "error": "Add at least one attachment before sending.",
                 "missingDesigns": missing,
                 "to": to_email,
                 "subject": subject,
@@ -21484,7 +21493,7 @@ def towels_order_towels():
                 to_email=to_email,
                 subject=subject,
                 body=body,
-                attachments=attachments,
+                attachments=all_attachments,
                 from_email=required_from,
             )
             from_email = str(sent.get("fromEmail") or "").strip().lower()
@@ -21525,8 +21534,8 @@ def towels_order_towels():
                 "body": body,
                 "fromEmail": sent.get("fromEmail") or required_from,
                 "missingDesigns": missing,
-                "attachmentCount": len(attachments),
-                "attachmentNames": [a.get("filename") for a in attachments],
+                "attachmentCount": len(all_attachments),
+                "attachmentNames": [a.get("filename") for a in all_attachments],
             }
         )
 
@@ -21536,7 +21545,7 @@ def towels_order_towels():
             to_email=to_email,
             subject=subject,
             body=body,
-            attachments=attachments,
+            attachments=all_attachments,
         ):
             try:
                 mark_towel_orders_ordered(
@@ -21555,8 +21564,8 @@ def towels_order_towels():
                     "body": body,
                     "fromEmail": required_from,
                     "missingDesigns": missing,
-                    "attachmentCount": len(attachments),
-                    "attachmentNames": [a.get("filename") for a in attachments],
+                    "attachmentCount": len(all_attachments),
+                    "attachmentNames": [a.get("filename") for a in all_attachments],
                     "warning": sent.get("error") or "",
                 }
             )
@@ -21572,7 +21581,7 @@ def towels_order_towels():
             "body": body,
             "fromEmail": required_from,
             "missingDesigns": missing,
-            "attachmentCount": len(attachments),
+            "attachmentCount": len(all_attachments),
             "attachments": attachment_payload,
             "error": sent.get("error")
             or "Could not send towel order email from justin.eckard@jrcogolf.com.",
