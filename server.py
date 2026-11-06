@@ -207,9 +207,11 @@ from needlepoint_belts import (
     update_order as update_needlepoint_order,
 )
 from towel_orders import (
+    TOWEL_EMAIL_SIGNATURE,
     append_order as append_towel_order,
     build_email_text as build_towel_email_text,
     collect_renamed_attachments as collect_towel_attachments,
+    from_email as towel_from_email,
     list_pending_orders as list_pending_towel_orders,
     mark_orders_ordered as mark_towel_orders_ordered,
     sheet_is_ready as towel_sheet_is_ready,
@@ -21355,6 +21357,12 @@ def towels_pending():
 @app.route("/api/towels/order-towels", methods=["POST", "OPTIONS"], endpoint="towels_order_towels_api")
 @login_required_session
 def towels_order_towels():
+    """
+    Prepare or send a towel supplier email (digitizing-style).
+
+    action=prepare (default): return editable to/subject/body + attachment metadata.
+    action=send: email Adam from justin.eckard@jrcogolf.com with designs attached.
+    """
     if request.method == "OPTIONS":
         return ("", 204)
     data = request.get_json(silent=True) or {}
@@ -21363,54 +21371,213 @@ def towels_order_towels():
         data.get("to") or data.get("supplierEmail") or towel_supplier_email() or ""
     ).strip()
     extra_notes = str(data.get("notes") or "").strip()
+    action = str(data.get("action") or "prepare").strip().lower()
+    if action in ("true", "1", "yes") or data.get("send") is True:
+        action = "send"
     if not selected:
         return jsonify({"ok": False, "error": "Select at least one towel order."}), 400
     if "@" not in to_email:
         return jsonify({"ok": False, "error": "Enter a supplier email address."}), 400
+
     normalized = []
     for raw in selected:
         order_num = str(raw.get("orderNumber") or raw.get("order") or "").strip()
         if not order_num:
-            return jsonify({"ok": False, "error": "Each selected towel needs an order number."}), 400
+            return jsonify(
+                {"ok": False, "error": "Each selected towel needs an order number."}
+            ), 400
         item = dict(raw)
         item["orderNumber"] = order_num
+        item["previewFileId"] = str(
+            raw.get("previewFileId") or raw.get("preview_file_id") or ""
+        ).strip()
         normalized.append(item)
 
     drive = get_drive_service()
     attachments = []
     missing = []
     for item in normalized:
-        atts = collect_towel_attachments(drive, item.get("orderNumber"))
+        atts = collect_towel_attachments(
+            drive,
+            item.get("orderNumber"),
+            preview_file_id=item.get("previewFileId") or "",
+        )
         if not atts:
             missing.append(str(item.get("orderNumber")))
         attachments.extend(atts)
 
     subject, body = build_towel_email_text(normalized, extra_notes=extra_notes)
+    subject = str(data.get("subject") or subject).strip() or subject
+    body = str(data.get("body") or body)
+    if "Justin Eckard" not in body:
+        body = body.rstrip() + "\n\n" + TOWEL_EMAIL_SIGNATURE
     if missing:
-        body += "\n\nNote: no design file was found to attach for order(s): " + ", ".join(
-            missing
+        body += (
+            "\n\nNote: no design file was found to attach for order(s): "
+            + ", ".join(missing)
         )
 
-    delivered = deliver_belt_order_email(
-        creds=get_google_credentials(),
-        to_email=to_email,
-        subject=subject,
-        body=body,
-        attachments=attachments,
-    )
-    if missing:
-        delivered["missingDesigns"] = missing
-    if delivered.get("ok") and delivered.get("method") in (
-        "gmail_draft",
-        "imap_draft",
-        "smtp",
-    ):
+    attachment_payload = []
+    for att in attachments:
+        raw = att.get("bytes") or b""
+        if not raw:
+            continue
+        attachment_payload.append(
+            {
+                "filename": att.get("filename") or "design.jpg",
+                "mime": att.get("mime") or "application/octet-stream",
+                "contentBase64": base64.b64encode(raw).decode("ascii"),
+                "orderNumber": next(
+                    (
+                        str(n.get("orderNumber") or "")
+                        for n in normalized
+                        if str(att.get("filename") or "").startswith(
+                            str(n.get("orderNumber") or "")
+                        )
+                    ),
+                    "",
+                ),
+            }
+        )
+
+    if action != "send":
+        return jsonify(
+            {
+                "ok": True,
+                "method": "prepare",
+                "to": to_email,
+                "subject": subject,
+                "body": body,
+                "fromEmail": towel_from_email(),
+                "orders": normalized,
+                "missingDesigns": missing,
+                "attachmentCount": len(attachment_payload),
+                "attachments": attachment_payload,
+            }
+        )
+
+    if not attachments:
+        return jsonify(
+            {
+                "ok": False,
+                "error": "No design files found to attach for the selected towel(s).",
+                "missingDesigns": missing,
+                "to": to_email,
+                "subject": subject,
+                "body": body,
+            }
+        ), 400
+
+    required_from = towel_from_email().strip().lower()
+    sent = {
+        "ok": False,
+        "method": "none",
+        "error": "",
+        "fromEmail": "",
+    }
+    try:
+        # Prefer Justin's dedicated Gmail token (same path digitizing can use).
+        creds = get_gmail_credentials()
+        if needlepoint_creds_have_gmail_scope(creds):
+            sent = send_gmail_message(
+                creds,
+                to_email=to_email,
+                subject=subject,
+                body=body,
+                attachments=attachments,
+                from_email=required_from,
+            )
+            from_email = str(sent.get("fromEmail") or "").strip().lower()
+            if sent.get("ok") and from_email and from_email != required_from:
+                logger.warning(
+                    "[Towels] Gmail API authenticated as %s (want %s)",
+                    from_email,
+                    required_from,
+                )
+        else:
+            sent = {
+                "ok": False,
+                "method": "none",
+                "error": "Justin Gmail login is missing Gmail permission; using SMTP.",
+                "fromEmail": "",
+                "needsGmailAuth": True,
+            }
+    except Exception as exc:
+        logger.warning("[Towels] Gmail API send failed: %s", exc)
+        sent = {
+            "ok": False,
+            "method": "none",
+            "error": str(exc),
+            "fromEmail": "",
+        }
+
+    if sent.get("ok"):
         try:
             mark_towel_orders_ordered(get_sheets_service(), SPREADSHEET_ID, normalized)
             _invalidate_towel_pending_cache()
         except Exception:
             logger.exception("[Towels] mark ordered failed")
-    return jsonify({**delivered, "subject": subject, "body": body, "to": to_email})
+        return jsonify(
+            {
+                **sent,
+                "to": to_email,
+                "subject": subject,
+                "body": body,
+                "fromEmail": sent.get("fromEmail") or required_from,
+                "missingDesigns": missing,
+                "attachmentCount": len(attachments),
+                "attachmentNames": [a.get("filename") for a in attachments],
+            }
+        )
+
+    # SMTP fallback (shop mail) — still tries to deliver with attachments.
+    try:
+        if send_needlepoint_smtp_email(
+            to_email=to_email,
+            subject=subject,
+            body=body,
+            attachments=attachments,
+        ):
+            try:
+                mark_towel_orders_ordered(
+                    get_sheets_service(), SPREADSHEET_ID, normalized
+                )
+                _invalidate_towel_pending_cache()
+            except Exception:
+                logger.exception("[Towels] mark ordered failed after SMTP")
+            return jsonify(
+                {
+                    "ok": True,
+                    "method": "smtp",
+                    "sent": True,
+                    "to": to_email,
+                    "subject": subject,
+                    "body": body,
+                    "fromEmail": required_from,
+                    "missingDesigns": missing,
+                    "attachmentCount": len(attachments),
+                    "attachmentNames": [a.get("filename") for a in attachments],
+                    "warning": sent.get("error") or "",
+                }
+            )
+    except Exception as exc:
+        logger.warning("[Towels] SMTP fallback failed: %s", exc)
+
+    return jsonify(
+        {
+            **sent,
+            "ok": False,
+            "to": to_email,
+            "subject": subject,
+            "body": body,
+            "fromEmail": required_from,
+            "missingDesigns": missing,
+            "attachmentCount": len(attachments),
+            "attachments": attachment_payload,
+            "error": sent.get("error")
+            or "Could not send towel order email from justin.eckard@jrcogolf.com.",
+        }
+    ), 502
 
 
 @app.route("/needlepoint/order-belts", methods=["POST", "OPTIONS"], endpoint="needlepoint_order_belts_plain")

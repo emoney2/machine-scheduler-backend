@@ -27,7 +27,16 @@ SHEET_TAB = "Towel Orders"
 STATUS_PENDING = "Pending"
 STATUS_ORDERED = "Ordered"
 DEFAULT_SUPPLIER_EMAIL = "adam@tempystees.com"
+DEFAULT_FROM_EMAIL = "justin.eckard@jrcogolf.com"
 TZ = ZoneInfo("America/New_York")
+
+TOWEL_EMAIL_SIGNATURE = (
+    "Thanks,\n"
+    "Justin Eckard\n"
+    "JR & Co.\n"
+    "678.294.5350\n"
+    "www.jrcogolf.com"
+)
 
 SHEET_HEADERS = (
     "Order #",
@@ -58,6 +67,13 @@ def supplier_email() -> str:
     if env:
         return env
     return DEFAULT_SUPPLIER_EMAIL
+
+
+def from_email() -> str:
+    env = (os.environ.get("TOWEL_FROM_EMAIL") or "").strip()
+    if env:
+        return env
+    return DEFAULT_FROM_EMAIL
 
 
 def sheet_is_ready() -> bool:
@@ -476,28 +492,34 @@ def build_email_text(
     *,
     extra_notes: str = "",
 ) -> tuple[str, str]:
-    today = datetime.now(TZ)
-    date_label = _format_mdy(today)
-    customers: list[str] = []
-    for item in orders or []:
-        company = str(item.get("company") or "").strip()
-        if company and company not in customers:
-            customers.append(company)
-    subject = f"JR & Co. Towel Order — {date_label}"
-    if customers:
-        subject = f"{subject} — {' / '.join(customers)}"
+    orders = list(orders or [])
+    parts = ["JR & Co Towel Order"]
+    if len(orders) == 1:
+        order_num = str(orders[0].get("orderNumber") or orders[0].get("order") or "").strip()
+        design = str(orders[0].get("design") or "").strip()
+        if order_num:
+            parts.append(f"#{order_num}")
+        if design:
+            parts.append(design)
+    else:
+        today = datetime.now(TZ)
+        parts.append(_format_mdy(today))
+        if orders:
+            parts.append(f"{len(orders)} towels")
+    subject = " - ".join(parts)
+
     lines = [
-        "Hello,",
+        "Hi Adam,",
         "",
-        "Please make the following towels:",
+        "Could you please make the following towels for us?",
         "",
     ]
-    for item in orders or []:
+    for item in orders:
         order_num = str(item.get("orderNumber") or item.get("order") or "").strip()
         design = str(item.get("design") or "").strip()
         company = str(item.get("company") or "").strip()
         product = str(item.get("product") or "").strip()
-        title = f"Order {order_num}"
+        title = f"Order {order_num}" if order_num else "Order"
         extras = [x for x in (company, design) if x]
         if extras:
             title += " — " + " / ".join(extras)
@@ -514,16 +536,9 @@ def build_email_text(
         lines.append("")
     if extra_notes.strip():
         lines.extend(["Notes:", extra_notes.strip(), ""])
-    lines.extend(
-        [
-            "Design files are attached, named by order number.",
-            "",
-            "Thank you,",
-            "Justin Eckard",
-            "JR & Co.",
-            "678.294.5350",
-        ]
-    )
+    lines.append("Design files are attached, named by order number.")
+    lines.append("")
+    lines.append(TOWEL_EMAIL_SIGNATURE)
     return subject, "\n".join(lines)
 
 
@@ -541,51 +556,117 @@ def _is_towel_design_file(file_meta: dict) -> bool:
     return ext in DESIGN_EXTS
 
 
-def collect_renamed_attachments(drive, order_number: Any) -> list[dict[str, Any]]:
-    """Attach design images/PDFs from the order folder, renamed to the order number."""
+def attachment_from_file_id(
+    drive, file_id: Any, order_number: Any = ""
+) -> dict[str, Any] | None:
+    """Download one Drive design file and rename it to the order number."""
+    fid = str(file_id or "").strip()
+    if not fid:
+        return None
+    try:
+        meta = (
+            drive.files()
+            .get(
+                fileId=fid,
+                fields="id,name,mimeType",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except Exception:
+        logger.exception("[Towels] failed to load Drive metadata for %s", fid)
+        meta = {}
+    try:
+        data = download_drive_bytes(drive, fid)
+    except Exception:
+        logger.exception("[Towels] failed to download Drive file %s", fid)
+        return None
+    if not data:
+        return None
+    name = str(meta.get("name") or "").strip() or "design.jpg"
+    mime = str(meta.get("mimeType") or "").strip() or "application/octet-stream"
+    filename = attachment_filename(order_number, name, 1, 1)
+    if mime.startswith("application/octet-stream"):
+        lower = filename.lower()
+        if lower.endswith(".png"):
+            mime = "image/png"
+        elif lower.endswith((".jpg", ".jpeg")):
+            mime = "image/jpeg"
+        elif lower.endswith(".pdf"):
+            mime = "application/pdf"
+    return {
+        "filename": filename,
+        "bytes": data,
+        "mime": mime,
+        "sourceId": fid,
+        "sourceName": name,
+    }
+
+
+def collect_renamed_attachments(
+    drive, order_number: Any, preview_file_id: Any = ""
+) -> list[dict[str, Any]]:
+    """
+    Attach design images/PDFs for one towel order.
+
+    Prefers previewFileId from the Towel Orders row, then files in the order folder.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    preview = attachment_from_file_id(drive, preview_file_id, order_number)
+    if preview:
+        out.append(preview)
+        seen.add(str(preview.get("sourceId") or ""))
+
     folder_id = find_order_folder_id(drive, order_number)
     if not folder_id:
-        logger.warning("[Towels] order folder not found for %s", order_number)
-        return []
+        if not out:
+            logger.warning("[Towels] order folder not found for %s", order_number)
+        return out
 
     designs = [f for f in list_design_files(drive, folder_id) if _is_towel_design_file(f)]
-    # Prefer images first, then PDFs.
     designs.sort(
         key=lambda f: (
             0 if str(f.get("mimeType") or "").startswith("image/") else 1,
             str(f.get("name") or "").lower(),
         )
     )
-    out: list[dict[str, Any]] = []
+    # If we already have a preview image, keep at most one extra PDF/image from folder.
     for i, meta in enumerate(designs, start=1):
+        fid = str(meta.get("id") or "")
+        if not fid or fid in seen:
+            continue
         try:
-            data = download_drive_bytes(drive, meta["id"])
+            data = download_drive_bytes(drive, fid)
         except Exception:
             logger.exception(
                 "[Towels] failed to download %s for order %s",
-                meta.get("id"),
+                fid,
                 order_number,
             )
             continue
         if not data:
             continue
         filename = attachment_filename(
-            order_number, meta.get("name") or "design.jpg", i, len(designs)
+            order_number, meta.get("name") or "design.jpg", len(out) + 1, max(1, len(designs))
         )
         mime = str(meta.get("mimeType") or "application/octet-stream")
-        if mime.startswith("image/"):
-            pass
-        elif str(meta.get("name") or "").lower().endswith(".pdf"):
+        if str(meta.get("name") or "").lower().endswith(".pdf"):
             mime = "application/pdf"
         out.append(
             {
                 "filename": filename,
                 "bytes": data,
                 "mime": mime,
-                "sourceId": meta.get("id"),
+                "sourceId": fid,
                 "sourceName": meta.get("name"),
             }
         )
+        seen.add(fid)
+        # One solid design file is enough for the vendor email.
+        if len(out) >= 1:
+            break
     if not out:
         logger.warning("[Towels] no design file for order %s", order_number)
     return out
