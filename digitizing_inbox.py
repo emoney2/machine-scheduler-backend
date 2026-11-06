@@ -95,16 +95,18 @@ def normalize_order_id(value: Any) -> str:
 
 
 def enabled() -> bool:
-    flag = (os.environ.get("DIGITIZING_INBOX_ENABLED") or "0").strip().lower()
+    # Default ON — set DIGITIZING_INBOX_ENABLED=0 to disable.
+    flag = (os.environ.get("DIGITIZING_INBOX_ENABLED") or "1").strip().lower()
     return flag not in {"0", "false", "no", "off"}
 
 
 def poll_interval_seconds() -> int:
+    # Default every 15 minutes — avoid hammering Gmail.
     try:
-        seconds = int(os.environ.get("DIGITIZING_INBOX_POLL_SECONDS") or "60")
+        seconds = int(os.environ.get("DIGITIZING_INBOX_POLL_SECONDS") or "900")
     except ValueError:
-        seconds = 60
-    return max(30, seconds)
+        seconds = 900
+    return max(300, seconds)
 
 
 def pubsub_topic() -> str:
@@ -262,7 +264,7 @@ def sha256_bytes(data: bytes) -> str:
 
 def _default_state() -> Dict[str, Any]:
     return {
-        "enabled": False,
+        "enabled": True,
         "activatedAt": "",
         "historyId": "",
         "watchExpiration": "",
@@ -272,7 +274,54 @@ def _default_state() -> Dict[str, Any]:
         "processedMessages": {},
         "orderFileHashes": {},  # orderNumber -> {sha256: filename}
         "orderFilenames": {},  # orderNumber -> [filenames in Drive we know]
+        # Orders that already received their first vendor import — never import again.
+        "lockedOrders": {},  # orderNumber -> { lockedAt, messageId }
     }
+
+
+def _rebuild_locked_orders(state: Dict[str, Any]) -> Dict[str, Any]:
+    locked = dict(state.get("lockedOrders") or {})
+    for mid, row in (state.get("processedMessages") or {}).items():
+        if not isinstance(row, dict):
+            continue
+        if row.get("status") != "imported":
+            continue
+        oid = normalize_order_id(row.get("orderNumber"))
+        if not oid or oid in locked:
+            continue
+        locked[oid] = {
+            "lockedAt": row.get("updatedAt") or row.get("receivedAt") or _now_iso(),
+            "messageId": mid,
+        }
+    state["lockedOrders"] = locked
+    return state
+
+
+def order_is_locked(state: Dict[str, Any], order_number: Any) -> bool:
+    oid = normalize_order_id(order_number)
+    if not oid:
+        return False
+    locked = state.get("lockedOrders") or {}
+    if oid in locked:
+        return True
+    # Also treat any successful import as locked.
+    for row in (state.get("processedMessages") or {}).values():
+        if not isinstance(row, dict):
+            continue
+        if row.get("status") == "imported" and normalize_order_id(row.get("orderNumber")) == oid:
+            return True
+    return False
+
+
+def lock_order(state: Dict[str, Any], order_number: Any, message_id: str = "") -> None:
+    oid = normalize_order_id(order_number)
+    if not oid:
+        return
+    locked = dict(state.get("lockedOrders") or {})
+    if oid in locked:
+        return
+    locked[oid] = {"lockedAt": _now_iso(), "messageId": str(message_id or "")}
+    state["lockedOrders"] = locked
 
 
 def load_state() -> Dict[str, Any]:
@@ -292,7 +341,9 @@ def load_state() -> Dict[str, Any]:
                 base["orderFileHashes"] = {}
             if not isinstance(base.get("orderFilenames"), dict):
                 base["orderFilenames"] = {}
-            return base
+            if not isinstance(base.get("lockedOrders"), dict):
+                base["lockedOrders"] = {}
+            return _rebuild_locked_orders(base)
         except Exception:
             logger.exception("Failed to read digitizing inbox state")
             return _default_state()
@@ -307,13 +358,18 @@ def save_state(state: Dict[str, Any]) -> None:
         tmp.replace(STATE_PATH)
 
 
-def activate(at_iso: Optional[str] = None) -> Dict[str, Any]:
+def ensure_active(at_iso: Optional[str] = None) -> Dict[str, Any]:
+    """Keep the inbox running; set activatedAt once if missing."""
     state = load_state()
     state["enabled"] = True
     if not state.get("activatedAt"):
         state["activatedAt"] = at_iso or _now_iso()
     save_state(state)
     return state
+
+
+def activate(at_iso: Optional[str] = None) -> Dict[str, Any]:
+    return ensure_active(at_iso)
 
 
 def deactivate() -> Dict[str, Any]:
@@ -327,44 +383,36 @@ def status_snapshot() -> Dict[str, Any]:
     state = load_state()
     msgs = state.get("processedMessages") or {}
     imported = []
-    needs_review = []
-    errors = []
     for mid, row in msgs.items():
-        item = {
-            "messageId": mid,
-            **(row if isinstance(row, dict) else {}),
-        }
-        st = str(item.get("status") or "")
-        if st == "imported":
-            imported.append(item)
-        elif st == "needs_review":
-            needs_review.append(item)
-        elif st in {"error", "partial"}:
-            errors.append(item)
+        if not isinstance(row, dict):
+            continue
+        if row.get("status") == "imported":
+            imported.append({"messageId": mid, **row})
 
     def _sort_key(row):
         return str(row.get("receivedAt") or row.get("updatedAt") or "")
 
     imported.sort(key=_sort_key, reverse=True)
-    needs_review.sort(key=_sort_key, reverse=True)
-    errors.sort(key=_sort_key, reverse=True)
+    locked = sorted(
+        normalize_order_id(k)
+        for k in (state.get("lockedOrders") or {}).keys()
+        if normalize_order_id(k)
+    )
+    last_check = state.get("lastCheckAt") or ""
     return {
         "ok": True,
         "featureEnabledEnv": enabled(),
-        "activated": bool(state.get("enabled") and state.get("activatedAt")),
+        "activated": bool(enabled() and state.get("enabled", True)),
         "activatedAt": state.get("activatedAt") or "",
-        "historyId": state.get("historyId") or "",
-        "watchExpiration": state.get("watchExpiration") or "",
-        "pubsubTopicConfigured": bool(pubsub_topic()),
-        "lastCheckAt": state.get("lastCheckAt") or "",
+        "lastCheckAt": last_check,
+        "lastPolledAt": last_check,
         "lastSuccessAt": state.get("lastSuccessAt") or "",
         "lastError": state.get("lastError") or "",
         "mailbox": MAILBOX_EMAIL,
         "vendorEmail": VENDOR_EMAIL,
-        "imported": imported[:50],
-        "needsReview": needs_review[:50],
-        "errors": errors[:50],
-        "importedOrderNumbers": sorted(
+        "pollIntervalSeconds": poll_interval_seconds(),
+        "importedOrderNumbers": locked
+        or sorted(
             {
                 normalize_order_id(r.get("orderNumber"))
                 for r in imported
@@ -663,6 +711,30 @@ def process_gmail_message(
         return {"ok": True, "needsReview": True, "result": row, "gate": gate}
 
     order_number = normalize_order_id(gate.get("orderNumber"))
+
+    # First successful import wins for this order — never overwrite later vendor mail.
+    if order_is_locked(state, order_number) and not force:
+        if not dry_run:
+            _mark_message(
+                state,
+                message_id,
+                status="skipped_order_locked",
+                order_number=order_number,
+                subject=subject,
+                received_at=received_at,
+                error="Order already received digitizing files; later emails ignored.",
+                filenames=filenames,
+            )
+            save_state(state)
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "order_already_imported",
+            "messageId": message_id,
+            "orderNumber": order_number,
+            "dryRun": dry_run,
+        }
+
     folder = _resolve_folder(order_number)
     if not folder.get("ok"):
         row = _mark_message(
@@ -872,6 +944,7 @@ def process_gmail_message(
         filenames=saved_names,
         drive_file_ids=uploaded_ids,
     )
+    lock_order(state, order_number, message_id)
     state["lastSuccessAt"] = _now_iso()
     state["lastError"] = ""
     save_state(state)
@@ -897,6 +970,8 @@ def _search_vendor_message_ids(gmail, *, after_epoch: Optional[int] = None, max_
 
 def run_pass(*, dry_run: bool = False, max_messages: int = 40, force_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     """Poll recent vendor emails and process qualifying ones."""
+    if not dry_run and not force_ids:
+        ensure_active()
     state = load_state()
     if not dry_run:
         state["lastCheckAt"] = _now_iso()
@@ -904,8 +979,6 @@ def run_pass(*, dry_run: bool = False, max_messages: int = 40, force_ids: Option
 
     if not enabled() and not dry_run and not force_ids:
         return {"ok": True, "skipped": True, "reason": "env_disabled"}
-    if not state.get("enabled") and not dry_run and not force_ids:
-        return {"ok": True, "skipped": True, "reason": "not_activated"}
 
     gmail = _gmail()
     processed = []
@@ -1012,24 +1085,23 @@ def handle_pubsub_push(envelope: dict) -> Dict[str, Any]:
 
 def _loop():
     try:
-        initial = int(os.environ.get("DIGITIZING_INBOX_POLL_INITIAL_SECONDS") or "40")
+        initial = int(os.environ.get("DIGITIZING_INBOX_POLL_INITIAL_SECONDS") or "90")
     except ValueError:
-        initial = 40
+        initial = 90
     time.sleep(max(0, initial))
     last_watch_renew = 0.0
     while True:
         try:
             if enabled():
-                state = load_state()
-                if state.get("enabled"):
-                    run_pass(dry_run=False)
-                    topic = pubsub_topic()
-                    if topic and (time.time() - last_watch_renew) > 20 * 3600:
-                        try:
-                            renew_watch()
-                            last_watch_renew = time.time()
-                        except Exception:
-                            logger.exception("Digitizing inbox watch renew failed")
+                ensure_active()
+                run_pass(dry_run=False)
+                topic = pubsub_topic()
+                if topic and (time.time() - last_watch_renew) > 20 * 3600:
+                    try:
+                        renew_watch()
+                        last_watch_renew = time.time()
+                    except Exception:
+                        logger.exception("Digitizing inbox watch renew failed")
         except Exception:
             logger.exception("Digitizing inbox poll pass failed")
         time.sleep(poll_interval_seconds())
@@ -1039,12 +1111,16 @@ def start_background_poller():
     """Daemon reconcile/poller (+ daily watch renew). Safe to call more than once."""
     global _started
     if not enabled():
-        logger.info("[DigitizingInbox] disabled (DIGITIZING_INBOX_ENABLED)")
+        logger.info("[DigitizingInbox] disabled (DIGITIZING_INBOX_ENABLED=0)")
         return
     with _start_lock:
         if _started:
             return
         _started = True
+    try:
+        ensure_active()
+    except Exception:
+        logger.exception("[DigitizingInbox] ensure_active on start failed")
     threading.Thread(target=_loop, name="digitizing-inbox", daemon=True).start()
     logger.info(
         "[DigitizingInbox] background poller started; vendor=%s mailbox=%s interval=%ss",

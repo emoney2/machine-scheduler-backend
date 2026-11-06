@@ -165,5 +165,29 @@ class DryRunFixtureTests(unittest.TestCase):
         self.assertTrue(any(n.lower().endswith(".dst") for n in proposed["filenames"]))
 
 
+class OrderLockTests(unittest.TestCase):
+    def test_first_import_locks_order_against_later_mail(self):
+        state = inbox._default_state()
+        self.assertFalse(inbox.order_is_locked(state, "1670"))
+        inbox.lock_order(state, "1670", message_id="msg-first")
+        self.assertTrue(inbox.order_is_locked(state, "1670"))
+        # A later wrong PO reuse of 1670 must see the lock.
+        self.assertTrue(inbox.order_is_locked(state, "1670.0"))
+
+    def test_imported_message_rebuilds_lock(self):
+        state = inbox._default_state()
+        state["processedMessages"]["msg-1"] = {
+            "status": "imported",
+            "orderNumber": "1670",
+            "updatedAt": "2026-03-01T12:00:00+00:00",
+        }
+        rebuilt = inbox._rebuild_locked_orders(state)
+        self.assertIn("1670", rebuilt["lockedOrders"])
+        self.assertTrue(inbox.order_is_locked(rebuilt, "1670"))
+
+    def test_default_poll_interval_is_not_aggressive(self):
+        self.assertGreaterEqual(inbox.poll_interval_seconds(), 300)
+
+
 if __name__ == "__main__":
     unittest.main()

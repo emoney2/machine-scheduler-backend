@@ -24,7 +24,7 @@ does not import mail.
 ## Environment variables (no secrets in git)
 
 ```bash
-# Master switch for the Render worker poller
+# Master switch (default ON). Set to 0 only to disable.
 DIGITIZING_INBOX_ENABLED=1
 
 # Mailbox + vendor (defaults shown)
@@ -41,13 +41,17 @@ DIGITIZING_INBOX_WEBHOOK_SECRET=long-random-string
 # Optional Render Cron secret (falls back to SALES_CRON_SECRET)
 DIGITIZING_INBOX_CRON_SECRET=long-random-string
 
-# Polling reconcile (always used; also recovers missed Pub/Sub)
-DIGITIZING_INBOX_POLL_SECONDS=60
-DIGITIZING_INBOX_POLL_INITIAL_SECONDS=40
+# Polling reconcile — default every 15 minutes (min 5 minutes)
+DIGITIZING_INBOX_POLL_SECONDS=900
+DIGITIZING_INBOX_POLL_INITIAL_SECONDS=90
 
 # Existing orders parent (folder named by Order #)
 ORDERS_PARENT_FOLDER_ID=1n6RX0SumEipD5Nb3pUIgO5OtQFfyQXYz
 ```
+
+**First email only per order:** after a successful import for order `1670`, any later
+vendor message that also says PO 1670 is ignored so a wrong re-send cannot overwrite
+files you already fixed.
 
 ## Google configuration you must complete
 
@@ -103,29 +107,19 @@ Optional Render Cron (every 5–15 minutes):
 Header: `X-Digitizing-Inbox-Cron-Secret: ...`  
 Add `?renewWatch=1` once per day if you want an explicit watch renew.
 
-### 5. Activate in the UI
+### 5. Keep it running
 
 1. Deploy backend + frontend.
-2. Set `DIGITIZING_INBOX_ENABLED=1` on Render and restart.
-3. Open **Digitizing** tab → **Activate**.
+2. Leave `DIGITIZING_INBOX_ENABLED` unset or `1` (default on).
+3. The Digitizing tab shows **Last polled** only — no activate/pause controls.
 
-Activation stores a timestamp. Only messages **after** that moment are imported
-by default (no automatic historical backfill).
+The poller auto-starts with the Render web service and records `activatedAt` once.
+Only messages after that first start are considered (no automatic historical backfill).
 
-### 6. Explicit backfill / dry-run
+API (session cookie required except pubsub/cron):
 
-From the Digitizing tab:
-
-- **Dry-run** — reports matched order / folder / files; uploads nothing.
-- **Check now** — process recent qualifying mail after activation.
-- **Retry** on a needs-review / error row — reprocess that Gmail message id.
-
-API equivalents (session cookie required except pubsub/cron):
-
-- `GET /api/digitizing/inbox/status`
-- `POST /api/digitizing/inbox/activate` `{ "enabled": true }`
-- `POST /api/digitizing/inbox/run` `{ "dryRun": true }`
-- `POST /api/digitizing/inbox/run` `{ "messageIds": ["..."], "force": true }`
+- `GET /api/digitizing/inbox/status` — includes `lastPolledAt`
+- `POST /api/digitizing/inbox/run` `{ "dryRun": true }` — optional ops use
 
 ## Matching rules (deterministic)
 
