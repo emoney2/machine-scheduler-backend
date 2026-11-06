@@ -29,6 +29,8 @@ data/sewing_board.json
 data/sewing_board.tmp
 data/digitizing_ordered.json
 data/digitizing_ordered.tmp
+data/digitizing_inbox.json
+data/digitizing_inbox.tmp
 
 # Warehouse Wilcom helper secrets and local delivery history
 wilcom_agent_config.json

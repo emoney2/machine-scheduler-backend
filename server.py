@@ -168,6 +168,7 @@ import label_archive as lblarch
 import sewing_priority_waiting as sew_waiting
 import embroidery_progress as emb_progress
 import digitizing_ordered as dig_ordered
+import digitizing_inbox as dig_inbox
 from wilcom_dispatch import MACHINE_IDS as WILCOM_MACHINE_IDS
 from wilcom_dispatch import dispatch as wilcom_dispatch
 from magnet_kanban import (
@@ -20981,6 +20982,340 @@ def digitizing_ordered():
         logger.exception("[Digitizing] mark ordered API failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
     return jsonify({"ok": True, "orderNumbers": ordered})
+
+
+def _digitizing_inbox_resolve_order_folder(order_number):
+    """
+    Resolve the existing numbered order folder using the same Drive parent
+    lookup the rest of the app uses, cross-checked with Production Orders
+    Order Folder Link / Folder Link when present.
+    """
+    oid = dig_inbox.normalize_order_id(order_number)
+    if not oid:
+        return {"ok": False, "error": "missing_order"}
+
+    try:
+        drive = get_drive_service()
+    except Exception as exc:
+        return {"ok": False, "error": f"drive_unavailable: {exc}"}
+
+    parent = _orders_drive_parent_id()
+    by_name = _find_folder_in_parent(drive, oid, parent)
+
+    sheet_folder_ids = []
+    try:
+        values, by_index = _orders_rows_snapshot()
+        # Keys in by_index are raw sheet strings; try normalized matches too.
+        idx = None
+        if isinstance(by_index, dict):
+            idx = by_index.get(oid)
+            if idx is None:
+                for key, value in by_index.items():
+                    if dig_inbox.normalize_order_id(key) == oid:
+                        idx = value
+                        break
+        row = _order_dict_at(idx) if idx is not None else None
+        if row:
+            for key in ("Order Folder Link", "Folder Link", "order folder link", "folder link"):
+                # Prefer exact header names from the row dict.
+                pass
+            for key in row.keys():
+                key_l = str(key or "").strip().lower()
+                if key_l in {"order folder link", "folder link"}:
+                    fid = _folder_id_from_drive_url(row.get(key))
+                    if fid and fid not in sheet_folder_ids:
+                        sheet_folder_ids.append(fid)
+    except Exception:
+        logger.exception("[DigitizingInbox] Production Orders folder lookup failed")
+
+    if len(sheet_folder_ids) > 1:
+        return {
+            "ok": False,
+            "error": "conflicting_sheet_folders",
+            "candidates": sheet_folder_ids,
+        }
+
+    sheet_id = sheet_folder_ids[0] if sheet_folder_ids else None
+    if by_name and sheet_id and by_name != sheet_id:
+        return {
+            "ok": False,
+            "error": "conflicting_folders",
+            "candidates": [by_name, sheet_id],
+            "byName": by_name,
+            "fromSheet": sheet_id,
+        }
+
+    folder_id = by_name or sheet_id
+    if not folder_id:
+        return {"ok": False, "error": "folder_missing", "orderNumber": oid}
+
+    try:
+        meta = (
+            drive.files()
+            .get(
+                fileId=folder_id,
+                fields="id, name, trashed",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        if meta.get("trashed"):
+            return {"ok": False, "error": "folder_trashed", "folderId": folder_id}
+        if dig_inbox.normalize_order_id(meta.get("name")) not in {"", oid}:
+            # Name mismatch is informational only when sheet link was used.
+            logger.warning(
+                "[DigitizingInbox] folder %s name %r != order %s",
+                folder_id,
+                meta.get("name"),
+                oid,
+            )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"folder_inaccessible: {exc}",
+            "folderId": folder_id,
+        }
+
+    return {
+        "ok": True,
+        "folderId": folder_id,
+        "folderLink": f"https://drive.google.com/drive/folders/{folder_id}",
+        "orderNumber": oid,
+        "source": "drive_name" if by_name else "sheet_link",
+    }
+
+
+def _digitizing_inbox_append_sheet_row(row):
+    try:
+        sheets = get_sheets_service()
+    except Exception:
+        return False
+    try:
+        meta = (
+            sheets.spreadsheets()
+            .get(spreadsheetId=SPREADSHEET_ID, fields="sheets.properties.title")
+            .execute()
+        )
+        titles = {
+            (s.get("properties") or {}).get("title")
+            for s in (meta.get("sheets") or [])
+        }
+        tab = dig_inbox.SHEET_TAB
+        if tab not in titles:
+            sheets.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
+            ).execute()
+            sheets.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'{tab}'!A1",
+                valueInputOption="RAW",
+                body={"values": [list(dig_inbox.SHEET_HEADERS)]},
+            ).execute()
+        sheets.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{tab}'!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [list(row)]},
+        ).execute()
+        return True
+    except Exception:
+        logger.exception("[DigitizingInbox] sheet append failed")
+        return False
+
+
+def _configure_digitizing_inbox():
+    from googleapiclient.discovery import build as _google_build
+
+    dig_inbox.configure(
+        get_gmail=lambda: _google_build(
+            "gmail",
+            "v1",
+            credentials=get_google_credentials(),
+            cache_discovery=False,
+        ),
+        get_drive=get_drive_service,
+        resolve_order_folder=_digitizing_inbox_resolve_order_folder,
+        append_inbox_sheet_row=_digitizing_inbox_append_sheet_row,
+    )
+
+
+try:
+    _configure_digitizing_inbox()
+except Exception:
+    logging.getLogger(__name__).exception("digitizing inbox configure failed at import")
+
+
+@app.route(
+    "/digitizing/inbox/status",
+    methods=["GET", "OPTIONS"],
+    endpoint="digitizing_inbox_status_plain",
+)
+@app.route(
+    "/api/digitizing/inbox/status",
+    methods=["GET", "OPTIONS"],
+    endpoint="digitizing_inbox_status_api",
+)
+@login_required_session
+def digitizing_inbox_status():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    return jsonify(dig_inbox.status_snapshot())
+
+
+@app.route(
+    "/digitizing/inbox/activate",
+    methods=["POST", "OPTIONS"],
+    endpoint="digitizing_inbox_activate_plain",
+)
+@app.route(
+    "/api/digitizing/inbox/activate",
+    methods=["POST", "OPTIONS"],
+    endpoint="digitizing_inbox_activate_api",
+)
+@login_required_session
+def digitizing_inbox_activate():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    watch = None
+    if data.get("enabled") is False:
+        dig_inbox.deactivate()
+    else:
+        dig_inbox.activate()
+        if dig_inbox.pubsub_topic():
+            try:
+                watch = dig_inbox.renew_watch()
+            except Exception as exc:
+                logger.exception("[DigitizingInbox] watch renew on activate failed")
+                watch = {"ok": False, "error": str(exc)}
+    return jsonify({"ok": True, "state": dig_inbox.status_snapshot(), "watch": watch})
+
+
+@app.route(
+    "/digitizing/inbox/run",
+    methods=["POST", "OPTIONS"],
+    endpoint="digitizing_inbox_run_plain",
+)
+@app.route(
+    "/api/digitizing/inbox/run",
+    methods=["POST", "OPTIONS"],
+    endpoint="digitizing_inbox_run_api",
+)
+@login_required_session
+def digitizing_inbox_run():
+    """Manual reconcile / dry-run / retry."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    dry_run = bool(data.get("dryRun") or data.get("dry_run"))
+    force_ids = data.get("messageIds") or data.get("messageId")
+    if isinstance(force_ids, str):
+        force_ids = [force_ids]
+    if force_ids is not None and not isinstance(force_ids, list):
+        force_ids = list(force_ids)
+    try:
+        if force_ids:
+            from googleapiclient.discovery import build as _google_build
+
+            results = []
+            gmail = _google_build(
+                "gmail",
+                "v1",
+                credentials=get_google_credentials(),
+                cache_discovery=False,
+            )
+            for mid in force_ids:
+                msg = (
+                    gmail.users()
+                    .messages()
+                    .get(userId="me", id=str(mid), format="full")
+                    .execute()
+                )
+                results.append(
+                    dig_inbox.process_gmail_message(
+                        msg, dry_run=dry_run, force=bool(data.get("force"))
+                    )
+                )
+            return jsonify({"ok": True, "dryRun": dry_run, "results": results})
+        out = dig_inbox.run_pass(dry_run=dry_run, max_messages=int(data.get("max") or 40))
+        return jsonify(out)
+    except Exception as exc:
+        logger.exception("[DigitizingInbox] run failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route(
+    "/digitizing/inbox/pubsub",
+    methods=["POST", "OPTIONS"],
+    endpoint="digitizing_inbox_pubsub_plain",
+)
+@app.route(
+    "/api/digitizing/inbox/pubsub",
+    methods=["POST", "OPTIONS"],
+    endpoint="digitizing_inbox_pubsub_api",
+)
+def digitizing_inbox_pubsub():
+    """
+    Google Pub/Sub push endpoint for Gmail users.watch notifications.
+    Validates DIGITIZING_INBOX_WEBHOOK_SECRET via ?token= or X-Digitizing-Inbox-Token.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    expect = dig_inbox.webhook_secret()
+    got = (
+        request.args.get("token")
+        or request.headers.get("X-Digitizing-Inbox-Token")
+        or ""
+    ).strip()
+    if not expect or got != expect:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    envelope = request.get_json(silent=True) or {}
+    try:
+        result = dig_inbox.handle_pubsub_push(envelope)
+        # Only 2xx after work finished/queued durably (run_pass persists state).
+        return jsonify(result), 200
+    except Exception as exc:
+        logger.exception("[DigitizingInbox] pubsub handler failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route(
+    "/digitizing/inbox/cron",
+    methods=["GET", "POST", "OPTIONS"],
+    endpoint="digitizing_inbox_cron_plain",
+)
+@app.route(
+    "/api/digitizing/inbox/cron",
+    methods=["GET", "POST", "OPTIONS"],
+    endpoint="digitizing_inbox_cron_api",
+)
+def digitizing_inbox_cron():
+    """Render Cron / external scheduler: reconcile + optional watch renew."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    expect = dig_inbox.cron_secret()
+    got = (
+        request.headers.get("X-Digitizing-Inbox-Cron-Secret")
+        or request.headers.get("X-Sales-Cron-Secret")
+        or request.args.get("secret")
+        or ""
+    ).strip()
+    if not expect or got != expect:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    renew = str(request.args.get("renewWatch") or "").lower() in {"1", "true", "yes"}
+    out = {"ok": True}
+    try:
+        if renew or dig_inbox.pubsub_topic():
+            # Renew at most via explicit flag; poller also renews daily.
+            if renew:
+                out["watch"] = dig_inbox.renew_watch()
+        out["pass"] = dig_inbox.run_pass(dry_run=False)
+        return jsonify(out)
+    except Exception as exc:
+        logger.exception("[DigitizingInbox] cron failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/api/reorder", methods=["POST"])

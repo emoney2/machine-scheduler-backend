@@ -17,14 +17,19 @@ graceful_timeout = int(os.environ.get("GUNICORN_GRACEFUL_TIMEOUT", "120"))
 
 
 def post_worker_init(worker):
-    """Watch the Directory sheet for new wholesale applications and email Justin."""
+    """Background watchers that keep running while the Render web service is up."""
+    import logging
+
+    log = logging.getLogger("gunicorn.error")
     try:
         import wholesale_signup_notify
 
         wholesale_signup_notify.start_background_poller()
     except Exception:
-        import logging
+        log.exception("wholesale signup notifier failed to start")
+    try:
+        import digitizing_inbox
 
-        logging.getLogger("gunicorn.error").exception(
-            "wholesale signup notifier failed to start"
-        )
+        digitizing_inbox.start_background_poller()
+    except Exception:
+        log.exception("digitizing inbox poller failed to start")
