@@ -188,25 +188,55 @@ def inspect_presentation(
     }
 
 
+def _normalize_design_id_filter(
+    design_ids: list[str] | set[str] | tuple[str, ...] | None,
+) -> set[str] | None:
+    """Return a set of designIds to keep, or None to keep all."""
+    if design_ids is None:
+        return None
+    out = {str(x).strip() for x in design_ids if str(x).strip()}
+    return out or None
+
+
 def resolve_flat_pngs(
     pdf_bytes: bytes,
     filename: str,
     download_bytes: Callable[[str], bytes],
+    *,
+    design_ids: list[str] | set[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Download and verify each design's flat PNG.
 
     ``download_bytes(file_id)`` must return raw file bytes from Drive.
+    When ``design_ids`` is set, only those designs are resolved (order UI pick).
     Raises ``JrcoPresentationError`` on local: ids or integrity failure.
     """
     inspect = inspect_presentation(pdf_bytes, filename)
-    if not inspect["ok"]:
+    wanted = _normalize_design_id_filter(design_ids)
+    designs = list(inspect["designs"])
+    if wanted is not None:
+        designs = [d for d in designs if str(d.get("designId") or "") in wanted]
+        if not designs:
+            raise JrcoPresentationError(
+                "No matching design(s) in presentation PDF for the selection"
+            )
+        # Only selected designs must be Drive-resolvable
+        bad = [d for d in designs if d.get("idKind") != "drive"]
+        if bad:
+            msgs = [
+                d.get("error")
+                or f"Page {d.get('page')}: cannot resolve flat PNG"
+                for d in bad
+            ]
+            raise JrcoPresentationError("; ".join(msgs))
+    elif not inspect["ok"]:
         raise JrcoPresentationError(
             "; ".join(inspect["blockingErrors"])
             or "Presentation PDF cannot be resolved"
         )
     resolved: list[dict[str, Any]] = []
-    for d in inspect["designs"]:
+    for d in designs:
         fid = d["flatPngDriveFileId"]
         try:
             png_bytes = download_bytes(fid)
@@ -249,6 +279,7 @@ def expand_presentation_uploads(
     download_bytes: Callable[[str], bytes],
     *,
     keep_proof_pdf: bool = True,
+    design_ids: list[str] | set[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]] | None:
     """
     Turn a JR presentation PDF into Drive upload payloads (flat PNGs + optional proof PDF).
@@ -267,7 +298,9 @@ def expand_presentation_uploads(
     except JrcoPresentationError:
         return None
 
-    flats = resolve_flat_pngs(raw, filename, download_bytes)
+    flats = resolve_flat_pngs(
+        raw, filename, download_bytes, design_ids=design_ids
+    )
     uploads: list[dict[str, Any]] = []
     for item in flats:
         uploads.append(

@@ -126,6 +126,44 @@ class JrcoPresentationTests(unittest.TestCase):
             None,
         )
 
+    def test_resolve_filters_selected_design(self):
+        png_a = b"\x89PNG\r\n\x1a\nA"
+        png_b = b"\x89PNG\r\n\x1a\nB"
+        dig_a = hashlib.sha256(png_a).hexdigest()
+        dig_b = hashlib.sha256(png_b).hexdigest()
+        m = {
+            "schemaVersion": 1,
+            "presentationId": "p1",
+            "designs": [
+                {
+                    "page": 1,
+                    "designId": "design-a",
+                    "productType": "driver",
+                    "artworkVersion": "v1",
+                    "flatPngDriveFileId": "fid-a",
+                    "flatPngSha256": dig_a,
+                    "sourcePsdDriveFileId": "",
+                },
+                {
+                    "page": 2,
+                    "designId": "design-b",
+                    "productType": "fairway",
+                    "artworkVersion": "v2",
+                    "flatPngDriveFileId": "fid-b",
+                    "flatPngSha256": dig_b,
+                    "sourcePsdDriveFileId": "",
+                },
+            ],
+        }
+        pdf = _make_presentation_pdf(m)
+        store = {"fid-a": png_a, "fid-b": png_b}
+        resolved = resolve_flat_pngs(
+            pdf, "demo.pdf", store.__getitem__, design_ids=["design-b"]
+        )
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0]["designId"], "design-b")
+        self.assertEqual(resolved[0]["bytes"], png_b)
+
 
 if __name__ == "__main__":
     unittest.main()

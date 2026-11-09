@@ -227,6 +227,29 @@ from jrco_presentation import (
     expand_presentation_uploads,
     inspect_presentation,
 )
+
+
+def _parse_jr_presentation_design_ids(form) -> list[str] | None:
+    """Optional order-form pick: which presentation page/design to attach."""
+    raw_list = []
+    try:
+        raw_list = list(form.getlist("jrPresentationDesignIds") or [])
+    except Exception:
+        raw_list = []
+    if not raw_list:
+        single = (form.get("jrPresentationDesignIds") or form.get("jrPresentationDesignId") or "").strip()
+        if single:
+            # Allow comma-separated single field
+            raw_list = [p.strip() for p in single.split(",") if p.strip()]
+    out = []
+    seen = set()
+    for item in raw_list:
+        for part in str(item).split(","):
+            did = part.strip()
+            if did and did not in seen:
+                seen.add(did)
+                out.append(did)
+    return out or None
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from flask import send_file  # ADD if not present
 
@@ -18694,7 +18717,9 @@ def _resolve_order_drive_folder_id(drive, order_number) -> str | None:
     return _find_folder_in_parent(drive, str(order_number).strip(), parent)
 
 
-def _upload_edit_files_to_order_folder(drive, folder_id, file_storages, order_label):
+def _upload_edit_files_to_order_folder(
+    drive, folder_id, file_storages, order_label, design_ids=None
+):
     """Upload multipart FileStorage list; return (webViewLinks, primary_file_id)."""
     from io import BytesIO
 
@@ -18761,6 +18786,7 @@ def _upload_edit_files_to_order_folder(drive, folder_id, file_storages, order_la
                 name,
                 lambda fid: _download_drive_file_bytes(drive, fid),
                 keep_proof_pdf=True,
+                design_ids=design_ids,
             )
         except JrcoPresentationError:
             raise
@@ -18778,7 +18804,7 @@ def _upload_edit_files_to_order_folder(drive, folder_id, file_storages, order_la
     return [lnk for lnk in links if lnk], primary_file_id
 
 
-def _upload_edit_print_files(drive, order_folder_id, file_storages):
+def _upload_edit_print_files(drive, order_folder_id, file_storages, design_ids=None):
     """Ensure Print Files subfolder, upload files, return folder web link."""
     from io import BytesIO
 
@@ -18805,6 +18831,7 @@ def _upload_edit_print_files(drive, order_folder_id, file_storages):
                 name,
                 lambda fid: _download_drive_file_bytes(drive, fid),
                 keep_proof_pdf=False,
+                design_ids=design_ids,
             )
             if expanded:
                 payloads = [
@@ -18846,6 +18873,7 @@ def edit_order(order_id):
         data = request.form
         prod_files = request.files.getlist("prodFiles")
         print_files = request.files.getlist("printFiles")
+        jr_design_ids = _parse_jr_presentation_design_ids(data)
         oid = _overview_normalize_order_key(order_id)
         if not oid:
             return jsonify({"error": "Order # required"}), 400
@@ -19016,7 +19044,7 @@ def edit_order(order_id):
                     ), 404
                 try:
                     links, primary_file_id = _upload_edit_files_to_order_folder(
-                        drive, folder_id, prod_files, oid
+                        drive, folder_id, prod_files, oid, design_ids=jr_design_ids
                     )
                 except JrcoPresentationError as pres_err:
                     return jsonify({"error": str(pres_err)}), 400
@@ -19038,7 +19066,9 @@ def edit_order(order_id):
                         {"error": f"Drive folder for order {oid} was not found."}
                     ), 404
                 try:
-                    print_link = _upload_edit_print_files(drive, folder_id, print_files)
+                    print_link = _upload_edit_print_files(
+                        drive, folder_id, print_files, design_ids=jr_design_ids
+                    )
                 except JrcoPresentationError as pres_err:
                     return jsonify({"error": str(pres_err)}), 400
                 _queue_change(("Print Files",), print_link, "Print Files")
@@ -19207,7 +19237,11 @@ def edit_order(order_id):
                                         pass
                                 try:
                                     back_links, back_pfid = _upload_edit_files_to_order_folder(
-                                        drive, back_folder, prod_files, back_order
+                                        drive,
+                                        back_folder,
+                                        prod_files,
+                                        back_order,
+                                        design_ids=jr_design_ids,
                                     )
                                     if back_links:
                                         new_val = ",".join(back_links)
@@ -19235,7 +19269,10 @@ def edit_order(order_id):
                                         pass
                                 try:
                                     new_val = _upload_edit_print_files(
-                                        drive, back_folder, print_files
+                                        drive,
+                                        back_folder,
+                                        print_files,
+                                        design_ids=jr_design_ids,
                                     )
                                 except Exception:
                                     logger.exception(
@@ -20446,6 +20483,7 @@ def submit_order():
         data = request.form
         prod_files = request.files.getlist("prodFiles")
         print_files = request.files.getlist("printFiles")
+        jr_design_ids = _parse_jr_presentation_design_ids(data)
 
         # ─── EARLY VALIDATION ────────────────────────────────────────────────
         materials = data.getlist("materials")
@@ -20704,6 +20742,7 @@ def submit_order():
                     name,
                     _download_presentation_flat,
                     keep_proof_pdf=True,
+                    design_ids=jr_design_ids,
                 )
             except JrcoPresentationError:
                 raise
@@ -20757,6 +20796,7 @@ def submit_order():
                     name,
                     _download_presentation_flat,
                     keep_proof_pdf=False,
+                    design_ids=jr_design_ids,
                 )
             except JrcoPresentationError:
                 raise
