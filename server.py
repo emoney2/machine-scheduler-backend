@@ -24364,11 +24364,8 @@ def _send_design_confirmation_email(
         for e in entries:
             url = e["url"]
             label = e["label"]
-            if "id=" in url:
-                file_id = url.split("id=")[-1].split("&")[0].split("#")[0].strip()
-                url_thumb = "https://drive.google.com/thumbnail?id=" + file_id + "&sz=w1200" if file_id else url
-            else:
-                url_thumb = url
+            # Prefer our auth proxy so private JR flats render in email clients
+            url_thumb = _drive_thumbnail_url(url, sz="w800") or url
             html_body += f'<p style="margin: 16px 0;"><strong>{_html_escape(label)}</strong></p>\n<p style="margin: 8px 0 16px 0;"><img src="{_html_escape(url_thumb)}" alt="{_html_escape(label)}" width="600" style="display: block; max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px;" /></p>\n'
     else:
         html_body += "<p><em>Design preview is being prepared.</em></p>\n"
@@ -24665,7 +24662,14 @@ def shopify_webhook_orders_create():
                                 elif "id=" in link:
                                     file_id = link.split("id=")[-1].split("&")[0].split("#")[0].strip()
                             if file_id and file_id != "anyoneWithLink":
-                                preview_urls.append("https://drive.google.com/thumbnail?id=" + file_id + "&sz=w1200")
+                                preview_urls.append(
+                                    _drive_thumbnail_url(file_id, sz="w800")
+                                    or (
+                                        "https://drive.google.com/thumbnail?id="
+                                        + file_id
+                                        + "&sz=w1200"
+                                    )
+                                )
                 if design_sent_col_idx is not None and duplicate_row_indices:
                     try:
                         col_letter = _col_letter_dedup(design_sent_col_idx)
