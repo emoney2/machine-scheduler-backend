@@ -136,14 +136,87 @@ def classify_flat_png_id(file_id: str) -> str:
     return "drive"
 
 
+def render_page_tiles(
+    pdf_bytes: bytes,
+    *,
+    max_width: int = 280,
+    jpeg_quality: int = 72,
+) -> list[dict[str, Any]]:
+    """
+    Rasterize each PDF page to a small JPEG data-URL for the order-form tile picker.
+
+    Uses PyMuPDF when available. Returns [] if rendering is unavailable.
+    """
+    if not pdf_bytes:
+        return []
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        logger.warning("PyMuPDF not installed — page tiles unavailable")
+        return []
+
+    tiles: list[dict[str, Any]] = []
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        logger.warning("Could not open PDF for page tiles: %s", e)
+        return []
+    try:
+        for i in range(len(doc)):
+            page = doc.load_page(i)
+            width = float(page.rect.width) or 1.0
+            zoom = max(0.15, min(2.0, float(max_width) / width))
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            try:
+                jpg = pix.tobytes("jpeg")
+            except Exception:
+                # Older PyMuPDF: convert via Pillow
+                from PIL import Image
+
+                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+                jpg = buf.getvalue()
+            if not jpg:
+                continue
+            # Re-encode once for consistent quality / size
+            try:
+                from PIL import Image
+
+                im = Image.open(BytesIO(jpg))
+                if im.mode != "RGB":
+                    im = im.convert("RGB")
+                out = BytesIO()
+                im.save(out, format="JPEG", quality=jpeg_quality, optimize=True)
+                jpg = out.getvalue()
+            except Exception:
+                pass
+            import base64
+
+            b64 = base64.b64encode(jpg).decode("ascii")
+            tiles.append(
+                {
+                    "page": i + 1,
+                    "thumbDataUrl": f"data:image/jpeg;base64,{b64}",
+                }
+            )
+    finally:
+        doc.close()
+    return tiles
+
+
 def inspect_presentation(
     pdf_bytes: bytes,
     filename: str = "",
+    *,
+    include_page_tiles: bool = False,
+    tile_max_width: int = 280,
 ) -> dict[str, Any]:
     """
     Extract manifest and classify each design (no Drive download).
 
     Returns a JSON-serializable summary for the order UI.
+    When ``include_page_tiles`` is True, also rasterizes PDF pages for the picker.
     """
     manifest = read_jrco_manifest(pdf_bytes)
     designs_out: list[dict[str, Any]] = []
@@ -178,11 +251,31 @@ def inspect_presentation(
                 "error": err,
             }
         )
+    page_tiles: list[dict[str, Any]] = []
+    if include_page_tiles:
+        try:
+            page_tiles = render_page_tiles(pdf_bytes, max_width=tile_max_width)
+        except Exception as e:
+            logger.warning("page tile render failed: %s", e)
+            page_tiles = []
+    # Attach matching tile onto each design for convenient UI binding
+    tiles_by_page = {
+        int(t["page"]): t.get("thumbDataUrl") or ""
+        for t in page_tiles
+        if t.get("page") is not None
+    }
+    for d in designs_out:
+        try:
+            page_n = int(d.get("page") or 0)
+        except (TypeError, ValueError):
+            page_n = 0
+        d["pageThumbDataUrl"] = tiles_by_page.get(page_n) or ""
     return {
         "ok": not blocking_errors,
         "schemaVersion": manifest.get("schemaVersion"),
         "presentationId": manifest.get("presentationId"),
         "designs": designs_out,
+        "pageTiles": page_tiles,
         "blockingErrors": blocking_errors,
         "filename": filename or "",
     }

@@ -6646,6 +6646,9 @@ def api_jrco_presentation_inspect():
 
     Multipart field: ``pdf`` (or ``file``). Does not download Drive flats —
     submit-time expansion resolves + verifies SHA-256.
+
+    Also returns ``pageTiles`` / per-design ``pageThumbDataUrl`` (small JPEG
+    data-URLs) for the order-form tile picker modal.
     """
     if request.method == "OPTIONS":
         return ("", 204)
@@ -6655,13 +6658,110 @@ def api_jrco_presentation_inspect():
     raw = f.read()
     name = f.filename or "presentation.pdf"
     try:
-        summary = inspect_presentation(raw, name)
+        summary = inspect_presentation(
+            raw, name, include_page_tiles=True, tile_max_width=280
+        )
         return jsonify(summary)
     except JrcoPresentationError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         logger.exception("[jrco-presentation/inspect] failed")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/jrco-presentation/flat-preview", methods=["GET", "OPTIONS"])
+def api_jrco_presentation_flat_preview():
+    """
+    Return a small JPEG preview of a production flat PNG on Drive.
+
+    Prefer Drive ``thumbnailLink`` (works for large private SA uploads). Fall
+    back to downloading + Pillow resize when no thumb is ready yet.
+    Query: ``fileId`` (required), ``sz`` like ``w640`` (optional).
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    file_id = (request.args.get("fileId") or "").strip()
+    if not file_id or file_id.lower().startswith("local:"):
+        return jsonify({"ok": False, "error": "Valid Drive fileId required"}), 400
+    sz = (request.args.get("sz") or "w640").strip().lower()
+    m = re.match(r"^w?(\d{2,4})$", sz)
+    edge = int(m.group(1)) if m else 640
+    edge = max(120, min(edge, 1280))
+
+    try:
+        drive = get_drive_service()
+        meta = (
+            drive.files()
+            .get(
+                fileId=file_id,
+                fields="id,name,mimeType,thumbnailLink,size",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except Exception as e:
+        logger.warning("[jrco flat-preview] meta failed for %s: %s", file_id, e)
+        return jsonify({"ok": False, "error": f"Drive lookup failed: {e}"}), 404
+
+    # 1) Prefer Google-generated thumbnail (small, fast, private-file safe via cookieless link)
+    thumb_link = (meta.get("thumbnailLink") or "").strip()
+    if thumb_link:
+        resized = re.sub(r"=s\d+", f"=s{edge}", thumb_link)
+        if resized == thumb_link and "=s" not in thumb_link:
+            sep = "&" if "?" in thumb_link else "?"
+            resized = f"{thumb_link}{sep}sz=s{edge}"
+        try:
+            tr = requests.get(resized, timeout=(4, 20))
+            body = tr.content or b""
+            looks_img = (
+                (len(body) > 3 and body[:3] == b"\xff\xd8\xff")
+                or (len(body) > 8 and body[:8] == b"\x89PNG\r\n\x1a\n")
+                or (len(body) > 6 and body[:6] in (b"GIF87a", b"GIF89a"))
+            )
+            if tr.status_code == 200 and looks_img:
+                ctype = tr.headers.get("Content-Type") or "image/jpeg"
+                resp = Response(body, status=200, mimetype=ctype)
+                resp.headers["Cache-Control"] = "private, max-age=300"
+                return resp
+        except Exception as e:
+            logger.info("[jrco flat-preview] thumbnailLink fetch failed: %s", e)
+
+    # 2) Fallback: download original and downscale (may be large — cap decode)
+    try:
+        raw = _download_drive_file_bytes(drive, file_id)
+    except Exception as e:
+        logger.warning("[jrco flat-preview] download failed for %s: %s", file_id, e)
+        return jsonify({"ok": False, "error": f"Download failed: {e}"}), 502
+
+    if not raw:
+        return jsonify({"ok": False, "error": "Empty file"}), 404
+
+    # Allow large production flats (unlike /api/drive/thumbnail hard 2MB skip)
+    try:
+        from io import BytesIO
+        from PIL import Image as PILImage
+
+        prev_limit = PILImage.MAX_IMAGE_PIXELS
+        PILImage.MAX_IMAGE_PIXELS = 80_000_000
+        try:
+            im = PILImage.open(BytesIO(raw))
+            im.thumbnail((edge, edge))
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=82, optimize=True)
+            jpg = buf.getvalue()
+        finally:
+            PILImage.MAX_IMAGE_PIXELS = prev_limit
+    except Exception as e:
+        logger.warning("[jrco flat-preview] resize failed for %s: %s", file_id, e)
+        return jsonify({"ok": False, "error": f"Could not build preview: {e}"}), 500
+
+    if not jpg:
+        return jsonify({"ok": False, "error": "Empty preview"}), 500
+    resp = Response(jpg, status=200, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "private, max-age=300"
+    return resp
 
 
 @app.route("/api/upload-email-preview", methods=["POST", "OPTIONS"])
