@@ -17011,19 +17011,7 @@ def jobs_for_company():
             # Return all jobs for the company, including completed ones
             if row_company == company:
                 image_link = str(row.get("Image", "")).strip()
-                file_id = ""
-                if "id=" in image_link:
-                    file_id = image_link.split("id=")[-1].split("&")[0]
-                elif "file/d/" in image_link:
-                    file_id = image_link.split("file/d/")[-1].split("/")[0]
-
-                preview_url = (
-                    f"https://drive.google.com/thumbnail?id={file_id}"
-                    if file_id
-                    else ""
-                )
-
-                row["image"] = preview_url
+                row["image"] = _drive_thumbnail_url(image_link)
                 row["orderId"] = str(row.get("Order #", "")).strip()
                 row["PO #"] = _po_number_from_row(row)
                 jobs.append(row)
@@ -17087,11 +17075,28 @@ def _is_outstanding_order_row(row: dict) -> bool:
     return stage not in ("COMPLETE", "COMPLETED")
 
 
-def _drive_thumbnail_url(image_link: str) -> str:
+def _backend_public_base() -> str:
+    return (
+        os.environ.get("BACKEND_PUBLIC_URL")
+        or "https://machine-scheduler-backend.onrender.com"
+    ).rstrip("/")
+
+
+def _drive_thumbnail_url(image_link: str, sz: str = "w160") -> str:
+    """
+    Browser-safe thumbnail URL for job cards / confirmation PDFs.
+
+    Always use our authenticated proxy — public drive.google.com/thumbnail
+    fails for private / shared-drive JR production flats (broken <img>).
+    """
     file_id = _extract_drive_file_id(str(image_link or "").strip())
-    if file_id:
-        return f"https://drive.google.com/thumbnail?id={file_id}"
-    return ""
+    if not file_id:
+        return ""
+    size = (sz or "w160").strip() or "w160"
+    return (
+        f"{_backend_public_base()}/api/drive/thumbnail"
+        f"?fileId={urllib.parse.quote(file_id)}&sz={urllib.parse.quote(size)}"
+    )
 
 
 def _fetch_drive_image_bytes(file_id: str):
@@ -17853,17 +17858,7 @@ def ship_production_queue():
             if qty_num > 0 and remaining <= 0:
                 continue
             image_link = str(row.get("Image", "")).strip()
-            file_id = ""
-            if "id=" in image_link:
-                file_id = image_link.split("id=")[-1].split("&")[0]
-            elif "file/d/" in image_link:
-                file_id = image_link.split("file/d/")[-1].split("/")[0]
-
-            preview_url = (
-                f"https://drive.google.com/thumbnail?id={file_id}"
-                if file_id
-                else ""
-            )
+            preview_url = _drive_thumbnail_url(image_link)
 
             company = str(row.get("Company Name", "")).strip()
             oid = str(row.get("Order #", "")).strip()
