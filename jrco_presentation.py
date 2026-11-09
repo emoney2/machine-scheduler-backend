@@ -205,6 +205,63 @@ def render_page_tiles(
     return tiles
 
 
+def render_page_png(
+    pdf_bytes: bytes,
+    page_1based: int,
+    *,
+    max_edge: int = 2400,
+) -> bytes:
+    """
+    Rasterize one PDF page (1-based) to a PNG suitable as a production preview.
+
+    Used when a presentation PDF has ``local:`` flat ids (Drive not configured
+    at export time) so the order form can still pick a page.
+    """
+    if not pdf_bytes:
+        raise JrcoPresentationError("Empty PDF")
+    try:
+        page_n = int(page_1based)
+    except (TypeError, ValueError) as e:
+        raise JrcoPresentationError("Page number must be an integer") from e
+    if page_n < 1:
+        raise JrcoPresentationError("Page number must be >= 1")
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as e:
+        raise JrcoPresentationError(
+            "PyMuPDF is required to rasterize presentation pages"
+        ) from e
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        raise JrcoPresentationError(f"Could not open PDF: {e}") from e
+    try:
+        if page_n > len(doc):
+            raise JrcoPresentationError(
+                f"Page {page_n} is out of range (PDF has {len(doc)} page(s))"
+            )
+        page = doc.load_page(page_n - 1)
+        rect = page.rect
+        long_edge = max(float(rect.width) or 1.0, float(rect.height) or 1.0)
+        target = max(400, min(int(max_edge or 2400), 4000))
+        zoom = max(0.5, min(4.0, float(target) / long_edge))
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        try:
+            png = pix.tobytes("png")
+        except Exception:
+            from PIL import Image
+
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            buf = BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            png = buf.getvalue()
+        if not png:
+            raise JrcoPresentationError(f"Failed to rasterize page {page_n}")
+        return png
+    finally:
+        doc.close()
+
+
 def inspect_presentation(
     pdf_bytes: bytes,
     filename: str = "",

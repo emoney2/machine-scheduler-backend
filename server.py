@@ -226,6 +226,7 @@ from jrco_presentation import (
     JrcoPresentationError,
     expand_presentation_uploads,
     inspect_presentation,
+    render_page_png,
 )
 
 
@@ -6851,6 +6852,48 @@ def api_jrco_presentation_flat_preview():
     resp = Response(jpg, status=200, mimetype="image/jpeg")
     resp.headers["Cache-Control"] = "private, max-age=300"
     return resp
+
+
+@app.route("/api/jrco-presentation/page-flat", methods=["POST", "OPTIONS"])
+def api_jrco_presentation_page_flat():
+    """
+    Rasterize one page of a JR presentation PDF to a PNG.
+
+    Used when the PDF was exported with ``local:`` flat ids (Drive not
+    configured on the desktop exporter). Multipart: ``pdf`` + ``page`` (1-based).
+    Optional ``maxEdge`` (default 2400).
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    f = request.files.get("pdf") or request.files.get("file")
+    if not f:
+        return jsonify({"ok": False, "error": "Upload a PDF as form field 'pdf'."}), 400
+    raw = f.read()
+    page_raw = (request.form.get("page") or request.args.get("page") or "").strip()
+    try:
+        page_n = int(float(page_raw))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "page must be a 1-based integer"}), 400
+    max_edge_raw = (
+        request.form.get("maxEdge") or request.args.get("maxEdge") or "2400"
+    ).strip()
+    try:
+        max_edge = int(float(max_edge_raw))
+    except (TypeError, ValueError):
+        max_edge = 2400
+    try:
+        png = render_page_png(raw, page_n, max_edge=max_edge)
+        resp = Response(png, status=200, mimetype="image/png")
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Content-Disposition"] = (
+            f'inline; filename="page-{page_n}-flat.png"'
+        )
+        return resp
+    except JrcoPresentationError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        logger.exception("[jrco-presentation/page-flat] failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/upload-email-preview", methods=["POST", "OPTIONS"])
@@ -17106,14 +17149,8 @@ def jobs_for_company():
         if not prod_data or not prod_data[0]:
             return jsonify({"jobs": []}), 200
 
-        headers = prod_data[0]
-
-        # Defensive: header lookup helper
-        def idx(h):
-            try:
-                return headers.index(h)
-            except ValueError:
-                return None
+        # Column A is always Order # (A1 is sometimes renamed/blanked).
+        headers = _normalize_order_number_headers(prod_data[0])
 
         jobs = []
         # Walk rows safely
@@ -17123,9 +17160,13 @@ def jobs_for_company():
             row_company = str(row.get("Company Name", "")).strip().lower()
             # Return all jobs for the company, including completed ones
             if row_company == company:
+                # Always take Order # from column A. Duplicate "Order #" headers
+                # later in the row can overwrite the real value with blanks.
+                order_num = str(padded[0] if padded else "").strip()
+                row["Order #"] = order_num
                 image_link = str(row.get("Image", "")).strip()
                 row["image"] = _drive_thumbnail_url(image_link)
-                row["orderId"] = str(row.get("Order #", "")).strip()
+                row["orderId"] = order_num
                 row["PO #"] = _po_number_from_row(row)
                 jobs.append(row)
 
@@ -17394,7 +17435,8 @@ def _outstanding_orders_for_company_rows(company_lower: str, include_completed: 
     if not prod_data or not prod_data[0]:
         return []
 
-    headers = prod_data[0]
+    # Column A is always Order # (A1 is sometimes renamed/blanked).
+    headers = _normalize_order_number_headers(prod_data[0])
     jobs = []
     for sheet_row, r in enumerate(prod_data[1:], start=2):
         padded = list(r) + [""] * max(0, len(headers) - len(r))
@@ -17420,7 +17462,8 @@ def _outstanding_orders_for_company_rows(company_lower: str, include_completed: 
         except (TypeError, ValueError):
             qty = 0
 
-        order_num = str(row.get("Order #", "")).strip()
+        # Always take Order # from column A (duplicate headers can blank it).
+        order_num = str(padded[0] if padded else "").strip()
         jobs.append(
             {
                 "Order #": order_num,
