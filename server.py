@@ -748,6 +748,105 @@ def _cap_thumb_bytes(raw, max_edge: int = 640):
         return None
 
 
+def _resize_image_bytes_to_jpeg(raw: bytes, max_edge: int = 640, *, quality: int = 82):
+    """Downscale arbitrary image bytes to a small JPEG (supports large production flats)."""
+    if not raw:
+        return None
+    try:
+        from io import BytesIO
+        from PIL import Image as PILImage
+
+        edge = max(64, min(int(max_edge or 640), 1280))
+        prev_limit = PILImage.MAX_IMAGE_PIXELS
+        # Production flats can be huge MasterLayout canvases.
+        PILImage.MAX_IMAGE_PIXELS = 80_000_000
+        try:
+            im = PILImage.open(BytesIO(raw))
+            im.thumbnail((edge, edge))
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=quality, optimize=True)
+            out = buf.getvalue()
+            return out or None
+        finally:
+            PILImage.MAX_IMAGE_PIXELS = prev_limit
+    except Exception as e:
+        logger.warning("_resize_image_bytes_to_jpeg failed: %s", e)
+        return None
+
+
+def _drive_large_image_preview_jpeg(file_id: str, max_edge: int = 640):
+    """
+    Build a small JPEG for Drive images that the fast thumbnail path cannot serve
+    (private / shared-drive / multi‑MB production flats).
+
+    Prefer Drive thumbnailLink; else download + Pillow resize.
+    """
+    fid = (file_id or "").strip()
+    if not fid or fid.lower().startswith("local:"):
+        return None
+    edge = max(64, min(int(max_edge or 640), 1280))
+
+    try:
+        drive = get_drive_service()
+    except Exception as e:
+        logger.warning("_drive_large_image_preview_jpeg: drive service failed: %s", e)
+        return None
+
+    thumb_link = ""
+    try:
+        meta = (
+            drive.files()
+            .get(
+                fileId=fid,
+                fields="id,mimeType,thumbnailLink,size",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        thumb_link = (meta.get("thumbnailLink") or "").strip()
+    except Exception as e:
+        logger.info("_drive_large_image_preview_jpeg: meta failed %s: %s", fid, e)
+
+    if thumb_link:
+        resized = re.sub(r"=s\d+", f"=s{edge}", thumb_link)
+        if resized == thumb_link and "=s" not in thumb_link:
+            sep = "&" if "?" in thumb_link else "?"
+            resized = f"{thumb_link}{sep}sz=s{edge}"
+        try:
+            tr = requests.get(resized, timeout=(4, 20))
+            body = tr.content or b""
+            if tr.status_code == 200 and body:
+                looks = (
+                    (len(body) > 3 and body[:3] == b"\xff\xd8\xff")
+                    or (len(body) > 8 and body[:8] == b"\x89PNG\r\n\x1a\n")
+                    or (len(body) > 6 and body[:6] in (b"GIF87a", b"GIF89a"))
+                )
+                if looks:
+                    # Already a small Google thumb — return as-is when JPEG, else re-encode
+                    if body[:3] == b"\xff\xd8\xff":
+                        return body
+                    jpg = _resize_image_bytes_to_jpeg(body, edge)
+                    if jpg:
+                        return jpg
+        except Exception as e:
+            logger.info(
+                "_drive_large_image_preview_jpeg: thumbnailLink fetch failed %s: %s",
+                fid,
+                e,
+            )
+
+    try:
+        raw = _download_drive_file_bytes(drive, fid)
+    except Exception as e:
+        logger.warning(
+            "_drive_large_image_preview_jpeg: download failed %s: %s", fid, e
+        )
+        return None
+    return _resize_image_bytes_to_jpeg(raw, edge)
+
+
 def _drive_thumb_cache_cleanup():
     """Drop expired thumbnails and enforce the entry-count and byte budget."""
     now = time.time()
@@ -4751,7 +4850,8 @@ def drive_thumbnail():
                 asess = _AuthSess(creds)
                 meta_r = asess.get(
                     f"https://www.googleapis.com/drive/v3/files/{file_id}"
-                    f"?fields=thumbnailLink,md5Checksum,modifiedTime,mimeType",
+                    f"?fields=thumbnailLink,md5Checksum,modifiedTime,mimeType"
+                    f"&supportsAllDrives=true",
                     timeout=(3, 5),
                 )
                 if meta_r.status_code == 200:
@@ -4900,8 +5000,24 @@ def drive_thumbnail():
                 if content_length > _THUMB_HARD_BYTES:
                     media.close()
                     app.logger.info(
-                        "📸 raw media skipped %s (%s bytes)", file_id, content_length
+                        "📸 raw media large %s (%s bytes) → resize fallback",
+                        file_id,
+                        content_length,
                     )
+                    big = _drive_large_image_preview_jpeg(
+                        file_id, max_edge=int(size_num or 640)
+                    )
+                    if big:
+                        _drive_thumb_cache_cleanup()
+                        _drive_thumb_cache[base_key] = {
+                            "bytes": big,
+                            "ts": time.time(),
+                        }
+                        return Response(
+                            big,
+                            mimetype="image/jpeg",
+                            headers={"Cache-Control": "public, max-age=86400"},
+                        )
                     return Response(status=204)
                 chunks = []
                 total = 0
@@ -4925,15 +5041,43 @@ def drive_thumbnail():
                 ):
                     if too_big:
                         app.logger.info(
-                            "📸 raw media skipped %s (>%s bytes)",
+                            "📸 raw media large %s (>%s bytes) → resize fallback",
                             file_id,
                             _THUMB_HARD_BYTES,
                         )
+                        big = _drive_large_image_preview_jpeg(
+                            file_id, max_edge=int(size_num or 640)
+                        )
+                        if big:
+                            _drive_thumb_cache_cleanup()
+                            _drive_thumb_cache[base_key] = {
+                                "bytes": big,
+                                "ts": time.time(),
+                            }
+                            return Response(
+                                big,
+                                mimetype="image/jpeg",
+                                headers={"Cache-Control": "public, max-age=86400"},
+                            )
                     return Response(status=204)
                 raw_bytes = _cap_thumb_bytes(
                     downloaded, max_edge=int(size_num or 640)
                 )
                 if not raw_bytes:
+                    big = _drive_large_image_preview_jpeg(
+                        file_id, max_edge=int(size_num or 640)
+                    )
+                    if big:
+                        _drive_thumb_cache_cleanup()
+                        _drive_thumb_cache[base_key] = {
+                            "bytes": big,
+                            "ts": time.time(),
+                        }
+                        return Response(
+                            big,
+                            mimetype="image/jpeg",
+                            headers={"Cache-Control": "public, max-age=86400"},
+                        )
                     return Response(status=204)
                 if hex_clean:
                     try:
@@ -5001,6 +5145,19 @@ def drive_thumbnail():
             except requests.RequestException as e:
                 app.logger.warning("📸 raw media error %s: %s", file_id, e)
         
+        # --- 4) Large / shared-drive image fallback (JR production flats, etc.)
+        big = _drive_large_image_preview_jpeg(
+            file_id, max_edge=int(size_num or 640)
+        )
+        if big:
+            _drive_thumb_cache_cleanup()
+            _drive_thumb_cache[base_key] = {"bytes": big, "ts": time.time()}
+            return Response(
+                big,
+                mimetype="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+
         # --- nothing worked
         return Response(status=204)
 
@@ -6674,8 +6831,8 @@ def api_jrco_presentation_flat_preview():
     """
     Return a small JPEG preview of a production flat PNG on Drive.
 
-    Prefer Drive ``thumbnailLink`` (works for large private SA uploads). Fall
-    back to downloading + Pillow resize when no thumb is ready yet.
+    Thin wrapper around the shared large-image preview helper used by
+    ``/api/drive/thumbnail`` (so Overview cards and Order Submission match).
     Query: ``fileId`` (required), ``sz`` like ``w640`` (optional).
     """
     if request.method == "OPTIONS":
@@ -6688,77 +6845,9 @@ def api_jrco_presentation_flat_preview():
     edge = int(m.group(1)) if m else 640
     edge = max(120, min(edge, 1280))
 
-    try:
-        drive = get_drive_service()
-        meta = (
-            drive.files()
-            .get(
-                fileId=file_id,
-                fields="id,name,mimeType,thumbnailLink,size",
-                supportsAllDrives=True,
-            )
-            .execute()
-        )
-    except Exception as e:
-        logger.warning("[jrco flat-preview] meta failed for %s: %s", file_id, e)
-        return jsonify({"ok": False, "error": f"Drive lookup failed: {e}"}), 404
-
-    # 1) Prefer Google-generated thumbnail (small, fast, private-file safe via cookieless link)
-    thumb_link = (meta.get("thumbnailLink") or "").strip()
-    if thumb_link:
-        resized = re.sub(r"=s\d+", f"=s{edge}", thumb_link)
-        if resized == thumb_link and "=s" not in thumb_link:
-            sep = "&" if "?" in thumb_link else "?"
-            resized = f"{thumb_link}{sep}sz=s{edge}"
-        try:
-            tr = requests.get(resized, timeout=(4, 20))
-            body = tr.content or b""
-            looks_img = (
-                (len(body) > 3 and body[:3] == b"\xff\xd8\xff")
-                or (len(body) > 8 and body[:8] == b"\x89PNG\r\n\x1a\n")
-                or (len(body) > 6 and body[:6] in (b"GIF87a", b"GIF89a"))
-            )
-            if tr.status_code == 200 and looks_img:
-                ctype = tr.headers.get("Content-Type") or "image/jpeg"
-                resp = Response(body, status=200, mimetype=ctype)
-                resp.headers["Cache-Control"] = "private, max-age=300"
-                return resp
-        except Exception as e:
-            logger.info("[jrco flat-preview] thumbnailLink fetch failed: %s", e)
-
-    # 2) Fallback: download original and downscale (may be large — cap decode)
-    try:
-        raw = _download_drive_file_bytes(drive, file_id)
-    except Exception as e:
-        logger.warning("[jrco flat-preview] download failed for %s: %s", file_id, e)
-        return jsonify({"ok": False, "error": f"Download failed: {e}"}), 502
-
-    if not raw:
-        return jsonify({"ok": False, "error": "Empty file"}), 404
-
-    # Allow large production flats (unlike /api/drive/thumbnail hard 2MB skip)
-    try:
-        from io import BytesIO
-        from PIL import Image as PILImage
-
-        prev_limit = PILImage.MAX_IMAGE_PIXELS
-        PILImage.MAX_IMAGE_PIXELS = 80_000_000
-        try:
-            im = PILImage.open(BytesIO(raw))
-            im.thumbnail((edge, edge))
-            if im.mode not in ("RGB", "L"):
-                im = im.convert("RGB")
-            buf = BytesIO()
-            im.save(buf, format="JPEG", quality=82, optimize=True)
-            jpg = buf.getvalue()
-        finally:
-            PILImage.MAX_IMAGE_PIXELS = prev_limit
-    except Exception as e:
-        logger.warning("[jrco flat-preview] resize failed for %s: %s", file_id, e)
-        return jsonify({"ok": False, "error": f"Could not build preview: {e}"}), 500
-
+    jpg = _drive_large_image_preview_jpeg(file_id, max_edge=edge)
     if not jpg:
-        return jsonify({"ok": False, "error": "Empty preview"}), 500
+        return jsonify({"ok": False, "error": "Could not build preview"}), 502
     resp = Response(jpg, status=200, mimetype="image/jpeg")
     resp.headers["Cache-Control"] = "private, max-age=300"
     return resp
@@ -8203,7 +8292,9 @@ def _drive_query_escape_name(name: str) -> str:
 
 
 def _download_drive_file_bytes(drive, file_id: str):
-    request_drive = drive.files().get_media(fileId=file_id)
+    request_drive = drive.files().get_media(
+        fileId=file_id, supportsAllDrives=True
+    )
     buf = BytesIO()
     downloader = MediaIoBaseDownload(buf, request_drive)
     done = False
