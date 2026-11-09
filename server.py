@@ -12602,6 +12602,118 @@ def _load_google_creds():
 
 
 # --- Drive: make file public (anyone with link → reader) ---------------------
+@app.route("/api/drive/repair-order-visibility", methods=["POST", "OPTIONS"])
+@login_required_session
+def drive_repair_order_visibility():
+    """
+    Make Image files + Print Files contents publicly viewable for given orders.
+
+    JSON: { "orderIds": ["1697","1698", ...] } or { "fileIds": ["1abc...", ...] }
+    Fixes Sheets Preview (IMAGE/uc) and Drive link access for JR flats.
+    """
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = FRONTEND_URL
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+        resp.headers["Access-Control-Allow-Methods"] = (
+            "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        )
+        return resp
+
+    data = request.get_json(silent=True) or {}
+    file_ids = []
+    for extra in data.get("fileIds") or []:
+        fid = str(extra or "").strip()
+        if fid and fid not in file_ids:
+            file_ids.append(fid)
+    folder_ids = []
+    for extra in data.get("folderIds") or []:
+        fid = str(extra or "").strip()
+        if fid and fid not in folder_ids:
+            folder_ids.append(fid)
+
+    order_ids = [
+        str(x).strip()
+        for x in (data.get("orderIds") or data.get("orders") or [])
+        if str(x).strip()
+    ]
+    try:
+        drive = get_drive_service()
+        # Resolve Image + Print Files links from the sheet when order ids given
+        if order_ids:
+            wanted = {o.replace(",", "") for o in order_ids}
+            prod_data = fetch_sheet(SPREADSHEET_ID, JOBS_FOR_COMPANY_RANGE) or []
+            if prod_data and prod_data[0]:
+                headers = prod_data[0]
+                for r in prod_data[1:]:
+                    padded = list(r) + [""] * max(0, len(headers) - len(r))
+                    row = dict(zip(headers, padded))
+                    oid = str(row.get("Order #") or "").strip().replace(",", "")
+                    if oid not in wanted:
+                        continue
+                    img = str(row.get("Image") or "").strip()
+                    fid = _extract_drive_file_id(img)
+                    if fid and fid not in file_ids:
+                        file_ids.append(fid)
+                    print_link = str(row.get("Print Files") or "").strip()
+                    m = re.search(r"/folders/([A-Za-z0-9_-]{10,})", print_link)
+                    if m and m.group(1) not in folder_ids:
+                        folder_ids.append(m.group(1))
+
+        # Expand Print Files folders → child file ids
+        for folder_id in list(folder_ids):
+            _make_drive_public(drive, folder_id, context="repair-folder")
+            try:
+                page_token = None
+                while True:
+                    resp = (
+                        drive.files()
+                        .list(
+                            q=f"'{folder_id}' in parents and trashed = false",
+                            fields="nextPageToken, files(id, mimeType)",
+                            pageSize=100,
+                            pageToken=page_token,
+                            supportsAllDrives=True,
+                            includeItemsFromAllDrives=True,
+                        )
+                        .execute()
+                    )
+                    for f in resp.get("files") or []:
+                        fid = f.get("id")
+                        if not fid:
+                            continue
+                        if f.get("mimeType") == "application/vnd.google-apps.folder":
+                            if fid not in folder_ids:
+                                folder_ids.append(fid)
+                        elif fid not in file_ids:
+                            file_ids.append(fid)
+                    page_token = resp.get("nextPageToken")
+                    if not page_token:
+                        break
+            except Exception as e:
+                logger.warning("[repair-order-visibility] list folder %s: %s", folder_id, e)
+
+        results = []
+        for file_id in file_ids:
+            ok = _make_drive_public(drive, file_id, context="repair-order-visibility")
+            results.append({"fileId": file_id, "ok": bool(ok)})
+
+        ok_count = sum(1 for r in results if r["ok"])
+        return jsonify(
+            {
+                "ok": ok_count > 0 or not results,
+                "repaired": ok_count,
+                "total": len(results),
+                "folderIds": folder_ids,
+                "results": results,
+            }
+        )
+    except Exception as e:
+        logger.exception("repair-order-visibility failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/drive/makePublic", methods=["POST", "OPTIONS"])
 @login_required_session
 def drive_make_public():
@@ -12617,31 +12729,32 @@ def drive_make_public():
         return resp
 
     data = request.get_json(silent=True) or {}
-    file_id = (data.get("fileId") or "").strip()
-    if not file_id:
+    file_ids = []
+    one = (data.get("fileId") or "").strip()
+    if one:
+        file_ids.append(one)
+    for extra in data.get("fileIds") or []:
+        fid = str(extra or "").strip()
+        if fid and fid not in file_ids:
+            file_ids.append(fid)
+    if not file_ids:
         return jsonify({"ok": False, "error": "missing fileId"}), 400
 
     try:
         drive = get_drive_service()
-        # Check existing permissions for 'anyone'
-        perms = (
-            drive.permissions()
-            .list(fileId=file_id, fields="permissions(id,type,role)")
-            .execute()
-        )
-        already_public = any(
-            p.get("type") == "anyone"
-            and p.get("role") in ("reader", "commenter", "writer")
-            for p in (perms.get("permissions") or [])
-        )
-
-        if not already_public:
-            # Make it public (view-only)
-            drive.permissions().create(
-                fileId=file_id, body={"type": "anyone", "role": "reader"}, fields="id"
-            ).execute()
-
-        return jsonify({"ok": True})
+        results = []
+        for file_id in file_ids:
+            ok = _make_drive_public(drive, file_id, context="makePublic-api")
+            results.append({"fileId": file_id, "ok": bool(ok)})
+        if not any(r["ok"] for r in results):
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "Could not set anyone-with-link. Workspace may block public sharing.",
+                    "results": results,
+                }
+            ), 500
+        return jsonify({"ok": True, "results": results})
     except Exception as e:
         # Don't blow up the UI on permission hiccups
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -20805,17 +20918,33 @@ def submit_order():
             query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
             if parent_id:
                 query += f" and '{parent_id}' in parents"
-            existing = drive.files().list(q=query, fields="files(id)").execute().get("files", [])
+            existing = (
+                drive.files()
+                .list(
+                    q=query,
+                    fields="files(id)",
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute()
+                .get("files", [])
+            )
             for f in existing:
                 fid = f["id"]
                 try:
-                    retry_google_api_call(lambda: drive.files().delete(fileId=fid).execute())
+                    retry_google_api_call(
+                        lambda: drive.files()
+                        .delete(fileId=fid, supportsAllDrives=True)
+                        .execute()
+                    )
                 except HttpError as e:
                     # Fallback: move to trash instead of permanent delete (avoids 500s on delete)
                     try:
                         retry_google_api_call(
                             lambda: drive.files().update(
-                                fileId=fid, body={"trashed": True}
+                                fileId=fid,
+                                body={"trashed": True},
+                                supportsAllDrives=True,
                             ).execute()
                         )
                     except Exception:
@@ -20824,14 +20953,14 @@ def submit_order():
             if parent_id:
                 meta["parents"] = [parent_id]
             folder = retry_google_api_call(
-                lambda: drive.files().create(body=meta, fields="id").execute()
+                lambda: drive.files()
+                .create(body=meta, fields="id", supportsAllDrives=True)
+                .execute()
             )
             return folder["id"]
 
         def make_public(file_id):
-            drive.permissions().create(
-                fileId=file_id, body={"role": "reader", "type": "anyone"}
-            ).execute()
+            return _make_drive_public(drive, file_id, context="submit")
 
         # ─── CREATE FIRST ORDER (FRONT) FOLDER ───────────────────────────────────
         from io import BytesIO
@@ -20907,8 +21036,15 @@ def submit_order():
                 body={"name": name, "parents": [folder_id]},
                 media_body=media,
                 fields="id,webViewLink",
+                supportsAllDrives=True,
             ).execute()
-            make_public(up["id"])
+            if not make_public(up["id"]):
+                logger.error(
+                    "[submit] Image file %s (%s) is NOT publicly viewable — "
+                    "Sheets Preview and Drive links will look blank",
+                    up.get("id"),
+                    name,
+                )
             # Skip Corel queue for Studio package artifacts (PNG/PDF/JSON from Needlepoint Studio).
             lower = str(name or "").lower()
             if not (
@@ -21052,28 +21188,34 @@ def submit_order():
                 for up_name, up_bytes, up_mime in print_payloads:
                     buf = BytesIO(up_bytes)
                     m = MediaIoBaseUpload(buf, mimetype=up_mime or "application/octet-stream")
-                    drive.files().create(
+                    up_pf = drive.files().create(
                         body={"name": up_name, "parents": [pf_id]},
                         media_body=m,
                         fields="id",
+                        supportsAllDrives=True,
                     ).execute()
+                    make_public(up_pf["id"])
                     buf = BytesIO(up_bytes)
                     m2 = MediaIoBaseUpload(buf, mimetype=up_mime or "application/octet-stream")
-                    drive.files().create(
+                    up_pf2 = drive.files().create(
                         body={"name": up_name, "parents": [back_pf_id]},
                         media_body=m2,
                         fields="id",
+                        supportsAllDrives=True,
                     ).execute()
+                    make_public(up_pf2["id"])
                 back_print_links = f"https://drive.google.com/drive/folders/{back_pf_id}"
             else:
                 for up_name, up_bytes, up_mime in print_payloads:
                     buf = BytesIO(up_bytes)
                     m = MediaIoBaseUpload(buf, mimetype=up_mime or "application/octet-stream")
-                    drive.files().create(
+                    up_pf = drive.files().create(
                         body={"name": up_name, "parents": [pf_id]},
                         media_body=m,
                         fields="id",
+                        supportsAllDrives=True,
                     ).execute()
+                    make_public(up_pf["id"])
                     del buf
             print_links = f"https://drive.google.com/drive/folders/{pf_id}"
 
@@ -22732,15 +22874,41 @@ def _drive_list_kwargs():
     }
 
 
-def _make_drive_public(drive, file_id):
+def _make_drive_public(drive, file_id, *, context: str = "drive"):
+    """
+    Grant anyone-with-link reader so Sheets IMAGE() and Drive links open without
+    being on the ACL. Returns True on success / already-public, False on failure.
+    """
+    fid = (file_id or "").strip()
+    if not fid:
+        return False
     try:
+        perms = (
+            drive.permissions()
+            .list(
+                fileId=fid,
+                fields="permissions(id,type,role)",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        already = any(
+            p.get("type") == "anyone"
+            and p.get("role") in ("reader", "commenter", "writer")
+            for p in (perms.get("permissions") or [])
+        )
+        if already:
+            return True
         drive.permissions().create(
-            fileId=file_id,
+            fileId=fid,
             body={"role": "reader", "type": "anyone"},
             supportsAllDrives=True,
+            fields="id",
         ).execute()
-    except Exception:
-        logger.warning("[reorder-batch] could not make file %s public", file_id)
+        return True
+    except Exception as e:
+        logger.warning("[%s] could not make file %s public: %s", context, fid, e)
+        return False
 
 
 def _find_folder_in_parent(drive, name, parent_id):
