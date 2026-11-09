@@ -121,6 +121,14 @@ class JrcoPresentationTests(unittest.TestCase):
         names = [u["filename"] for u in uploads]
         self.assertTrue(any(n.endswith(".png") for n in names))
         self.assertTrue(any(n.endswith("-jr-presentation-proof.pdf") for n in names))
+        prod_only = expand_presentation_uploads(
+            pdf, "My Proof.pdf", lambda _fid: png, keep_proof_pdf=False
+        )
+        prod_names = [u["filename"] for u in (prod_only or [])]
+        self.assertTrue(any(n.endswith(".png") for n in prod_names))
+        self.assertFalse(
+            any(n.endswith("-jr-presentation-proof.pdf") for n in prod_names)
+        )
         self.assertEqual(
             expand_presentation_uploads(b"not-pdf", "x.pdf", lambda f: b""),
             None,

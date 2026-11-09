@@ -18785,7 +18785,7 @@ def _upload_edit_files_to_order_folder(
                 raw,
                 name,
                 lambda fid: _download_drive_file_bytes(drive, fid),
-                keep_proof_pdf=True,
+                keep_proof_pdf=False,
                 design_ids=design_ids,
             )
         except JrcoPresentationError:
@@ -20737,11 +20737,13 @@ def submit_order():
                 return
 
             try:
+                # Production gets the selected immutable flat PNG only — never the
+                # multi-page proof PDF (page JPEGs are customer proof, not art).
                 expanded = expand_presentation_uploads(
                     raw,
                     name,
                     _download_presentation_flat,
-                    keep_proof_pdf=True,
+                    keep_proof_pdf=False,
                     design_ids=jr_design_ids,
                 )
             except JrcoPresentationError:
