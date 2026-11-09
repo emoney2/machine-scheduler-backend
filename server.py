@@ -17296,6 +17296,7 @@ def _outstanding_orders_for_company_rows(company_lower: str, include_completed: 
             continue
 
         image_link = str(row.get("Image", "")).strip()
+        image_file_id = _extract_drive_file_id(image_link) or ""
         preview_url = _drive_thumbnail_url(image_link)
         try:
             unit_price = float(row.get("Price") or 0)
@@ -17322,7 +17323,9 @@ def _outstanding_orders_for_company_rows(company_lower: str, include_completed: 
                 "Due Date": row.get("Due Date", ""),
                 "PO #": _po_number_from_row(row),
                 "Sales Rep": _sales_rep_from_production_row(row, headers, padded),
+                "Image": image_link,
                 "image": preview_url,
+                "imageFileId": image_file_id,
                 "orderId": order_num,
                 "jobKey": str(sheet_row),
                 "sheetRow": sheet_row,
@@ -17443,21 +17446,37 @@ def build_order_confirmation_pdf(company_name: str, jobs: list) -> bytes:
             line_total_sum += float(line_total or 0)
 
             img_cell = Paragraph("No preview", normal)
-            file_id = _extract_drive_file_id(job.get("image") or "")
-            if not file_id:
-                image_link = str(job.get("Image", "")).strip()
-                file_id = _extract_drive_file_id(image_link)
-            # Prefer Drive thumbnail; full originals can exceed Pillow's pixel limit
-            # (~89M) and OOM the PDF builder (DecompressionBombWarning).
+            file_id = (
+                _extract_drive_file_id(job.get("imageFileId") or "")
+                or _extract_drive_file_id(job.get("image") or "")
+                or _extract_drive_file_id(job.get("Image") or "")
+            )
+            # Use authenticated large-flat preview (JR production PNGs are private /
+            # multi-MB). Public drive.google.com/thumbnail returns empty for them.
             prepared = None
             if file_id:
-                for fetcher in (_fetch_drive_thumbnail_bytes, _fetch_drive_image_bytes):
-                    img_bytes = fetcher(file_id)
-                    if not img_bytes:
-                        continue
-                    prepared = _prepare_pdf_preview_image(img_bytes)
-                    if prepared:
-                        break
+                try:
+                    jpg = _drive_large_image_preview_jpeg(file_id, max_edge=400)
+                    if jpg:
+                        prepared = _prepare_pdf_preview_image(jpg, max_px=400)
+                except Exception as e:
+                    logger.warning(
+                        "order-confirmation preview failed for %s: %s", file_id, e
+                    )
+                if not prepared:
+                    for fetcher in (
+                        _fetch_drive_thumbnail_bytes,
+                        _fetch_drive_image_bytes,
+                    ):
+                        try:
+                            img_bytes = fetcher(file_id)
+                        except Exception:
+                            img_bytes = None
+                        if not img_bytes:
+                            continue
+                        prepared = _prepare_pdf_preview_image(img_bytes)
+                        if prepared:
+                            break
             if prepared:
                 try:
                     buf, orig_w, orig_h = prepared
@@ -22688,10 +22707,14 @@ def _folder_id_from_drive_url(url):
 
 
 def _file_id_from_drive_url(url):
-    m = re.search(r"/file/d/([A-Za-z0-9_-]{10,})", str(url or ""))
+    s = str(url or "")
+    m = re.search(r"/file/d/([A-Za-z0-9_-]{10,})", s)
     if m:
         return m.group(1)
-    m = re.search(r"[?&]id=([A-Za-z0-9_-]{10,})", str(url or ""))
+    m = re.search(r"[?&]fileId=([A-Za-z0-9_-]{10,})", s, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([A-Za-z0-9_-]{10,})", s)
     return m.group(1) if m else None
 
 
@@ -23907,9 +23930,15 @@ def _extract_drive_file_id(url):
     url = (url or "").strip()
     if not url:
         return None
+    if re.fullmatch(r"[A-Za-z0-9_-]{12,}", url):
+        return url
     m = re.search(r"/api/email-preview-image/([A-Za-z0-9_-]+)", url)
     if m:
         return m.group(1)
+    # Our proxy uses fileId=; public Drive thumbs use id=
+    m = re.search(r"[?&]fileId=([^&\s/#]+)", url, re.I)
+    if m:
+        return urllib.parse.unquote(m.group(1))
     m = re.search(r"[?&]id=([^&\s/#]+)", url)
     if m:
         return m.group(1)
