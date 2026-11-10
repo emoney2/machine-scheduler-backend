@@ -225,7 +225,10 @@ from jr_needlepoint_package import (
 from jrco_presentation import (
     JrcoPresentationError,
     expand_presentation_uploads,
+    extract_embedded_file,
     inspect_presentation,
+    is_pdf_filename,
+    looks_like_pdf,
     render_page_png,
 )
 
@@ -19078,38 +19081,215 @@ def _resolve_order_drive_folder_id(drive, order_number) -> str | None:
     return _find_folder_in_parent(drive, str(order_number).strip(), parent)
 
 
+def _drive_file_view_link(file_id: str) -> str:
+    """Canonical Image-column link for a file living in the order Drive folder."""
+    fid = str(file_id or "").strip()
+    if not fid:
+        return ""
+    return f"https://drive.google.com/file/d/{fid}/view"
+
+
+def _is_previewable_image_name(name: str) -> bool:
+    lower = str(name or "").lower()
+    return lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+
+
+def _normalize_drive_image_upload(name: str, raw_bytes: bytes, mimetype: str | None):
+    """
+    Force correct image bytes + mimeType so Drive can preview the file and Sheets
+    IMAGE()/uc links work. Returns (filename, bytes, mimetype).
+
+    Never upload non-image bytes (PDF/HTML/etc.) labeled as image/png or image/jpeg —
+    that produces blank Drive viewers and broken Sheets IMAGE() previews.
+    """
+    from io import BytesIO as _BytesIO
+
+    fname = str(name or "upload.bin")
+    lower = fname.lower()
+    data = raw_bytes or b""
+    mime = (mimetype or "").strip() or "application/octet-stream"
+
+    png_magic = b"\x89PNG\r\n\x1a\n"
+    jpeg_magic = b"\xff\xd8\xff"
+    claims_png = lower.endswith(".png") or mime == "image/png"
+    claims_jpeg = lower.endswith((".jpg", ".jpeg")) or mime in (
+        "image/jpeg",
+        "image/jpg",
+    )
+
+    if claims_png or data.startswith(png_magic):
+        if not data.startswith(png_magic):
+            if looks_like_pdf(data):
+                raise ValueError(
+                    f"{fname}: PDF bytes were labeled as PNG. "
+                    "Rasterize the PDF page before uploading to Image."
+                )
+            try:
+                from PIL import Image as PILImage
+
+                im = PILImage.open(_BytesIO(data))
+                out = _BytesIO()
+                im.save(out, format="PNG", optimize=True)
+                data = out.getvalue()
+            except Exception as e:
+                raise ValueError(
+                    f"{fname}: could not coerce bytes to a real PNG ({e}). "
+                    "Refusing to upload a non-image as image/png."
+                ) from e
+        if not lower.endswith(".png"):
+            fname = f"{fname.rsplit('.', 1)[0] or 'production'}.png"
+        return fname, data, "image/png"
+
+    if claims_jpeg or data.startswith(jpeg_magic):
+        if not data.startswith(jpeg_magic):
+            if looks_like_pdf(data):
+                raise ValueError(
+                    f"{fname}: PDF bytes were labeled as JPEG. "
+                    "Rasterize the PDF page before uploading to Image."
+                )
+            try:
+                from PIL import Image as PILImage
+
+                im = PILImage.open(_BytesIO(data))
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                out = _BytesIO()
+                im.save(out, format="JPEG", quality=92, optimize=True)
+                data = out.getvalue()
+            except Exception as e:
+                raise ValueError(
+                    f"{fname}: could not coerce bytes to a real JPEG ({e}). "
+                    "Refusing to upload a non-image as image/jpeg."
+                ) from e
+        if not lower.endswith((".jpg", ".jpeg")):
+            fname = f"{fname.rsplit('.', 1)[0] or 'production'}.jpg"
+        return fname, data, "image/jpeg"
+
+    return fname, data, mime
+
+
+def _require_drive_public(drive, file_id, *, context: str, name: str = "") -> None:
+    """
+    Sheets IMAGE(uc?export=view) and anonymous Drive links need anyone-reader.
+    Fail hard so we never write Image/Preview links that look blank.
+    """
+    if _make_drive_public(drive, file_id, context=context):
+        return
+    # One retry — Drive occasionally flakes on permissions.create.
+    if _make_drive_public(drive, file_id, context=f"{context}-retry"):
+        return
+    label = f" ({name})" if name else ""
+    raise RuntimeError(
+        f"Could not make Drive file {file_id}{label} publicly viewable. "
+        "Sheets Preview and the Drive link would appear blank. "
+        "Retry submit, or run /api/drive/repair-order-visibility."
+    )
+
+
+def _downscale_png_for_sheet_image(
+    raw_bytes: bytes,
+    *,
+    max_edge: int = 2400,
+    max_bytes: int = 6 * 1024 * 1024,
+) -> bytes:
+    """
+    JR presentation flats are often 50–100MB. Sheets IMAGE(uc?export=view) and
+    the Drive viewer fail or show a blank/sliver preview for those. Keep full-res
+    copies in Print Files; shrink only the Image-column file.
+    """
+    data = raw_bytes or b""
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return data
+    if len(data) <= max_bytes:
+        # Still may be huge dimensions with good PNG compression — check size.
+        try:
+            from PIL import Image as PILImage
+            from io import BytesIO as _BytesIO
+
+            im = PILImage.open(_BytesIO(data))
+            w, h = im.size
+            if max(w, h) <= max_edge:
+                return data
+        except Exception:
+            return data
+    try:
+        from PIL import Image as PILImage
+        from io import BytesIO as _BytesIO
+
+        im = PILImage.open(_BytesIO(data))
+        im.load()
+        w, h = im.size
+        long_edge = max(w, h) or 1
+        if long_edge > max_edge:
+            scale = float(max_edge) / float(long_edge)
+            nw = max(1, int(round(w * scale)))
+            nh = max(1, int(round(h * scale)))
+            im = im.resize((nw, nh), getattr(PILImage, "Resampling", PILImage).LANCZOS)
+        if im.mode not in ("RGB", "RGBA", "L"):
+            im = im.convert("RGBA" if "A" in (im.mode or "") else "RGB")
+        out = _BytesIO()
+        im.save(out, format="PNG", optimize=True)
+        shrunk = out.getvalue()
+        if shrunk and len(shrunk) < len(data):
+            logger.info(
+                "[drive-upload] downscaled Image PNG %s→%s bytes (%sx%s)",
+                len(data),
+                len(shrunk),
+                im.size[0],
+                im.size[1],
+            )
+            return shrunk
+    except Exception as e:
+        logger.warning("[drive-upload] Image PNG downscale failed: %s", e)
+    return data
+
+
 def _upload_edit_files_to_order_folder(
     drive, folder_id, file_storages, order_label, design_ids=None
 ):
-    """Upload multipart FileStorage list; return (webViewLinks, primary_file_id)."""
+    """Upload into the order folder; return (file/d view links, primary image file id)."""
     from io import BytesIO
 
     links = []
     primary_file_id = None
-
-    def _make_public(file_id):
-        try:
-            drive.permissions().create(
-                fileId=file_id, body={"role": "reader", "type": "anyone"}
-            ).execute()
-        except Exception:
-            pass
+    primary_is_image = False
 
     def _upload_one(name, raw_bytes, mimetype):
-        nonlocal primary_file_id
+        nonlocal primary_file_id, primary_is_image
+        name, raw_bytes, mimetype = _normalize_drive_image_upload(
+            name, raw_bytes, mimetype
+        )
+        if (mimetype or "").startswith("image/") or _is_previewable_image_name(name):
+            raw_bytes = _downscale_png_for_sheet_image(raw_bytes)
         buf = BytesIO(raw_bytes)
         media = MediaIoBaseUpload(
-            buf, mimetype=mimetype or "application/octet-stream"
+            buf, mimetype=mimetype or "application/octet-stream", resumable=False
         )
-        up = drive.files().create(
-            body={"name": name, "parents": [folder_id]},
-            media_body=media,
-            fields="id,webViewLink",
-        ).execute()
-        _make_public(up["id"])
-        links.append(up.get("webViewLink") or "")
-        if primary_file_id is None:
-            primary_file_id = up["id"]
+        up = (
+            drive.files()
+            .create(
+                body={
+                    "name": name,
+                    "parents": [folder_id],
+                    "mimeType": mimetype or "application/octet-stream",
+                },
+                media_body=media,
+                fields="id,webViewLink,mimeType",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        file_id = up.get("id") or ""
+        _require_drive_public(drive, file_id, context="order-edit", name=name)
+        link = _drive_file_view_link(file_id)
+        if link:
+            links.append(link)
+        is_image = _is_previewable_image_name(name) or str(
+            up.get("mimeType") or ""
+        ).startswith("image/")
+        if file_id and (primary_file_id is None or (is_image and not primary_is_image)):
+            primary_file_id = file_id
+            primary_is_image = is_image
         lower = str(name or "").lower()
         if not (
             lower.endswith("-customer-view.png")
@@ -19141,6 +19321,9 @@ def _upload_edit_files_to_order_folder(
             for item in expanded:
                 _upload_one(item["filename"], item["bytes"], item["mimetype"])
             continue
+        # Never put a multi-page JR presentation PDF in the Image column.
+        # Expand to flat PNG(s) when Drive ids exist; otherwise rasterize the
+        # selected page (or page 1) into a PNG in this order folder.
         try:
             expanded = expand_presentation_uploads(
                 raw,
@@ -19149,8 +19332,40 @@ def _upload_edit_files_to_order_folder(
                 keep_proof_pdf=False,
                 design_ids=design_ids,
             )
-        except JrcoPresentationError:
-            raise
+        except JrcoPresentationError as pres_err:
+            # local: / missing Drive flats — rasterize a page instead of failing
+            # or writing a non-previewable PDF link into Image.
+            try:
+                page_n = 1
+                if design_ids:
+                    summary = inspect_presentation(raw, name)
+                    wanted = {str(x).strip() for x in design_ids if str(x).strip()}
+                    for d in summary.get("designs") or []:
+                        if str(d.get("designId") or "").strip() in wanted:
+                            try:
+                                page_n = int(d.get("page") or 1)
+                            except (TypeError, ValueError):
+                                page_n = 1
+                            break
+                png = render_page_png(raw, page_n, max_edge=2400)
+                flat_name = f"{(name or 'presentation').rsplit('.', 1)[0]}-p{page_n}-flat.png"
+                _upload_one(flat_name, png, "image/png")
+                logger.warning(
+                    "[order-edit] JR presentation %s had unresolvable flats (%s); "
+                    "rasterized page %s into order folder",
+                    name,
+                    pres_err,
+                    page_n,
+                )
+                continue
+            except Exception as raster_err:
+                logger.exception(
+                    "[order-edit] JR presentation rasterize fallback failed for %s",
+                    name,
+                )
+                raise JrcoPresentationError(
+                    f"{pres_err} (also failed to rasterize page: {raster_err})"
+                ) from raster_err
         except Exception as exp_err:
             logger.warning(
                 "[order-edit] JR presentation expand failed for %s: %s", name, exp_err
@@ -19159,6 +19374,18 @@ def _upload_edit_files_to_order_folder(
         if expanded:
             for item in expanded:
                 _upload_one(item["filename"], item["bytes"], item["mimetype"])
+            continue
+        # Never put a raw PDF in Image — Sheets IMAGE() cannot render it, and
+        # Drive often shows a blank viewer for mislabeled / non-previewable PDFs.
+        if looks_like_pdf(raw) or is_pdf_filename(name):
+            png = render_page_png(raw, 1, max_edge=2400)
+            flat_name = f"{(name or 'upload').rsplit('.', 1)[0]}-p1-flat.png"
+            _upload_one(flat_name, png, "image/png")
+            logger.warning(
+                "[order-edit] rasterized PDF %s → %s for Image column",
+                name,
+                flat_name,
+            )
             continue
         _upload_one(name, raw, mime)
 
@@ -21073,21 +21300,33 @@ def submit_order():
         back_prod_links = []
 
         def _upload_prod_payload(name, raw_bytes, mimetype, folder_id, order_label):
+            name, raw_bytes, mimetype = _normalize_drive_image_upload(
+                name, raw_bytes, mimetype
+            )
+            # Image column only — Print Files keep the full-resolution flat.
+            if (mimetype or "").startswith("image/") or _is_previewable_image_name(
+                name
+            ):
+                raw_bytes = _downscale_png_for_sheet_image(raw_bytes)
             buf = BytesIO(raw_bytes)
-            media = MediaIoBaseUpload(buf, mimetype=mimetype or "application/octet-stream")
+            media = MediaIoBaseUpload(
+                buf, mimetype=mimetype or "application/octet-stream", resumable=False
+            )
             up = drive.files().create(
-                body={"name": name, "parents": [folder_id]},
+                body={
+                    "name": name,
+                    "parents": [folder_id],
+                    "mimeType": mimetype or "application/octet-stream",
+                },
                 media_body=media,
-                fields="id,webViewLink",
+                fields="id,webViewLink,mimeType",
                 supportsAllDrives=True,
             ).execute()
-            if not make_public(up["id"]):
-                logger.error(
-                    "[submit] Image file %s (%s) is NOT publicly viewable — "
-                    "Sheets Preview and Drive links will look blank",
-                    up.get("id"),
-                    name,
-                )
+            _require_drive_public(
+                drive, up.get("id") or "", context="submit", name=name
+            )
+            # Always store a canonical order-folder file link in Image.
+            up["webViewLink"] = _drive_file_view_link(up["id"]) or up.get("webViewLink")
             # Skip Corel queue for Studio package artifacts (PNG/PDF/JSON from Needlepoint Studio).
             lower = str(name or "").lower()
             if not (
@@ -21130,8 +21369,42 @@ def submit_order():
                     keep_proof_pdf=False,
                     design_ids=jr_design_ids,
                 )
-            except JrcoPresentationError:
-                raise
+            except JrcoPresentationError as pres_err:
+                # local: flats — rasterize selected/first page into order folder PNG.
+                page_n = 1
+                try:
+                    summary = inspect_presentation(raw, name)
+                    wanted = {
+                        str(x).strip()
+                        for x in (jr_design_ids or [])
+                        if str(x).strip()
+                    }
+                    for d in summary.get("designs") or []:
+                        if not wanted or str(d.get("designId") or "").strip() in wanted:
+                            try:
+                                page_n = int(d.get("page") or 1)
+                            except (TypeError, ValueError):
+                                page_n = 1
+                            if wanted:
+                                break
+                    png = render_page_png(raw, page_n, max_edge=2400)
+                    flat_name = (
+                        f"{(name or 'presentation').rsplit('.', 1)[0]}-p{page_n}-flat.png"
+                    )
+                    presentation_flat_uploads.append((flat_name, png, "image/png"))
+                    logger.warning(
+                        "[submit] JR presentation %s had unresolvable flats (%s); "
+                        "rasterized page %s",
+                        name,
+                        pres_err,
+                        page_n,
+                    )
+                    yield flat_name, png, "image/png"
+                    return
+                except Exception as raster_err:
+                    raise JrcoPresentationError(
+                        f"{pres_err} (also failed to rasterize page: {raster_err})"
+                    ) from raster_err
             except Exception as exp_err:
                 logger.warning(
                     "[submit] JR presentation expand failed for %s: %s", name, exp_err
@@ -21146,6 +21419,26 @@ def submit_order():
                         presentation_flat_uploads.append((up_name, up_bytes, up_mime))
                     yield up_name, up_bytes, up_mime
                 return
+
+            # Never put a raw PDF in Image — Sheets IMAGE() cannot render it.
+            if looks_like_pdf(raw) or is_pdf_filename(name):
+                try:
+                    png = render_page_png(raw, 1, max_edge=2400)
+                    flat_name = (
+                        f"{(name or 'upload').rsplit('.', 1)[0]}-p1-flat.png"
+                    )
+                    logger.warning(
+                        "[submit] rasterized PDF %s → %s for Image column",
+                        name,
+                        flat_name,
+                    )
+                    yield flat_name, png, "image/png"
+                    return
+                except Exception as raster_err:
+                    raise JrcoPresentationError(
+                        f"PDF production file could not be converted to a "
+                        f"preview PNG: {raster_err}"
+                    ) from raster_err
 
             yield name, raw, mime
 
@@ -21229,36 +21522,66 @@ def submit_order():
                 back_pf_id = create_folder("Print Files", parent_id=back_order_folder_id)
                 make_public(back_pf_id)
                 for up_name, up_bytes, up_mime in print_payloads:
-                    buf = BytesIO(up_bytes)
-                    m = MediaIoBaseUpload(buf, mimetype=up_mime or "application/octet-stream")
+                    name_n, bytes_n, mime_n = _normalize_drive_image_upload(
+                        up_name, up_bytes, up_mime
+                    )
+                    buf = BytesIO(bytes_n)
+                    m = MediaIoBaseUpload(
+                        buf, mimetype=mime_n or "application/octet-stream"
+                    )
                     up_pf = drive.files().create(
-                        body={"name": up_name, "parents": [pf_id]},
+                        body={
+                            "name": name_n,
+                            "parents": [pf_id],
+                            "mimeType": mime_n or "application/octet-stream",
+                        },
                         media_body=m,
                         fields="id",
                         supportsAllDrives=True,
                     ).execute()
-                    make_public(up_pf["id"])
-                    buf = BytesIO(up_bytes)
-                    m2 = MediaIoBaseUpload(buf, mimetype=up_mime or "application/octet-stream")
+                    _require_drive_public(
+                        drive, up_pf["id"], context="submit-print", name=name_n
+                    )
+                    buf = BytesIO(bytes_n)
+                    m2 = MediaIoBaseUpload(
+                        buf, mimetype=mime_n or "application/octet-stream"
+                    )
                     up_pf2 = drive.files().create(
-                        body={"name": up_name, "parents": [back_pf_id]},
+                        body={
+                            "name": name_n,
+                            "parents": [back_pf_id],
+                            "mimeType": mime_n or "application/octet-stream",
+                        },
                         media_body=m2,
                         fields="id",
                         supportsAllDrives=True,
                     ).execute()
-                    make_public(up_pf2["id"])
+                    _require_drive_public(
+                        drive, up_pf2["id"], context="submit-print-back", name=name_n
+                    )
                 back_print_links = f"https://drive.google.com/drive/folders/{back_pf_id}"
             else:
                 for up_name, up_bytes, up_mime in print_payloads:
-                    buf = BytesIO(up_bytes)
-                    m = MediaIoBaseUpload(buf, mimetype=up_mime or "application/octet-stream")
+                    name_n, bytes_n, mime_n = _normalize_drive_image_upload(
+                        up_name, up_bytes, up_mime
+                    )
+                    buf = BytesIO(bytes_n)
+                    m = MediaIoBaseUpload(
+                        buf, mimetype=mime_n or "application/octet-stream"
+                    )
                     up_pf = drive.files().create(
-                        body={"name": up_name, "parents": [pf_id]},
+                        body={
+                            "name": name_n,
+                            "parents": [pf_id],
+                            "mimeType": mime_n or "application/octet-stream",
+                        },
                         media_body=m,
                         fields="id",
                         supportsAllDrives=True,
                     ).execute()
-                    make_public(up_pf["id"])
+                    _require_drive_public(
+                        drive, up_pf["id"], context="submit-print", name=name_n
+                    )
                     del buf
             print_links = f"https://drive.google.com/drive/folders/{pf_id}"
 
