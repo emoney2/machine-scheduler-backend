@@ -395,6 +395,12 @@ KANBAN_PHOTOS_FOLDER_ID = (
     os.environ.get("KANBAN_PHOTOS_FOLDER_ID") or ""
 ).strip() or None
 
+# Social Media / Photo Station captures (stills + video). Prefer a dedicated
+# Drive folder via PHOTO_STATION_FOLDER_ID; otherwise find/create "JR Photo Station".
+PHOTO_STATION_FOLDER_ID = (
+    os.environ.get("PHOTO_STATION_FOLDER_ID") or ""
+).strip() or None
+
 # Single-tab headers (exact order for A1 row)
 KANBAN_HEADERS = [
     "Type",
@@ -2234,7 +2240,14 @@ def _drive_upload_image_jpeg(file_stream, filename, folder_id=None):
     file_metadata = {"name": filename, "parents": [folder_id]}
     media = MediaIoBaseUpload(file_stream, mimetype="image/jpeg", resumable=False)
     created = (
-        svc.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        svc.files()
+        .create(
+            body=file_metadata,
+            media_body=media,
+            fields="id",
+            supportsAllDrives=True,
+        )
+        .execute()
     )
     fid = created.get("id")
     # Absolute URL so Sheets / Netlify img tags can load it
@@ -2244,6 +2257,29 @@ def _drive_upload_image_jpeg(file_stream, filename, folder_id=None):
     ).rstrip("/")
     photo_url = f"{public_base}/api/drive/thumbnail?fileId={fid}&sz=w640"
     return fid, photo_url
+
+
+def _drive_upload_bytes(file_stream, filename, mimetype, folder_id, resumable=False):
+    """Upload arbitrary bytes to Drive; returns Drive file resource dict."""
+    if not folder_id:
+        raise RuntimeError("Drive folder_id is required")
+    svc = get_drive_service()
+    file_metadata = {"name": filename, "parents": [folder_id]}
+    media = MediaIoBaseUpload(
+        file_stream,
+        mimetype=(mimetype or "application/octet-stream"),
+        resumable=bool(resumable),
+    )
+    return (
+        svc.files()
+        .create(
+            body=file_metadata,
+            media_body=media,
+            fields="id,name,mimeType,size,webViewLink,webContentLink",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
 
 
 def _kanban_photo_url_from_maybe_data(photo, kid):
@@ -5306,6 +5342,161 @@ def kanban_upload_photo():
         return jsonify({"photoUrl": photo_url, "fileId": file_id})
     except Exception as e:
         app.logger.exception("kanban_upload_photo failed")
+        return jsonify({"error": str(e)}), 500
+
+
+def _get_photo_station_root_folder_id(drive):
+    """
+    Root Drive folder for Photo Station / Social Media Camera captures.
+    Order: PHOTO_STATION_FOLDER_ID → find/create "JR Photo Station" → Kanban photos folder.
+    """
+    explicit = (PHOTO_STATION_FOLDER_ID or "").strip()
+    if explicit and _drive_folder_usable(drive, explicit):
+        return explicit
+    if explicit:
+        logging.warning(
+            "PHOTO_STATION_FOLDER_ID=%s missing/inaccessible; "
+            "falling back to find/create by name",
+            explicit,
+        )
+    try:
+        return _get_named_drive_folder_id(
+            drive,
+            folder_id_env="PHOTO_STATION_FOLDER_ID",
+            folder_name_env="PHOTO_STATION_FOLDER_NAME",
+            default_name="JR Photo Station",
+        )
+    except Exception as e:
+        if KANBAN_PHOTOS_FOLDER_ID and _drive_folder_usable(
+            drive, KANBAN_PHOTOS_FOLDER_ID
+        ):
+            logging.warning(
+                "Photo Station folder resolve failed (%s); using KANBAN_PHOTOS_FOLDER_ID",
+                e,
+            )
+            return KANBAN_PHOTOS_FOLDER_ID
+        raise
+
+
+def _photo_station_ensure_session_folder(drive, session_id: str):
+    """Create (or reuse) a per-capture subfolder under the Photo Station root."""
+    root_id = _get_photo_station_root_folder_id(drive)
+    name = (session_id or "").strip() or f"session_{int(time.time())}"
+    # Keep Drive folder names simple
+    name = re.sub(r"[^\w.\- ]+", "_", name)[:120] or f"session_{int(time.time())}"
+    safe = name.replace("'", "\\'")
+    q = (
+        f"name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' "
+        f"and '{root_id}' in parents and trashed = false"
+    )
+    res = (
+        drive.files()
+        .list(
+            q=q,
+            fields="files(id,name)",
+            pageSize=5,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        )
+        .execute()
+    )
+    files = res.get("files") or []
+    if files:
+        return files[0]["id"], root_id, name
+    meta = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [root_id],
+    }
+    created = (
+        drive.files()
+        .create(body=meta, fields="id", supportsAllDrives=True)
+        .execute()
+    )
+    return created["id"], root_id, name
+
+
+# === PHOTO STATION: upload still / video to Google Drive ======================
+@app.route("/api/photo-station/upload", methods=["POST"])
+@login_required_session
+def photo_station_upload():
+    """
+    FormData:
+      file=<blob>
+      sessionId=<JR_YYYY-MM-DD_NNN>
+      filename=<JR_..._Photo_01.jpg | JR_..._360_Video.mp4>
+    Returns: { ok, fileId, name, mimeType, webViewLink, folderId, rootFolderId, photoUrl? }
+    """
+    from werkzeug.utils import secure_filename
+
+    f = request.files.get("file")
+    session_id = (request.form.get("sessionId") or "").strip()
+    filename = (request.form.get("filename") or "").strip()
+    if not f:
+        return jsonify({"error": "missing file"}), 400
+    if not filename:
+        filename = secure_filename(f.filename or f"capture_{int(time.time())}")
+    else:
+        # Preserve JR_ naming; only strip path separators
+        filename = filename.replace("\\", "/").split("/")[-1]
+        filename = filename.strip() or f"capture_{int(time.time())}"
+    if not session_id:
+        session_id = filename.rsplit(".", 1)[0][:40] or f"session_{int(time.time())}"
+
+    try:
+        drive = get_drive_service()
+        folder_id, root_id, folder_name = _photo_station_ensure_session_folder(
+            drive, session_id
+        )
+        raw = f.read()
+        if not raw:
+            return jsonify({"error": "empty file"}), 400
+        mime = (f.mimetype or "").strip() or "application/octet-stream"
+        lower = filename.lower()
+        if lower.endswith((".jpg", ".jpeg")):
+            mime = "image/jpeg"
+        elif lower.endswith(".png"):
+            mime = "image/png"
+        elif lower.endswith(".mp4"):
+            mime = "video/mp4"
+        elif lower.endswith(".webm"):
+            mime = "video/webm"
+        elif lower.endswith(".mov"):
+            mime = "video/quicktime"
+
+        stream = io.BytesIO(raw)
+        stream.seek(0)
+        # Videos are larger — use resumable upload
+        resumable = mime.startswith("video/") or len(raw) > 4_000_000
+        created = _drive_upload_bytes(
+            stream, filename, mime, folder_id, resumable=resumable
+        )
+        fid = created.get("id")
+        public_base = (
+            os.environ.get("BACKEND_PUBLIC_URL")
+            or "https://machine-scheduler-backend.onrender.com"
+        ).rstrip("/")
+        photo_url = None
+        if mime.startswith("image/") and fid:
+            photo_url = f"{public_base}/api/drive/thumbnail?fileId={fid}&sz=w640"
+
+        return jsonify(
+            {
+                "ok": True,
+                "fileId": fid,
+                "name": created.get("name") or filename,
+                "mimeType": created.get("mimeType") or mime,
+                "size": created.get("size"),
+                "webViewLink": created.get("webViewLink"),
+                "webContentLink": created.get("webContentLink"),
+                "folderId": folder_id,
+                "folderName": folder_name,
+                "rootFolderId": root_id,
+                "photoUrl": photo_url,
+            }
+        )
+    except Exception as e:
+        app.logger.exception("photo_station_upload failed")
         return jsonify({"error": str(e)}), 500
 
 
