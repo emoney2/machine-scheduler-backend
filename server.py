@@ -126,7 +126,7 @@ from flask import make_response
 from werkzeug.exceptions import HTTPException
 from flask_cors import CORS
 from flask_cors import CORS, cross_origin
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, emit
 from flask import Response
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
@@ -32520,7 +32520,164 @@ def on_connect():
 
 @socketio.on("disconnect")
 def on_disconnect():
+    global _COMXIM_BRIDGE
     logger.info(f"Client disconnected: {request.sid}")
+    if _COMXIM_BRIDGE.get("sid") == request.sid:
+        logger.info("ComXim Fire bridge disconnected")
+        _COMXIM_BRIDGE = {
+            "sid": None,
+            "deviceName": None,
+            "bleConnected": False,
+            "connectedAt": None,
+            "lastSeen": None,
+        }
+        socketio.emit(
+            "comxim:bridgeStatus",
+            {"online": False, "bleConnected": False, "deviceName": None},
+        )
+
+
+# === Photo Station / ComXim Fire HD bridge relay ==============================
+# iPhone Safari cannot talk BLE to the MT200RUBL. A Fire HD keeps a BLE link to
+# the turntable and relays CT commands from Photo Station over Socket.IO.
+_COMXIM_BRIDGE = {
+    "sid": None,
+    "deviceName": None,
+    "bleConnected": False,
+    "connectedAt": None,
+    "lastSeen": None,
+}
+
+
+def _comxim_bridge_public_status():
+    online = bool(_COMXIM_BRIDGE.get("sid"))
+    return {
+        "online": online,
+        "bleConnected": bool(_COMXIM_BRIDGE.get("bleConnected")) if online else False,
+        "deviceName": _COMXIM_BRIDGE.get("deviceName") if online else None,
+        "connectedAt": _COMXIM_BRIDGE.get("connectedAt"),
+        "lastSeen": _COMXIM_BRIDGE.get("lastSeen"),
+    }
+
+
+def _comxim_bridge_token_ok(token):
+    expected = (os.environ.get("COMXIM_BRIDGE_TOKEN") or "").strip()
+    if not expected:
+        # No token configured — allow shop use (bridge page is still behind app login).
+        return True
+    return (token or "").strip() == expected
+
+
+@app.route("/api/photo-station/turntable-status", methods=["GET"])
+@login_required_session
+def photo_station_turntable_status():
+    return jsonify({"ok": True, **_comxim_bridge_public_status()})
+
+
+@socketio.on("comxim:registerBridge")
+def comxim_register_bridge(data):
+    global _COMXIM_BRIDGE
+    data = data or {}
+    if not _comxim_bridge_token_ok(data.get("token")):
+        emit("comxim:bridgeError", {"error": "invalid bridge token"})
+        return
+    _COMXIM_BRIDGE = {
+        "sid": request.sid,
+        "deviceName": (data.get("deviceName") or "").strip() or None,
+        "bleConnected": bool(data.get("bleConnected")),
+        "connectedAt": _now_iso_utc(),
+        "lastSeen": _now_iso_utc(),
+    }
+    logger.info(
+        "ComXim bridge registered sid=%s device=%s ble=%s",
+        request.sid,
+        _COMXIM_BRIDGE["deviceName"],
+        _COMXIM_BRIDGE["bleConnected"],
+    )
+    emit("comxim:bridgeRegistered", {"ok": True, **_comxim_bridge_public_status()})
+    socketio.emit("comxim:bridgeStatus", _comxim_bridge_public_status())
+
+
+@socketio.on("comxim:bridgeState")
+def comxim_bridge_state(data):
+    global _COMXIM_BRIDGE
+    if _COMXIM_BRIDGE.get("sid") != request.sid:
+        return
+    data = data or {}
+    if "bleConnected" in data:
+        _COMXIM_BRIDGE["bleConnected"] = bool(data.get("bleConnected"))
+    if data.get("deviceName"):
+        _COMXIM_BRIDGE["deviceName"] = str(data.get("deviceName")).strip() or None
+    _COMXIM_BRIDGE["lastSeen"] = _now_iso_utc()
+    socketio.emit("comxim:bridgeStatus", _comxim_bridge_public_status())
+
+
+@socketio.on("comxim:command")
+def comxim_command(data):
+    """Photo Station → Fire bridge: send a CT command and optionally wait for an event."""
+    data = data or {}
+    request_id = (data.get("requestId") or "").strip()
+    command = (data.get("command") or "").strip()
+    if not request_id or not command:
+        emit(
+            "comxim:commandResult",
+            {
+                "requestId": request_id,
+                "ok": False,
+                "error": "missing requestId or command",
+            },
+        )
+        return
+    bridge_sid = _COMXIM_BRIDGE.get("sid")
+    if not bridge_sid:
+        emit(
+            "comxim:commandResult",
+            {
+                "requestId": request_id,
+                "ok": False,
+                "error": "Fire HD bridge is offline. Open /turntable-bridge on the Fire tablet.",
+            },
+        )
+        return
+    if not _COMXIM_BRIDGE.get("bleConnected"):
+        emit(
+            "comxim:commandResult",
+            {
+                "requestId": request_id,
+                "ok": False,
+                "error": "Fire HD bridge is online but Bluetooth is not connected to the turntable.",
+            },
+        )
+        return
+    payload = {
+        "requestId": request_id,
+        "command": command,
+        "waitFor": (data.get("waitFor") or "OK").strip().upper(),
+        "timeoutMs": int(data.get("timeoutMs") or 45000),
+        "fromSid": request.sid,
+    }
+    socketio.emit("comxim:bridgeSend", payload, to=bridge_sid)
+
+
+@socketio.on("comxim:bridgeResult")
+def comxim_bridge_result(data):
+    """Fire bridge → Photo Station response."""
+    if _COMXIM_BRIDGE.get("sid") != request.sid:
+        return
+    data = data or {}
+    _COMXIM_BRIDGE["lastSeen"] = _now_iso_utc()
+    target = (data.get("fromSid") or "").strip()
+    result = {
+        "requestId": data.get("requestId"),
+        "ok": bool(data.get("ok")),
+        "lines": data.get("lines") or [],
+        "error": data.get("error"),
+        "command": data.get("command"),
+    }
+    if target:
+        socketio.emit("comxim:commandResult", result, to=target)
+    else:
+        socketio.emit("comxim:commandResult", result)
 
 
 # --- Public URL shortener (no auth, no app redirects) ---
