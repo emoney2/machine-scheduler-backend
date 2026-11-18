@@ -3073,32 +3073,68 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 _LOGIN_TOKEN_SALT = "ms-web-login"
 _LOGIN_TOKEN_MAX_AGE = 12 * 3600
+# iPhone camera tab and Fire turntable tab stay signed in. The page refreshes
+# this token while it is open, so a station that is used does not hit the cap.
+_KIOSK_TOKEN_MAX_AGE = 180 * 24 * 3600
+_KIOSK_PATHS = ("/photo-station", "/turntable-bridge")
 
 
 def _login_serializer():
     return URLSafeTimedSerializer(app.secret_key, salt=_LOGIN_TOKEN_SALT)
 
 
-def _issue_login_token():
-    return _login_serializer().dumps(
-        {
-            "user": "admin",
-            "token": os.environ.get("ADMIN_TOKEN", ""),
-            "login_time": time.time(),
-        }
-    )
+def _kiosk_home_from_url(url):
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        from urllib.parse import urlparse
+
+        path = urlparse(raw).path or raw
+    except Exception:
+        path = raw
+    path = "/" + path.lstrip("/")
+    if len(path) > 1:
+        path = path.rstrip("/")
+    for allowed in _KIOSK_PATHS:
+        if path == allowed:
+            return allowed
+    return ""
+
+
+def _request_is_station_device():
+    ua = request.headers.get("User-Agent") or ""
+    return bool(re.search(r"iPhone|iPad|iPod|Silk|Kindle|Android", ua, re.I))
+
+
+def _issue_login_token(kiosk_home="", login_time=None):
+    payload = {
+        "user": "admin",
+        "token": os.environ.get("ADMIN_TOKEN", ""),
+        "login_time": float(login_time if login_time else time.time()),
+    }
+    home = _kiosk_home_from_url(kiosk_home)
+    if home:
+        payload["kiosk"] = True
+        payload["home"] = home
+    return _login_serializer().dumps(payload)
 
 
 def _load_login_token(raw):
     try:
-        data = _login_serializer().loads(raw, max_age=_LOGIN_TOKEN_MAX_AGE)
-        if data.get("user") != "admin":
-            return None
-        if data.get("token") != os.environ.get("ADMIN_TOKEN", ""):
-            return None
-        return data
+        data = _login_serializer().loads(raw, max_age=_KIOSK_TOKEN_MAX_AGE)
     except (BadSignature, SignatureExpired, Exception):
         return None
+    if not data.get("kiosk"):
+        try:
+            data = _login_serializer().loads(raw, max_age=_LOGIN_TOKEN_MAX_AGE)
+        except (BadSignature, SignatureExpired, Exception):
+            return None
+    if data.get("user") != "admin":
+        return None
+    if data.get("token") != os.environ.get("ADMIN_TOKEN", ""):
+        return None
+    return data
 
 
 def _apply_bearer_session():
@@ -6988,6 +7024,29 @@ def drive_proxy(file_id):
 def api_ping():
     # Hitting this endpoint updates session["last_activity"] via the decorator
     return jsonify({"ok": True}), 200
+
+
+@app.route("/api/session/keep", methods=["POST", "OPTIONS"])
+@login_required_session
+def api_session_keep():
+    """Renew the station login for the iPhone camera tab or the Fire turntable tab."""
+    if not _request_is_station_device():
+        return jsonify({"ok": True, "kiosk": False}), 200
+    body = request.get_json(silent=True) or {}
+    home = _kiosk_home_from_url(body.get("home") or "")
+    auth = (request.headers.get("Authorization") or "").strip()
+    existing = None
+    if len(auth) >= 8 and auth[:7].lower() == "bearer ":
+        existing = _load_login_token(auth[7:].strip())
+    if not home and existing and existing.get("kiosk"):
+        home = _kiosk_home_from_url(existing.get("home") or "")
+    if not home:
+        return jsonify({"ok": True, "kiosk": False}), 200
+    login_time = None
+    if existing and existing.get("login_time"):
+        login_time = existing.get("login_time")
+    token = _issue_login_token(home, login_time=login_time)
+    return jsonify({"ok": True, "kiosk": True, "home": home, "token": token}), 200
 
 
 @app.route("/api/jrco-presentation/inspect", methods=["POST", "OPTIONS"])
@@ -14553,7 +14612,10 @@ def login():
             session["login_time"] = time.time()
             session["login_ts"] = datetime.utcnow().timestamp()
             session.modified = True
-            dest = _attach_login_token(next_url, _issue_login_token())
+            kiosk_home = ""
+            if _request_is_station_device():
+                kiosk_home = _kiosk_home_from_url(next_url)
+            dest = _attach_login_token(next_url, _issue_login_token(kiosk_home))
             # 200 + JS redirect (not 302): iPhone Safari often drops Set-Cookie on redirects.
             resp = make_response(
                 render_template_string(_login_success_page, next=dest)
