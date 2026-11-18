@@ -14894,6 +14894,156 @@ def _overview_shipping_method(row: dict) -> str:
     return planning or via
 
 
+_OVERVIEW_CUT_MATERIAL_KEYS = (
+    "Material1",
+    "Material2",
+    "Material3",
+    "Material4",
+    "Material5",
+    "Back Material",
+)
+
+
+def _overview_norm_material_name(name) -> str:
+    return re.sub(r"\s+", " ", str(name or "").strip().lower())
+
+
+def _overview_cell_is_cut_qty(val) -> bool:
+    """True when a Cut List cell holds a submitted cut quantity, not a material name."""
+    if val is None or isinstance(val, bool):
+        return False
+    if isinstance(val, (int, float)):
+        return True
+    s = str(val).strip().replace(",", "")
+    if not s:
+        return False
+    try:
+        float(s)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _overview_json_cell(val):
+    if val is None:
+        return ""
+    if hasattr(val, "isoformat"):
+        return val.isoformat()
+    return val
+
+
+def _overview_order_material_name(order, label):
+    """Material name on a Production Orders row, including 'Material 1' headers."""
+    keys = [label]
+    if label.startswith("Material") and len(label) > 8 and label[8:].isdigit():
+        keys.append("Material " + label[8:])
+    for key in keys:
+        name = str((order or {}).get(key) or "").strip()
+        if name:
+            return name
+    return ""
+
+
+def _overview_uncut_jobs_by_material(orders_full, cut_values):
+    """
+    Normalized material name -> outstanding jobs that still need that material cut.
+
+    A job is skipped when it is complete/shipped, or Cut List Status is complete.
+    A material on that job is skipped when its Cut List quantity cell (the column
+    immediately to the right of Material1–5 / Back Material) already has a number.
+    """
+    headers = []
+    cut_by_key = {}
+    status_idx = None
+    if cut_values:
+        headers = [str(h).strip() for h in (cut_values[0] or [])]
+        order_idx = headers.index("Order #") if "Order #" in headers else None
+        status_idx = headers.index("Status") if "Status" in headers else None
+        if order_idx is not None:
+            for raw in cut_values[1:]:
+                row = list(raw or [])
+                oid = row[order_idx] if order_idx < len(row) else ""
+                key = _overview_normalize_order_key(oid)
+                if key:
+                    cut_by_key[key] = row
+
+    material_cols = []
+    header_index = {h.lower(): i for i, h in enumerate(headers)}
+    for label in _OVERVIEW_CUT_MATERIAL_KEYS:
+        idx = header_index.get(label.lower())
+        if idx is None and label.startswith("Material") and label[8:].isdigit():
+            idx = header_index.get(("Material " + label[8:]).lower())
+        if idx is not None:
+            material_cols.append((label, idx))
+
+    by_name = {}
+
+    def add_job(name, job):
+        nk = _overview_norm_material_name(name)
+        if not nk:
+            return
+        bucket = by_name.setdefault(nk, [])
+        if any(existing.get("order") == job.get("order") for existing in bucket):
+            return
+        bucket.append(job)
+
+    done_status = {"COMPLETE", "COMPLETED", "DONE"}
+
+    for o in orders_full or []:
+        if not isinstance(o, dict):
+            continue
+        if _overview_exclude_completed_or_shipped(o):
+            continue
+        oid = _overview_normalize_order_key(o.get("Order #"))
+        if not oid:
+            continue
+        cut_status = str(o.get("Cut Status") or "").strip().upper()
+        if cut_status in done_status:
+            continue
+        row = cut_by_key.get(oid)
+        if row is not None and status_idx is not None and status_idx < len(row):
+            if str(row[status_idx] or "").strip().upper() in done_status:
+                continue
+
+        job = {
+            "order": oid,
+            "company": str(o.get("Company Name") or "").strip(),
+            "design": str(o.get("Design") or "").strip(),
+            "product": str(o.get("Product") or "").strip(),
+            "qty": _overview_json_cell(o.get("Quantity")),
+            "due": _overview_json_cell(o.get("Due Date")),
+            "stage": str(o.get("Stage") or "").strip(),
+        }
+
+        labels = material_cols or [(label, None) for label in _OVERVIEW_CUT_MATERIAL_KEYS]
+        for label, col in labels:
+            name = _overview_order_material_name(o, label)
+            if not name and row is not None and col is not None and col < len(row):
+                src = row[col]
+                if not _overview_cell_is_cut_qty(src):
+                    name = str(src or "").strip()
+            if not name:
+                continue
+            if row is not None and col is not None:
+                dest = col + 1
+                if dest < len(row) and _overview_cell_is_cut_qty(row[dest]):
+                    continue
+            add_job(name, job)
+
+    return by_name
+
+
+def _overview_attach_uncut_jobs(groups, jobs_by_material):
+    jobs_by_material = jobs_by_material or {}
+    for grp in groups or []:
+        for item in grp.get("items") or []:
+            if str(item.get("type") or "").lower() == "thread":
+                continue
+            key = _overview_norm_material_name(item.get("name"))
+            item["jobs"] = list(jobs_by_material.get(key) or [])
+    return groups
+
+
 def _overview_ship_address(row: dict) -> dict:
     city = state = zipc = ""
     city_g = state_g = zip_g = ""
@@ -14943,6 +15093,7 @@ def build_overview_payload():
     )
 
     rows = []
+    uncut_by_material = {}
     sewing_by_order = {}
     orders_full_for_pairing = []
     try:
@@ -15024,6 +15175,15 @@ def build_overview_payload():
             len(rows),
             len(orders_full),
         )
+        try:
+            uncut_by_material = _overview_uncut_jobs_by_material(orders_full, cut_rows)
+            app.logger.info(
+                "📦 Uncut jobs by material: %d materials",
+                len(uncut_by_material),
+            )
+        except Exception:
+            app.logger.exception("uncut jobs by material failed")
+            uncut_by_material = {}
 
     except Exception as e:
         app.logger.exception(
@@ -15225,11 +15385,17 @@ def build_overview_payload():
             len(lines_future),
         )
 
-        vendor_list = _overview_parse_material_lines_to_vendor_groups(
-            lines_now, material_color_map
+        vendor_list = _overview_attach_uncut_jobs(
+            _overview_parse_material_lines_to_vendor_groups(
+                lines_now, material_color_map
+            ),
+            uncut_by_material,
         )
-        vendor_list_future = _overview_parse_material_lines_to_vendor_groups(
-            lines_future, material_color_map
+        vendor_list_future = _overview_attach_uncut_jobs(
+            _overview_parse_material_lines_to_vendor_groups(
+                lines_future, material_color_map
+            ),
+            uncut_by_material,
         )
         app.logger.info(
             "📦 Materials grouped: now=%s vendors (%s items), future=%s vendors (%s items)",
