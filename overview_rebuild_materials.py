@@ -11,9 +11,9 @@ Material model (ledger hole + later-first list split):
   rawNow/rawLater = job shortfalls (cover now demand first with available)
   Assign toBuy to rawLater FIRST, remainder to Now.
   Example Leaf Green: Inv -87, On Order 74 → toBuy 14 → Now 0, Later 14.
-  A material is omitted unless work is still open for it:
-    Cut List (not the Fur tab) for Material1–5 and Back Material.
-    Fur List for Fur Color (Emerald Green Fur and the other furs).
+  A material is omitted unless a job still needs it cut:
+    Name contains the word Fur → Fur List Status is not Complete.
+    Any other material → Cut List Status is not Complete.
 
 Thread model (Min Inv / Reorder from Thread Inventory):
   position = Inventory + max(sheet On Order, Thread Data Ordered cones)
@@ -280,112 +280,64 @@ def _po_material_name(row: List[Any], headers: List[Any], label: str) -> str:
     return ""
 
 
+def _list_status_is_complete(val: Any) -> bool:
+    return _as_text(val).strip().lower() in {"complete", "completed"}
+
+
+def _material_uses_fur_list(name: str) -> bool:
+    return bool(re.search(r"\bfur\b", _normalize_material_name(name)))
+
+
+def _open_names_on_list(values: Optional[List[List[Any]]], name_headers: List[str]) -> Optional[set]:
+    """Names on rows whose Status column is not Complete. None if the sheet was not read."""
+    if values is None:
+        return None
+    names: set = set()
+    if not values:
+        return names
+    headers = [str(h or "").strip() for h in (values[0] or [])]
+
+    def col(label: str) -> Optional[int]:
+        want = label.strip().lower()
+        for i, header in enumerate(headers):
+            if header.lower() == want:
+                return i
+        return None
+
+    status_idx = col("Status")
+    name_idxs = [idx for idx in (col(label) for label in name_headers) if idx is not None]
+    for raw in values[1:]:
+        row = list(raw or [])
+        if (
+            status_idx is not None
+            and status_idx < len(row)
+            and _list_status_is_complete(row[status_idx])
+        ):
+            continue
+        for idx in name_idxs:
+            if idx >= len(row):
+                continue
+            key = _normalize_material_name(row[idx])
+            if key:
+                names.add(key)
+    return names
+
+
 def _outstanding_material_names(
     po: List[List[Any]],
     cut_values: Optional[List[List[Any]]],
     fur_values: Optional[List[List[Any]]],
 ) -> Tuple[Optional[set], Optional[set]]:
     """
-    (cut names, fur names) still open. None means that sheet could not be read,
-    so the caller leaves those materials on the list instead of hiding all of them.
+    Open Cut List material names and open Fur List colors.
 
-    Cut materials (Material1–5, Back Material) come from Cut List rows that are
-    not complete, and only when that material's cut quantity is still empty.
-    Fur colors come from Fur List rows that are not complete.
+    Status Complete means that job is already cut. Any other Status is not cut.
     """
-    if cut_values is None and fur_values is None:
-        return None, None
-    cut_headers, cut_by_order = _index_sheet_by_order(cut_values or [])
-    fur_headers, fur_by_order = _index_sheet_by_order(fur_values or [])
-    po_headers = list(po[0] or []) if po else []
-    stage_idx = _header_index(po_headers, ["stage"])
-    if stage_idx < 0:
-        stage_idx = 8
-    order_idx = _header_index(po_headers, ["order #", "order number", "order"])
-    if order_idx < 0:
-        order_idx = 0
-    fur_color_idx = _header_index(po_headers, ["fur color", "furcolor", "fur"])
-
-    cut_cols: List[Tuple[str, int]] = []
-    for label in _CUT_MATERIAL_LABELS:
-        idx = cut_headers.get(label.lower())
-        if idx is None and label.startswith("Material") and label[8:].isdigit():
-            idx = cut_headers.get(("material " + label[8:]).lower())
-        if idx is not None:
-            cut_cols.append((label, idx))
-    cut_status_idx = cut_headers.get("cut status", cut_headers.get("status"))
-    fur_status_idx = fur_headers.get("fur status", fur_headers.get("status"))
-    fur_sheet_color_idx = fur_headers.get("fur color", fur_headers.get("furcolor"))
-
-    cut_names: Optional[set] = set() if cut_values is not None else None
-    fur_names: Optional[set] = set() if fur_values is not None else None
-
-    def add_cut(name: Any) -> None:
-        if cut_names is None:
-            return
-        key = _normalize_material_name(name)
-        if key:
-            cut_names.add(key)
-
-    def add_fur(name: Any) -> None:
-        if fur_names is None:
-            return
-        key = _normalize_material_name(name)
-        if key:
-            fur_names.add(key)
-
-    for raw in (po or [])[1:]:
-        row = list(raw or [])
-        stage = _as_text(row[stage_idx] if stage_idx < len(row) else "")
-        if _is_terminal_stage(stage):
-            continue
-        oid = _as_order_text(row[order_idx] if order_idx < len(row) else "").strip()
-        if not oid:
-            continue
-
-        cut_row = cut_by_order.get(oid)
-        if cut_row is not None:
-            cut_done = (
-                cut_status_idx is not None
-                and cut_status_idx < len(cut_row)
-                and _status_is_done(cut_row[cut_status_idx])
-            )
-            if not cut_done:
-                labels = cut_cols or [(label, None) for label in _CUT_MATERIAL_LABELS]
-                for label, col in labels:
-                    name = _po_material_name(row, po_headers, label)
-                    if not name and cut_row is not None and col is not None and col < len(cut_row):
-                        src = cut_row[col]
-                        if not _cell_is_cut_qty(src):
-                            name = _as_text(src).strip()
-                    if not name:
-                        continue
-                    if cut_row is not None and col is not None:
-                        dest = col + 1
-                        if dest < len(cut_row) and _cell_is_cut_qty(cut_row[dest]):
-                            continue
-                    add_cut(name)
-
-        fur_row = fur_by_order.get(oid)
-        if fur_row is not None:
-            fur_done = (
-                fur_status_idx is not None
-                and fur_status_idx < len(fur_row)
-                and _status_is_done(fur_row[fur_status_idx])
-            )
-            if not fur_done:
-                color = ""
-                if fur_color_idx >= 0 and fur_color_idx < len(row):
-                    color = _as_text(row[fur_color_idx]).strip()
-                if (
-                    not color
-                    and fur_sheet_color_idx is not None
-                    and fur_sheet_color_idx < len(fur_row)
-                ):
-                    color = _as_text(fur_row[fur_sheet_color_idx]).strip()
-                add_fur(color)
-
-    return cut_names, fur_names
+    del po  # Lists carry the material name and Status; production stage does not.
+    return (
+        _open_names_on_list(cut_values, list(_CUT_MATERIAL_LABELS)),
+        _open_names_on_list(fur_values, ["Fur Color"]),
+    )
 
 
 def _material_still_needed(
@@ -393,18 +345,15 @@ def _material_still_needed(
     cut_names: Optional[set],
     fur_names: Optional[set],
 ) -> bool:
-    """Keep a buy when Cut List or Fur List still has this material open.
-
-    A sheet that failed to load does not by itself remove the material.
-    """
+    """Fur materials follow Fur List Status. Everything else follows Cut List Status."""
     key = _normalize_material_name(name)
-    on_cut = bool(cut_names is not None and key in cut_names)
-    on_fur = bool(fur_names is not None and key in fur_names)
-    if on_cut or on_fur:
+    if _material_uses_fur_list(name):
+        if fur_names is None:
+            return True
+        return key in fur_names
+    if cut_names is None:
         return True
-    if cut_names is None or fur_names is None:
-        return True
-    return False
+    return key in cut_names
 
 
 def _parse_date(v: Any) -> Optional[datetime]:

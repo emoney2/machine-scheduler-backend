@@ -15013,103 +15013,105 @@ def _overview_order_material_name(order, label):
     return ""
 
 
-def _overview_uncut_jobs_by_material(orders_full, cut_values):
+def _overview_material_uses_fur_list(name) -> bool:
+    """Fur colors are finished on the Fur List. Every other material uses Cut List."""
+    return bool(re.search(r"\bfur\b", _overview_norm_material_name(name)))
+
+
+def _overview_status_is_complete(val) -> bool:
+    return str(val or "").strip().lower() in {"complete", "completed"}
+
+
+def _overview_header_index(headers, name: str):
+    want = str(name or "").strip().lower()
+    for i, header in enumerate(headers or []):
+        if str(header or "").strip().lower() == want:
+            return i
+    return None
+
+
+def _overview_sheet_job(headers, row):
+    def cell(name):
+        idx = _overview_header_index(headers, name)
+        if idx is None or idx >= len(row):
+            return ""
+        return row[idx]
+
+    order_idx = _overview_header_index(headers, "Order #")
+    if order_idx is None:
+        order_idx = _overview_header_index(headers, "Order Number")
+    oid = _overview_normalize_order_key(row[order_idx] if order_idx is not None and order_idx < len(row) else "")
+    if not oid:
+        return None
+    return {
+        "order": oid,
+        "company": str(cell("Company Name") or "").strip(),
+        "design": str(cell("Design") or "").strip(),
+        "product": str(cell("Product") or "").strip(),
+        "qty": _overview_json_cell(cell("Quantity")),
+        "due": _overview_json_cell(cell("Due Date")),
+        "stage": str(cell("Stage") or "").strip(),
+        "status": str(cell("Status") or "").strip(),
+    }
+
+
+def _overview_uncut_jobs_by_material(cut_values, fur_values):
     """
-    Normalized material name -> outstanding jobs that still need that material cut.
+    Jobs whose list Status is not Complete.
 
-    A job is skipped when it is complete/shipped, or Cut List Status is complete.
-    A material on that job is skipped when its Cut List quantity cell (the column
-    immediately to the right of Material1–5 / Back Material) already has a number.
+    Material names containing the word Fur use Fur List Status and Fur Color.
+    Every other material uses Cut List Status and Material1–5 / Back Material.
     """
-    headers = []
-    cut_by_key = {}
-    status_idx = None
-    if cut_values:
-        headers = [str(h).strip() for h in (cut_values[0] or [])]
-        order_idx = headers.index("Order #") if "Order #" in headers else None
-        status_idx = headers.index("Status") if "Status" in headers else None
-        if order_idx is not None:
-            for raw in cut_values[1:]:
-                row = list(raw or [])
-                oid = row[order_idx] if order_idx < len(row) else ""
-                key = _overview_normalize_order_key(oid)
-                if key:
-                    cut_by_key[key] = row
+    fur_jobs = {}
+    cut_jobs = {}
 
-    material_cols = []
-    header_index = {h.lower(): i for i, h in enumerate(headers)}
-    for label in _OVERVIEW_CUT_MATERIAL_KEYS:
-        idx = header_index.get(label.lower())
-        if idx is None and label.startswith("Material") and label[8:].isdigit():
-            idx = header_index.get(("Material " + label[8:]).lower())
-        if idx is not None:
-            material_cols.append((label, idx))
-
-    by_name = {}
-
-    def add_job(name, job):
+    def add_job(bucket, name, job):
         nk = _overview_norm_material_name(name)
-        if not nk:
+        if not nk or not job:
             return
-        bucket = by_name.setdefault(nk, [])
-        if any(existing.get("order") == job.get("order") for existing in bucket):
+        rows = bucket.setdefault(nk, [])
+        if any(existing.get("order") == job.get("order") for existing in rows):
             return
-        bucket.append(job)
+        rows.append(job)
 
-    done_status = {"COMPLETE", "COMPLETED", "DONE"}
-
-    for o in orders_full or []:
-        if not isinstance(o, dict):
-            continue
-        if _overview_exclude_completed_or_shipped(o):
-            continue
-        oid = _overview_normalize_order_key(o.get("Order #"))
-        if not oid:
-            continue
-        cut_status = str(o.get("Cut Status") or "").strip().upper()
-        if cut_status in done_status:
-            continue
-        row = cut_by_key.get(oid)
-        if row is not None and status_idx is not None and status_idx < len(row):
-            if str(row[status_idx] or "").strip().upper() in done_status:
+    def walk(values, name_headers, bucket):
+        if not values:
+            return
+        headers = [str(h).strip() if h is not None else "" for h in (values[0] or [])]
+        status_idx = _overview_header_index(headers, "Status")
+        name_idxs = []
+        for label in name_headers:
+            idx = _overview_header_index(headers, label)
+            if idx is not None:
+                name_idxs.append(idx)
+        for raw in values[1:]:
+            row = list(raw or [])
+            if status_idx is not None and status_idx < len(row) and _overview_status_is_complete(row[status_idx]):
                 continue
-
-        job = {
-            "order": oid,
-            "company": str(o.get("Company Name") or "").strip(),
-            "design": str(o.get("Design") or "").strip(),
-            "product": str(o.get("Product") or "").strip(),
-            "qty": _overview_json_cell(o.get("Quantity")),
-            "due": _overview_json_cell(o.get("Due Date")),
-            "stage": str(o.get("Stage") or "").strip(),
-        }
-
-        labels = material_cols or [(label, None) for label in _OVERVIEW_CUT_MATERIAL_KEYS]
-        for label, col in labels:
-            name = _overview_order_material_name(o, label)
-            if not name and row is not None and col is not None and col < len(row):
-                src = row[col]
-                if not _overview_cell_is_cut_qty(src):
-                    name = str(src or "").strip()
-            if not name:
+            job = _overview_sheet_job(headers, row)
+            if not job:
                 continue
-            if row is not None and col is not None:
-                dest = col + 1
-                if dest < len(row) and _overview_cell_is_cut_qty(row[dest]):
+            for idx in name_idxs:
+                if idx >= len(row):
                     continue
-            add_job(name, job)
+                add_job(bucket, row[idx], job)
 
-    return by_name
+    walk(fur_values, ["Fur Color"], fur_jobs)
+    walk(cut_values, list(_OVERVIEW_CUT_MATERIAL_KEYS), cut_jobs)
+    return {"fur": fur_jobs, "cut": cut_jobs}
 
 
 def _overview_attach_uncut_jobs(groups, jobs_by_material):
     jobs_by_material = jobs_by_material or {}
+    fur_jobs = jobs_by_material.get("fur") or {}
+    cut_jobs = jobs_by_material.get("cut") or {}
     for grp in groups or []:
         for item in grp.get("items") or []:
             if str(item.get("type") or "").lower() == "thread":
                 continue
             key = _overview_norm_material_name(item.get("name"))
-            item["jobs"] = list(jobs_by_material.get(key) or [])
+            source = fur_jobs if _overview_material_uses_fur_list(item.get("name")) else cut_jobs
+            item["jobs"] = list(source.get(key) or [])
     return groups
 
 
@@ -15285,10 +15287,11 @@ def build_overview_payload():
             len(orders_full),
         )
         try:
-            uncut_by_material = _overview_uncut_jobs_by_material(orders_full, cut_rows)
+            uncut_by_material = _overview_uncut_jobs_by_material(cut_rows, fur_rows)
             app.logger.info(
-                "📦 Uncut jobs by material: %d materials",
-                len(uncut_by_material),
+                "📦 Uncut jobs by material: fur=%d cut=%d",
+                len((uncut_by_material.get("fur") or {})),
+                len((uncut_by_material.get("cut") or {})),
             )
         except Exception:
             app.logger.exception("uncut jobs by material failed")
