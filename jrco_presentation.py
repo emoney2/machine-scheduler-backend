@@ -126,6 +126,82 @@ def design_flat_filename(design: dict[str, Any], pdf_filename: str = "") -> str:
     return f"{pdf_stem}-p{page}-flat.png"
 
 
+def _text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def design_order_fields(design: dict[str, Any]) -> dict[str, Any]:
+    """
+    Swatch / fur fields the desktop exporter stores on each manifest design.
+
+    Photoshop material swatches land as ``materialCategory`` + ``materialColorName``
+    (and optional ``materials[]`` when more than one swatch was applied).
+    Fur is ``furColorName``. Older PDFs only have the singular fields.
+    """
+    swatches: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_swatch(category: str, color_name: str, name: str = "") -> None:
+        category = _text(category)
+        color_name = _text(color_name)
+        name = _text(name)
+        if not category and not color_name and not name:
+            return
+        key = (category.casefold(), color_name.casefold(), name.casefold())
+        if key in seen:
+            return
+        seen.add(key)
+        swatches.append(
+            {"category": category, "colorName": color_name, "name": name}
+        )
+
+    raw_list = design.get("materials")
+    if isinstance(raw_list, list):
+        for item in raw_list:
+            if isinstance(item, str):
+                add_swatch("", "", item)
+            elif isinstance(item, dict):
+                add_swatch(
+                    item.get("category") or item.get("materialCategory") or "",
+                    item.get("colorName") or item.get("materialColorName") or "",
+                    item.get("name") or "",
+                )
+    if not swatches:
+        add_swatch(
+            design.get("materialCategory") or "",
+            design.get("materialColorName") or "",
+            "",
+        )
+
+    fur_rgb = design.get("furColorRgb")
+    if not (
+        isinstance(fur_rgb, (list, tuple))
+        and len(fur_rgb) >= 3
+    ):
+        fur_rgb = None
+    else:
+        try:
+            fur_rgb = [int(fur_rgb[0]), int(fur_rgb[1]), int(fur_rgb[2])]
+        except (TypeError, ValueError):
+            fur_rgb = None
+
+    design_name = _text(
+        design.get("designName") or design.get("sourceName") or design.get("label")
+    )
+    return {
+        "furColorName": _text(design.get("furColorName")),
+        "furColorHex": _text(design.get("furColorHex")),
+        "furColorRgb": fur_rgb,
+        "materialCategory": _text(design.get("materialCategory")),
+        "materialColorName": _text(design.get("materialColorName")),
+        "leatherColorName": _text(design.get("leatherColorName")),
+        "designName": design_name,
+        "materials": swatches[:5],
+    }
+
+
 def classify_flat_png_id(file_id: str) -> str:
     """Return ``local``, ``drive``, or ``empty``."""
     fid = (file_id or "").strip()
@@ -297,20 +373,20 @@ def inspect_presentation(
         elif kind == "empty":
             err = "Missing flatPngDriveFileId"
             blocking_errors.append(f"Page {d.get('page')}: {err}")
-        designs_out.append(
-            {
-                "page": d.get("page"),
-                "designId": d.get("designId"),
-                "productType": d.get("productType") or "",
-                "artworkVersion": d.get("artworkVersion") or "",
-                "flatPngDriveFileId": fid,
-                "flatPngSha256": d.get("flatPngSha256") or "",
-                "sourcePsdDriveFileId": d.get("sourcePsdDriveFileId") or "",
-                "idKind": kind,
-                "suggestedFilename": design_flat_filename(d, filename),
-                "error": err,
-            }
-        )
+        row = {
+            "page": d.get("page"),
+            "designId": d.get("designId"),
+            "productType": d.get("productType") or "",
+            "artworkVersion": d.get("artworkVersion") or "",
+            "flatPngDriveFileId": fid,
+            "flatPngSha256": d.get("flatPngSha256") or "",
+            "sourcePsdDriveFileId": d.get("sourcePsdDriveFileId") or "",
+            "idKind": kind,
+            "suggestedFilename": design_flat_filename(d, filename),
+            "error": err,
+        }
+        row.update(design_order_fields(d))
+        designs_out.append(row)
     page_tiles: list[dict[str, Any]] = []
     if include_page_tiles:
         try:

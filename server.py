@@ -227,6 +227,7 @@ from jrco_presentation import (
     expand_presentation_uploads,
     extract_embedded_file,
     inspect_presentation,
+    is_jrco_presentation_pdf,
     is_pdf_filename,
     looks_like_pdf,
     render_page_png,
@@ -19865,25 +19866,11 @@ def _upload_edit_print_files(drive, order_folder_id, file_storages, design_ids=N
         raw = f.read()
         name = f.filename or "print.bin"
         mime = f.mimetype or "application/octet-stream"
+        # A JR presentation PDF is production art. Never expand its flat into Print Files.
+        if is_jrco_presentation_pdf(raw, name):
+            logger.info("[order-edit] skipping presentation PDF in Print Files: %s", name)
+            continue
         payloads = [(name, raw, mime)]
-        try:
-            expanded = expand_presentation_uploads(
-                raw,
-                name,
-                lambda fid: _download_drive_file_bytes(drive, fid),
-                keep_proof_pdf=False,
-                design_ids=design_ids,
-            )
-            if expanded:
-                payloads = [
-                    (item["filename"], item["bytes"], item["mimetype"])
-                    for item in expanded
-                    if item.get("role") == "flat_production"
-                ] or payloads
-        except JrcoPresentationError:
-            raise
-        except Exception:
-            pass
         for up_name, up_bytes, up_mime in payloads:
             buf = BytesIO(up_bytes)
             media = MediaIoBaseUpload(
@@ -21791,9 +21778,6 @@ def submit_order():
                 _queue_corel_vectorize_job(drive, folder_id, name, order_label)
             return up
 
-        # Flat PNGs resolved from JR presentation PDFs — also land in Print Files.
-        presentation_flat_uploads: list[tuple[str, bytes, str]] = []
-
         def _download_presentation_flat(file_id: str) -> bytes:
             return _download_drive_file_bytes(drive, file_id)
 
@@ -21844,7 +21828,6 @@ def submit_order():
                     flat_name = (
                         f"{(name or 'presentation').rsplit('.', 1)[0]}-p{page_n}-flat.png"
                     )
-                    presentation_flat_uploads.append((flat_name, png, "image/png"))
                     logger.warning(
                         "[submit] JR presentation %s had unresolvable flats (%s); "
                         "rasterized page %s",
@@ -21865,12 +21848,7 @@ def submit_order():
                 expanded = None
             if expanded:
                 for item in expanded:
-                    up_name = item["filename"]
-                    up_bytes = item["bytes"]
-                    up_mime = item["mimetype"]
-                    if item.get("role") == "flat_production":
-                        presentation_flat_uploads.append((up_name, up_bytes, up_mime))
-                    yield up_name, up_bytes, up_mime
+                    yield item["filename"], item["bytes"], item["mimetype"]
                 return
 
             # Never put a raw PDF in Image — Sheets IMAGE() cannot render it.
@@ -21918,43 +21896,22 @@ def submit_order():
             return jsonify({"error": str(pres_err)}), 400
 
         def _iter_print_upload_items(file_storage):
-            """Yield print payloads; expand JR presentation PDFs to flat PNGs only (no proof PDF)."""
+            """Yield print payloads. JR presentation PDFs are production-only."""
             raw = file_storage.read()
             name = file_storage.filename or "upload.bin"
             mime = file_storage.mimetype or "application/octet-stream"
-            try:
-                expanded = expand_presentation_uploads(
-                    raw,
-                    name,
-                    _download_presentation_flat,
-                    keep_proof_pdf=False,
-                    design_ids=jr_design_ids,
-                )
-            except JrcoPresentationError:
-                raise
-            except Exception as exp_err:
-                logger.warning(
-                    "[submit] JR presentation print expand failed for %s: %s",
-                    name,
-                    exp_err,
-                )
-                expanded = None
-            if expanded:
-                for item in expanded:
-                    if item.get("role") == "flat_production":
-                        yield item["filename"], item["bytes"], item["mimetype"]
+            if is_jrco_presentation_pdf(raw, name):
+                logger.info("[submit] skipping presentation PDF in Print Files: %s", name)
                 return
             yield name, raw, mime
 
-        # Create Print Files subfolder if user uploaded print files OR checked the Print checkbox
-        # OR a JR presentation PDF resolved flat PNG(s) onto the order.
+        # Print Files only when the user checked Print or attached print files.
+        # A production PDF / flat PNG must not mark Print or copy into Print Files.
         print_val = (data.get("print") or "").strip().upper()
-        if presentation_flat_uploads:
-            print_val = "YES"
         print_cell = "YES" if print_val == "YES" else "NO"
         print_links = ""
         back_print_links = ""
-        if print_files or print_val == "YES" or presentation_flat_uploads:
+        if print_files or print_val == "YES":
             pf_id = create_folder("Print Files", parent_id=order_folder_id)
             make_public(pf_id)
             try:
@@ -21962,12 +21919,6 @@ def submit_order():
                 for f in print_files:
                     for up_name, up_bytes, up_mime in _iter_print_upload_items(f):
                         print_payloads.append((up_name, up_bytes, up_mime))
-                # Deduplicate by filename — presentation flats already staged from prod expand.
-                seen_print_names = {n for n, _, _ in print_payloads}
-                for up_name, up_bytes, up_mime in presentation_flat_uploads:
-                    if up_name not in seen_print_names:
-                        print_payloads.append((up_name, up_bytes, up_mime))
-                        seen_print_names.add(up_name)
             except JrcoPresentationError as pres_err:
                 return jsonify({"error": str(pres_err)}), 400
 

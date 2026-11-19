@@ -12,6 +12,7 @@ from pypdf import PdfWriter
 from jrco_presentation import (
     JrcoPresentationError,
     expand_presentation_uploads,
+    design_order_fields,
     inspect_presentation,
     is_jrco_presentation_pdf,
     read_jrco_manifest,
@@ -172,6 +173,56 @@ class JrcoPresentationTests(unittest.TestCase):
         self.assertEqual(len(resolved), 1)
         self.assertEqual(resolved[0]["designId"], "design-b")
         self.assertEqual(resolved[0]["bytes"], png_b)
+
+    def test_inspect_passes_photoshop_swatch_fields(self):
+        m = _valid_manifest(
+            design={
+                "furColorName": "Brown Fur",
+                "furColorHex": "#382424",
+                "furColorRgb": [56, 36, 36],
+                "materialCategory": "Ostrich Vinyl",
+                "materialColorName": "Coffee",
+                "leatherColorName": "",
+                "productType": "mallet",
+            }
+        )
+        info = inspect_presentation(
+            _make_presentation_pdf(m),
+            "Atlanta Athletic Club 2026-11-11.pdf",
+        )
+        d = info["designs"][0]
+        self.assertEqual(d["furColorName"], "Brown Fur")
+        self.assertEqual(d["furColorHex"], "#382424")
+        self.assertEqual(d["furColorRgb"], [56, 36, 36])
+        self.assertEqual(d["materialCategory"], "Ostrich Vinyl")
+        self.assertEqual(d["materialColorName"], "Coffee")
+        self.assertEqual(d["leatherColorName"], "")
+        self.assertEqual(
+            d["materials"],
+            [{"category": "Ostrich Vinyl", "colorName": "Coffee", "name": ""}],
+        )
+        self.assertEqual(d["designName"], "")
+
+    def test_order_fields_prefer_materials_list(self):
+        fields = design_order_fields(
+            {
+                "materialCategory": "Ignored",
+                "materialColorName": "Ignored",
+                "furColorName": "Navy Blue Fur",
+                "designName": "patternlogos",
+                "materials": [
+                    {"category": "Cheyenne", "colorName": "Long Rifle"},
+                    {"category": "Wow", "colorName": "Black"},
+                    "Black Fur",
+                ],
+            }
+        )
+        self.assertEqual(fields["designName"], "patternlogos")
+        self.assertEqual(fields["furColorName"], "Navy Blue Fur")
+        self.assertEqual(
+            [m["colorName"] or m["name"] for m in fields["materials"]],
+            ["Long Rifle", "Black", "Black Fur"],
+        )
 
     def test_render_page_keeps_pdf_page_inches(self):
         import fitz
