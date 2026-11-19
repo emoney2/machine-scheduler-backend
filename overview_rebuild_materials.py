@@ -6,11 +6,14 @@ Ports Tools/OverviewMaterialThread.gs (JRCO_rebuildMaterialsToOrder) so the Over
 
 Material model (ledger hole + later-first list split):
   net   = Inventory + On Order
-  toBuy = max(0, Reorder - net)          # Reorder 0 → buy back to 0
+  toBuy = max(0, Reorder - net)          # Reorder 0 → buy back to 0; skip if shortfall ≤ 0.1
   available = max(0, Inventory) + On Order
   rawNow/rawLater = job shortfalls (cover now demand first with available)
   Assign toBuy to rawLater FIRST, remainder to Now.
   Example Leaf Green: Inv -87, On Order 74 → toBuy 14 → Now 0, Later 14.
+  A material is omitted unless work is still open for it:
+    Cut List (not the Fur tab) for Material1–5 and Back Material.
+    Fur List for Fur Color (Emerald Green Fur and the other furs).
 
 Thread model (Min Inv / Reorder from Thread Inventory):
   position = Inventory + max(sheet On Order, Thread Data Ordered cones)
@@ -35,6 +38,12 @@ logger = logging.getLogger(__name__)
 
 FUTURE_DUE_DAYS = 60
 START_ROW = 3
+# Ledger dust (inventory -0.00000046) used to ceil to 1 yard. Only list a buy
+# when the real shortfall is greater than this.
+MIN_MATERIAL_LIST_QTY = 0.1
+# Anything smaller than 1/10000 of a yard or sqft is zero. A balance like
+# -0.0000004615 with nothing on order and no open job is not an action.
+LEDGER_DUST = 1e-4
 # Madeira Polyneon: cones logged to Thread Data as feet (qty × 5500 yd × 3 ft/yd)
 FEET_PER_CONE = 5500 * 3
 ALLOWED_THREAD_STAGES = frozenset({"ordered", "fur", "cut", "print", "embroidery"})
@@ -78,6 +87,14 @@ def _as_num(v: Any) -> float:
         return float(v)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _zero_if_dust(v: Any) -> float:
+    """Treat float leftovers such as -0.0000004615 as an empty balance."""
+    n = _as_num(v)
+    if not math.isfinite(n) or abs(n) < LEDGER_DUST:
+        return 0.0
+    return n
 
 
 def _header_index(headers: List[Any], names: List[str]) -> int:
@@ -195,6 +212,199 @@ def _is_terminal_stage(st: str) -> bool:
 def _is_open_material_stage(st: str) -> bool:
     s = (st or "").lower().strip()
     return s in {"ordered", "fur", "cut", "print", "embroidery", "sewing", "sew"}
+
+
+_CUT_MATERIAL_LABELS = (
+    "Material1",
+    "Material2",
+    "Material3",
+    "Material4",
+    "Material5",
+    "Back Material",
+)
+_DONE_STATUS = frozenset({"complete", "completed", "done"})
+
+
+def _cell_is_cut_qty(val: Any) -> bool:
+    """True when a Cut List cell is a submitted quantity, not a material name."""
+    if val is None or isinstance(val, bool):
+        return False
+    if isinstance(val, (int, float)) and math.isfinite(float(val)):
+        return True
+    s = _as_text(val).strip().replace(",", "")
+    if not s:
+        return False
+    try:
+        float(s)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _status_is_done(val: Any) -> bool:
+    return _as_text(val).strip().lower() in _DONE_STATUS
+
+
+def _index_sheet_by_order(values: List[List[Any]]) -> Tuple[Dict[str, int], Dict[str, List[Any]]]:
+    """Header map (lower name → col) and order # → raw row."""
+    headers: Dict[str, int] = {}
+    by_order: Dict[str, List[Any]] = {}
+    if not values:
+        return headers, by_order
+    for i, h in enumerate(values[0] or []):
+        key = re.sub(r"\s+", " ", _as_text(h).strip().lower())
+        if key and key not in headers:
+            headers[key] = i
+    order_idx = headers.get("order #")
+    if order_idx is None:
+        order_idx = headers.get("order number")
+    if order_idx is None:
+        return headers, by_order
+    for raw in values[1:]:
+        row = list(raw or [])
+        oid = _as_order_text(row[order_idx] if order_idx < len(row) else "").strip()
+        if oid:
+            by_order[oid] = row
+    return headers, by_order
+
+
+def _po_material_name(row: List[Any], headers: List[Any], label: str) -> str:
+    keys = [label.lower()]
+    if label.startswith("Material") and label[8:].isdigit():
+        keys.append(("material " + label[8:]).lower())
+    idx = _header_index(headers, keys)
+    if idx >= 0 and idx < len(row):
+        name = _as_text(row[idx]).strip()
+        if name:
+            return name
+    return ""
+
+
+def _outstanding_material_names(
+    po: List[List[Any]],
+    cut_values: Optional[List[List[Any]]],
+    fur_values: Optional[List[List[Any]]],
+) -> Tuple[Optional[set], Optional[set]]:
+    """
+    (cut names, fur names) still open. None means that sheet could not be read,
+    so the caller leaves those materials on the list instead of hiding all of them.
+
+    Cut materials (Material1–5, Back Material) come from Cut List rows that are
+    not complete, and only when that material's cut quantity is still empty.
+    Fur colors come from Fur List rows that are not complete.
+    """
+    if cut_values is None and fur_values is None:
+        return None, None
+    cut_headers, cut_by_order = _index_sheet_by_order(cut_values or [])
+    fur_headers, fur_by_order = _index_sheet_by_order(fur_values or [])
+    po_headers = list(po[0] or []) if po else []
+    stage_idx = _header_index(po_headers, ["stage"])
+    if stage_idx < 0:
+        stage_idx = 8
+    order_idx = _header_index(po_headers, ["order #", "order number", "order"])
+    if order_idx < 0:
+        order_idx = 0
+    fur_color_idx = _header_index(po_headers, ["fur color", "furcolor", "fur"])
+
+    cut_cols: List[Tuple[str, int]] = []
+    for label in _CUT_MATERIAL_LABELS:
+        idx = cut_headers.get(label.lower())
+        if idx is None and label.startswith("Material") and label[8:].isdigit():
+            idx = cut_headers.get(("material " + label[8:]).lower())
+        if idx is not None:
+            cut_cols.append((label, idx))
+    cut_status_idx = cut_headers.get("cut status", cut_headers.get("status"))
+    fur_status_idx = fur_headers.get("fur status", fur_headers.get("status"))
+    fur_sheet_color_idx = fur_headers.get("fur color", fur_headers.get("furcolor"))
+
+    cut_names: Optional[set] = set() if cut_values is not None else None
+    fur_names: Optional[set] = set() if fur_values is not None else None
+
+    def add_cut(name: Any) -> None:
+        if cut_names is None:
+            return
+        key = _normalize_material_name(name)
+        if key:
+            cut_names.add(key)
+
+    def add_fur(name: Any) -> None:
+        if fur_names is None:
+            return
+        key = _normalize_material_name(name)
+        if key:
+            fur_names.add(key)
+
+    for raw in (po or [])[1:]:
+        row = list(raw or [])
+        stage = _as_text(row[stage_idx] if stage_idx < len(row) else "")
+        if _is_terminal_stage(stage):
+            continue
+        oid = _as_order_text(row[order_idx] if order_idx < len(row) else "").strip()
+        if not oid:
+            continue
+
+        cut_row = cut_by_order.get(oid)
+        if cut_row is not None:
+            cut_done = (
+                cut_status_idx is not None
+                and cut_status_idx < len(cut_row)
+                and _status_is_done(cut_row[cut_status_idx])
+            )
+            if not cut_done:
+                labels = cut_cols or [(label, None) for label in _CUT_MATERIAL_LABELS]
+                for label, col in labels:
+                    name = _po_material_name(row, po_headers, label)
+                    if not name and cut_row is not None and col is not None and col < len(cut_row):
+                        src = cut_row[col]
+                        if not _cell_is_cut_qty(src):
+                            name = _as_text(src).strip()
+                    if not name:
+                        continue
+                    if cut_row is not None and col is not None:
+                        dest = col + 1
+                        if dest < len(cut_row) and _cell_is_cut_qty(cut_row[dest]):
+                            continue
+                    add_cut(name)
+
+        fur_row = fur_by_order.get(oid)
+        if fur_row is not None:
+            fur_done = (
+                fur_status_idx is not None
+                and fur_status_idx < len(fur_row)
+                and _status_is_done(fur_row[fur_status_idx])
+            )
+            if not fur_done:
+                color = ""
+                if fur_color_idx >= 0 and fur_color_idx < len(row):
+                    color = _as_text(row[fur_color_idx]).strip()
+                if (
+                    not color
+                    and fur_sheet_color_idx is not None
+                    and fur_sheet_color_idx < len(fur_row)
+                ):
+                    color = _as_text(fur_row[fur_sheet_color_idx]).strip()
+                add_fur(color)
+
+    return cut_names, fur_names
+
+
+def _material_still_needed(
+    name: str,
+    cut_names: Optional[set],
+    fur_names: Optional[set],
+) -> bool:
+    """Keep a buy when Cut List or Fur List still has this material open.
+
+    A sheet that failed to load does not by itself remove the material.
+    """
+    key = _normalize_material_name(name)
+    on_cut = bool(cut_names is not None and key in cut_names)
+    on_fur = bool(fur_names is not None and key in fur_names)
+    if on_cut or on_fur:
+        return True
+    if cut_names is None or fur_names is None:
+        return True
+    return False
 
 
 def _parse_date(v: Any) -> Optional[datetime]:
@@ -355,11 +565,17 @@ def _material_buy_later_first(
     """
     toBuy from ledger hole; assign to later job shortfall first, remainder to now.
     """
-    inv = float(on_hand or 0)
-    oo = float(on_ord or 0)
+    inv = _zero_if_dust(on_hand)
+    oo = _zero_if_dust(on_ord)
+    sum_now = _zero_if_dust(sum_now)
+    sum_future = _zero_if_dust(sum_future)
     net = inv + oo
     target = max(0.0, float(reorder or 0))
-    to_buy = max(0, int(math.ceil(target - net - 1e-9)))
+    raw_hole = target - net
+    if raw_hole <= MIN_MATERIAL_LIST_QTY:
+        to_buy = 0
+    else:
+        to_buy = max(0, int(math.ceil(raw_hole - 1e-9)))
     available = max(0.0, inv) + max(0.0, oo)
     raw_now, raw_later, _ = _allocate_stock_cover_near_first(available, sum_now, sum_future)
     meta = {
@@ -532,6 +748,24 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
     ti = _fetch_values(svc, spreadsheet_id, "Thread Inventory")
     td = _fetch_values(svc, spreadsheet_id, "Thread Data")
     ml = _fetch_values(svc, spreadsheet_id, "Material Log")
+    cut_values: Optional[List[List[Any]]] = None
+    fur_values: Optional[List[List[Any]]] = None
+    try:
+        cut_values = _fetch_values(svc, spreadsheet_id, "Cut List!A1:ZZ")
+    except Exception:
+        logger.exception("Cut List read failed; materials will not be gated on uncut jobs")
+        cut_values = None
+    try:
+        fur_values = _fetch_values(svc, spreadsheet_id, "Fur List!A1:ZZ")
+    except Exception:
+        logger.exception("Fur List read failed; fur colors will not be gated on open fur jobs")
+        fur_values = None
+    open_cut_names, open_fur_names = _outstanding_material_names(po, cut_values, fur_values)
+    logger.info(
+        "Open material names: cut=%s fur=%s",
+        "unread" if open_cut_names is None else len(open_cut_names),
+        "unread" if open_fur_names is None else len(open_fur_names),
+    )
 
     if not po or not mi or not ti or not td:
         raise RuntimeError("Missing required sheet data (Production Orders / inventories / Thread Data).")
@@ -624,8 +858,8 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
         name = _as_text(_cell(row, 0)).strip()
         if not name:
             continue
-        on_hand = _as_num(_cell(row, 1))
-        on_ord = _as_num(_cell(row, 2))
+        on_hand = _zero_if_dust(_cell(row, 1))
+        on_ord = _zero_if_dust(_cell(row, 2))
         unit = _as_text(_cell(row, 3))
         # Thread cones are owned by Thread Inventory (Min Inv / Reorder).
         # Skip Cone rows (and header junk like "Thread Colors Auto Order…") here
@@ -652,11 +886,30 @@ def rebuild_materials_to_order(sheets_service, spreadsheet_id: str) -> Dict[str,
             hs_by_order,
             idx_ml_panel,
         )
+        sum_now = _zero_if_dust(sum_now)
+        sum_future = _zero_if_dust(sum_future)
+        # ~0 on hand, nothing inbound, and no open job still needs this material.
+        if (
+            on_hand == 0
+            and on_ord == 0
+            and sum_now == 0
+            and sum_future == 0
+            and not _material_still_needed(name, open_cut_names, open_fur_names)
+        ):
+            continue
         now_mat, future_mat, meta = _material_buy_later_first(
             on_hand, on_ord, reorder, sum_now, sum_future
         )
 
         if now_mat <= 0 and future_mat <= 0:
+            continue
+        # Inventory can be short with nothing left to cut or fur. Do not order then.
+        if not _material_still_needed(name, open_cut_names, open_fur_names):
+            logger.info(
+                "skip %s: toBuy=%s but no open Cut List or Fur List job",
+                name,
+                meta.get("toBuy") or 0,
+            )
             continue
 
         if future_mat > 0 and now_mat == 0:

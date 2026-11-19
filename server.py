@@ -14923,6 +14923,12 @@ def _overview_parse_material_lines_to_vendor_groups(lines, material_color_map):
             continue
 
         typ = "Thread" if unit.lower().startswith("cone") else "Material"
+        try:
+            qty_num = float(qty)
+        except (TypeError, ValueError):
+            qty_num = 0.0
+        if typ == "Material" and qty_num <= 0:
+            continue
         material_color = None
         if typ == "Material" and material_color_map:
             material_color = material_color_map.get(name.lower())
@@ -15105,6 +15111,46 @@ def _overview_attach_uncut_jobs(groups, jobs_by_material):
             key = _overview_norm_material_name(item.get("name"))
             item["jobs"] = list(jobs_by_material.get(key) or [])
     return groups
+
+
+# Balances smaller than this are float dust (for example -0.0000004615), not stock.
+_OVERVIEW_LEDGER_DUST = 1e-4
+
+
+def _overview_drop_idle_dust_materials(groups, ledger):
+    """Hide a material that is effectively zero, with nothing on order and no open job.
+
+    Overview lists are an action list. A name like 2 Tone Deep Croco Ocean Black
+    at -0.0000004615 yards and no outstanding cut does not belong on it.
+    """
+    ledger = ledger or {}
+    kept = []
+    for grp in groups or []:
+        items = []
+        for item in grp.get("items") or []:
+            if str(item.get("type") or "").lower() == "thread":
+                items.append(item)
+                continue
+            jobs = item.get("jobs") or []
+            levels = ledger.get(_overview_norm_material_name(item.get("name")))
+            if levels and not jobs:
+                try:
+                    inv = float(levels[0])
+                    on_order = float(levels[1])
+                except (TypeError, ValueError):
+                    inv = on_order = None
+                if (
+                    inv is not None
+                    and isfinite(inv)
+                    and isfinite(on_order)
+                    and abs(inv) < _OVERVIEW_LEDGER_DUST
+                    and abs(on_order) < _OVERVIEW_LEDGER_DUST
+                ):
+                    continue
+            items.append(item)
+        if items:
+            kept.append({**grp, "items": items})
+    return kept
 
 
 def _overview_ship_address(row: dict) -> dict:
@@ -15408,8 +15454,9 @@ def build_overview_payload():
     try:
         svc = get_sheets_service().spreadsheets().values()
 
-        # Fetch Material Inventory once for color lookups (optimization)
+        # Fetch Material Inventory once for color lookups and the idle-dust filter.
         material_color_map = {}
+        material_ledger = {}
         try:
             inv_resp = svc.get(
                 spreadsheetId=SPREADSHEET_ID,
@@ -15419,16 +15466,33 @@ def build_overview_payload():
             inv_rows = inv_resp.get("values", [])
             if inv_rows and len(inv_rows) > 1:
                 headers = [str(h).strip() for h in inv_rows[0]]
-                name_idx = headers.index("Materials") if "Materials" in headers else 0
-                color_idx = headers.index("Color") if "Color" in headers else None
+                header_keys = [
+                    re.sub(r"\s+", " ", str(h or "").strip().lower()) for h in headers
+                ]
 
-                if color_idx is not None:
-                    for row in inv_rows[1:]:
-                        if len(row) > name_idx and len(row) > color_idx:
-                            mat_name = str(row[name_idx]).strip().lower()
-                            mat_color = str(row[color_idx]).strip() if row[color_idx] else None
-                            if mat_name and mat_color:
-                                material_color_map[mat_name] = mat_color
+                def _inv_col(names, fallback):
+                    for name in names:
+                        if name in header_keys:
+                            return header_keys.index(name)
+                    return fallback
+
+                name_idx = _inv_col(["materials", "material"], 0)
+                color_idx = _inv_col(["color"], -1)
+                inv_idx = _inv_col(["inventory..", "inventory"], 1)
+                on_order_idx = _inv_col(["on order..", "on order"], 2)
+
+                for row in inv_rows[1:]:
+                    if len(row) <= name_idx:
+                        continue
+                    mat_name = str(row[name_idx]).strip()
+                    if not mat_name:
+                        continue
+                    if color_idx >= 0 and len(row) > color_idx and row[color_idx]:
+                        material_color_map[mat_name.lower()] = str(row[color_idx]).strip()
+                    material_ledger[_overview_norm_material_name(mat_name)] = (
+                        row[inv_idx] if inv_idx < len(row) else 0,
+                        row[on_order_idx] if on_order_idx < len(row) else 0,
+                    )
         except Exception as e:
             app.logger.warning(f"Failed to fetch Material Inventory for color lookup: {e}")
 
@@ -15448,17 +15512,23 @@ def build_overview_payload():
             len(lines_future),
         )
 
-        vendor_list = _overview_attach_uncut_jobs(
-            _overview_parse_material_lines_to_vendor_groups(
-                lines_now, material_color_map
+        vendor_list = _overview_drop_idle_dust_materials(
+            _overview_attach_uncut_jobs(
+                _overview_parse_material_lines_to_vendor_groups(
+                    lines_now, material_color_map
+                ),
+                uncut_by_material,
             ),
-            uncut_by_material,
+            material_ledger,
         )
-        vendor_list_future = _overview_attach_uncut_jobs(
-            _overview_parse_material_lines_to_vendor_groups(
-                lines_future, material_color_map
+        vendor_list_future = _overview_drop_idle_dust_materials(
+            _overview_attach_uncut_jobs(
+                _overview_parse_material_lines_to_vendor_groups(
+                    lines_future, material_color_map
+                ),
+                uncut_by_material,
             ),
-            uncut_by_material,
+            material_ledger,
         )
         app.logger.info(
             "📦 Materials grouped: now=%s vendors (%s items), future=%s vendors (%s items)",
@@ -21090,32 +21160,113 @@ def make_public(file_id, drive_service):
         fileId=file_id, body={"type": "anyone", "role": "reader"}, fields="id"
     ).execute()
 
+def _sheet_order_key(value):
+    """Match Production Orders / Material Log order numbers across 1234, 1234.0, and 1,234."""
+    s = str(value or "").strip().lstrip("#").replace(",", "")
+    if not s:
+        return ""
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".", 1)[0]
+    try:
+        n = float(s)
+    except ValueError:
+        return s
+    if abs(n - round(n)) < 1e-9:
+        return str(int(round(n)))
+    return s
+
+
+def _append_material_log_sheet_rows(log_rows, when_text):
+    """Append usage rows onto the Material Log tab in this request.
+
+    O/R is left blank. OUT rows are consumption, not purchases waiting to be received.
+    """
+    if not log_rows:
+        return 0
+    header_rows = fetch_sheet(SPREADSHEET_ID, "Material Log!1:1") or []
+    headers = [str(h or "").strip() for h in (header_rows[0] if header_rows else [])]
+    if not any(headers):
+        raise RuntimeError("Material Log header row is missing")
+
+    values = []
+    for rec in log_rows:
+        row = [""] * len(headers)
+        for i, header in enumerate(headers):
+            if not header or header == "O/R":
+                continue
+            if header == "Date":
+                row[i] = when_text
+                continue
+            val = rec.get(header)
+            if val not in (None, ""):
+                row[i] = val
+        values.append(row)
+
+    with sheet_lock:
+        get_sheets_service().spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="Material Log!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": values},
+        ).execute()
+
+    global _matlog_cache
+    _matlog_cache = None
+    try:
+        invalidate_materials_needed_cache()
+    except Exception:
+        pass
+    try:
+        invalidate_material_inventory_status_cache()
+    except Exception:
+        pass
+    return len(values)
+
+
 def write_material_log_for_order(order_number):
     """
-    Python port of Apps Script material logging logic.
-    Writes Material Log rows to Supabase only.
-    Google Sheets + Apps Script continue running in parallel.
+    Write this order's OUT rows onto the Material Log sheet immediately.
+    Supabase gets the same rows when it is configured.
+    Apps Script is only a backup if the sheet append fails.
     """
 
-    if not supabase:
-        logger.warning("[MATLOG] Supabase not configured, skipping")
-        return
-
+    sheet_written = False
+    queued_backup = False
     try:
         # ───────────────────────────────────────────────────────────
-        # 1) Fetch Production Orders
-        po = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
-        if not po or len(po) < 2:
-            logger.error("[MATLOG] Production Orders empty")
-            return
-
-        headers = po[0]
-        rows = po[1:]
-        h = {k: i for i, k in enumerate(headers)}
-
-        row = next((r for r in rows if str(r[h["Order #"]]) == str(order_number)), None)
+        # 1) Fetch Production Orders (retry: the new row was just written)
+        row = None
+        h = None
+        for attempt in range(3):
+            po = fetch_sheet(SPREADSHEET_ID, ORDERS_RANGE)
+            if not po or len(po) < 2:
+                logger.error("[MATLOG] Production Orders empty")
+                return
+            headers = po[0]
+            h = {k: i for i, k in enumerate(headers)}
+            if "Order #" not in h:
+                logger.error("[MATLOG] Production Orders missing Order # column")
+                return
+            want = _sheet_order_key(order_number)
+            order_idx = h["Order #"]
+            row = next(
+                (
+                    r
+                    for r in po[1:]
+                    if _sheet_order_key(r[order_idx] if order_idx < len(r) else "")
+                    == want
+                ),
+                None,
+            )
+            if row:
+                break
+            if attempt < 2:
+                time.sleep(0.5)
         if not row:
             logger.error("[MATLOG] Order %s not found in sheet", order_number)
+            log_material_to_google_sheets(order_number)
+            queued_backup = True
             return
 
         qty = float(row[h["Quantity"]])
@@ -21236,7 +21387,7 @@ def write_material_log_for_order(order_number):
 
         log_rows = []
 
-        def log(material, usage):
+        def log(material, usage, panel="FRONT"):
             log_rows.append({
                 "Date": datetime.utcnow().isoformat(),
 
@@ -21252,6 +21403,7 @@ def write_material_log_for_order(order_number):
                 "IN/OUT": "OUT",
                 "O/R": "ORDERED",
                 "Recut": "",
+                "Panel": panel,
             })
 
 
@@ -21290,7 +21442,7 @@ def write_material_log_for_order(order_number):
                 continue
 
             base = compute_usage(mat, front_yards, calibrate_driver_yards=True)
-            log(mat, base * (pct / 100))
+            log(mat, base * (pct / 100), "FRONT")
 
         # ───────────────────────────────────────────────────────────
         # 6) Back material
@@ -21300,6 +21452,7 @@ def write_material_log_for_order(order_number):
             log(
                 back_mat,
                 compute_usage(back_mat, back_yards, calibrate_driver_yards=True),
+                "BACK",
             )
 
         # ───────────────────────────────────────────────────────────
@@ -21320,6 +21473,7 @@ def write_material_log_for_order(order_number):
                 log(
                     fur,
                     compute_usage(fur, fur_qty, calibrate_driver_yards=True),
+                    "FUR",
                 )
 
         # ───────────────────────────────────────────────────────────
@@ -21332,110 +21486,110 @@ def write_material_log_for_order(order_number):
                     compute_usage(
                         mat, (v * qty) / ppy, calibrate_driver_yards=True
                     ),
+                    "FOAM",
                 )
 
         for mat in ["N Magnets", "S Magnets"]:
             v = tbl_float(mat)
             if v > 0:
-                log(mat, compute_usage(mat, v * qty))
+                log(mat, compute_usage(mat, v * qty), "HARDWARE")
 
         v = tbl_float("1/2\" Elastic")
         if v > 0:
-            log("1/2\" Elastic", compute_usage("1/2\" Elastic", (v * qty) / 36))
+            log("1/2\" Elastic", compute_usage("1/2\" Elastic", (v * qty) / 36), "ELASTIC")
 
         for mat in ["1/4\" Black Grommets", "Paracord (ft)", "Cord Stoppers"]:
             v = tbl_float(mat)
             if v > 0:
-                log(mat, compute_usage(mat, v * qty))
+                log(mat, compute_usage(mat, v * qty), "PART")
 
         # ───────────────────────────────────────────────────────────
-        # 9) Insert rows into Supabase Material Log
-        for r in log_rows:
-            logger.info("[MATLOG] Inserting row:\n%s", json.dumps(r, indent=2))
-            supabase.table("Material Log").insert(r).execute()
+        # 9) Material Log sheet first (what the shop looks at), then Supabase
+        sheet_stamp = datetime.now(ZoneInfo("America/New_York")).strftime(
+            "%m/%d/%Y %H:%M:%S"
+        )
+        try:
+            added = _append_material_log_sheet_rows(log_rows, sheet_stamp)
+            sheet_written = True
+            logger.info(
+                "[MATLOG] Appended %s Material Log sheet rows for order %s",
+                added,
+                order_number,
+            )
+        except Exception:
+            logger.exception(
+                "[MATLOG] Direct Material Log append failed for order %s; using Apps Script backup",
+                order_number,
+            )
+            log_material_to_google_sheets(order_number)
+            queued_backup = True
 
-        logger.info("[MATLOG] Inserted %s rows for order %s", len(log_rows), order_number)
+        if supabase:
+            for r in log_rows:
+                sb_row = {k: v for k, v in r.items() if k != "Panel"}
+                logger.info("[MATLOG] Inserting row:\n%s", json.dumps(sb_row, indent=2))
+                supabase.table("Material Log").insert(sb_row).execute()
+            logger.info("[MATLOG] Inserted %s Supabase rows for order %s", len(log_rows), order_number)
+        else:
+            logger.warning("[MATLOG] Supabase not configured; sheet rows still written for order %s", order_number)
 
     except Exception:
         logger.exception("[MATLOG] Failure for order %s", order_number)
+        if not sheet_written and not queued_backup:
+            log_material_to_google_sheets(order_number)
 
 
 def log_material_to_google_sheets(order_number):
     """
-    Calls Google Apps Script web app to log materials to Material Log sheet.
-    This is needed because onEdit triggers don't fire for programmatic edits.
+    Backup writer. The submit path appends Material Log rows itself.
+    This runs only when that append did not happen. onEdit does not fire for API writes.
     """
-    logger.info("[MaterialLog] Attempting to log materials to Google Sheets for order %s", order_number)
+    logger.info("[MaterialLog] Apps Script backup for order %s", order_number)
     apps_script_url = os.environ.get("GOOGLE_APPS_SCRIPT_WEBAPP_URL")
-    
+
     if not apps_script_url:
-        logger.error("[MaterialLog] GOOGLE_APPS_SCRIPT_WEBAPP_URL environment variable not set! "
-                    "Skipping Google Sheets material log for order %s. "
-                    "Please set this variable to your Google Apps Script web app URL.", order_number)
-        return
-    
-    logger.info("[MaterialLog] Calling Google Apps Script web app at: %s", apps_script_url)
-    
-    try:
-        payload = {
-            "orderNumber": str(order_number)
-        }
-        
-        # Google Apps Script web apps may redirect, so we allow redirects
-        # but also check for HTML error pages
-        response = requests.post(
-            apps_script_url,
-            json=payload,
-            timeout=30,
-            headers={"Content-Type": "application/json"},
-            allow_redirects=True
+        logger.error(
+            "[MaterialLog] GOOGLE_APPS_SCRIPT_WEBAPP_URL is not set. "
+            "Material Log was not written for order %s.",
+            order_number,
         )
-        
+        return
+
+    try:
+        response = _post_google_apps_script_webapp(
+            apps_script_url,
+            {"orderNumber": str(order_number)},
+            timeout=90,
+        )
         response.raise_for_status()
-        
-        # Log response details for debugging
-        content_type = response.headers.get("Content-Type", "")
-        response_text = response.text[:1000]  # First 1000 chars for logging
-        
-        logger.info("[MaterialLog] Response status: %s, Content-Type: %s, Body preview: %s", 
-                    response.status_code, content_type, response_text[:200])
-        
-        # Check if response is HTML (error page or authorization required)
-        if "text/html" in content_type.lower() or response_text.strip().startswith("<"):
-            logger.error("[MaterialLog] Google Apps Script returned HTML instead of JSON for order %s. "
-                        "This usually means the web app needs authorization. "
-                        "Please visit the web app URL in a browser once to authorize it. "
-                        "Response preview: %s", 
-                        order_number, response_text[:500])
+        result, parse_err = _parse_json_from_apps_script_response(response)
+        if parse_err or not result:
+            logger.error(
+                "[MaterialLog] Apps Script backup failed for order %s: %s",
+                order_number,
+                parse_err or "empty response",
+            )
             return
-        
-        # Check if response is empty
-        if not response_text.strip():
-            logger.error("[MaterialLog] Empty response from Google Apps Script for order %s. "
-                        "The web app may not be deployed correctly or the URL may be incorrect.", 
-                        order_number)
-            return
-        
-        # Try to parse JSON
-        try:
-            result = response.json()
-        except ValueError as json_err:
-            logger.error("[MaterialLog] Failed to parse JSON response for order %s. "
-                        "Response text: %s, Error: %s", 
-                        order_number, response_text[:500], str(json_err))
-            return
-        
         if result.get("success"):
-            logger.info("[MaterialLog] Successfully logged materials to Google Sheets for order %s", order_number)
+            logger.info(
+                "[MaterialLog] Apps Script backup logged order %s", order_number
+            )
         else:
-            logger.error("[MaterialLog] Google Apps Script returned error for order %s: %s", 
-                       order_number, result.get("error", "Unknown error"))
-            
+            logger.error(
+                "[MaterialLog] Apps Script backup error for order %s: %s",
+                order_number,
+                result.get("error", "Unknown error"),
+            )
     except requests.exceptions.RequestException as e:
-        logger.error("[MaterialLog] Failed to call Google Apps Script web app for order %s: %s", 
-                    order_number, str(e))
-    except Exception as e:
-        logger.exception("[MaterialLog] Unexpected error calling Google Apps Script for order %s", order_number)
+        logger.error(
+            "[MaterialLog] Apps Script backup request failed for order %s: %s",
+            order_number,
+            str(e),
+        )
+    except Exception:
+        logger.exception(
+            "[MaterialLog] Apps Script backup failed for order %s", order_number
+        )
 
 
 def _last_order_num_from_col_a(col_values):
@@ -22084,22 +22238,12 @@ def submit_order():
                     sb_err,
                 )
 
-        # ─────────────────────────────────────────────────────────────────────
-        # ✅ NEW: WRITE MATERIAL LOG ROWS TO SUPABASE (OPTION B)
-        # ─────────────────────────────────────────────────────────────────────
+        # Material Log sheet (and Supabase) in this request. Apps Script is backup only.
         if not skips_materials:
             try:
                 write_material_log_for_order(new_order)
             except Exception as e:
                 logger.error("[MaterialLog] Failed for order %s: %s", new_order, e)
-
-            # ─────────────────────────────────────────────────────────────────────
-            # ✅ NEW: LOG MATERIALS TO GOOGLE SHEETS MATERIAL LOG VIA APPS SCRIPT
-            # ─────────────────────────────────────────────────────────────────────
-            try:
-                log_material_to_google_sheets(new_order)
-            except Exception as e:
-                logger.error("[MaterialLog] Failed to log to Google Sheets for order %s: %s", new_order, e)
 
         # ─── WRITE SECOND ORDER (BACK) ROW FOR QUILTED FRONT PRODUCTS ──────────
         # (Files already uploaded to back_order_folder_id one-at-a-time above)
@@ -22201,17 +22345,10 @@ def submit_order():
                         sb_err,
                     )
 
-            # Write material log for back order
             try:
                 write_material_log_for_order(back_order)
             except Exception as e:
                 logger.error("[MaterialLog] Failed for back order %s: %s", back_order, e)
-
-            # Log materials to Google Sheets Material Log for back order
-            try:
-                log_material_to_google_sheets(back_order)
-            except Exception as e:
-                logger.error("[MaterialLog] Failed to log to Google Sheets for back order %s: %s", back_order, e)
 
         # First uploaded production file id — UI can show /api/drive/thumbnail on Order Submission strip
         primary_file_id = None
@@ -24210,14 +24347,6 @@ def _create_reorder_from_existing_order_locked(
         write_material_log_for_order(new_order)
     except Exception as e:
         logger.error("[MaterialLog] Failed for reorder %s: %s", new_order, e)
-    try:
-        log_material_to_google_sheets(new_order)
-    except Exception as e:
-        logger.error(
-            "[MaterialLog] Failed to log to Google Sheets for reorder %s: %s",
-            new_order,
-            e,
-        )
 
     if is_quilted_front and back_order:
         back_next_row = next_row + 1
@@ -24296,14 +24425,6 @@ def _create_reorder_from_existing_order_locked(
             write_material_log_for_order(back_order)
         except Exception as e:
             logger.error("[MaterialLog] Failed for back reorder %s: %s", back_order, e)
-        try:
-            log_material_to_google_sheets(back_order)
-        except Exception as e:
-            logger.error(
-                "[MaterialLog] Failed to log to Google Sheets for back reorder %s: %s",
-                back_order,
-                e,
-            )
 
     invalidate_upcoming_cache()
     result = {"status": "ok", "order": new_order}
