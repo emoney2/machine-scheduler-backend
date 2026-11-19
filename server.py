@@ -15055,19 +15055,37 @@ def _overview_sheet_job(headers, row):
     }
 
 
-def _overview_uncut_jobs_by_material(cut_values, fur_values):
+def _overview_complete_production_orders(orders_full):
+    """Order numbers whose Production Orders Stage is Complete."""
+    done = set()
+    for order in orders_full or []:
+        if not isinstance(order, dict):
+            continue
+        stage = str(order.get("Stage") or "").strip().lower()
+        if stage not in {"complete", "completed"}:
+            continue
+        oid = _overview_normalize_order_key(order.get("Order #"))
+        if oid:
+            done.add(oid)
+    return done
+
+
+def _overview_uncut_jobs_by_material(cut_values, fur_values, complete_orders=None):
     """
-    Jobs whose list Status is not Complete.
+    Jobs whose list Status is not Complete and whose Production Orders Stage is not Complete.
 
     Material names containing the word Fur use Fur List Status and Fur Color.
     Every other material uses Cut List Status and Material1–5 / Back Material.
     """
+    complete_orders = complete_orders or set()
     fur_jobs = {}
     cut_jobs = {}
 
     def add_job(bucket, name, job):
         nk = _overview_norm_material_name(name)
         if not nk or not job:
+            return
+        if job.get("order") in complete_orders:
             return
         rows = bucket.setdefault(nk, [])
         if any(existing.get("order") == job.get("order") for existing in rows):
@@ -15089,7 +15107,7 @@ def _overview_uncut_jobs_by_material(cut_values, fur_values):
             if status_idx is not None and status_idx < len(row) and _overview_status_is_complete(row[status_idx]):
                 continue
             job = _overview_sheet_job(headers, row)
-            if not job:
+            if not job or job.get("order") in complete_orders:
                 continue
             for idx in name_idxs:
                 if idx >= len(row):
@@ -15287,7 +15305,11 @@ def build_overview_payload():
             len(orders_full),
         )
         try:
-            uncut_by_material = _overview_uncut_jobs_by_material(cut_rows, fur_rows)
+            uncut_by_material = _overview_uncut_jobs_by_material(
+                cut_rows,
+                fur_rows,
+                _overview_complete_production_orders(orders_full),
+            )
             app.logger.info(
                 "📦 Uncut jobs by material: fur=%d cut=%d",
                 len((uncut_by_material.get("fur") or {})),
