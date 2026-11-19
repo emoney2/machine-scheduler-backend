@@ -15,6 +15,7 @@ from jrco_presentation import (
     inspect_presentation,
     is_jrco_presentation_pdf,
     read_jrco_manifest,
+    render_page_png,
     resolve_flat_pngs,
 )
 
@@ -171,6 +172,21 @@ class JrcoPresentationTests(unittest.TestCase):
         self.assertEqual(len(resolved), 1)
         self.assertEqual(resolved[0]["designId"], "design-b")
         self.assertEqual(resolved[0]["bytes"], png_b)
+
+    def test_render_page_keeps_pdf_page_inches(self):
+        import fitz
+        from PIL import Image
+
+        width_in = 16.615
+        doc = fitz.open()
+        doc.new_page(width=width_in * 72, height=10 * 72)
+        png = render_page_png(doc.tobytes(), 1, max_edge=2400)
+        im = Image.open(BytesIO(png))
+        dpi = im.info.get("dpi")
+        self.assertIsNotNone(dpi)
+        self.assertAlmostEqual(im.size[0] / float(dpi[0]), width_in, places=2)
+        # 2400px at 72 ppi is the 33.33" mis-size this must not produce.
+        self.assertLess(im.size[0] / float(dpi[0]), 20)
 
 
 if __name__ == "__main__":

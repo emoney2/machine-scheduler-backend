@@ -32,6 +32,19 @@ class NormalizeDriveImageUploadTests(unittest.TestCase):
             server._normalize_drive_image_upload("headcover-flat.png", pdf, "image/png")
         self.assertIn("PDF bytes", str(ctx.exception))
 
+    def test_downscale_keeps_300ppi_width(self):
+        """A 300 ppi blade-sized flat must not open at 72 ppi after the 2400px cap."""
+        buf = BytesIO()
+        # 4800px @ 300 ppi = 16.0". Capping the long edge at 2400 must stay 16.0".
+        Image.new("RGB", (4800, 1200), color=(255, 255, 255)).save(buf, format="PNG")
+        out = server._downscale_png_for_sheet_image(buf.getvalue(), max_edge=2400)
+        im = Image.open(BytesIO(out))
+        dpi = im.info.get("dpi")
+        self.assertIsNotNone(dpi)
+        self.assertAlmostEqual(im.size[0] / dpi[0], 16.0, places=2)
+        self.assertLess(abs(im.size[0] / 72.0 - 33.33), 1.0)
+        self.assertGreater(dpi[0], 100)
+
     def test_rejects_html_labeled_png(self):
         html = b"<!DOCTYPE html><html><body>login</body></html>"
         with self.assertRaises(ValueError) as ctx:

@@ -19605,6 +19605,25 @@ def _require_drive_public(drive, file_id, *, context: str, name: str = "") -> No
     )
 
 
+# Design templates (Blade, Mallet, Driver, …) are 300 ppi. Export often strips
+# the PNG pHYs chunk; a 2400px Image file then opens at 72 ppi and measures
+# 33.33" instead of the template width (~16.5" for a blade).
+_PRODUCTION_FLAT_PPI = 300.0
+
+
+def _png_ppi(im) -> tuple[float, float] | None:
+    dpi = im.info.get("dpi")
+    if not isinstance(dpi, (tuple, list)) or len(dpi) < 2:
+        return None
+    try:
+        x, y = float(dpi[0]), float(dpi[1])
+    except (TypeError, ValueError):
+        return None
+    if x <= 1 or y <= 1:
+        return None
+    return x, y
+
+
 def _downscale_png_for_sheet_image(
     raw_bytes: bytes,
     *,
@@ -19613,8 +19632,9 @@ def _downscale_png_for_sheet_image(
 ) -> bytes:
     """
     JR presentation flats are often 50–100MB. Sheets IMAGE(uc?export=view) and
-    the Drive viewer fail or show a blank/sliver preview for those. Keep full-res
-    copies in Print Files; shrink only the Image-column file.
+    the Drive viewer fail or show a blank/sliver preview for those. Shrink the
+    Image-column file so the sheet preview can render, keeping the template's
+    physical size (inches) in the PNG resolution.
     """
     data = raw_bytes or b""
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -19639,23 +19659,37 @@ def _downscale_png_for_sheet_image(
         im.load()
         w, h = im.size
         long_edge = max(w, h) or 1
+        src_ppi = _png_ppi(im)
+        if src_ppi is None and long_edge > max_edge:
+            src_ppi = (_PRODUCTION_FLAT_PPI, _PRODUCTION_FLAT_PPI)
+        resized = False
         if long_edge > max_edge:
             scale = float(max_edge) / float(long_edge)
             nw = max(1, int(round(w * scale)))
             nh = max(1, int(round(h * scale)))
             im = im.resize((nw, nh), getattr(PILImage, "Resampling", PILImage).LANCZOS)
+            resized = True
+        else:
+            nw, nh = im.size
         if im.mode not in ("RGB", "RGBA", "L"):
             im = im.convert("RGBA" if "A" in (im.mode or "") else "RGB")
         out = _BytesIO()
-        im.save(out, format="PNG", optimize=True)
+        save_kwargs = {"format": "PNG", "optimize": True}
+        if src_ppi:
+            save_kwargs["dpi"] = (
+                nw * src_ppi[0] / float(w),
+                nh * src_ppi[1] / float(h),
+            )
+        im.save(out, **save_kwargs)
         shrunk = out.getvalue()
-        if shrunk and len(shrunk) < len(data):
+        if shrunk and (resized or len(shrunk) < len(data)):
             logger.info(
-                "[drive-upload] downscaled Image PNG %s→%s bytes (%sx%s)",
+                "[drive-upload] downscaled Image PNG %s→%s bytes (%sx%s @ %s ppi)",
                 len(data),
                 len(shrunk),
                 im.size[0],
                 im.size[1],
+                save_kwargs.get("dpi"),
             )
             return shrunk
     except Exception as e:

@@ -245,7 +245,10 @@ def render_page_png(
         long_edge = max(float(rect.width) or 1.0, float(rect.height) or 1.0)
         target = max(400, min(int(max_edge or 2400), 4000))
         zoom = max(0.5, min(4.0, float(target) / long_edge))
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        # PNG pHYs must match the zoom. Leaving it at 72 or 96 ppi turns a
+        # 2400px edge into ~33" or ~25" instead of the PDF page size.
+        dpi = max(36, int(round(72.0 * zoom)))
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
         try:
             png = pix.tobytes("png")
         except Exception:
@@ -253,7 +256,7 @@ def render_page_png(
 
             img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
             buf = BytesIO()
-            img.save(buf, format="PNG", optimize=True)
+            img.save(buf, format="PNG", optimize=True, dpi=(dpi, dpi))
             png = buf.getvalue()
         if not png:
             raise JrcoPresentationError(f"Failed to rasterize page {page_n}")
