@@ -5419,8 +5419,9 @@ def _photo_station_ensure_session_folder(drive, session_id: str):
     """Create (or reuse) a per-capture subfolder under the Photo Station root."""
     root_id = _get_photo_station_root_folder_id(drive)
     name = (session_id or "").strip() or f"session_{int(time.time())}"
-    # Keep Drive folder names simple
-    name = re.sub(r"[^\w.\- ]+", "_", name)[:120] or f"session_{int(time.time())}"
+    # Keep the readable "Order - Job - Product" name; drop only path-illegal characters.
+    name = re.sub(r'[\\/:*?"<>|]+', " ", name)
+    name = re.sub(r"\s+", " ", name).strip()[:120] or f"session_{int(time.time())}"
     safe = name.replace("'", "\\'")
     q = (
         f"name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' "
@@ -5535,6 +5536,36 @@ def photo_station_upload():
     except Exception as e:
         app.logger.exception("photo_station_upload failed")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/photo-station/job", methods=["GET"])
+@login_required_session
+def photo_station_job():
+    """
+    Look up a scanned job (Order #) for the photo station.
+    Returns the order number, design (job name), company, and product.
+    Does not build Drive thumbnails.
+    """
+    order_number = (request.args.get("orderNumber") or "").strip()
+    if not order_number:
+        return jsonify({"error": "missing orderNumber"}), 400
+    try:
+        ensure_orders_cache()
+        row = _orders_get_by_id_cached(order_number)
+    except Exception as e:
+        app.logger.exception("photo_station_job lookup failed")
+        return jsonify({"error": str(e)}), 500
+    if not row:
+        return jsonify({"error": "Order not found"}), 404
+    return jsonify(
+        {
+            "ok": True,
+            "order": str(row.get("Order #") or order_number).strip(),
+            "jobName": str(row.get("Design") or "").strip(),
+            "company": str(row.get("Company Name") or "").strip(),
+            "product": str(row.get("Product") or "").strip(),
+        }
+    )
 
 
 # === KANBAN: upsert item (manager) ============================================
