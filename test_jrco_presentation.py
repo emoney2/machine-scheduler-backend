@@ -15,9 +15,12 @@ from jrco_presentation import (
     design_order_fields,
     inspect_presentation,
     is_jrco_presentation_pdf,
+    next_print_pdf_filename,
+    order_print_pdf_filename,
     read_jrco_manifest,
     render_page_png,
     resolve_flat_pngs,
+    resolve_print_pdf,
 )
 
 
@@ -238,6 +241,72 @@ class JrcoPresentationTests(unittest.TestCase):
         self.assertAlmostEqual(im.size[0] / float(dpi[0]), width_in, places=2)
         # 2400px at 72 ppi is the 33.33" mis-size this must not produce.
         self.assertLess(im.size[0] / float(dpi[0]), 20)
+
+    def test_inspect_print_pdf_fields(self):
+        m = _valid_manifest(
+            design={
+                "printPdfDriveFileId": "print123",
+                "printPdfSha256": "b" * 64,
+                "printView": "front only",
+                "designName": "Logo",
+            }
+        )
+        info = inspect_presentation(_make_presentation_pdf(m), "x.pdf")
+        design = info["designs"][0]
+        self.assertTrue(info["ok"])
+        self.assertEqual(design["printIdKind"], "drive")
+        self.assertEqual(design["printPdfDriveFileId"], "print123")
+        self.assertEqual(design["printPdfSha256"], "b" * 64)
+        self.assertEqual(design["printView"], "front only")
+        self.assertIsNone(design["printError"])
+        self.assertEqual(design["designName"], "Logo")
+
+    def test_empty_print_id_is_not_an_error(self):
+        info = inspect_presentation(_make_presentation_pdf(_valid_manifest()), "x.pdf")
+        design = info["designs"][0]
+        self.assertTrue(info["ok"])
+        self.assertEqual(design["printIdKind"], "empty")
+        self.assertEqual(design["printPdfDriveFileId"], "")
+        self.assertIsNone(design["printError"])
+
+    def test_local_print_id_does_not_block_the_flat(self):
+        m = _valid_manifest(design={"printPdfDriveFileId": "local:" + "ab" * 32})
+        info = inspect_presentation(_make_presentation_pdf(m), "x.pdf")
+        self.assertTrue(info["ok"])
+        self.assertEqual(info["designs"][0]["printIdKind"], "local")
+        self.assertIn("never uploaded", info["designs"][0]["printError"])
+
+    def test_print_filename_strips_and_suffixes(self):
+        self.assertEqual(
+            order_print_pdf_filename("1640", 'Driver: Front'),
+            "1640 - Print File - Driver Front.pdf",
+        )
+        existing = {"1640 - Print File - Driver Front.pdf"}
+        self.assertEqual(
+            next_print_pdf_filename(existing, "1640", "Driver Front"),
+            "1640 - Print File - Driver Front-2.pdf",
+        )
+        existing.add("1640 - Print File - Driver Front-2.pdf")
+        self.assertEqual(
+            next_print_pdf_filename(existing, "1640", "Driver Front"),
+            "1640 - Print File - Driver Front-3.pdf",
+        )
+
+    def test_resolve_print_pdf_verifies_sha_and_rejects_local(self):
+        pdf = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF"
+        digest = hashlib.sha256(pdf).hexdigest()
+        self.assertEqual(
+            resolve_print_pdf("print-id", digest, lambda _fid: pdf),
+            pdf,
+        )
+        with self.assertRaises(JrcoPresentationError) as bad_hash:
+            resolve_print_pdf("print-id", "0" * 64, lambda _fid: pdf)
+        self.assertIn("SHA-256", str(bad_hash.exception))
+        with self.assertRaises(JrcoPresentationError) as local:
+            resolve_print_pdf("local:abc", digest, lambda _fid: pdf)
+        self.assertIn("never uploaded", str(local.exception))
+        with self.assertRaises(JrcoPresentationError):
+            resolve_print_pdf("", digest, lambda _fid: pdf)
 
 
 if __name__ == "__main__":

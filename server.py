@@ -230,7 +230,9 @@ from jrco_presentation import (
     is_jrco_presentation_pdf,
     is_pdf_filename,
     looks_like_pdf,
+    next_print_pdf_filename,
     render_page_png,
+    resolve_print_pdf,
 )
 
 
@@ -7179,6 +7181,38 @@ def api_jrco_presentation_page_flat():
     except Exception as e:
         logger.exception("[jrco-presentation/page-flat] failed")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/jrco-presentation/print-pdf", methods=["GET", "OPTIONS"])
+def api_jrco_presentation_print_pdf():
+    """
+    Download one manifest print PDF for the order-form Print Preview.
+
+    Query: ``fileId`` and ``sha256``. Bytes are returned only after
+    sha256(bytes) matches. Nothing is saved onto an order here.
+    ``local:`` and an empty id are rejected — an empty id is not a print file,
+    and ``local:`` must not be guessed.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    file_id = (request.args.get("fileId") or "").strip()
+    sha = (request.args.get("sha256") or "").strip()
+    try:
+        drive = get_drive_service()
+        pdf = resolve_print_pdf(
+            file_id,
+            sha,
+            lambda fid, drive=drive: _download_drive_file_bytes(drive, fid),
+        )
+    except JrcoPresentationError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        logger.exception("[jrco-presentation/print-pdf] failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+    resp = Response(pdf, status=200, mimetype="application/pdf")
+    resp.headers["Cache-Control"] = "private, max-age=300"
+    resp.headers["Content-Disposition"] = 'inline; filename="print-file.pdf"'
+    return resp
 
 
 @app.route("/api/upload-email-preview", methods=["POST", "OPTIONS"])
@@ -19996,19 +20030,185 @@ def _upload_edit_print_files(drive, order_folder_id, file_storages, design_ids=N
         if is_jrco_presentation_pdf(raw, name):
             logger.info("[order-edit] skipping presentation PDF in Print Files: %s", name)
             continue
-        payloads = [(name, raw, mime)]
+        up_name, up_bytes, up_mime = _prepare_print_upload(name, raw, mime)
+        payloads = [(up_name, up_bytes, up_mime)]
         for up_name, up_bytes, up_mime in payloads:
             buf = BytesIO(up_bytes)
             media = MediaIoBaseUpload(
                 buf, mimetype=up_mime or "application/octet-stream"
             )
             drive.files().create(
-                body={"name": up_name, "parents": [pf_id]},
+                body={
+                    "name": up_name,
+                    "parents": [pf_id],
+                    "mimeType": up_mime or "application/octet-stream",
+                },
                 media_body=media,
-                fields="id",
+                fields="id,mimeType",
+                supportsAllDrives=True,
             ).execute()
 
     return f"https://drive.google.com/drive/folders/{pf_id}"
+
+
+def _print_folder_filenames(drive, print_folder_id) -> set[str]:
+    names: set[str] = set()
+    page_token = None
+    while True:
+        res = (
+            drive.files()
+            .list(
+                q=f"'{print_folder_id}' in parents and trashed = false",
+                fields="nextPageToken, files(name)",
+                pageSize=200,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        for item in res.get("files") or []:
+            name = item.get("name")
+            if name:
+                names.add(name)
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return names
+
+
+def _ensure_print_files_folder(drive, order_folder_id) -> str:
+    """Return the order's Print Files folder, creating it when missing."""
+    pf_id = _find_folder_in_parent(drive, "Print Files", order_folder_id)
+    if not pf_id:
+        pf_id = _create_named_drive_folder(drive, "Print Files", order_folder_id)
+    try:
+        drive.permissions().create(
+            fileId=pf_id, body={"role": "reader", "type": "anyone"}
+        ).execute()
+    except Exception:
+        pass
+    return pf_id
+
+
+def _discard_drive_file(drive, file_id: str) -> None:
+    if not file_id:
+        return
+    try:
+        drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+    except Exception:
+        try:
+            drive.files().update(
+                fileId=file_id,
+                body={"trashed": True},
+                supportsAllDrives=True,
+            ).execute()
+        except Exception:
+            logger.warning("[print-pdf] could not remove non-PDF file %s", file_id)
+
+
+def _prepare_print_upload(name: str, raw: bytes, mime: str | None):
+    """Print-folder upload. PDF bytes stay a PDF; never rasterize them."""
+    if looks_like_pdf(raw):
+        base = str(name or "print").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        if not base.lower().endswith(".pdf"):
+            stem = base.rsplit(".", 1)[0] if "." in base else base
+            base = f"{stem or 'print'}.pdf"
+        return base, raw, "application/pdf"
+    return _normalize_drive_image_upload(name, raw, mime)
+
+
+def _upload_pdf_bytes(drive, print_folder_id: str, fname: str, pdf_bytes: bytes) -> dict:
+    from io import BytesIO
+
+    buf = BytesIO(pdf_bytes)
+    buf.seek(0)
+    media = MediaIoBaseUpload(buf, mimetype="application/pdf", resumable=False)
+    return drive.files().create(
+        body={
+            "name": fname,
+            "parents": [print_folder_id],
+            "mimeType": "application/pdf",
+        },
+        media_body=media,
+        fields="id,name,mimeType",
+        supportsAllDrives=True,
+    ).execute()
+
+
+def _upload_verified_print_pdf(
+    drive,
+    print_folder_id,
+    order_number,
+    product_name,
+    pdf_bytes,
+    source_file_id: str = "",
+) -> str:
+    """Save the print file as a real PDF named ``{order} - Print File - {Product}.pdf``."""
+    if not looks_like_pdf(pdf_bytes):
+        raise JrcoPresentationError(
+            "Print file must be saved as a PDF. The downloaded file is not a PDF."
+        )
+    fname = next_print_pdf_filename(
+        _print_folder_filenames(drive, print_folder_id),
+        order_number,
+        product_name,
+    )
+    if not str(fname).lower().endswith(".pdf"):
+        fname = f"{fname}.pdf"
+
+    saved = None
+    source_id = (source_file_id or "").strip()
+    if source_id and not source_id.lower().startswith("local:"):
+        try:
+            meta = drive.files().get(
+                fileId=source_id,
+                fields="id,mimeType",
+                supportsAllDrives=True,
+            ).execute()
+            source_mime = str(meta.get("mimeType") or "")
+            if source_mime in (
+                "application/pdf",
+                "application/x-pdf",
+                "application/acrobat",
+            ):
+                saved = drive.files().copy(
+                    fileId=source_id,
+                    body={"name": fname, "parents": [print_folder_id]},
+                    fields="id,name,mimeType",
+                    supportsAllDrives=True,
+                ).execute()
+        except Exception:
+            logger.exception("[print-pdf] could not copy source PDF %s", source_id)
+            saved = None
+
+    if str((saved or {}).get("mimeType") or "") != "application/pdf":
+        if saved and saved.get("id"):
+            _discard_drive_file(drive, saved.get("id"))
+        saved = _upload_pdf_bytes(drive, print_folder_id, fname, pdf_bytes)
+
+    saved_mime = str((saved or {}).get("mimeType") or "")
+    saved_name = str((saved or {}).get("name") or fname)
+    saved_id = str((saved or {}).get("id") or "")
+    if saved_mime != "application/pdf" or not saved_name.lower().endswith(".pdf"):
+        _discard_drive_file(drive, saved_id)
+        raise JrcoPresentationError(
+            "Print file must be saved as a PDF. "
+            f"Drive stored {saved_mime or 'an unknown type'} as {saved_name}."
+        )
+    if saved_name != fname and saved_id:
+        try:
+            drive.files().update(
+                fileId=saved_id,
+                body={"name": fname},
+                fields="id,name",
+                supportsAllDrives=True,
+            ).execute()
+        except Exception:
+            logger.warning("[print-pdf] could not rename %s to %s", saved_name, fname)
+    _require_drive_public(drive, saved_id, context="print-pdf", name=fname)
+    logger.info("[print-pdf] saved PDF %s (%s) in folder %s", fname, saved_id, print_folder_id)
+    return fname
 
 
 @app.route("/api/orders/<order_id>/edit", methods=["OPTIONS", "POST"])
@@ -20189,6 +20389,20 @@ def edit_order(order_id):
 
             primary_file_id = None
             drive = None
+            linked_print_id = (data.get("jrPrintPdfDriveFileId") or "").strip()
+            linked_print_sha = (data.get("jrPrintPdfSha256") or "").strip()
+            linked_print_bytes = None
+            if linked_print_id:
+                # Preview still attached. Download and verify before any sheet write.
+                drive = get_drive_service()
+                try:
+                    linked_print_bytes = resolve_print_pdf(
+                        linked_print_id,
+                        linked_print_sha,
+                        lambda fid, drive=drive: _download_drive_file_bytes(drive, fid),
+                    )
+                except JrcoPresentationError as pres_err:
+                    return jsonify({"error": str(pres_err)}), 400
             if any(getattr(f, "filename", None) for f in (prod_files or [])):
                 drive = get_drive_service()
                 folder_id = _resolve_order_drive_folder_id(drive, oid)
@@ -20227,6 +20441,29 @@ def edit_order(order_id):
                     return jsonify({"error": str(pres_err)}), 400
                 _queue_change(("Print Files",), print_link, "Print Files")
                 _queue_change(("Print",), "YES", "Print")
+
+            if linked_print_bytes:
+                if drive is None:
+                    drive = get_drive_service()
+                folder_id = _resolve_order_drive_folder_id(drive, oid)
+                if not folder_id:
+                    return jsonify(
+                        {"error": f"Drive folder for order {oid} was not found."}
+                    ), 404
+                pf_id = _ensure_print_files_folder(drive, folder_id)
+                _upload_verified_print_pdf(
+                    drive,
+                    pf_id,
+                    oid,
+                    product,
+                    linked_print_bytes,
+                    source_file_id=linked_print_id,
+                )
+                _queue_change(
+                    ("Print Files",),
+                    f"https://drive.google.com/drive/folders/{pf_id}",
+                    "Print Files",
+                )
 
             if cell_updates:
                 _batch_update_production_order_cells(sheets, row_num, cell_updates)
@@ -20411,11 +20648,12 @@ def edit_order(order_id):
                                     logger.exception(
                                         "[order-edit] back-order file upload failed"
                                     )
-                        if label == "Print Files" and print_files:
+                        if label == "Print Files" and (print_files or linked_print_bytes):
                             if drive is None:
                                 drive = get_drive_service()
                             back_folder = _resolve_order_drive_folder_id(drive, back_order)
-                            if back_folder:
+                            saved_back_print = False
+                            if back_folder and print_files:
                                 for f in print_files:
                                     try:
                                         f.stream.seek(0)
@@ -20428,10 +20666,41 @@ def edit_order(order_id):
                                         print_files,
                                         design_ids=jr_design_ids,
                                     )
+                                    saved_back_print = True
                                 except Exception:
                                     logger.exception(
                                         "[order-edit] back-order print upload failed"
                                     )
+                            if back_folder and linked_print_bytes:
+                                try:
+                                    back_pf = _ensure_print_files_folder(
+                                        drive, back_folder
+                                    )
+                                    back_product_name = (
+                                        back_current.get("Product")
+                                        or str(product or "")
+                                        .replace("Front", "Back")
+                                        .replace("front", "back")
+                                    )
+                                    _upload_verified_print_pdf(
+                                        drive,
+                                        back_pf,
+                                        back_order,
+                                        back_product_name,
+                                        linked_print_bytes,
+                                        source_file_id=linked_print_id,
+                                    )
+                                    new_val = (
+                                        "https://drive.google.com/drive/folders/"
+                                        f"{back_pf}"
+                                    )
+                                    saved_back_print = True
+                                except Exception:
+                                    logger.exception(
+                                        "[order-edit] back-order linked print PDF failed"
+                                    )
+                            if not saved_back_print:
+                                continue
                         back_updates.append((idx, new_val))
                         back_changed.append(label)
                     if back_updates:
@@ -21882,6 +22151,21 @@ def submit_order():
         def make_public(file_id):
             return _make_drive_public(drive, file_id, context="submit")
 
+        # Linked print PDF is present only when its preview was not removed.
+        # Verify before creating the order folder so a bad hash saves nothing.
+        linked_print_id = (data.get("jrPrintPdfDriveFileId") or "").strip()
+        linked_print_sha = (data.get("jrPrintPdfSha256") or "").strip()
+        linked_print_bytes = None
+        if linked_print_id:
+            try:
+                linked_print_bytes = resolve_print_pdf(
+                    linked_print_id,
+                    linked_print_sha,
+                    lambda fid, drive=drive: _download_drive_file_bytes(drive, fid),
+                )
+            except JrcoPresentationError as pres_err:
+                return jsonify({"error": str(pres_err)}), 400
+
         # ─── CREATE FIRST ORDER (FRONT) FOLDER ───────────────────────────────────
         from io import BytesIO
         reorder_from_raw = (data.get("reorderFrom") or "").strip()
@@ -22115,13 +22399,14 @@ def submit_order():
                 return
             yield name, raw, mime
 
-        # Print Files only when the user checked Print or attached print files.
-        # A production PDF / flat PNG must not mark Print or copy into Print Files.
+        # Print Files when Print is checked, a print file was attached, or the
+        # page's print PDF is still in Print Preview. The proof page and the
+        # flat PNG are never copied in as the print file.
         print_val = (data.get("print") or "").strip().upper()
         print_cell = "YES" if print_val == "YES" else "NO"
         print_links = ""
         back_print_links = ""
-        if print_files or print_val == "YES":
+        if print_files or print_val == "YES" or linked_print_bytes:
             pf_id = create_folder("Print Files", parent_id=order_folder_id)
             make_public(pf_id)
             try:
@@ -22136,7 +22421,7 @@ def submit_order():
                 back_pf_id = create_folder("Print Files", parent_id=back_order_folder_id)
                 make_public(back_pf_id)
                 for up_name, up_bytes, up_mime in print_payloads:
-                    name_n, bytes_n, mime_n = _normalize_drive_image_upload(
+                    name_n, bytes_n, mime_n = _prepare_print_upload(
                         up_name, up_bytes, up_mime
                     )
                     buf = BytesIO(bytes_n)
@@ -22176,7 +22461,7 @@ def submit_order():
                 back_print_links = f"https://drive.google.com/drive/folders/{back_pf_id}"
             else:
                 for up_name, up_bytes, up_mime in print_payloads:
-                    name_n, bytes_n, mime_n = _normalize_drive_image_upload(
+                    name_n, bytes_n, mime_n = _prepare_print_upload(
                         up_name, up_bytes, up_mime
                     )
                     buf = BytesIO(bytes_n)
@@ -22197,6 +22482,27 @@ def submit_order():
                         drive, up_pf["id"], context="submit-print", name=name_n
                     )
                     del buf
+            if linked_print_bytes:
+                _upload_verified_print_pdf(
+                    drive,
+                    pf_id,
+                    new_order,
+                    product,
+                    linked_print_bytes,
+                    source_file_id=linked_print_id,
+                )
+                if is_quilted_front and back_pf_id and back_order:
+                    back_product_name = (
+                        str(product or "").replace("Front", "Back").replace("front", "back")
+                    )
+                    _upload_verified_print_pdf(
+                        drive,
+                        back_pf_id,
+                        back_order,
+                        back_product_name,
+                        linked_print_bytes,
+                        source_file_id=linked_print_id,
+                    )
             print_links = f"https://drive.google.com/drive/folders/{pf_id}"
 
         # ─── WRITE TO GOOGLE SHEETS ──────────────────────────────────────────

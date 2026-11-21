@@ -1,8 +1,12 @@
-"""JR Local Presentation PDF → production flat PNG handoff (schemaVersion 1).
+"""JR Local Presentation PDF handoff (schemaVersion 1).
 
 Presentation PDFs embed ``jrco-manifest.json`` as a file attachment. Pages are
 customer proofs only; immutable flat PNGs live on Google Drive (or ``local:<sha>``
 placeholders when desktop Drive upload was not configured).
+
+A design may also name a separate print PDF (``printPdfDriveFileId``). An empty
+id means that design has no print file. ``local:`` means it was never uploaded.
+``printView`` is already baked into that PDF and is not used to rebuild it.
 """
 
 from __future__ import annotations
@@ -19,6 +23,11 @@ logger = logging.getLogger(__name__)
 MANIFEST_NAME = "jrco-manifest.json"
 SCHEMA_VERSION = 1
 LOCAL_ID_PREFIX = "local:"
+LOCAL_PRINT_ERROR = (
+    "This page’s print PDF was never uploaded (local:). "
+    "Re-export after Drive upload. No print file was attached."
+)
+_ILLEGAL_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 
 
 class JrcoPresentationError(ValueError):
@@ -212,6 +221,78 @@ def classify_flat_png_id(file_id: str) -> str:
     return "drive"
 
 
+def order_print_pdf_filename(
+    order_number: str, product_name: str, copy_index: int = 1
+) -> str:
+    """``{order} - Print File - {Product}.pdf``, with ``-2`` / ``-3`` before .pdf."""
+    order = _ILLEGAL_FILENAME_CHARS.sub("", str(order_number or "")).strip() or "order"
+    product = _ILLEGAL_FILENAME_CHARS.sub("", str(product_name or ""))
+    product = re.sub(r"\s+", " ", product).strip() or "Product"
+    stem = f"{order} - Print File - {product}"
+    if copy_index >= 2:
+        stem = f"{stem}-{copy_index}"
+    return f"{stem}.pdf"
+
+
+def next_print_pdf_filename(
+    existing_names, order_number: str, product_name: str
+) -> str:
+    """Pick a Print Files name that does not overwrite an existing file."""
+    taken = {str(name) for name in (existing_names or []) if str(name)}
+    name = order_print_pdf_filename(order_number, product_name, 1)
+    if name not in taken:
+        return name
+    copy_index = 2
+    while True:
+        candidate = order_print_pdf_filename(order_number, product_name, copy_index)
+        if candidate not in taken:
+            return candidate
+        copy_index += 1
+
+
+def resolve_print_pdf(
+    file_id: str,
+    expected_sha256: str,
+    download_bytes: Callable[[str], bytes],
+) -> bytes:
+    """Download a manifest print PDF and require a SHA-256 match.
+
+    Empty ids are not a print file. ``local:`` is an error — do not guess.
+    A hash mismatch raises and must not be saved onto the order.
+    """
+    fid = (file_id or "").strip()
+    kind = classify_flat_png_id(fid)
+    if kind == "empty":
+        raise JrcoPresentationError("This design has no print file.")
+    if kind == "local":
+        raise JrcoPresentationError(LOCAL_PRINT_ERROR)
+    expected = (expected_sha256 or "").strip().lower()
+    if not expected:
+        raise JrcoPresentationError(
+            "Print PDF is missing printPdfSha256. It was not saved."
+        )
+    try:
+        raw = download_bytes(fid)
+    except Exception as e:
+        raise JrcoPresentationError(
+            f"Failed to download print PDF (Drive id {fid}): {e}"
+        ) from e
+    if not raw:
+        raise JrcoPresentationError(
+            f"Empty download for print PDF (Drive id {fid})"
+        )
+    actual = _sha256_hex(raw).lower()
+    if actual != expected:
+        raise JrcoPresentationError(
+            f"SHA-256 mismatch for print PDF: expected {expected}, got {actual}"
+        )
+    if not looks_like_pdf(raw):
+        raise JrcoPresentationError(
+            "Drive file for this print PDF is not a PDF. It was not saved."
+        )
+    return raw
+
+
 def render_page_tiles(
     pdf_bytes: bytes,
     *,
@@ -360,6 +441,8 @@ def inspect_presentation(
     for d in manifest["designs"]:
         fid = str(d.get("flatPngDriveFileId") or "").strip()
         kind = classify_flat_png_id(fid)
+        print_id = str(d.get("printPdfDriveFileId") or "").strip()
+        print_kind = classify_flat_png_id(print_id)
         err = None
         if kind == "local":
             err = (
@@ -384,6 +467,11 @@ def inspect_presentation(
             "idKind": kind,
             "suggestedFilename": design_flat_filename(d, filename),
             "error": err,
+            "printPdfDriveFileId": print_id,
+            "printPdfSha256": str(d.get("printPdfSha256") or "").strip(),
+            "printView": str(d.get("printView") or "").strip(),
+            "printIdKind": print_kind,
+            "printError": LOCAL_PRINT_ERROR if print_kind == "local" else None,
         }
         row.update(design_order_fields(d))
         designs_out.append(row)
