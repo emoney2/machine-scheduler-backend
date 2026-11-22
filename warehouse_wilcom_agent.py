@@ -20,7 +20,7 @@ from typing import Any, Dict
 import requests
 
 AGENT_VERSION = "1.0"
-MACHINE_IDS = ("machine1", "machine2", "machine3", "machine4")
+MACHINE_IDS = ("machine1", "machine2", "machine3", "machine4", "machine5")
 PLACEHOLDER_PREFIX = "REPLACE_WITH_"
 LOG = logging.getLogger("wilcom-agent")
 

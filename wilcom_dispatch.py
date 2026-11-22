@@ -13,7 +13,7 @@ from copy import deepcopy
 from typing import Any, Dict, Iterable, Optional
 
 
-MACHINE_IDS = ("machine1", "machine2", "machine3", "machine4")
+MACHINE_IDS = ("machine1", "machine2", "machine3", "machine4", "machine5")
 TERMINAL_STATES = {"completed", "failed"}
 
 
@@ -75,7 +75,7 @@ class WilcomDispatch:
         if not order:
             raise ValueError("orderId is required")
         if machine not in MACHINE_IDS:
-            raise ValueError("machineId must be machine1, machine2, machine3, or machine4")
+            raise ValueError("machineId must be machine1, machine2, machine3, machine4, or machine5")
 
         with self._lock:
             status = self._agent_status_locked()

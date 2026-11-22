@@ -23,6 +23,7 @@ EMBROIDERY_MACHINE_HEADS = {
     "Machine 2": 6,
     "Machine 3": 6,
     "Machine 4": 6,
+    "Machine 5": 6,
 }
 EMBROIDERY_MACHINES = tuple(EMBROIDERY_MACHINE_HEADS)
 EMBROIDERY_SPEED = 30_000.0

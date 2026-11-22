@@ -8,6 +8,8 @@ from production_scheduler import (
     build_schedule,
     can_split_embroidery_job,
     detect_shipping_groups,
+    EMBROIDERY_MACHINES,
+    embroidery_heads,
     embroidery_hours,
     embroidery_runs,
     estimate_ground_transit_days,
@@ -98,6 +100,10 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(machines, {"Machine 2", "Machine 3", "Machine 4"})
         self.assertTrue(all(j["heads"] == 6 for j in result["embroidery"]))
         self.assertTrue(all(isinstance(j["machine"], str) for j in result["embroidery"]))
+
+    def test_machine_five_is_a_six_head(self):
+        self.assertIn("Machine 5", EMBROIDERY_MACHINES)
+        self.assertEqual(embroidery_heads("Machine 5"), 6)
 
     def test_single_head_machine_is_available(self):
         rows = [order(i, Quantity=30) for i in (100, 200, 300)] + [order(400, Quantity=1)]

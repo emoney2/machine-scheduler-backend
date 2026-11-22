@@ -21139,7 +21139,7 @@ def handle_placeholders_updated(data):
 # Replace the single MANUAL_RANGE and single get() call with this:
 
 MANUAL_PLACEHOLDERS_RANGE = "Manual State!A2:H"
-MANUAL_MACHINES_RANGE = "Manual State!I2:L2"
+MANUAL_MACHINES_RANGE = "Manual State!I2:M2"
 
 
 @app.route("/api/manualState", methods=["GET"])
@@ -21162,22 +21162,23 @@ def get_manual_state():
         ph_rows = resp.get("valueRanges", [{}])[0].get("values") or []
         m_rows = resp.get("valueRanges", [{}, {}])[1].get("values") or []
 
-        # Parse machines (I–J from first row)
-        # Parse machines (I–J from first row) — tolerate single-cell rows
+        # Parse machines (I–M from first row) — tolerate short rows
         first = m_rows[0] if m_rows else []
         c0 = str(first[0]).strip() if len(first) > 0 and first[0] is not None else ""
         c1 = str(first[1]).strip() if len(first) > 1 and first[1] is not None else ""
         c2 = str(first[2]).strip() if len(first) > 2 and first[2] is not None else ""
         c3 = str(first[3]).strip() if len(first) > 3 and first[3] is not None else ""
+        c4 = str(first[4]).strip() if len(first) > 4 and first[4] is not None else ""
 
         # Split, strip, and drop empties
         machine1_ids = [s.strip() for s in c0.split(",") if s and s.strip()]
         machine2_ids = [s.strip() for s in c1.split(",") if s and s.strip()]
         machine3_ids = [s.strip() for s in c2.split(",") if s and s.strip()]
         machine4_ids = [s.strip() for s in c3.split(",") if s and s.strip()]
+        machine5_ids = [s.strip() for s in c4.split(",") if s and s.strip()]
 
         # Build set of ACTIVE IDs (exclude Sewing/Complete) from Production Orders as before...
-        # Just return raw IDs from I2:L2 and placeholders; pruning happens client-side.
+        # Just return raw IDs from I2:M2 and placeholders; pruning happens client-side.
         # Collect placeholders from A–H, stop when A is blank
         phs = []
         for r in ph_rows:
@@ -21198,12 +21199,13 @@ def get_manual_state():
                 }
             )
 
-        # Return raw IDs from I2:L2 and placeholders; pruning happens client-side.
+        # Return raw IDs from I2:M2 and placeholders; pruning happens client-side.
         m1_clean = machine1_ids
         m2_clean = machine2_ids
         m3_clean = machine3_ids
         m4_clean = machine4_ids
-        result = {"machineColumns": [m1_clean, m2_clean, m3_clean, m4_clean], "placeholders": phs}
+        m5_clean = machine5_ids
+        result = {"machineColumns": [m1_clean, m2_clean, m3_clean, m4_clean, m5_clean], "placeholders": phs}
         _manual_state_cache = result
         _manual_state_ts = now
         return jsonify(result), 200
@@ -21220,7 +21222,7 @@ def get_manual_state():
 @login_required_session
 def save_manual_state():
     """
-    Save manual state (machine1–machine4 order + placeholders), but FIRST
+    Save manual state (machine1–machine5 order + placeholders), but FIRST
     prune any order IDs whose Stage is 'Sewing' or 'Complete' in Production Orders.
     """
     try:
@@ -21236,6 +21238,9 @@ def save_manual_state():
         ]
         incoming_m4 = [
             str(x).strip() for x in data.get("machine4", []) if str(x).strip()
+        ]
+        incoming_m5 = [
+            str(x).strip() for x in data.get("machine5", []) if str(x).strip()
         ]
         placeholders = data.get("placeholders", [])
 
@@ -21255,26 +21260,28 @@ def save_manual_state():
         pruned_m2 = _uniq_preserve(incoming_m2)
         pruned_m3 = _uniq_preserve(incoming_m3)
         pruned_m4 = _uniq_preserve(incoming_m4)
+        pruned_m5 = _uniq_preserve(incoming_m5)
 
         # Nothing pruned on the server; client will ignore unknown/complete/sewing IDs
         removed_ids = set()
 
-        # --- Write the pruned lists back to Manual State (I2:L2) ---
+        # --- Write the pruned lists back to Manual State (I2:M2) ---
         i2 = ",".join(pruned_m1)
         j2 = ",".join(pruned_m2)
         k2 = ",".join(pruned_m3)
         l2 = ",".join(pruned_m4)
+        m2 = ",".join(pruned_m5)
 
         # Local Sheets client
         sheets = get_sheets_service().spreadsheets().values()
 
-        # Derive the sheet name from MANUAL_MACHINES_RANGE and write to I2:L2
+        # Derive the sheet name from MANUAL_MACHINES_RANGE and write to I2:M2
         _sheet_name = MANUAL_MACHINES_RANGE.split("!")[0]
         sheets.update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{_sheet_name}!I2:L2",
+            range=f"{_sheet_name}!I2:M2",
             valueInputOption="RAW",
-            body={"values": [[i2, j2, k2, l2]]},
+            body={"values": [[i2, j2, k2, l2, m2]]},
         ).execute()
 
         # Invalidate cache so next GET returns fresh data (stops periodic poll from reverting the UI)
@@ -21287,7 +21294,7 @@ def save_manual_state():
             jsonify(
                 {
                     "ok": True,
-                    "machineColumns": [pruned_m1, pruned_m2, pruned_m3, pruned_m4],
+                    "machineColumns": [pruned_m1, pruned_m2, pruned_m3, pruned_m4, pruned_m5],
                     "placeholders": placeholders,
                     "removed": sorted(list(removed_ids)),
                 }
@@ -21321,10 +21328,12 @@ def auto_fill_machines():
         machine2_jobs = data.get("machine2", [])
         machine3_jobs = data.get("machine3", [])
         machine4_jobs = data.get("machine4", [])
+        machine5_jobs = data.get("machine5", [])
         machine1_headCount = data.get("machine1_headCount", 1)
         machine2_headCount = data.get("machine2_headCount", 6)
         machine3_headCount = data.get("machine3_headCount", 6)
         machine4_headCount = data.get("machine4_headCount", 6)
+        machine5_headCount = data.get("machine5_headCount", 6)
         
         # Only process machines with >= 6 heads
         target_machines = []
@@ -21345,6 +21354,12 @@ def auto_fill_machines():
                 "key": "machine4",
                 "jobs": machine4_jobs[:],  # copy
                 "headCount": machine4_headCount
+            })
+        if machine5_headCount >= 6:
+            target_machines.append({
+                "key": "machine5",
+                "jobs": machine5_jobs[:],  # copy
+                "headCount": machine5_headCount
             })
         # Note: machine1 has 1 head, so it's excluded
         
@@ -21453,6 +21468,7 @@ def auto_fill_machines():
         updated_machine2 = machine2_jobs
         updated_machine3 = machine3_jobs
         updated_machine4 = machine4_jobs
+        updated_machine5 = machine5_jobs
         for machine in target_machines:
             if machine["key"] == "machine2":
                 updated_machine2 = machine["jobs"]
@@ -21460,6 +21476,8 @@ def auto_fill_machines():
                 updated_machine3 = machine["jobs"]
             elif machine["key"] == "machine4":
                 updated_machine4 = machine["jobs"]
+            elif machine["key"] == "machine5":
+                updated_machine5 = machine["jobs"]
         
         result = {
             "status": "ok",
@@ -21468,6 +21486,7 @@ def auto_fill_machines():
             "machine2": updated_machine2,
             "machine3": updated_machine3,
             "machine4": updated_machine4,
+            "machine5": updated_machine5,
             "moves_made": moves_made
         }
         
