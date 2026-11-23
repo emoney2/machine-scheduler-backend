@@ -5417,6 +5417,71 @@ def _get_photo_station_root_folder_id(drive):
         raise
 
 
+def _photo_station_norm_name(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _photo_station_company_for_upload(order_number: str, posted_company: str) -> str:
+    """Prefer the company on the live order, then the name sent with the upload."""
+    order_number = str(order_number or "").strip()
+    if order_number:
+        try:
+            row = _orders_get_by_id_cached(order_number)
+        except Exception:
+            logging.exception("photo station company lookup failed for %s", order_number)
+            row = None
+        if row:
+            company = str(row.get("Company Name") or "").strip()
+            if company:
+                return company
+    return str(posted_company or "").strip()
+
+
+def _no_social_media_companies() -> set:
+    """
+    Company names on the No Social Media tab.
+    Read fresh on every upload so a newly added company is caught immediately.
+    """
+    tab = (os.environ.get("NO_SOCIAL_MEDIA_TAB") or "No Social Media").strip() or "No Social Media"
+    rows = fetch_sheet(SPREADSHEET_ID, f"'{tab}'!A1:Z")
+    if not rows:
+        return set()
+    header = [str(cell or "").strip().lower() for cell in (rows[0] or [])]
+    company_idx = None
+    for i, label in enumerate(header):
+        if label in {"company", "company name", "customer", "customer name", "name"}:
+            company_idx = i
+            break
+    names = set()
+    data_rows = rows[1:] if company_idx is not None else rows
+    skip = {"company", "company name", "customer", "customer name", "name", "no social media"}
+    for row in data_rows:
+        cells = row or []
+        if company_idx is not None:
+            cells = [cells[company_idx]] if company_idx < len(cells) else []
+        for cell in cells:
+            name = _photo_station_norm_name(cell)
+            if name and name not in skip:
+                names.add(name)
+    return names
+
+
+def _photo_station_folder_name_for_upload(session_id: str, order_number: str, posted_company: str) -> str:
+    """ALL CAPS when this company is on the No Social Media tab."""
+    name = (session_id or "").strip()
+    company = _photo_station_company_for_upload(order_number, posted_company)
+    if not company:
+        return name
+    try:
+        blocked = _no_social_media_companies()
+    except Exception:
+        logging.exception("No Social Media tab read failed; keeping the original folder name")
+        return name
+    if _photo_station_norm_name(company) in blocked:
+        return name.upper()
+    return name
+
+
 def _photo_station_ensure_session_folder(drive, session_id: str):
     """Create (or reuse) a per-capture subfolder under the Photo Station root."""
     root_id = _get_photo_station_root_folder_id(drive)
@@ -5471,6 +5536,8 @@ def photo_station_upload():
 
     f = request.files.get("file")
     session_id = (request.form.get("sessionId") or "").strip()
+    order_number = (request.form.get("orderNumber") or "").strip()
+    posted_company = (request.form.get("company") or "").strip()
     filename = (request.form.get("filename") or "").strip()
     if not f:
         return jsonify({"error": "missing file"}), 400
@@ -5482,6 +5549,13 @@ def photo_station_upload():
         filename = filename.strip() or f"capture_{int(time.time())}"
     if not session_id:
         session_id = filename.rsplit(".", 1)[0][:40] or f"session_{int(time.time())}"
+    if not order_number:
+        order_match = re.match(r"^(\d+)", session_id)
+        if order_match:
+            order_number = order_match.group(1)
+    session_id = _photo_station_folder_name_for_upload(
+        session_id, order_number, posted_company
+    )
 
     try:
         drive = get_drive_service()
