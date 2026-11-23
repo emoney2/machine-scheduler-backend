@@ -5488,7 +5488,7 @@ def _photo_station_ensure_session_folder(drive, session_id: str):
     name = (session_id or "").strip() or f"session_{int(time.time())}"
     # Keep the readable "Order - Job - Product" name; drop only path-illegal characters.
     name = re.sub(r'[\\/:*?"<>|]+', " ", name)
-    name = re.sub(r"\s+", " ", name).strip()[:120] or f"session_{int(time.time())}"
+    name = re.sub(r"\s+", " ", name).strip()[:200] or f"session_{int(time.time())}"
     safe = name.replace("'", "\\'")
     q = (
         f"name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' "
