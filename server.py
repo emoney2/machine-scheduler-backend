@@ -33309,7 +33309,7 @@ def on_connect():
 
 @socketio.on("disconnect")
 def on_disconnect():
-    global _COMXIM_BRIDGE
+    global _COMXIM_BRIDGE, _LIGHTS_BRIDGE
     logger.info(f"Client disconnected: {request.sid}")
     if _COMXIM_BRIDGE.get("sid") == request.sid:
         logger.info("ComXim Fire bridge disconnected")
@@ -33324,6 +33324,10 @@ def on_disconnect():
             "comxim:bridgeStatus",
             {"online": False, "bleConnected": False, "deviceName": None},
         )
+    if _LIGHTS_BRIDGE.get("sid") == request.sid:
+        logger.info("Photo station lights bridge disconnected")
+        _LIGHTS_BRIDGE = {"sid": None, "host": None, "connected": False, "ip": None, "lastSeen": None}
+        socketio.emit("lights:bridgeStatus", {"online": False, "connected": False, "host": None, "ip": None})
 
 
 # === Photo Station / ComXim Fire HD bridge relay ==============================
@@ -33467,6 +33471,105 @@ def comxim_bridge_result(data):
         socketio.emit("comxim:commandResult", result, to=target)
     else:
         socketio.emit("comxim:commandResult", result)
+
+
+# === Photo Station lights (Shelly Plug US Gen4) ==============================
+# The iPhone page is HTTPS, so it cannot call the plug's local http:// address.
+# The Fire tablet bridge page keeps a Bluetooth link to the plug and switches it.
+_LIGHTS_BRIDGE = {"sid": None, "host": None, "connected": False, "ip": None, "lastSeen": None}
+
+
+def _lights_bridge_public_status():
+    online = bool(_LIGHTS_BRIDGE.get("sid"))
+    return {
+        "online": online,
+        "connected": bool(_LIGHTS_BRIDGE.get("connected")) if online else False,
+        "host": _LIGHTS_BRIDGE.get("host") if online else None,
+        "ip": _LIGHTS_BRIDGE.get("ip") if online else None,
+    }
+
+
+@socketio.on("lights:registerBridge")
+def lights_register_bridge(data):
+    global _LIGHTS_BRIDGE
+    data = data or {}
+    _LIGHTS_BRIDGE = {
+        "sid": request.sid,
+        "host": (data.get("host") or "").strip() or None,
+        "connected": bool(data.get("connected")),
+        "ip": (data.get("ip") or "").strip() or None,
+        "lastSeen": _now_iso_utc(),
+    }
+    logger.info(
+        "Lights bridge registered sid=%s host=%s connected=%s ip=%s",
+        request.sid,
+        _LIGHTS_BRIDGE["host"],
+        _LIGHTS_BRIDGE["connected"],
+        _LIGHTS_BRIDGE["ip"],
+    )
+    status = _lights_bridge_public_status()
+    emit("lights:bridgeRegistered", {"ok": True, **status})
+    socketio.emit("lights:bridgeStatus", status)
+
+
+@socketio.on("lights:set")
+def lights_set(data):
+    """Photo Station → Fire bridge: turn the Shelly plug on or off."""
+    data = data or {}
+    request_id = (data.get("requestId") or "").strip()
+    if not request_id:
+        emit("lights:result", {"requestId": request_id, "ok": False, "error": "missing requestId"})
+        return
+    bridge_sid = _LIGHTS_BRIDGE.get("sid")
+    if not bridge_sid:
+        emit(
+            "lights:result",
+            {
+                "requestId": request_id,
+                "ok": False,
+                "error": "Lights bridge is offline. Open the turntable bridge page on the Fire tablet.",
+            },
+        )
+        return
+    if not _LIGHTS_BRIDGE.get("connected"):
+        emit(
+            "lights:result",
+            {
+                "requestId": request_id,
+                "ok": False,
+                "error": "Lights are not connected. On the bridge page, tap Connect Lights Bluetooth.",
+            },
+        )
+        return
+    socketio.emit(
+        "lights:bridgeSet",
+        {"requestId": request_id, "on": bool(data.get("on")), "fromSid": request.sid},
+        to=bridge_sid,
+    )
+
+
+@socketio.on("lights:bridgeResult")
+def lights_bridge_result(data):
+    if _LIGHTS_BRIDGE.get("sid") != request.sid:
+        return
+    data = data or {}
+    _LIGHTS_BRIDGE["lastSeen"] = _now_iso_utc()
+    if data.get("host"):
+        _LIGHTS_BRIDGE["host"] = str(data.get("host")).strip() or _LIGHTS_BRIDGE.get("host")
+    if data.get("ip"):
+        _LIGHTS_BRIDGE["ip"] = str(data.get("ip")).strip() or _LIGHTS_BRIDGE.get("ip")
+    result = {
+        "requestId": data.get("requestId"),
+        "ok": bool(data.get("ok")),
+        "on": data.get("on"),
+        "error": data.get("error"),
+        "host": _LIGHTS_BRIDGE.get("host"),
+    }
+    target = (data.get("fromSid") or "").strip()
+    if target:
+        socketio.emit("lights:result", result, to=target)
+    else:
+        socketio.emit("lights:result", result)
 
 
 # --- Public URL shortener (no auth, no app redirects) ---
