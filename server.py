@@ -231,6 +231,7 @@ from jrco_presentation import (
     is_pdf_filename,
     looks_like_pdf,
     next_print_pdf_filename,
+    print_outline_name,
     render_page_png,
     resolve_print_pdf,
 )
@@ -8542,6 +8543,8 @@ def _drive_folder_usable(drive, folder_id: str) -> bool:
 _DEFAULT_PACKING_SLIP_PRINT_FOLDER_ID = "1J6QqPQ9XOdvoSzYWwaAb1TSTa223oBcG"
 _DEFAULT_LABEL_PRINT_FOLDER_ID = "1nvSfxOKeBJSLuDddX0dkgHRIaTeMVRDf"
 _DEFAULT_LABEL_ARCHIVE_FOLDER_ID = "18ROtltPSXZQSUvKox0eoTD2DbdRc1TDc"
+# Fur List process-sheet print → Print Fur PDF (shop watcher prints + opens Wilcom).
+_DEFAULT_PRINT_FUR_PDF_FOLDER_ID = "1yrOklbTahRgwRbhIoSUtaYJETo49IGvv"
 
 
 def _get_pinned_or_named_drive_folder_id(
@@ -8579,7 +8582,7 @@ def _get_pinned_or_named_drive_folder_id(
 
 def _get_packing_slip_print_drive_folder_id(drive):
     """
-    Drive folder where packing-slip PDFs / stamped Fur sheets are uploaded.
+    Drive folder where packing-slip PDFs are uploaded (UPS / ship flow).
 
     This is info@jrco.us My Drive / PackingSlipPrinter. PACKING_SLIP_PRINT_FOLDER_ID
     overrides the pinned id. If that folder is not visible to the scheduler
@@ -8593,6 +8596,26 @@ def _get_packing_slip_print_drive_folder_id(drive):
     logging.error(
         "PackingSlipPrinter folder %s is not accessible to the scheduler Drive account. "
         "Share info@jrco.us PackingSlipPrinter with that account as Editor. "
+        "Not using a different folder.",
+        folder_id or "(unset)",
+    )
+    return folder_id
+
+
+def _get_print_fur_pdf_drive_folder_id(drive):
+    """
+    Drive folder for Fur List process-sheet prints.
+
+    Shop PC watcher on Print Fur PDF prints the sheet and opens/queues the .EMB
+    in Wilcom. Do not send these to PackingSlipPrinter.
+    """
+    explicit = (os.environ.get("PRINT_FUR_PDF_FOLDER_ID") or "").strip()
+    folder_id = explicit or _DEFAULT_PRINT_FUR_PDF_FOLDER_ID
+    if folder_id and _drive_folder_usable(drive, folder_id):
+        return folder_id
+    logging.error(
+        "Print Fur PDF folder %s is not accessible to the scheduler Drive account. "
+        "Share info@jrco.us Print Fur PDF with that account as Editor. "
         "Not using a different folder.",
         folder_id or "(unset)",
     )
@@ -8947,20 +8970,51 @@ def _packing_slip_local_sync_dir() -> str:
     return owned
 
 
-def _try_copy_packing_slip_to_local_sync_folder(tmp_path: str, pdf_filename: str) -> None:
-    """Best-effort copy so a folder watcher sees the slip immediately on a Windows shop machine."""
-    slip_dir = _packing_slip_local_sync_dir()
+def _print_fur_pdf_local_sync_dir() -> str:
+    """Local Drive Desktop path for Fur List process sheets (Print Fur PDF watcher)."""
+    explicit = (os.getenv("PRINT_FUR_PDF_LOCAL_SYNC_DIR") or "").strip()
+    if explicit:
+        return explicit
+    owned = r"G:\My Drive\Print Fur PDF"
+    if os.path.isdir(owned):
+        return owned
+    shortcut = os.path.join(
+        r"G:\.shortcut-targets-by-id",
+        _DEFAULT_PRINT_FUR_PDF_FOLDER_ID,
+        "Print Fur PDF",
+    )
+    if os.path.isdir(shortcut):
+        return shortcut
+    return owned
+
+
+def _try_copy_to_local_sync_folder(tmp_path: str, pdf_filename: str, sync_dir: str, label: str) -> None:
+    """Best-effort copy so a folder watcher sees the file immediately on a Windows shop machine."""
     if not tmp_path or not os.path.isfile(tmp_path) or not pdf_filename:
         return
-    if not _label_output_path_usable_on_this_host(slip_dir):
+    if not _label_output_path_usable_on_this_host(sync_dir):
         return
     try:
-        os.makedirs(slip_dir, exist_ok=True)
-        dest = os.path.join(slip_dir, pdf_filename)
+        os.makedirs(sync_dir, exist_ok=True)
+        dest = os.path.join(sync_dir, pdf_filename)
         shutil.copy2(tmp_path, dest)
-        logging.info("Packing slip saved to local sync folder: %s", dest)
+        logging.info("%s saved to local sync folder: %s", label, dest)
     except OSError as e:
-        logging.warning("Packing slip local sync copy failed (%s): %s", slip_dir, e)
+        logging.warning("%s local sync copy failed (%s): %s", label, sync_dir, e)
+
+
+def _try_copy_packing_slip_to_local_sync_folder(tmp_path: str, pdf_filename: str) -> None:
+    """Best-effort copy so a folder watcher sees the slip immediately on a Windows shop machine."""
+    _try_copy_to_local_sync_folder(
+        tmp_path, pdf_filename, _packing_slip_local_sync_dir(), "Packing slip"
+    )
+
+
+def _try_copy_print_fur_pdf_to_local_sync_folder(tmp_path: str, pdf_filename: str) -> None:
+    """Best-effort copy so the Print Fur PDF watcher sees the sheet immediately."""
+    _try_copy_to_local_sync_folder(
+        tmp_path, pdf_filename, _print_fur_pdf_local_sync_dir(), "Print Fur PDF"
+    )
 
 
 def _normalize_packages_for_ups(raw_list):
@@ -20214,11 +20268,11 @@ def _upload_verified_print_pdf(
     drive,
     print_folder_id,
     order_number,
-    product_name,
+    product_type,
     pdf_bytes,
     source_file_id: str = "",
 ) -> str:
-    """Save the print file as a real PDF named ``{order} - Print File - {Product}.pdf``."""
+    """Save the print PDF as ``{order} - Print File - {OutlineToken}.pdf``."""
     if not looks_like_pdf(pdf_bytes):
         raise JrcoPresentationError(
             "Print file must be saved as a PDF. The downloaded file is not a PDF."
@@ -20226,7 +20280,7 @@ def _upload_verified_print_pdf(
     fname = next_print_pdf_filename(
         _print_folder_filenames(drive, print_folder_id),
         order_number,
-        product_name,
+        product_type,
     )
     if not str(fname).lower().endswith(".pdf"):
         fname = f"{fname}.pdf"
@@ -20465,11 +20519,13 @@ def edit_order(order_id):
             drive = None
             linked_print_id = (data.get("jrPrintPdfDriveFileId") or "").strip()
             linked_print_sha = (data.get("jrPrintPdfSha256") or "").strip()
+            linked_print_product_type = (data.get("jrPrintProductType") or "").strip()
             linked_print_bytes = None
             if linked_print_id:
-                # Preview still attached. Download and verify before any sheet write.
+                # Preview still attached. Name and verify before any sheet write.
                 drive = get_drive_service()
                 try:
+                    print_outline_name(linked_print_product_type)
                     linked_print_bytes = resolve_print_pdf(
                         linked_print_id,
                         linked_print_sha,
@@ -20529,7 +20585,7 @@ def edit_order(order_id):
                     drive,
                     pf_id,
                     oid,
-                    product,
+                    linked_print_product_type,
                     linked_print_bytes,
                     source_file_id=linked_print_id,
                 )
@@ -20750,17 +20806,11 @@ def edit_order(order_id):
                                     back_pf = _ensure_print_files_folder(
                                         drive, back_folder
                                     )
-                                    back_product_name = (
-                                        back_current.get("Product")
-                                        or str(product or "")
-                                        .replace("Front", "Back")
-                                        .replace("front", "back")
-                                    )
                                     _upload_verified_print_pdf(
                                         drive,
                                         back_pf,
                                         back_order,
-                                        back_product_name,
+                                        linked_print_product_type,
                                         linked_print_bytes,
                                         source_file_id=linked_print_id,
                                     )
@@ -22248,9 +22298,11 @@ def submit_order():
         # Verify before creating the order folder so a bad hash saves nothing.
         linked_print_id = (data.get("jrPrintPdfDriveFileId") or "").strip()
         linked_print_sha = (data.get("jrPrintPdfSha256") or "").strip()
+        linked_print_product_type = (data.get("jrPrintProductType") or "").strip()
         linked_print_bytes = None
         if linked_print_id:
             try:
+                print_outline_name(linked_print_product_type)
                 linked_print_bytes = resolve_print_pdf(
                     linked_print_id,
                     linked_print_sha,
@@ -22330,7 +22382,7 @@ def submit_order():
             name, raw_bytes, mimetype = _normalize_drive_image_upload(
                 name, raw_bytes, mimetype
             )
-            # Image column only — Print Files keep the full-resolution flat.
+            # Downscale huge flats so the Image-column preview renders in Sheets.
             if (mimetype or "").startswith("image/") or _is_previewable_image_name(
                 name
             ):
@@ -22580,19 +22632,16 @@ def submit_order():
                     drive,
                     pf_id,
                     new_order,
-                    product,
+                    linked_print_product_type,
                     linked_print_bytes,
                     source_file_id=linked_print_id,
                 )
                 if is_quilted_front and back_pf_id and back_order:
-                    back_product_name = (
-                        str(product or "").replace("Front", "Back").replace("front", "back")
-                    )
                     _upload_verified_print_pdf(
                         drive,
                         back_pf_id,
                         back_order,
-                        back_product_name,
+                        linked_print_product_type,
                         linked_print_bytes,
                         source_file_id=linked_print_id,
                     )
@@ -33734,26 +33783,33 @@ def _download_drive_pdf_to_temp(drive, file_id, filename):
     return tmp_path
 
 
-def _copy_stamped_pdf_to_packing_slip_printer(drive, stamped_file):
+def _copy_stamped_pdf_to_print_fur_pdf(drive, stamped_file, order):
     """
-    Copy newest {order}_Stamped*.pdf into info@jrco.us PackingSlipPrinter.
+    Copy newest {order}_Stamped*.pdf into info@jrco.us Print Fur PDF.
+    Local watcher prints the sheet and opens/queues the .EMB in Wilcom.
     """
-    pdf_name = stamped_file["name"]
-    packing_folder_id = _get_packing_slip_print_drive_folder_id(drive)
+    order_s = str(order).strip()
+    original_name = stamped_file["name"]
+    # Watcher extracts leading digits; keep order_ prefix for reliable parsing.
+    if original_name.startswith(f"{order_s}_"):
+        pdf_name = original_name
+    else:
+        pdf_name = f"{order_s}_{original_name}"
+    print_folder_id = _get_print_fur_pdf_drive_folder_id(drive)
     drive.files().copy(
         fileId=stamped_file["id"],
-        body={"name": pdf_name, "parents": [packing_folder_id]},
+        body={"name": pdf_name, "parents": [print_folder_id]},
         fields="id, name",
         supportsAllDrives=True,
     ).execute()
     logging.info(
-        "Stamped PDF copied to PackingSlipPrinter %s: %s",
-        packing_folder_id,
+        "Stamped PDF copied to Print Fur PDF %s: %s",
+        print_folder_id,
         pdf_name,
     )
     tmp_path = _download_drive_pdf_to_temp(drive, stamped_file["id"], pdf_name)
     if tmp_path:
-        _try_copy_packing_slip_to_local_sync_folder(tmp_path, pdf_name)
+        _try_copy_print_fur_pdf_to_local_sync_folder(tmp_path, pdf_name)
         try:
             os.remove(tmp_path)
         except OSError:
@@ -33762,7 +33818,8 @@ def _copy_stamped_pdf_to_packing_slip_printer(drive, stamped_file):
 
 def _process_single_order_print(drive, order, orders_parent_folder_id):
     """
-    Find the newest {order}_Stamped*.pdf in the order folder and queue it for packing-slip print.
+    Find the newest {order}_Stamped*.pdf in the order folder and queue it for
+    Fur process-sheet print + Wilcom open (Print Fur PDF watcher).
     Returns (success, error_message).
     """
     try:
@@ -33814,9 +33871,9 @@ def _process_single_order_print(drive, order, orders_parent_folder_id):
                 f"No stamped PDF found for order {order} (expected {order}_Stamped*.pdf)",
             )
 
-        _copy_stamped_pdf_to_packing_slip_printer(drive, stamped_pdf)
+        _copy_stamped_pdf_to_print_fur_pdf(drive, stamped_pdf, order)
         print(
-            f"✅ Queued stamped PDF for order {order}: {stamped_pdf['name']} → PackingSlipPrinter"
+            f"✅ Queued stamped PDF for order {order}: {stamped_pdf['name']} → Print Fur PDF"
         )
         return (True, None)
     except Exception as e:

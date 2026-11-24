@@ -988,96 +988,38 @@ def _boxes_from_used(used: Counter) -> List[Dict[str, Any]]:
     return out
 
 
-def _pack_by_capacity(
-    totals: Dict[str, int], capacity: Dict[str, Dict[str, int]]
-) -> Optional[List[Dict[str, Any]]]:
-    """
-    Pack mixed products using learned fill fractions.
-    Each product uses 1/capacity of a box; fill boxes smallest-first.
-    """
-    remaining = Counter({k: int(v) for k, v in totals.items() if int(v) > 0})
-    if not remaining:
-        return None
+def _product_pack_order(
+    remaining: Dict[str, int], volume_map: Dict[str, float]
+) -> List[str]:
+    """Largest total volume product first, then largest unit volume, then name."""
 
-    # prod -> preset_id -> capacity
-    cap_by_preset: Dict[str, Dict[str, int]] = defaultdict(dict)
-    for prod, by_box in capacity.items():
-        for bkey, cap in by_box.items():
-            pid = _match_preset_id_for_box_key(bkey)
-            if pid and cap > 0:
-                cap_by_preset[prod][pid] = int(cap)
+    def _key(prod: str) -> Tuple[float, float, str]:
+        qty = int(remaining.get(prod, 0))
+        unit = float(volume_map.get(prod, 0) or 0)
+        return (qty * unit, unit, prod)
 
-    if any(p not in cap_by_preset for p in remaining):
-        return None
-
-    presets_small_first = sorted(SHIP_BOX_PRESETS, key=_preset_vol)
-    used: Counter = Counter()
-    guard = 0
-    while sum(remaining.values()) > 0 and guard < 400:
-        guard += 1
-        opened = False
-        for preset in presets_small_first:
-            pid = preset["id"]
-            # Need capacity data for at least one remaining product in this box
-            if not any(pid in cap_by_preset.get(prod, {}) for prod in remaining):
-                continue
-            fill_left = 1.0
-            box_took = False
-            # Prefer denser products first (higher 1/cap)
-            prods = sorted(
-                [p for p in remaining if pid in cap_by_preset.get(p, {})],
-                key=lambda p: 1.0 / float(cap_by_preset[p][pid]),
-                reverse=True,
-            )
-            progressed = True
-            while progressed and fill_left > 1e-9:
-                progressed = False
-                for prod in prods:
-                    if remaining[prod] <= 0:
-                        continue
-                    cap = cap_by_preset[prod][pid]
-                    unit = 1.0 / float(cap)
-                    if unit <= fill_left + 1e-9:
-                        remaining[prod] -= 1
-                        if remaining[prod] <= 0:
-                            del remaining[prod]
-                        fill_left -= unit
-                        box_took = True
-                        progressed = True
-            if box_took:
-                used[pid] += 1
-                opened = True
-                break
-        if not opened:
-            return None
-
-    return _boxes_from_used(used) or None
+    return sorted([p for p in remaining if remaining[p] > 0], key=_key, reverse=True)
 
 
-def _preferred_preset_order(
+def _largest_box_order(
     totals: Dict[str, int], capacity: Dict[str, Dict[str, int]]
 ) -> List[Dict[str, Any]]:
     """
-    Prefer box sizes actually used for these products historically.
-    Fall back to largest→smallest so we don't spam tiny cartons.
+    Biggest boxes first. Historically used sizes for these products stay ahead of
+    unused sizes so stocked cartons win ties at the large end.
     """
-    votes: Counter = Counter()
+    used_ids: set = set()
     for prod in totals:
-        for bkey in (capacity.get(prod) or {}):
+        for bkey in capacity.get(prod) or {}:
             pid = _match_preset_id_for_box_key(bkey)
             if pid:
-                votes[pid] += 1
-    if votes:
-        ranked = [pid for pid, _ in votes.most_common()]
-        preferred = [_preset_by_id(pid) for pid in ranked if _preset_by_id(pid)]
-        rest = [
-            p
-            for p in sorted(SHIP_BOX_PRESETS, key=_preset_vol, reverse=True)
-            if p["id"] not in votes
-        ]
-        return preferred + rest
-    # No history: larger boxes first (fewer cartons for mixed orders)
-    return sorted(SHIP_BOX_PRESETS, key=_preset_vol, reverse=True)
+                used_ids.add(pid)
+    largest_first = sorted(SHIP_BOX_PRESETS, key=_preset_vol, reverse=True)
+    if not used_ids:
+        return largest_first
+    return [p for p in largest_first if p["id"] in used_ids] + [
+        p for p in largest_first if p["id"] not in used_ids
+    ]
 
 
 def _volume_box_presets(
@@ -1105,38 +1047,185 @@ def _volume_box_presets(
     ]
 
 
+def _pack_plan_to_boxes(
+    plan: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    used: Counter = Counter()
+    for box in plan:
+        pid = box.get("preset_id")
+        if pid:
+            used[pid] += 1
+    return _boxes_from_used(used)
+
+
+def _pack_by_capacity(
+    totals: Dict[str, int], capacity: Dict[str, Dict[str, int]]
+) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+    """
+    Pack mixed products using learned fill fractions.
+
+    Product-contiguous: finish the largest (by fill) product line before the next.
+    Opens largest workable boxes first.
+    Returns (boxes_summary, pack_plan).
+    """
+    remaining = Counter({k: int(v) for k, v in totals.items() if int(v) > 0})
+    if not remaining:
+        return None
+
+    cap_by_preset: Dict[str, Dict[str, int]] = defaultdict(dict)
+    for prod, by_box in capacity.items():
+        for bkey, cap in by_box.items():
+            pid = _match_preset_id_for_box_key(bkey)
+            if pid and cap > 0:
+                cap_by_preset[prod][pid] = int(cap)
+
+    if any(p not in cap_by_preset for p in remaining):
+        return None
+
+    # Synthetic volume = 1/capacity on largest known box — for product order only
+    vol_proxy: Dict[str, float] = {}
+    for prod in remaining:
+        caps = list((cap_by_preset.get(prod) or {}).values())
+        vol_proxy[prod] = 1.0 / float(max(caps)) if caps else 1.0
+
+    # Fixed order from the original load — finish A across cartons before B
+    prod_order = _product_pack_order(remaining, vol_proxy)
+    preset_order = _largest_box_order(totals, capacity)
+    plan: List[Dict[str, Any]] = []
+    guard = 0
+    while sum(remaining.values()) > 0 and guard < 400:
+        guard += 1
+        lead = next((p for p in prod_order if remaining.get(p, 0) > 0), None)
+        if not lead:
+            break
+        chosen = None
+        for preset in preset_order:
+            pid = preset["id"]
+            if pid in cap_by_preset.get(lead, {}):
+                chosen = preset
+                break
+        if not chosen:
+            for preset in preset_order:
+                if any(preset["id"] in cap_by_preset.get(p, {}) for p in remaining):
+                    chosen = preset
+                    break
+        if not chosen:
+            return None
+
+        pid = chosen["id"]
+        fill_left = 1.0
+        box_counts: Counter = Counter()
+        for prod in prod_order:
+            if remaining.get(prod, 0) <= 0:
+                continue
+            cap = cap_by_preset.get(prod, {}).get(pid)
+            if not cap:
+                continue
+            unit = 1.0 / float(cap)
+            while remaining[prod] > 0 and unit <= fill_left + 1e-9:
+                remaining[prod] -= 1
+                if remaining[prod] <= 0:
+                    del remaining[prod]
+                fill_left -= unit
+                box_counts[prod] += 1
+            # Still more of this product → leave spare space; next carton continues it
+            if remaining.get(prod, 0) > 0:
+                break
+        if not box_counts:
+            return None
+        plan.append(
+            {
+                "label": chosen["label"],
+                "L": chosen["L"],
+                "W": chosen["W"],
+                "H": chosen["H"],
+                "weight": chosen["weight"],
+                "preset_id": pid,
+                "box_key": box_key(
+                    chosen["L"], chosen["W"], chosen["H"], chosen["weight"]
+                ),
+                "pieces": [
+                    {"product_norm": p, "qty": int(q)} for p, q in box_counts.items()
+                ],
+            }
+        )
+
+    summary = _pack_plan_to_boxes(plan)
+    return (summary, plan) if summary else None
+
+
+def _preferred_preset_order(
+    totals: Dict[str, int], capacity: Dict[str, Dict[str, int]]
+) -> List[Dict[str, Any]]:
+    """Largest boxes first; historically used sizes ranked ahead of unused."""
+    return _largest_box_order(totals, capacity)
+
+
 def _pack_by_volume(
     totals: Dict[str, int],
     volume_map: Dict[str, float],
     *,
     capacity: Optional[Dict[str, Dict[str, int]]] = None,
-) -> Optional[List[Dict[str, Any]]]:
-    """Pack by cubic volume into historically preferred / larger boxes."""
-    items: List[Tuple[str, float]] = []
+) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+    """
+    Pack by cubic volume into largest workable boxes.
+
+    Product-contiguous: put the highest total-volume product into the biggest
+    box first and keep filling that product before starting the next — so a
+    2-box ship is "most of A, then rest of A + B", not half A/B in each carton.
+    Returns (boxes_summary, pack_plan).
+    """
+    remaining = Counter()
+    unit_vol: Dict[str, float] = {}
     for prod, qty in totals.items():
-        vol = volume_map.get(prod.lower())
-        if vol is None or vol <= 0:
+        vol = volume_map.get(str(prod).lower())
+        if vol is None or vol <= 0 or int(qty) <= 0:
             return None
-        items.extend([(prod, float(vol))] * int(qty))
-    if not items:
+        key = str(prod).lower()
+        unit_vol[key] = float(vol)
+        remaining[key] = int(qty)
+    if not remaining:
         return None
 
-    items.sort(key=lambda x: x[1], reverse=True)
+    # Fixed order from the original load — finish A across cartons before B
+    prod_order = _product_pack_order(remaining, unit_vol)
     volume_presets = _volume_box_presets(totals, capacity or {})
     largest_vol = max(_preset_vol(p) for p in volume_presets)
-    remaining = list(items)
-    used: Counter = Counter()
+    plan: List[Dict[str, Any]] = []
     guard = 0
-    while remaining and guard < 400:
+    while sum(remaining.values()) > 0 and guard < 400:
         guard += 1
-        first = remaining[0]
-        if first[1] > largest_vol + 1e-9:
-            used[sorted(SHIP_BOX_PRESETS, key=_preset_vol)[-1]["id"]] += 1
-            remaining.pop(0)
+        lead = next((p for p in prod_order if remaining.get(p, 0) > 0), None)
+        if not lead:
+            break
+        lead_unit = unit_vol[lead]
+
+        if lead_unit > largest_vol + 1e-9:
+            # Oversized unit — still emit largest carton and consume one
+            chosen = sorted(SHIP_BOX_PRESETS, key=_preset_vol)[-1]
+            remaining[lead] -= 1
+            if remaining[lead] <= 0:
+                del remaining[lead]
+            plan.append(
+                {
+                    "label": chosen["label"],
+                    "L": chosen["L"],
+                    "W": chosen["W"],
+                    "H": chosen["H"],
+                    "weight": chosen["weight"],
+                    "preset_id": chosen["id"],
+                    "box_key": box_key(
+                        chosen["L"], chosen["W"], chosen["H"], chosen["weight"]
+                    ),
+                    "pieces": [{"product_norm": lead, "qty": 1}],
+                }
+            )
             continue
 
-        remaining_vol = sum(item[1] for item in remaining)
-        target_vol = min(largest_vol, max(first[1], remaining_vol))
+        remaining_vol = sum(
+            int(qty) * unit_vol[prod] for prod, qty in remaining.items()
+        )
+        target_vol = min(largest_vol, max(lead_unit, remaining_vol))
         chosen = next(
             (
                 p
@@ -1145,17 +1234,47 @@ def _pack_by_volume(
             ),
             max(volume_presets, key=_preset_vol),
         )
-        space = _preset_vol(chosen)
-        i = 0
-        while i < len(remaining):
-            if remaining[i][1] <= space + 1e-9:
-                space -= remaining[i][1]
-                remaining.pop(i)
-            else:
-                i += 1
-        used[chosen["id"]] += 1
 
-    return _boxes_from_used(used) or None
+        space = _preset_vol(chosen)
+        box_counts: Counter = Counter()
+        for prod in prod_order:
+            if remaining.get(prod, 0) <= 0:
+                continue
+            u = unit_vol[prod]
+            if u > space + 1e-9 and box_counts:
+                # Leftover gap too small for this product; do not skip ahead to a
+                # smaller product while an earlier line still has pieces waiting.
+                break
+            while remaining.get(prod, 0) > 0 and u <= space + 1e-9:
+                remaining[prod] -= 1
+                if remaining[prod] <= 0:
+                    del remaining[prod]
+                space -= u
+                box_counts[prod] += 1
+            # Still more of this product → leave spare space; next carton continues it
+            if remaining.get(prod, 0) > 0:
+                break
+        if not box_counts:
+            return None
+        plan.append(
+            {
+                "label": chosen["label"],
+                "L": chosen["L"],
+                "W": chosen["W"],
+                "H": chosen["H"],
+                "weight": chosen["weight"],
+                "preset_id": chosen["id"],
+                "box_key": box_key(
+                    chosen["L"], chosen["W"], chosen["H"], chosen["weight"]
+                ),
+                "pieces": [
+                    {"product_norm": p, "qty": int(q)} for p, q in box_counts.items()
+                ],
+            }
+        )
+
+    summary = _pack_plan_to_boxes(plan)
+    return (summary, plan) if summary else None
 
 
 def suggest_boxes(
@@ -1177,7 +1296,7 @@ def suggest_boxes(
     hist = history if history is not None else load_history()
     empty_counts = {p["id"]: 0 for p in SHIP_BOX_PRESETS}
 
-    def _result(boxes, source, confidence, reason):
+    def _result(boxes, source, confidence, reason, pack_plan=None):
         counts, custom = _boxes_to_counts(boxes or [])
         return {
             "status": "ok",
@@ -1185,6 +1304,7 @@ def suggest_boxes(
                 "box_counts": counts,
                 "custom_boxes": custom,
                 "boxes_summary": boxes or [],
+                "pack_plan": pack_plan or [],
                 "confidence": confidence,
                 "reason": reason,
                 "source": source,
@@ -1201,6 +1321,7 @@ def suggest_boxes(
                 "box_counts": empty_counts,
                 "custom_boxes": [],
                 "boxes_summary": [],
+                "pack_plan": [],
                 "confidence": "none",
                 "reason": "No packable pieces (backs excluded).",
                 "source": "none",
@@ -1219,23 +1340,29 @@ def suggest_boxes(
     if merged_vols and all(p in merged_vols for p in totals):
         packed_v = _pack_by_volume(totals, merged_vols, capacity=capacity)
         if packed_v:
+            boxes_v, plan_v = packed_v
             src = "capacity_volume" if learned_vols else "volume"
             conf = "medium" if learned_vols else "low"
             why = (
-                "Packed from least learned product volumes (box volume × product share in past shipments)."
+                "Packed from least learned product volumes (box volume × product share in past shipments). "
+                "Largest product fills the biggest box first (not split evenly across cartons)."
                 if learned_vols
-                else "Packed from product volume table (still learning from shipments)."
+                else "Packed from product volume table (still learning from shipments). "
+                "Largest product fills the biggest box first (not split evenly across cartons)."
             )
-            return _result(packed_v, src, conf, why)
+            return _result(boxes_v, src, conf, why, pack_plan=plan_v)
 
     # 2) Capacity fill fractions when every product has learned box fit
     packed = _pack_by_capacity(totals, capacity)
     if packed:
+        boxes_c, plan_c = packed
         return _result(
-            packed,
+            boxes_c,
             "capacity",
             "medium",
-            "Packed from learned pieces-per-box for each product.",
+            "Packed from learned pieces-per-box for each product. "
+            "Largest product fills the biggest box first (not split evenly across cartons).",
+            pack_plan=plan_c,
         )
 
     # 3) Rare bonus: exact same mix seen before

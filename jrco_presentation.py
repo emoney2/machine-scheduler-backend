@@ -221,30 +221,57 @@ def classify_flat_png_id(file_id: str) -> str:
     return "drive"
 
 
+# Manifest productType → black-outline file token. BlackOutline is already
+# in the token. There is no driver entry; do not invent one.
+PRINT_OUTLINE_NAMES = {
+    "alignment_stick_cover": "AlignmentStickCoverBlackOutline",
+    "barrel": "BarrelDriverBlackOutline",
+    "blade": "BladeBlackOutline",
+    "center_shaft_mallet": "CenterShaftMalletTBlackOutline",
+    "df3_mallet": "DF3MalletBlackOutline",
+    "fairway": "FairwayBlackOutline",
+    "hybrid": "HybridBlackOutline",
+    "mallet": "MalletBlackOutline",
+    "mid_mallet": "MidMalletBlackOutline",
+}
+
+
+def print_outline_name(product_type: str) -> str:
+    """Return the exact outline token for a manifest productType."""
+    key = str(product_type or "").strip().lower().replace("-", "_").replace(" ", "_")
+    name = PRINT_OUTLINE_NAMES.get(key)
+    if not name:
+        shown = str(product_type or "").strip() or "(empty)"
+        raise JrcoPresentationError(
+            f"No black-outline file name for productType {shown}. "
+            "The print file was not saved."
+        )
+    return name
+
+
 def order_print_pdf_filename(
-    order_number: str, product_name: str, copy_index: int = 1
+    order_number: str, product_type: str, copy_index: int = 1
 ) -> str:
-    """``{order} - Print File - {Product}.pdf``, with ``-2`` / ``-3`` before .pdf."""
+    """``{order} - Print File - {OutlineToken}.pdf``, with ``-2`` / ``-3`` before .pdf."""
+    outline = print_outline_name(product_type)
     order = _ILLEGAL_FILENAME_CHARS.sub("", str(order_number or "")).strip() or "order"
-    product = _ILLEGAL_FILENAME_CHARS.sub("", str(product_name or ""))
-    product = re.sub(r"\s+", " ", product).strip() or "Product"
-    stem = f"{order} - Print File - {product}"
+    stem = f"{order} - Print File - {outline}"
     if copy_index >= 2:
         stem = f"{stem}-{copy_index}"
     return f"{stem}.pdf"
 
 
 def next_print_pdf_filename(
-    existing_names, order_number: str, product_name: str
+    existing_names, order_number: str, product_type: str
 ) -> str:
     """Pick a Print Files name that does not overwrite an existing file."""
     taken = {str(name) for name in (existing_names or []) if str(name)}
-    name = order_print_pdf_filename(order_number, product_name, 1)
+    name = order_print_pdf_filename(order_number, product_type, 1)
     if name not in taken:
         return name
     copy_index = 2
     while True:
-        candidate = order_print_pdf_filename(order_number, product_name, copy_index)
+        candidate = order_print_pdf_filename(order_number, product_type, copy_index)
         if candidate not in taken:
             return candidate
         copy_index += 1

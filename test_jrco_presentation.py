@@ -276,21 +276,24 @@ class JrcoPresentationTests(unittest.TestCase):
         self.assertEqual(info["designs"][0]["printIdKind"], "local")
         self.assertIn("never uploaded", info["designs"][0]["printError"])
 
-    def test_print_filename_strips_and_suffixes(self):
+    def test_print_filename_uses_manifest_product_type(self):
         self.assertEqual(
-            order_print_pdf_filename("1640", 'Driver: Front'),
-            "1640 - Print File - Driver Front.pdf",
+            order_print_pdf_filename("1640", "blade"),
+            "1640 - Print File - BladeBlackOutline.pdf",
         )
-        existing = {"1640 - Print File - Driver Front.pdf"}
         self.assertEqual(
-            next_print_pdf_filename(existing, "1640", "Driver Front"),
-            "1640 - Print File - Driver Front-2.pdf",
+            order_print_pdf_filename("1640", "center_shaft_mallet"),
+            "1640 - Print File - CenterShaftMalletTBlackOutline.pdf",
         )
-        existing.add("1640 - Print File - Driver Front-2.pdf")
+        existing = {"1640 - Print File - FairwayBlackOutline.pdf"}
         self.assertEqual(
-            next_print_pdf_filename(existing, "1640", "Driver Front"),
-            "1640 - Print File - Driver Front-3.pdf",
+            next_print_pdf_filename(existing, "1640", "fairway"),
+            "1640 - Print File - FairwayBlackOutline-2.pdf",
         )
+        with self.assertRaises(JrcoPresentationError):
+            order_print_pdf_filename("1640", "driver")
+        with self.assertRaises(JrcoPresentationError):
+            order_print_pdf_filename("1640", "Driver Front")
 
     def test_resolve_print_pdf_verifies_sha_and_rejects_local(self):
         pdf = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF"
