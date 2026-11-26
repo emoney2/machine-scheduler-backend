@@ -34113,6 +34113,27 @@ app.register_blueprint(
 
 
 # ─── Run ────────────────────────────────────────────────────────────────────────
+
+# ─── Headcover Studio (/headcover-studio): live materials + save proof sheets to the customer folder ───
+import headcover_studio as _headcover_studio
+
+_headcover_studio.register_routes(
+    app,
+    login_required=login_required_session,
+    get_drive=get_drive_service,
+    send_cached_json=send_cached_json,
+    material_rows=_material_inventory_detail_rows,
+    fur_names=lambda: [
+        str(r[0]).strip()
+        for r in (fetch_sheet(SPREADSHEET_ID, "Material Inventory!I2:I") or [])
+        if r and str(r[0]).strip()
+    ],
+    list_children=_list_drive_children,
+    create_folder=_create_named_drive_folder,
+    upload_bytes=_drive_upload_bytes,
+    logger=logger,
+)
+
 if __name__ == "__main__":
     # --- Startup banner ---
     print("🚀 JRCO server.py loaded and running...")

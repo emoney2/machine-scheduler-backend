@@ -1,0 +1,3 @@
+# Only for the local PSD tools in headcover_tools/ (not needed on Render)
+numpy>=1.24
+Pillow>=10.0.0
