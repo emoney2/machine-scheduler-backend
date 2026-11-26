@@ -6,6 +6,7 @@ plus a UV map (.uv.bin = zlib, row-delta int16 (u,v) pairs in layout pixels,
 """
 import os
 import json
+import struct
 import zlib
 import numpy as np
 from PIL import Image
@@ -16,9 +17,33 @@ from .psdread import parse
 uvmap.MODE = "cp"   # control-point bbox: matched Photoshop within 0-5 levels / 255
 
 
-def build(src, out_dir, name, content_w=6300, content_h=5252):
+def _so_size(so):
+    """Width/height of the smart object's own document (the 'Sz  ' descriptor)."""
+    j = so.find(b"Sz  ")
+    if j < 0:
+        return None
+    a, b = so.find(b"Wdthdoub", j), so.find(b"Hghtdoub", j)
+    if a < 0 or b < 0:
+        return None
+    return int(round(struct.unpack(">d", so[a + 8:a + 16])[0])), int(round(struct.unpack(">d", so[b + 8:b + 16])[0]))
+
+
+def _content_size(layers):
+    """Size of the product's master layout as placed in the 3Draw (each product has its own)."""
+    for x in layers:
+        so = x["extra"].get(b"SoLE")
+        if so and x["clip"]:
+            size = _so_size(so)
+            if size and size[0] > 0 and size[1] > 0:
+                return size
+    raise SystemExit("Couldn't read the master layout size from the 3Draw's smart objects")
+
+
+def build(src, out_dir, name, content_w=None, content_h=None):
     W, H, L = parse(src)
     os.makedirs(out_dir, exist_ok=True)
+    if not content_w or not content_h:
+        content_w, content_h = _content_size(L)
 
     def full(x):
         d = x["data"]
