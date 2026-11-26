@@ -2,7 +2,7 @@
 Headcover Studio backend (/headcover-studio page).
 
 The studio renders everything in the browser. The backend only:
-  GET  /api/headcover-studio/materials   live Material Inventory names (+ vendor/color) and fur names
+  GET  /api/headcover-studio/materials   live Material Inventory names (+ vendor/color); furs = rows named "<Color> Fur"
   POST /api/headcover-studio/sheets      save a finished proof sheet into the club's customer folder
   GET  /api/headcover-studio/sheets      list sheets already saved for a club
 
@@ -85,7 +85,7 @@ def sheet_filename(club, kind, existing_names, today=None):
     return name
 
 
-def register_routes(app, *, login_required, get_drive, send_cached_json, material_rows, fur_names,
+def register_routes(app, *, login_required, get_drive, send_cached_json, material_rows,
                     list_children, create_folder, upload_bytes, logger):
     """Wire the Headcover Studio routes into the Flask app (called once from server.py)."""
 
@@ -100,7 +100,9 @@ def register_routes(app, *, login_required, get_drive, send_cached_json, materia
             mats = []
             for r in material_rows() or []:
                 mats.append({"name": r.get("name", ""), "vendor": r.get("vendor", ""), "color": r.get("color", "")})
-            return {"materials": mats, "furs": list(fur_names() or [])}
+            # Furs are Material Inventory rows named "<Color> Fur" (e.g. "Navy Blue Fur").
+            furs = [m["name"] for m in mats if re.search(r"\bfur\b", m["name"], re.I)]
+            return {"materials": mats, "furs": furs}
 
         return send_cached_json("headcover:materials", 300, build)
 

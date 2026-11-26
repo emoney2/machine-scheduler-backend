@@ -34123,11 +34123,6 @@ _headcover_studio.register_routes(
     get_drive=get_drive_service,
     send_cached_json=send_cached_json,
     material_rows=_material_inventory_detail_rows,
-    fur_names=lambda: [
-        str(r[0]).strip()
-        for r in (fetch_sheet(SPREADSHEET_ID, "Material Inventory!I2:I") or [])
-        if r and str(r[0]).strip()
-    ],
     list_children=_list_drive_children,
     create_folder=_create_named_drive_folder,
     upload_bytes=_drive_upload_bytes,
