@@ -81,10 +81,13 @@ def build(src, out_dir, name, content_w=None, content_h=None):
     fur = [x for x in L if x["name"].upper() == "FUR" and not x["hidden"]]
     furd = None
     if fur:
+        # where the fur sits in the stack: the number of views Photoshop draws beneath it
+        fur_order = sum(1 for x in L[:L.index(fur[0])] if b"SoLE" in x["extra"] and x["clip"])
         f = full(fur[0])
         ys, xs = np.where(f[..., 3] > 0)
         y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
-        furd = {"bbox": [int(x0), int(y0), int(x1 - x0), int(y1 - y0)], "png": png(f[y0:y1, x0:x1], "fur.png")}
+        furd = {"bbox": [int(x0), int(y0), int(x1 - x0), int(y1 - y0)], "png": png(f[y0:y1, x0:x1], "fur.png"),
+                "order": fur_order}
 
     ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     for idx, x in enumerate(L):
