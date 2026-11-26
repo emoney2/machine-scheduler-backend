@@ -88,9 +88,11 @@ def build(src, out_dir, name, content_w=None, content_h=None):
         return np.clip(np.round(base), 0, 255).astype(np.uint8)
 
     views = []
+    covers = []   # (stack index, alpha) of each view, to hide overlay pixels that Photoshop draws underneath a view
     for i, x in enumerate(L):
         if b"SoLE" in x["extra"] and x["clip"]:
             base = clip_base(i)
+            covers.append((i, base[..., 3].astype(np.float64) / 255))
             ys, xs = np.where(base[..., 3] > 0)
             y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
             uv = uvmap.map_layer(x["extra"][b"SoLE"], content_w, content_h, W, H, ss=2)[y0:y1, x0:x1]
@@ -122,7 +124,12 @@ def build(src, out_dir, name, content_w=None, content_h=None):
             continue
         if x["clip"] or (idx + 1 < len(L) and L[idx + 1]["clip"]):
             continue   # clip bases and clipped shading layers are folded into each view's shading, not the overlay
-        ov.alpha_composite(Image.fromarray(full(x), "RGBA"))
+        lay = full(x)
+        above = [a for k, a in covers if k > idx]
+        if above:   # a layer beneath a cover (e.g. a white panel under the design) is hidden where the cover is
+            lay = lay.copy()
+            lay[..., 3] = np.round(lay[..., 3] * (1 - np.max(above, axis=0))).astype(np.uint8)
+        ov.alpha_composite(Image.fromarray(lay, "RGBA"))
     ov.save(os.path.join(out_dir, "overlay.png"), optimize=True)
 
     proof = {"name": name, "w": W, "h": H, "contentW": content_w, "contentH": content_h,
