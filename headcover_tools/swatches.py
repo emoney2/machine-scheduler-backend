@@ -19,6 +19,16 @@ from .psdread import parse
 LINE_RX = re.compile(r"leather|vinyl solid|lining", re.I)
 TILE_PX = 256
 TILE_INCHES = 2.1   # assumed width of the cropped square on a real swatch tag
+# Solid-colour lines render as their measured colour tinting the template's leather (no photo
+# texture). Patterned / exotic lines keep their seamless tile.
+SOLID_LINES = {"classic leather", "premium vinyl solid", "emboss patch leather", "metallic leather"}
+PRINT_FURS = re.compile(r"print|tie dye|tiger|camo|leopard", re.I)
+
+
+def is_solid(line, name):
+    if "lining" in line.lower():   # furs: plain colours are solid, prints keep their texture
+        return not PRINT_FURS.search(name)
+    return line.lower() in SOLID_LINES
 
 
 # ---------- 1. extract tags + labels from one PSD ----------
@@ -184,7 +194,7 @@ def build_library(psds, out_dir, fixes=None, sheet=True):
             tile.save(os.path.join(out_dir, mid + ".jpg"), quality=88)
             materials.append({"id": mid, "name": name, "line": line, "origin": origin,
                               "kind": "fur" if "lining" in line.lower() else "material",
-                              "hex": hexc, "tile": mid + ".jpg", "tileInches": TILE_INCHES,
+                              "hex": hexc, "solid": is_solid(line, name), "tile": mid + ".jpg", "tileInches": TILE_INCHES,
                               "source": key})
     json.dump({"version": 1, "materials": materials}, open(os.path.join(out_dir, "swatches.json"), "w"), indent=1)
     if sheet:   # written to the current folder, not into the deployed data
