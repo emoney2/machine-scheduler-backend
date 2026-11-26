@@ -3,6 +3,8 @@
     python -m headcover_tools add-design  "CamoTest.psd"   --product Driver
     python -m headcover_tools add-proof   "Driver3Draw.psd" --name Driver
     python -m headcover_tools build-swatches "Page 23 - Materials 1.psd" "Page 24 - Materials 2.psd" ...
+    python -m headcover_tools bake-prepare "Driver3Draw.psd" ...   then run photoshop/bake_uv.jsx, then
+    python -m headcover_tools bake-apply                          (exact side views; see bake.py)
 
 Output goes straight into frontend/public/headcover-studio/ and catalog.json is updated,
 so the new design / proof / swatches show up in the studio after the next frontend build.
@@ -52,6 +54,10 @@ def main():
     s.add_argument("psds", nargs="+")
     s.add_argument("--fix", action="append", default=[], help='label fix, e.g. "p26@436,1779=Black" (see "source" in swatches.json)')
 
+    b = sub.add_parser("bake-prepare", help="3Draw PSDs -> coordinate images + job list for photoshop/bake_uv.jsx")
+    b.add_argument("psds", nargs="+")
+    sub.add_parser("bake-apply", help="Photoshop renders -> exact view-N.uv.bin in the proofs")
+
     a = ap.parse_args()
     out = a.out
     if a.cmd == "add-design":
@@ -67,6 +73,14 @@ def main():
         pr = build(a.psd, os.path.join(out, "proofs", pid), a.name)
         _register(out, "proofs", {"id": pid, "dir": f"proofs/{pid}/"})
         print(f"proof {pid}: {len(pr['views'])} views, fur={'yes' if pr['fur'] else 'no'}")
+    elif a.cmd == "bake-prepare":
+        from .bake import prepare
+        for j in prepare(a.psds, _slug, out):
+            print("queued", j.split("|")[1])
+        print("Now in Photoshop: File > Scripts > Browse... > headcover_tools/photoshop/bake_uv.jsx")
+    elif a.cmd == "bake-apply":
+        from .bake import apply_all
+        apply_all()
     elif a.cmd == "build-swatches":
         from .swatches import build_library
         psds = []

@@ -22,3 +22,19 @@ Templates and proofs are matched by product name (`template.product == proof.nam
 Swatch label corrections live in `swatch_fixes.json`, keyed by page and tag position (the `source` field in `swatches.json`).
 
 Colorway rules (enforced in the browser, `frontend/src/headcoverStudio/engine.js`): back panel = lightest colour in that colorway's camo; camo uses 3 of the 4 picks: A = lightest + picks 1 & 2, B = lightest + picks 2 & 3. Customers see the 3D proof; the flat layout is in the lightbox only.
+
+## Exact 3D side views (Photoshop bake, one time per 3Draw)
+
+Quilted and custom-warped side views can't be decoded from the PSD reliably, so their UV maps are baked by Photoshop itself.
+This is an offline step on the PC; the live app only ever loads the resulting `.uv.bin` files.
+
+```
+python -m headcover_tools add-proof    "...\3D Models\Driver3Draw.psd" --name Driver     # as before
+python -m headcover_tools bake-prepare "...\3D Models\Driver3Draw.psd"
+#   Photoshop: File > Scripts > Browse... > backend/headcover_tools/photoshop/bake_uv.jsx
+python -m headcover_tools bake-apply
+```
+
+`bake_uv.jsx` opens each 3Draw, duplicates it and closes the original untouched, embeds the linked master layout,
+swaps its pixels for a 16-bit coordinate image and renders each view alone (smart filters and layer styles hidden).
+It never saves the 3Draw or the master layout. Working files go to `headcover_tools/photoshop/work/` (git-ignored).
