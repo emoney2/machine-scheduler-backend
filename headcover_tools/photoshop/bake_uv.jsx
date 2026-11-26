@@ -46,9 +46,9 @@ function bake(path, product, cw, ch){
     app.activeDocument = nd; var L = nd.layers[0]; nd.activeLayer = L;
     L.grouped = false; L.blendMode = BlendMode.NORMAL; L.opacity = 100; L.fillOpacity = 100; L.visible = true;
     try { executeAction(s("disableLayerStyle"), undefined, DialogModes.NO); } catch(e) {}
-    try { var hd = new ActionDescriptor(), hl = new ActionList(), hr = new ActionReference();   // smart filters would recolour the code
-      hr.putClass(s("filterFX")); hr.putEnumerated(s("layer"), s("ordinal"), s("targetEnum")); hl.putReference(hr);
-      hd.putList(s("null"), hl); executeAction(s("hide"), hd, DialogModes.NO); } catch(e) {}
+    try { var fd = new ActionDescriptor(), fr = new ActionReference();   // smart filters would recolour the code: delete them from this throwaway copy
+      fr.putClass(s("filterFX")); fr.putEnumerated(s("layer"), s("ordinal"), s("targetEnum")); fd.putReference(s("null"), fr);
+      executeAction(s("delete"), fd, DialogModes.NO); } catch(e) {}
     var o = new TiffSaveOptions(); o.imageCompression = TIFFEncoding.TIFFLZW; o.transparency = true; o.layers = false; o.alphaChannels = false; o.byteOrder = ByteOrder.IBM;
     nd.saveAs(new File(ROOT + "out/" + product + "__" + i + "__" + safeName(sos[i].name) + ".tif"), o, true);
     nd.close(SaveOptions.DONOTSAVECHANGES); log("  rendered " + sos[i].name);
