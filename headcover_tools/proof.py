@@ -61,10 +61,36 @@ def build(src, out_dir, name, content_w=None, content_h=None):
         Image.fromarray(a, "RGBA").save(os.path.join(out_dir, fname), optimize=True)
         return fname
 
+    def clip_base(i):
+        """Shading under the design: the clip group's base plus any clipped shading layers between it and the
+        smart object (e.g. a 41% multiply shadow), blended the way Photoshop does inside a clipping group."""
+        j = i - 1
+        while j > 0 and L[j]["clip"]:
+            j -= 1
+        base = full(L[j]).astype(np.float64)
+        for k in range(j + 1, i):
+            x = L[k]
+            if x["hidden"] or b"SoLE" in x["extra"]:
+                continue
+            lay = full(x).astype(np.float64)
+            eff = (lay[..., 3:4] / 255) * (x["op"] / 255) * (base[..., 3:4] > 0)
+            c, b = lay[..., :3], base[..., :3]
+            mode = x["blend"].strip()
+            if mode == "mul":
+                r = b * c / 255
+            elif mode == "fdiv":
+                r = np.minimum(255, b * 255 / np.maximum(c, 1))
+            elif mode == "scrn":
+                r = 255 - (255 - b) * (255 - c) / 255
+            else:
+                r = c
+            base[..., :3] = b * (1 - eff) + r * eff
+        return np.clip(np.round(base), 0, 255).astype(np.uint8)
+
     views = []
     for i, x in enumerate(L):
         if b"SoLE" in x["extra"] and x["clip"]:
-            base = full(L[i - 1])
+            base = clip_base(i)
             ys, xs = np.where(base[..., 3] > 0)
             y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
             uv = uvmap.map_layer(x["extra"][b"SoLE"], content_w, content_h, W, H, ss=2)[y0:y1, x0:x1]
@@ -94,8 +120,8 @@ def build(src, out_dir, name, content_w=None, content_h=None):
         if (x["hidden"] or x["sect"] in (1, 2, 3) or b"SoLE" in x["extra"]
                 or x["name"] == "Background" or x["name"].upper() == "FUR"):
             continue
-        if idx + 1 < len(L) and L[idx + 1]["clip"]:
-            continue   # clip bases are the shading, not overlay
+        if x["clip"] or (idx + 1 < len(L) and L[idx + 1]["clip"]):
+            continue   # clip bases and clipped shading layers are folded into each view's shading, not the overlay
         ov.alpha_composite(Image.fromarray(full(x), "RGBA"))
     ov.save(os.path.join(out_dir, "overlay.png"), optimize=True)
 
